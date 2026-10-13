@@ -11,6 +11,9 @@ pub fn router() -> Router<AppState> {
         .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
+        .route("/auth/totp/setup", post(totp_setup))
+        .route("/auth/totp/enable", post(totp_enable))
+        .route("/auth/totp/verify", post(totp_verify))
 }
 
 #[derive(Deserialize)]
@@ -159,4 +162,104 @@ async fn me(
     let _ = auth_at;
 
     Ok(Json(json!({ "id": user.id, "email": user.email, "global_role": user.global_role })))
+}
+
+async fn current_user_id(session: &Session) -> Result<uuid::Uuid, AppError> {
+    session
+        .get("user_id")
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?
+        .ok_or(AppError::Unauthorized)
+}
+
+async fn totp_setup(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Json<Value>, AppError> {
+    let user_id = current_user_id(&session).await?;
+    let user: models::user::User = sqlx::query_as("select * from users where id = $1")
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await?;
+
+    let secret = auth::totp::generate_secret();
+    sqlx::query("update users set totp_secret = $1, totp_enabled = false where id = $2")
+        .bind(&secret)
+        .bind(user_id)
+        .execute(&state.db)
+        .await?;
+
+    Ok(Json(json!({ "provisioning_uri": auth::totp::provisioning_uri(&secret, &user.email) })))
+}
+
+#[derive(Deserialize)]
+struct TotpCodeRequest {
+    code: String,
+}
+
+async fn totp_enable(
+    State(state): State<AppState>,
+    session: Session,
+    Json(payload): Json<TotpCodeRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user_id = current_user_id(&session).await?;
+    let user: models::user::User = sqlx::query_as("select * from users where id = $1")
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await?;
+    let secret = user.totp_secret.ok_or_else(|| AppError::Validation("run setup first".into()))?;
+
+    if !auth::totp::verify_code(&secret, &user.email, &payload.code) {
+        return Err(AppError::Validation("invalid code".into()));
+    }
+
+    sqlx::query("update users set totp_enabled = true where id = $1")
+        .bind(user_id)
+        .execute(&state.db)
+        .await?;
+    Ok(Json(json!({ "enabled": true })))
+}
+
+async fn totp_verify(
+    State(state): State<AppState>,
+    session: Session,
+    Json(payload): Json<TotpCodeRequest>,
+) -> Result<Json<Value>, AppError> {
+    let pending_user_id: uuid::Uuid = session
+        .get("pending_user_id")
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?
+        .ok_or(AppError::Unauthorized)?;
+
+    let user: models::user::User = sqlx::query_as("select * from users where id = $1")
+        .bind(pending_user_id)
+        .fetch_one(&state.db)
+        .await?;
+    let secret = user.totp_secret.ok_or(AppError::Unauthorized)?;
+
+    if !auth::totp::verify_code(&secret, &user.email, &payload.code) {
+        return Err(AppError::Unauthorized);
+    }
+
+    session.remove::<uuid::Uuid>("pending_user_id").await.ok();
+
+    // Rotate the session ID before promoting this "pending 2FA" session to a
+    // fully authenticated one, mirroring `login`'s non-TOTP success path.
+    // Without this, a session ID that existed before TOTP verification
+    // (e.g. attacker-fixed) could be reused as the post-auth session.
+    session
+        .cycle_id()
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+
+    session
+        .insert("user_id", user.id)
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+    session
+        .insert("auth_at", chrono::Utc::now())
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+
+    Ok(Json(json!({ "authenticated": true })))
 }
