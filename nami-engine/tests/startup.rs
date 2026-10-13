@@ -12,6 +12,34 @@ use std::process::{Command, Output};
 use base64::Engine;
 use nami_engine::crypto::TEST_KEY;
 
+/// A fresh, empty directory of this test's own under the system temp dir.
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "nami-startup-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Runs the engine with an empty environment except `vars` (plus an
+/// unreachable `DATABASE_URL`), in `dir`, where a `.env` file may wait.
+fn start_engine_in(dir: &std::path::Path, vars: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nami-engine"));
+    command
+        .env_clear()
+        .current_dir(dir)
+        .env("DATABASE_URL", "postgres://nami:nami@127.0.0.1:1/nami");
+    for (name, value) in vars {
+        command.env(name, value);
+    }
+    command.output().expect("the nami-engine binary runs")
+}
+
 fn start_engine(encryption_key: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nami-engine"));
     command
@@ -74,4 +102,53 @@ fn the_engine_refuses_to_start_on_the_built_in_test_key() {
         stderr.contains("NAMI_ENCRYPTION_KEY must not be the built-in test key"),
         "{stderr}"
     );
+}
+
+/// A `.env` line that does not parse stops startup instead of silently ending
+/// the loading there (every key after it would go unread). The message names
+/// the line and its key, never a value from the file.
+#[test]
+fn the_engine_refuses_to_start_on_a_dotenv_file_that_does_not_parse() {
+    let dir = scratch_dir("bad-dotenv");
+    std::fs::write(
+        dir.join(".env"),
+        "# settings\nPORT=8090\nSMTP_FROM=Nami <noreply@nami.local>\nSMTP_PASSWORD=hunter2-secret\n",
+    )
+    .unwrap();
+
+    let output = start_engine_in(&dir, &[]);
+
+    assert!(!output.status.success(), "the engine must not start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains(".env"), "{stderr}");
+    assert!(stderr.contains("line 3"), "{stderr}");
+    assert!(stderr.contains("SMTP_FROM"), "{stderr}");
+    for value in ["noreply", "Nami <", "hunter2"] {
+        assert!(!stderr.contains(value), "{value:?} leaked: {stderr}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// Every line of a `.env` file is read, the ones after a quoted value with
+/// spaces included: here the last line's key is the built-in test key, which
+/// the engine refuses by name, so the refusal proves the line was read.
+#[test]
+fn the_engine_reads_a_dotenv_file_to_its_last_line() {
+    let dir = scratch_dir("good-dotenv");
+    let test_key = base64::engine::general_purpose::STANDARD.encode(TEST_KEY);
+    std::fs::write(
+        dir.join(".env"),
+        format!("SMTP_FROM=\"Nami <noreply@nami.local>\"\nNAMI_ENCRYPTION_KEY={test_key}\n"),
+    )
+    .unwrap();
+
+    let output = start_engine_in(&dir, &[]);
+
+    assert!(!output.status.success(), "the engine must not start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("NAMI_ENCRYPTION_KEY must not be the built-in test key"),
+        "{stderr}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
 }

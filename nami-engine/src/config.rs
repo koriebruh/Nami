@@ -1,4 +1,9 @@
-use std::{str::FromStr, time::Duration};
+use std::{
+    io,
+    path::{Path, PathBuf},
+    str::FromStr,
+    time::Duration,
+};
 
 #[derive(Clone)]
 pub struct Config {
@@ -61,7 +66,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        dotenvy::dotenv().ok();
+        load_dotenv_or_stop();
         Self {
             database_url: std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
             port: std::env::var("PORT")
@@ -187,6 +192,110 @@ fn encryption_key_from_env() -> [u8; crate::crypto::KEY_LEN] {
     crate::crypto::parse_key(&raw).unwrap_or_else(|message| panic!("{message}"))
 }
 
+/// Loads the `.env` file of the working directory (or its nearest parent), see
+/// [`load_dotenv`], and stops startup if it cannot be loaded.
+fn load_dotenv_or_stop() {
+    let Ok(start) = std::env::current_dir() else {
+        return;
+    };
+    if let Err(message) = load_dotenv(&start) {
+        panic!("{message}");
+    }
+}
+
+/// Loads the `.env` file found in `start` or its nearest parent, as
+/// `dotenvy::dotenv()` would for the working directory: a variable already set
+/// in the environment wins, and having no `.env` file at all is fine.
+///
+/// Anything else is an error, and then nothing of the file is loaded: the
+/// whole file is parsed before any of it is applied. (`dotenvy` on its own
+/// stops at a line it cannot parse, after loading the lines before it, so an
+/// unquoted value with a space would silently leave every later key unread.)
+/// The message names the file and the line, and the key when the line has
+/// one, but never shows a value: the file holds secrets.
+pub fn load_dotenv(start: &Path) -> Result<(), String> {
+    let Some(path) = find_dotenv(start)? else {
+        return Ok(());
+    };
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("{}: cannot be read: {e}", path.display()))?;
+    // `dotenvy` drops a leading byte order mark when it loads a file, but not
+    // when it only parses one; drop it for both.
+    let content = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+    for parsed in dotenvy::from_read_iter(content) {
+        if let Err(e) = parsed {
+            return Err(describe_dotenv_error(&path, content, &e));
+        }
+    }
+    dotenvy::from_read(content).map_err(|e| describe_dotenv_error(&path, content, &e))
+}
+
+/// `.env` in `start` or the nearest of its parents that has one, like
+/// `dotenvy`'s own search.
+fn find_dotenv(start: &Path) -> Result<Option<PathBuf>, String> {
+    for dir in start.ancestors() {
+        let candidate = dir.join(".env");
+        match std::fs::metadata(&candidate) {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(candidate)),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("{}: cannot be read: {e}", candidate.display())),
+        }
+    }
+    Ok(None)
+}
+
+/// Why `path` could not be loaded, without a word of its values. `dotenvy`'s
+/// own message quotes the offending text, which may be a secret, so the line
+/// is located and named instead.
+fn describe_dotenv_error(path: &Path, content: &[u8], error: &dotenvy::Error) -> String {
+    let file = path.display();
+    match error {
+        dotenvy::Error::LineParse(text, _) => {
+            let content = String::from_utf8_lossy(content);
+            let advice = "quote values that contain spaces or special characters, e.g. KEY=\"a value\"; nothing from the file was loaded";
+            match locate_unparsable_line(&content, text) {
+                Some((number, Some(key))) => {
+                    format!("{file}: line {number} ({key}) cannot be parsed: {advice}")
+                }
+                Some((number, None)) => format!("{file}: line {number} cannot be parsed: {advice}"),
+                None => format!("{file}: a line cannot be parsed: {advice}"),
+            }
+        }
+        dotenvy::Error::Io(e) => format!("{file}: cannot be read: {e}"),
+        _ => format!("{file}: cannot be loaded (a value is not valid unicode)"),
+    }
+}
+
+/// The 1-based number of the first line of `content` that `dotenvy` cannot
+/// parse on its own and that holds `text` (the part of the line `dotenvy`
+/// reported), with the line's key when it has a well-formed one.
+fn locate_unparsable_line(content: &str, text: &str) -> Option<(usize, Option<String>)> {
+    let needle = text.lines().next().unwrap_or_default().trim();
+    content
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim_start().starts_with('#'))
+        .filter(|(_, line)| line.contains(needle))
+        .find(|(_, line)| dotenvy::from_read_iter(line.as_bytes()).any(|parsed| parsed.is_err()))
+        .map(|(index, line)| (index + 1, dotenv_key(line)))
+}
+
+/// The key of a `KEY=value` line (`export KEY=value` too), if it is a plain
+/// name: anything else might be part of a value, so it is not shown.
+fn dotenv_key(line: &str) -> Option<String> {
+    let line = line.trim_start();
+    let line = line.strip_prefix("export ").unwrap_or(line);
+    let (key, _) = line.split_once('=')?;
+    let key = key.trim();
+    let mut chars = key.chars();
+    let plain = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+    plain.then(|| key.to_string())
+}
+
 /// The setting, or a stop at startup with `parse`'s message (which names the
 /// variable and never holds a secret).
 fn or_stop<T>(parsed: Result<T, String>) -> T {
@@ -267,7 +376,114 @@ fn parse_bool_flag(value: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, flag_from_value, parse_bool_flag, positive_from_value};
+    use super::{
+        Config, flag_from_value, load_dotenv, locate_unparsable_line, parse_bool_flag,
+        positive_from_value,
+    };
+
+    /// A fresh, empty directory of this test's own under the system temp dir.
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nami-config-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A line that does not parse is an error naming the line and its key,
+    /// never a value, and nothing of the file is loaded, not even the lines
+    /// before it.
+    #[test]
+    fn a_dotenv_line_that_does_not_parse_is_an_error_and_loads_nothing() {
+        let dir = scratch_dir("bad");
+        let before = format!("NAMI_CONFIG_TEST_{}", std::process::id());
+        std::fs::write(
+            dir.join(".env"),
+            format!(
+                "# settings\n{before}=first-value\nexport SMTP_FROM=Nami <noreply@nami.local>\nSMTP_PASSWORD=hunter2\n"
+            ),
+        )
+        .unwrap();
+
+        let message = load_dotenv(&dir).unwrap_err();
+
+        assert!(
+            message.contains(".env: line 3 (SMTP_FROM) cannot be parsed"),
+            "{message}"
+        );
+        for value in ["noreply", "Nami <", "hunter2", "first-value"] {
+            assert!(!message.contains(value), "{value:?} leaked: {message}");
+        }
+        assert!(std::env::var(&before).is_err(), "nothing was loaded");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A line whose start is not a plain key is located by number only: its
+    /// text may be a pasted secret.
+    #[test]
+    fn a_line_without_a_plain_key_is_named_by_its_number_only() {
+        let dir = scratch_dir("nokey");
+        std::fs::write(dir.join(".env"), "A=1\ns3cr3t pasted here\n").unwrap();
+
+        let message = load_dotenv(&dir).unwrap_err();
+
+        assert!(
+            message.contains(".env: line 2 cannot be parsed"),
+            "{message}"
+        );
+        assert!(!message.contains("s3cr3t"), "{message}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The same text earlier in a line that parses does not mislead the
+    /// search for the bad line.
+    #[test]
+    fn the_bad_line_is_the_one_that_does_not_parse_on_its_own() {
+        assert_eq!(
+            locate_unparsable_line("A=\"x y\"\n# B=x y\nB=x y\n", "x y"),
+            Some((3, Some("B".to_string())))
+        );
+    }
+
+    /// No `.env` anywhere up the tree is fine: the environment is all there is.
+    #[test]
+    fn a_missing_dotenv_file_is_fine() {
+        let dir = scratch_dir("none");
+        assert_eq!(load_dotenv(&dir), Ok(()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The example file is what operators copy: every line of it must parse,
+    /// or dotenvy stops at the bad one and every later key goes unread.
+    #[test]
+    fn the_shipped_env_example_parses_to_its_last_line() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/.env.example");
+        let content = std::fs::read(path).unwrap();
+        let pairs: Vec<(String, String)> = dotenvy::from_read_iter(&content[..])
+            .collect::<Result<_, _>>()
+            .expect("every line of .env.example parses");
+        let value = |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(value("SMTP_FROM"), Some("Nami <noreply@nami.local>"));
+        for key in [
+            "COOKIE_SECURE",
+            "CLICKHOUSE_URL",
+            "UI_BASE_URL",
+            "UPTIME_WORKER_ENABLED",
+            "NAMI_ENCRYPTION_KEY",
+        ] {
+            assert!(value(key).is_some(), "{key} is read");
+        }
+    }
 
     #[test]
     fn positive_numbers_are_read_as_given() {
