@@ -1,7 +1,25 @@
+use std::{str::FromStr, time::Duration};
+
 #[derive(Clone)]
 pub struct Config {
     pub database_url: String,
+    /// The private API (`PORT`, default 8080): only nami-ui may reach it. It
+    /// trusts the client address nami-ui puts in `X-Forwarded-For` (the login
+    /// rate limit is keyed on it), so it must never be exposed directly.
     pub port: u16,
+    /// The public listener (`PUBLIC_PORT`, default 8081): only the endpoints
+    /// that outside clients call without a session, such as heartbeat pings.
+    /// The one port to expose to cron jobs and other machines.
+    pub public_port: u16,
+    /// Size of the Postgres pool (`DATABASE_MAX_CONNECTIONS`, default 20).
+    pub database_max_connections: u32,
+    /// How long a request or the worker waits for a free pooled connection
+    /// before failing (`DATABASE_ACQUIRE_TIMEOUT_SECS`, default 5).
+    pub database_acquire_timeout: Duration,
+    /// The longest any one statement may run (`DATABASE_STATEMENT_TIMEOUT_SECS`,
+    /// default 30), set on every pooled connection, so a hung query fails
+    /// instead of silently stalling monitoring.
+    pub database_statement_timeout: Duration,
     pub smtp_host: String,
     pub smtp_port: u16,
     pub cookie_secure: bool,
@@ -36,12 +54,24 @@ impl Config {
     pub fn from_env() -> Self {
         dotenvy::dotenv().ok();
         Self {
-            database_url: std::env::var("DATABASE_URL")
-                .expect("DATABASE_URL must be set"),
+            database_url: std::env::var("DATABASE_URL").expect("DATABASE_URL must be set"),
             port: std::env::var("PORT")
                 .unwrap_or_else(|_| "8080".to_string())
                 .parse()
                 .expect("PORT must be a number"),
+            public_port: std::env::var("PUBLIC_PORT")
+                .unwrap_or_else(|_| "8081".to_string())
+                .parse()
+                .expect("PUBLIC_PORT must be a number"),
+            database_max_connections: env_positive("DATABASE_MAX_CONNECTIONS", 20),
+            database_acquire_timeout: Duration::from_secs(env_positive(
+                "DATABASE_ACQUIRE_TIMEOUT_SECS",
+                5,
+            )),
+            database_statement_timeout: Duration::from_secs(env_positive(
+                "DATABASE_STATEMENT_TIMEOUT_SECS",
+                30,
+            )),
             smtp_host: std::env::var("SMTP_HOST").unwrap_or_else(|_| "localhost".to_string()),
             smtp_port: std::env::var("SMTP_PORT")
                 .unwrap_or_else(|_| "1025".to_string())
@@ -53,6 +83,18 @@ impl Config {
             encryption_key: encryption_key_from_env(),
             ..Self::from_env_defaults_only()
         }
+        .with_distinct_ports()
+    }
+
+    /// The API and the public listener cannot share a port: the API must stay
+    /// private while the public port is exposed.
+    fn with_distinct_ports(self) -> Self {
+        assert!(
+            self.port != self.public_port,
+            "PORT and PUBLIC_PORT must differ (both are {}): the API must stay private while the public port is exposed",
+            self.port
+        );
+        self
     }
 
     /// Test-only constructor: doesn't require `DATABASE_URL`/`GOOGLE_CLIENT_ID`/etc. to be
@@ -71,6 +113,10 @@ impl Config {
         Self {
             database_url: String::new(),
             port: 8080,
+            public_port: 8081,
+            database_max_connections: 20,
+            database_acquire_timeout: Duration::from_secs(5),
+            database_statement_timeout: Duration::from_secs(30),
             smtp_host: "localhost".to_string(),
             smtp_port: 1025,
             cookie_secure: false,
@@ -94,7 +140,8 @@ impl Config {
                 .unwrap_or_else(|_| "https://api.github.com/user".to_string()),
             clickhouse_url: std::env::var("CLICKHOUSE_URL")
                 .unwrap_or_else(|_| "http://localhost:8123".to_string()),
-            clickhouse_user: std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "nami".to_string()),
+            clickhouse_user: std::env::var("CLICKHOUSE_USER")
+                .unwrap_or_else(|_| "nami".to_string()),
             clickhouse_password: std::env::var("CLICKHOUSE_PASSWORD")
                 .unwrap_or_else(|_| "nami".to_string()),
             clickhouse_database: std::env::var("CLICKHOUSE_DATABASE")
@@ -114,6 +161,33 @@ impl Config {
 fn encryption_key_from_env() -> [u8; crate::crypto::KEY_LEN] {
     let raw = std::env::var("NAMI_ENCRYPTION_KEY").unwrap_or_default();
     crate::crypto::parse_key(&raw).unwrap_or_else(|message| panic!("{message}"))
+}
+
+/// Reads a positive whole number from the environment, `default` when it is
+/// unset. Anything else (zero, a negative or fractional number, text) stops
+/// startup with a message naming the variable, instead of guessing.
+fn env_positive<T>(name: &str, default: T) -> T
+where
+    T: FromStr + PartialOrd + Default,
+{
+    match std::env::var(name) {
+        Ok(value) => positive_from_value(name, &value),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            panic!("{name} must be valid unicode, got {value:?}")
+        }
+    }
+}
+
+/// `value` as a positive whole number, or a panic that names `name`.
+fn positive_from_value<T>(name: &str, value: &str) -> T
+where
+    T: FromStr + PartialOrd + Default,
+{
+    match value.parse::<T>() {
+        Ok(number) if number > T::default() => number,
+        _ => panic!("{name} must be a positive whole number, got {value:?}"),
+    }
 }
 
 /// Reads a boolean env flag, `default` when it is unset. A value that is not
@@ -146,9 +220,15 @@ fn flag_from_value(name: &str, value: &str) -> bool {
 fn parse_bool_flag(value: &str) -> Option<bool> {
     const TRUE: [&str; 4] = ["true", "1", "yes", "on"];
     const FALSE: [&str; 4] = ["false", "0", "no", "off"];
-    if TRUE.iter().any(|spelling| value.eq_ignore_ascii_case(spelling)) {
+    if TRUE
+        .iter()
+        .any(|spelling| value.eq_ignore_ascii_case(spelling))
+    {
         Some(true)
-    } else if FALSE.iter().any(|spelling| value.eq_ignore_ascii_case(spelling)) {
+    } else if FALSE
+        .iter()
+        .any(|spelling| value.eq_ignore_ascii_case(spelling))
+    {
         Some(false)
     } else {
         None
@@ -157,14 +237,73 @@ fn parse_bool_flag(value: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{flag_from_value, parse_bool_flag};
+    use super::{Config, flag_from_value, parse_bool_flag, positive_from_value};
+
+    #[test]
+    fn positive_numbers_are_read_as_given() {
+        assert_eq!(
+            positive_from_value::<u32>("DATABASE_MAX_CONNECTIONS", "1"),
+            1
+        );
+        assert_eq!(
+            positive_from_value::<u32>("DATABASE_MAX_CONNECTIONS", "50"),
+            50
+        );
+        assert_eq!(
+            positive_from_value::<u64>("DATABASE_ACQUIRE_TIMEOUT_SECS", "5"),
+            5
+        );
+    }
+
+    #[test]
+    fn zero_negative_fractional_and_text_values_stop_startup() {
+        for value in ["0", "-1", "1.5", "", " 5", "five", "5s"] {
+            let result = std::panic::catch_unwind(|| {
+                positive_from_value::<u64>("DATABASE_STATEMENT_TIMEOUT_SECS", value)
+            });
+            let message = *result
+                .expect_err(value)
+                .downcast::<String>()
+                .expect("a formatted message");
+            assert_eq!(
+                message,
+                format!(
+                    "DATABASE_STATEMENT_TIMEOUT_SECS must be a positive whole number, got {value:?}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_defaults_keep_the_api_and_the_public_listener_apart() {
+        let config = Config::from_env_for_test();
+        assert_eq!((config.port, config.public_port), (8080, 8081));
+        assert_eq!(config.database_max_connections, 20);
+        assert_eq!(config.database_acquire_timeout.as_secs(), 5);
+        assert_eq!(config.database_statement_timeout.as_secs(), 30);
+    }
+
+    #[test]
+    #[should_panic(expected = "PORT and PUBLIC_PORT must differ (both are 9000)")]
+    fn the_api_and_the_public_listener_cannot_share_a_port() {
+        Config {
+            port: 9000,
+            public_port: 9000,
+            ..Config::from_env_for_test()
+        }
+        .with_distinct_ports();
+    }
 
     #[test]
     fn parse_bool_flag_accepts_the_documented_spellings_case_insensitively() {
-        for value in ["true", "TRUE", "True", "1", "yes", "YES", "Yes", "on", "ON", "On"] {
+        for value in [
+            "true", "TRUE", "True", "1", "yes", "YES", "Yes", "on", "ON", "On",
+        ] {
             assert_eq!(parse_bool_flag(value), Some(true), "{value:?}");
         }
-        for value in ["false", "FALSE", "False", "0", "no", "NO", "No", "off", "OFF", "Off"] {
+        for value in [
+            "false", "FALSE", "False", "0", "no", "NO", "No", "off", "OFF", "Off",
+        ] {
             assert_eq!(parse_bool_flag(value), Some(false), "{value:?}");
         }
     }
@@ -172,8 +311,27 @@ mod tests {
     #[test]
     fn parse_bool_flag_rejects_everything_else() {
         for value in [
-            "", " ", "true ", " false", "treu", "fasle", "2", "-1", "01", "00", "y", "n", "t", "f",
-            "enabled", "disabled", "truee", "nope", "null", "none", "\u{ff54}rue",
+            "",
+            " ",
+            "true ",
+            " false",
+            "treu",
+            "fasle",
+            "2",
+            "-1",
+            "01",
+            "00",
+            "y",
+            "n",
+            "t",
+            "f",
+            "enabled",
+            "disabled",
+            "truee",
+            "nope",
+            "null",
+            "none",
+            "\u{ff54}rue",
         ] {
             assert_eq!(parse_bool_flag(value), None, "{value:?}");
         }

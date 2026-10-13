@@ -17,19 +17,20 @@ pub enum PingOutcome {
     Recorded { transition: Option<Transition> },
 }
 
-/// The longest string that can be a token (they are 64 hex characters, see
+/// A ping token's length: 32 random bytes, hex-encoded (see
 /// `models::heartbeat::insert_heartbeat`).
-const MAX_TOKEN_LEN: usize = 128;
+pub const TOKEN_LEN: usize = 64;
 
-/// Whether `token` could be one: printable ASCII, not absurdly long. Anything
-/// else cannot match a row, so [`record_ping`] answers "unknown" without a
-/// query. Besides saving the round trip, this keeps a NUL byte (Postgres
-/// refuses it in text, which would be a 500 for whoever sent it) an ordinary
-/// unknown token.
-fn could_be_a_token(token: &str) -> bool {
-    !token.is_empty()
-        && token.len() <= MAX_TOKEN_LEN
-        && token.bytes().all(|byte| byte.is_ascii_graphic())
+/// Whether `token` has a token's exact shape: [`TOKEN_LEN`] lowercase hex
+/// characters. Anything else cannot match a row, so it is answered "unknown"
+/// without touching the database. Besides saving the round trip (the ping
+/// endpoint is public), this keeps a NUL byte (Postgres refuses it in text,
+/// which would be a 500 for whoever sent it) an ordinary unknown token.
+pub fn is_well_formed_token(token: &str) -> bool {
+    token.len() == TOKEN_LEN
+        && token
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Records a ping in one transaction, under the heartbeat's row lock so a
@@ -43,7 +44,7 @@ fn could_be_a_token(token: &str) -> bool {
 /// Paused heartbeats keep accepting pings — `last_ping_at` stays fresh — but
 /// their state is frozen: no status change, no incident change, no alert.
 pub async fn record_ping(pool: &PgPool, token: &str) -> Result<PingOutcome, sqlx::Error> {
-    if !could_be_a_token(token) {
+    if !is_well_formed_token(token) {
         return Ok(PingOutcome::UnknownToken);
     }
     let known: bool =
@@ -265,38 +266,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_tokens_could_be_tokens() {
+    fn generated_tokens_are_well_formed() {
         for _ in 0..50 {
             let (token, _hash) = crate::auth::token::new_opaque_token();
-            assert_eq!(token.len(), 64);
-            assert!(could_be_a_token(&token), "{token}");
+            assert_eq!(token.len(), TOKEN_LEN);
+            assert!(is_well_formed_token(&token), "{token}");
         }
-        assert!(could_be_a_token("not-a-real-token"));
+        assert!(is_well_formed_token(&"0123456789abcdef".repeat(4)));
     }
 
     #[test]
-    fn the_length_limit_is_exact() {
-        assert!(could_be_a_token(&"a".repeat(MAX_TOKEN_LEN)));
-        assert!(!could_be_a_token(&"a".repeat(MAX_TOKEN_LEN + 1)));
-        assert!(!could_be_a_token(""));
+    fn the_length_is_exact() {
+        assert!(is_well_formed_token(&"a".repeat(TOKEN_LEN)));
+        assert!(!is_well_formed_token(&"a".repeat(TOKEN_LEN - 1)));
+        assert!(!is_well_formed_token(&"a".repeat(TOKEN_LEN + 1)));
+        assert!(!is_well_formed_token(""));
     }
 
     #[test]
-    fn nul_whitespace_control_and_non_ascii_text_cannot_be_a_token() {
-        for text in [
-            "a\0b",
-            "\0",
-            "a b",
-            " ",
-            "\t",
-            "a\nb",
-            "a\r\nb",
-            "\u{7f}",
-            "\u{20ac}",
-            "caf\u{e9}",
-            "a\u{200b}b",
+    fn only_lowercase_hex_digits_are_accepted() {
+        for bad in [
+            'A', 'F', 'g', 'z', '-', '_', '.', '/', '%', ' ', '\0', '\n', '\u{7f}', '\u{e9}',
         ] {
-            assert!(!could_be_a_token(text), "{text:?}");
+            let token = format!("{}{bad}", "a".repeat(TOKEN_LEN - 1));
+            assert!(!is_well_formed_token(&token), "{bad:?}");
         }
+        assert!(!is_well_formed_token("not-a-real-token"));
+        assert!(
+            !is_well_formed_token(&"A".repeat(TOKEN_LEN)),
+            "uppercase hex"
+        );
+        // 64 bytes but fewer characters: never a token either.
+        assert!(!is_well_formed_token(&"\u{e9}".repeat(TOKEN_LEN / 2)));
     }
 }

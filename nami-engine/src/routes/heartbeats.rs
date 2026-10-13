@@ -1,12 +1,15 @@
+use std::sync::Arc;
+
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Request, State, rejection::PathRejection},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
@@ -16,7 +19,7 @@ use crate::{
     state::AppState,
     uptime::{
         alerts,
-        heartbeat::{PingOutcome, record_ping},
+        heartbeat::{PingOutcome, is_well_formed_token, record_ping},
     },
 };
 
@@ -40,13 +43,28 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-/// The public ping endpoint. No session: the token in the path is the
-/// secret, and cron jobs call the engine directly. Every reply says
+/// How many pings may be handled at once. The endpoint is public and needs no
+/// session, and every well-formed token costs database work: a ping that finds
+/// every place taken is answered at once with `503` and `Retry-After: 1`
+/// (cron jobs retry, e.g. `curl --retry 3`) instead of waiting for a pooled
+/// connection, so a flood of pings can never starve the API or the worker of
+/// the pool they share.
+pub const MAX_PINGS_IN_FLIGHT: usize = 4;
+
+/// The places a ping holds while it runs (see [`MAX_PINGS_IN_FLIGHT`]).
+#[derive(Clone)]
+struct PingSlots(Arc<Semaphore>);
+
+/// The public ping endpoint, served on the public listener only (see
+/// `router::build_public_router`). No session: the token in the path is the
+/// secret, and cron jobs call it directly. A ping must hold one of
+/// `ping_slots`' places while it runs. Every reply says
 /// `Cache-Control: no-store`: a ping is a GET with a side effect, which no
 /// cache may answer or keep.
-pub fn public_router() -> Router<AppState> {
+pub fn public_router(ping_slots: Arc<Semaphore>) -> Router<AppState> {
     Router::new()
         .route("/api/v1/heartbeat/{token}", get(ping).post(ping))
+        .layer(Extension(PingSlots(ping_slots)))
         .layer(middleware::from_fn(no_store))
 }
 
@@ -166,12 +184,20 @@ async fn delete_heartbeat(
 
 async fn ping(
     State(state): State<AppState>,
+    Extension(PingSlots(slots)): Extension<PingSlots>,
     token: Result<Path<String>, PathRejection>,
-) -> Result<Json<Value>, AppError> {
-    // A path segment that is not even valid UTF-8 is as unknown a token as any
-    // other: the endpoint only ever answers 200 or 404 (bar a database failure).
+) -> Result<Response, AppError> {
+    // A path segment that is not even valid UTF-8, or not a token's exact
+    // shape, is as unknown a token as any other, and costs no database work:
+    // the endpoint only ever answers 200, 404 or 503 (bar a database failure).
     let Ok(Path(token)) = token else {
         return Err(AppError::NotFound);
+    };
+    if !is_well_formed_token(&token) {
+        return Err(AppError::NotFound);
+    }
+    let Ok(_slot) = slots.try_acquire() else {
+        return Ok(busy());
     };
     match record_ping(&state.db, &token).await? {
         PingOutcome::UnknownToken => Err(AppError::NotFound),
@@ -182,7 +208,17 @@ async fn ping(
                 let state = state.clone();
                 tokio::spawn(async move { alerts::notify_transition(&state, &transition).await });
             }
-            Ok(Json(json!({ "ok": true })))
+            Ok(Json(json!({ "ok": true })).into_response())
         }
     }
+}
+
+/// The reply to a ping that found every place taken: try again in a second.
+fn busy() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "1")],
+        Json(json!({ "error": "busy, retry shortly" })),
+    )
+        .into_response()
 }

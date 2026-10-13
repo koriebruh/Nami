@@ -8,16 +8,19 @@
 //! router inline; test files' `test_app()`/`build_app()` helpers do too.
 
 use axum::{
+    Router,
     extract::{ConnectInfo, Request},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    Router,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use time::Duration as TimeDuration;
-use tower_governor::{governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer};
-use tower_sessions::{cookie::SameSite, Expiry, SessionManagerLayer, SessionStore};
+use tokio::sync::Semaphore;
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+};
+use tower_sessions::{Expiry, SessionManagerLayer, SessionStore, cookie::SameSite};
 
 use crate::{error::AppError, routes, state::AppState};
 
@@ -50,17 +53,46 @@ fn rate_limited_with_governor(router: Router<AppState>) -> Router<AppState> {
 /// (`tower_sessions::MemoryStore`). Callers add the session layer via
 /// `configure_session_layer` below, which is itself shared so the layer's
 /// *settings* (as opposed to its store) are identical everywhere.
+///
+/// This is the private API (`PORT`): nami-ui is its only client, and it is
+/// never exposed directly. Its login rate limit is keyed on the client address
+/// nami-ui sends in `X-Forwarded-For`, which anyone reaching this port could
+/// forge. What outside clients must reach goes on the public listener instead
+/// ([`build_public_router`]).
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(routes::health::router())
         .merge(routes::auth::router())
-        .merge(rate_limited_with_governor(routes::auth::rate_limited_router()))
+        .merge(rate_limited_with_governor(
+            routes::auth::rate_limited_router(),
+        ))
         .merge(routes::projects::router())
         .merge(routes::sources::router())
         .merge(routes::monitors::router())
         .merge(routes::incidents::router())
         .merge(routes::heartbeats::router())
-        .merge(routes::heartbeats::public_router())
+        .with_state(state)
+}
+
+/// The public listener's router (`PUBLIC_PORT`): only what clients outside
+/// reach without a session, namely the heartbeat ping endpoint (later the log,
+/// OTLP and Sentry ingest endpoints) and a `/health` that does not touch the
+/// database. None of the API is served here, so the public port can be exposed
+/// to cron jobs and other machines without exposing the API with it. Pings
+/// share [`routes::heartbeats::MAX_PINGS_IN_FLIGHT`] places.
+pub fn build_public_router(state: AppState) -> Router {
+    build_public_router_with_ping_slots(
+        state,
+        Arc::new(Semaphore::new(routes::heartbeats::MAX_PINGS_IN_FLIGHT)),
+    )
+}
+
+/// [`build_public_router`] whose pings hold places of `ping_slots` (tests hold
+/// its places to fill the endpoint up).
+pub fn build_public_router_with_ping_slots(state: AppState, ping_slots: Arc<Semaphore>) -> Router {
+    Router::new()
+        .merge(routes::health::public_router())
+        .merge(routes::heartbeats::public_router(ping_slots))
         .with_state(state)
 }
 

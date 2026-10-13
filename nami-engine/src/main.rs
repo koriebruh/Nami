@@ -5,7 +5,7 @@ use nami_engine::{
     db, email, router,
     state::AppState,
 };
-use std::net::SocketAddr;
+use std::{future::IntoFuture, net::SocketAddr};
 use tower_sessions_sqlx_store::PostgresStore;
 
 #[tokio::main]
@@ -18,9 +18,12 @@ async fn main() {
     if config.encryption_key == TEST_KEY {
         panic!("NAMI_ENCRYPTION_KEY must not be the built-in test key");
     }
-    let pool = db::connect_pool(&config.database_url)
-        .await
-        .expect("failed to connect to database");
+    let pool = db::connect_pool(
+        &config.database_url,
+        &db::PoolSettings::from_config(&config),
+    )
+    .await
+    .expect("failed to connect to database");
     sqlx::migrate!("./migrations")
         .run(&pool)
         .await
@@ -59,7 +62,7 @@ async fn main() {
     // removing either can't silently go untested again.
     let session_layer = router::configure_session_layer(session_store, config.cookie_secure);
 
-    let port = config.port;
+    let (port, public_port) = (config.port, config.public_port);
     let state = AppState {
         db: pool,
         mailer: email::Mailer::new(&config.smtp_host, config.smtp_port),
@@ -75,16 +78,32 @@ async fn main() {
         tracing::info!("uptime worker disabled (UPTIME_WORKER_ENABLED=false)");
     }
 
+    let public_app = router::build_public_router(state.clone());
     let app = router::build_router(state).layer(session_layer);
 
+    // Two listeners. The API (`PORT`) is private: nami-ui is its only client,
+    // and it trusts the client address nami-ui forwards. The public listener
+    // (`PUBLIC_PORT`) serves only the endpoints outside clients call, such as
+    // heartbeat pings, and is the only one to expose.
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
-        .unwrap();
-    tracing::info!("listening on port {}", port);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        .unwrap_or_else(|e| panic!("failed to bind PORT {port}: {e}"));
+    let public_listener = tokio::net::TcpListener::bind(("0.0.0.0", public_port))
+        .await
+        .unwrap_or_else(|e| panic!("failed to bind PUBLIC_PORT {public_port}: {e}"));
+    tracing::info!("API listening on port {port} (private: only nami-ui may reach it)");
+    tracing::info!("public endpoints listening on port {public_port}");
+    tokio::try_join!(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
+        axum::serve(
+            public_listener,
+            public_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .into_future(),
     )
-    .await
-    .unwrap();
+    .expect("a listener failed");
 }
