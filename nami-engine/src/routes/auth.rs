@@ -14,6 +14,8 @@ pub fn router() -> Router<AppState> {
         .route("/auth/totp/setup", post(totp_setup))
         .route("/auth/totp/enable", post(totp_enable))
         .route("/auth/totp/verify", post(totp_verify))
+        .route("/auth/password/forgot", post(forgot_password))
+        .route("/auth/password/reset", post(reset_password))
 }
 
 #[derive(Deserialize)]
@@ -158,8 +160,10 @@ async fn me(
         .await?
         .ok_or(AppError::Unauthorized)?;
 
-    // Task 9 adds `password_changed_at`; until then this check is a no-op.
-    let _ = auth_at;
+    if auth_at < user.password_changed_at {
+        session.delete().await.ok();
+        return Err(AppError::Unauthorized);
+    }
 
     Ok(Json(json!({ "id": user.id, "email": user.email, "global_role": user.global_role })))
 }
@@ -262,4 +266,50 @@ async fn totp_verify(
         .map_err(|_| AppError::Validation("session error".into()))?;
 
     Ok(Json(json!({ "authenticated": true })))
+}
+
+#[derive(Deserialize)]
+struct ForgotPasswordRequest {
+    email: String,
+}
+
+async fn forgot_password(
+    State(state): State<AppState>,
+    Json(payload): Json<ForgotPasswordRequest>,
+) -> Result<Json<Value>, AppError> {
+    let generic_response = Json(json!({ "message": "if this email exists, a reset link was sent" }));
+
+    let Some(user) = models::user::find_by_email(&state.db, &payload.email).await? else {
+        return Ok(generic_response);
+    };
+
+    let (raw_token, token_hash) = auth::token::new_opaque_token();
+    models::token::insert_reset_token(&state.db, user.id, &token_hash).await?;
+    state
+        .mailer
+        .send(&user.email, "Reset your Nami password", format!("Reset: /auth/password/reset?token={raw_token}"))
+        .await?;
+
+    Ok(generic_response)
+}
+
+#[derive(Deserialize)]
+struct ResetPasswordRequest {
+    token: String,
+    new_password: String,
+}
+
+async fn reset_password(
+    State(state): State<AppState>,
+    Json(payload): Json<ResetPasswordRequest>,
+) -> Result<Json<Value>, AppError> {
+    let token_hash = auth::token::hash_token(&payload.token);
+    let user_id = models::token::consume_valid_reset_token(&state.db, &token_hash)
+        .await?
+        .ok_or_else(|| AppError::Validation("invalid or expired token".into()))?;
+
+    let new_hash = auth::password::hash_password(&payload.new_password)?;
+    models::user::update_password(&state.db, user_id, &new_hash).await?;
+
+    Ok(Json(json!({ "message": "password reset" })))
 }

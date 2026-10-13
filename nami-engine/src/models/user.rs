@@ -11,6 +11,7 @@ pub struct User {
     pub global_role: String,
     pub totp_secret: Option<String>,
     pub totp_enabled: bool,
+    pub password_changed_at: DateTime<Utc>,
 }
 
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>, sqlx::Error> {
@@ -39,5 +40,16 @@ pub async fn mark_email_verified(pool: &PgPool, user_id: Uuid) -> Result<(), sql
         .bind(user_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+pub async fn update_password(pool: &PgPool, user_id: Uuid, new_hash: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "update users set password_hash = $1, password_changed_at = now() where id = $2",
+    )
+    .bind(new_hash)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
