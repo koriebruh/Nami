@@ -73,6 +73,10 @@ task review — disclose this in every PR description.
 
 ## Conventions
 
+- All infrastructure (Postgres, Mailpit, ClickHouse, and anything added
+  later) runs as containers via `nami-engine/docker-compose.yaml` — never
+  installed natively on the host. `docker compose up -d <service>` before
+  running the engine or its tests.
 - Commit messages: Conventional Commits (`feat(engine): ...`, `fix(ui): ...`,
   `chore: ...`).
 - Rust: no ORM — SQLx with compile-time checked queries. Server-side
