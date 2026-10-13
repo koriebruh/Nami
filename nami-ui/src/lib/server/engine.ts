@@ -131,3 +131,40 @@ export async function engineFailure(response: Response, fallback: string) {
 	redirectToLoginIfUnauthorized(response);
 	return fail(response.status, { message: await engineErrorMessage(response, fallback) });
 }
+
+/**
+ * nami-engine's URL as your cron jobs reach it, for heartbeat ping URLs.
+ * Pings go straight to the engine (cron jobs are not browser sessions), so
+ * this can differ from the internal ENGINE_URL this BFF calls.
+ *
+ * An empty or blank `PUBLIC_ENGINE_URL` (`PUBLIC_ENGINE_URL=` in an env file)
+ * counts as unset. Anything else must be an absolute http(s) URL, a base that
+ * `/api/v1/heartbeat/<token>` can be appended to: it is shown to every member
+ * of a project and pasted into crontabs, so a scheme-less host, another scheme,
+ * credentials or a query string is a configuration error, not something to
+ * show. The message leaves the value out, since it may hold a secret.
+ */
+export function publicEngineUrl(): string {
+	const configured = (process.env.PUBLIC_ENGINE_URL ?? '').trim();
+	if (configured === '') return 'http://localhost:8080';
+
+	let url: URL | undefined;
+	try {
+		url = new URL(configured);
+	} catch {
+		// Reported below, together with a URL of the wrong scheme.
+	}
+	if (!url || (url.protocol !== 'http:' && url.protocol !== 'https:')) {
+		throw new Error(
+			'PUBLIC_ENGINE_URL must be an absolute http:// or https:// URL, for example https://engine.example.com'
+		);
+	}
+	if (url.username || url.password || url.search || url.hash) {
+		throw new Error(
+			'PUBLIC_ENGINE_URL must not contain credentials, a query string or a fragment: it is the base that /api/v1/heartbeat/<token> is appended to'
+		);
+	}
+	// Scheme, host and port as the URL parser writes them, plus the path prefix
+	// without its trailing slash(es).
+	return (url.origin + url.pathname).replace(/\/+$/, '');
+}
