@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 use super::{
     alerts::{self, Subject, Transition, TransitionKind},
-    checker::{self, CheckOutcome, CheckStatus},
+    checker::{self, CheckContext, CheckOutcome, CheckStatus},
     heartbeat,
     store::{self, UptimeCheckRow},
 };
@@ -528,16 +528,16 @@ async fn pass(
         return Ok(0);
     }
 
-    // Built per pass: cheap next to the checks themselves, and it never
-    // outlives the runtime that drives its connections.
-    let http = checker::build_http_client();
+    // Built per pass and dropped with it, never kept between passes: see
+    // `CheckContext` for why.
+    let ctx = Arc::new(CheckContext::for_state(state));
     let claimed = claimed
         .into_iter()
         .map(|(monitor, place)| (monitor, Some(place)))
         .collect();
     let mut checks = RunningChecks::start(claimed, &limits.in_flight, move |monitor| {
-        let http = http.clone();
-        async move { checker::perform_check(&http, &monitor).await }
+        let ctx = Arc::clone(&ctx);
+        async move { checker::perform_check(&ctx, &monitor).await }
     });
 
     let mut alerts = PassAlerts::new(state, notifications);
