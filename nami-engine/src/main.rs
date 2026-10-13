@@ -1,4 +1,4 @@
-use nami_engine::{config::Config, db, state::AppState, routes};
+use nami_engine::{config::Config, db, email, state::AppState, routes};
 use axum::Router;
 
 #[tokio::main]
@@ -13,7 +13,8 @@ async fn main() {
         .await
         .expect("failed to run migrations");
 
-    let state = AppState { db: pool };
+    let mailer = email::Mailer::new(&config.smtp_host, config.smtp_port);
+    let state = AppState { db: pool, mailer };
     let app = Router::new()
         .merge(routes::health::router())
         .with_state(state);
