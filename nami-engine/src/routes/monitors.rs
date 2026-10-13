@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use axum::{
     Json, Router,
@@ -18,9 +18,24 @@ use crate::{
     uptime::store::{self, MonitorStats, UptimeCheckRow},
 };
 
+/// How long the monitor list waits for ClickHouse's uptime answer. Past it the
+/// list is served without uptime, exactly as when ClickHouse returns an error,
+/// instead of waiting for the HTTP client's own 30 s timeout.
+const UPTIME_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `GET .../checks?limit=`: the default when `limit` is absent. A `limit`
+/// outside `MIN_CHECKS_LIMIT..=MAX_CHECKS_LIMIT` is clamped into it, not
+/// rejected.
+const DEFAULT_CHECKS_LIMIT: u32 = 50;
+const MIN_CHECKS_LIMIT: u32 = 1;
+const MAX_CHECKS_LIMIT: u32 = 500;
+
 // RBAC mirrors routes/projects.rs: viewer reads, member creates/edits,
-// admin deletes. Authorization runs before any lookup, so a caller without
-// access gets 403 whether or not the monitor exists.
+// admin deletes. `require_project_role` runs before any database or
+// ClickHouse lookup, so a caller without access gets 403 whether or not the
+// monitor exists. Extractors run before the handler body, so a malformed path
+// or query string (`?limit=abc`) is a 400 even for such a caller; that
+// reveals nothing about the project.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -55,14 +70,18 @@ async fn list_monitors(
     require_project_role(&state.db, &user, project_id, "viewer").await?;
     let monitors = monitor::list_for_project(&state.db, project_id).await?;
     // Uptime decorates this list; current status comes from Postgres. If
-    // ClickHouse is down, still list every monitor, with uptime unknown.
-    let uptime = match store::uptime_24h_by_monitor(&state.clickhouse, project_id, Utc::now()).await
-    {
-        Ok(uptime) => uptime,
-        Err(e) => {
-            tracing::warn!(error = %e, %project_id, "24h uptime unavailable; listing monitors without it");
-            HashMap::new()
-        }
+    // ClickHouse is down, erroring or too slow, still list every monitor,
+    // with uptime unknown.
+    let monitor_ids: Vec<Uuid> = monitors.iter().map(|monitor| monitor.id).collect();
+    let lookup = tokio::time::timeout(
+        UPTIME_LOOKUP_TIMEOUT,
+        store::uptime_24h_by_monitor(&state.clickhouse, project_id, &monitor_ids, Utc::now()),
+    )
+    .await;
+    let uptime = match lookup {
+        Ok(Ok(uptime)) => uptime,
+        Ok(Err(e)) => uptime_unavailable(project_id, &e),
+        Err(elapsed) => uptime_unavailable(project_id, &elapsed),
     };
     Ok(Json(
         monitors
@@ -76,6 +95,13 @@ async fn list_monitors(
             })
             .collect(),
     ))
+}
+
+/// Logs why the uptime lookup failed (an error, or the deadline passing) and
+/// returns no uptime, so the list is served without it either way.
+fn uptime_unavailable(project_id: Uuid, reason: &dyn std::fmt::Display) -> HashMap<Uuid, f64> {
+    tracing::warn!(error = %reason, %project_id, "24h uptime unavailable; listing monitors without it");
+    HashMap::new()
 }
 
 async fn create_monitor(
@@ -151,7 +177,10 @@ async fn list_checks(
     monitor::find_in_project(&state.db, project_id, monitor_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_CHECKS_LIMIT)
+        .clamp(MIN_CHECKS_LIMIT, MAX_CHECKS_LIMIT);
     Ok(Json(
         store::recent_checks(&state.clickhouse, project_id, monitor_id, limit).await?,
     ))

@@ -10,7 +10,9 @@ pub struct IncidentListItem {
     pub project_id: Uuid,
     pub monitor_id: Option<Uuid>,
     pub heartbeat_id: Option<Uuid>,
-    /// Name of the monitor (or heartbeat) the incident belongs to.
+    /// Name of the monitor the incident belongs to. Heartbeat incidents
+    /// arrive in Task 6; until then `heartbeat_id` is always null and every
+    /// incident has a monitor.
     pub source_name: Option<String>,
     pub title: String,
     pub cause: Option<String>,

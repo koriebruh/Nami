@@ -1,5 +1,7 @@
 //! Check history in ClickHouse (`uptime_checks`).
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -44,9 +46,11 @@ pub async fn insert_checks(
     ch.insert_rows("uptime_checks", rows).await
 }
 
-/// Buckets in the stats series: 48 x 30 minutes = the last 24 hours.
+/// Buckets in the stats series: 48 x 30 minutes, which covers 23.5 to 24
+/// hours (see [`monitor_stats`]).
 pub const SERIES_BUCKETS: i64 = 48;
-/// Must match `INTERVAL 30 MINUTE` in the series query.
+/// Length of a series bucket. The series query takes it as a bound parameter,
+/// so the SQL and the Rust bucket arithmetic cannot drift apart.
 pub const BUCKET_SECONDS: i64 = 30 * 60;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -69,29 +73,49 @@ fn ratio(up: u64, total: u64) -> Option<f64> {
     (total > 0).then(|| up as f64 / total as f64)
 }
 
-/// 24-hour uptime per monitor of one project, from one grouped query.
-/// Monitors with no checks in the window are absent from the map.
+/// The text ClickHouse parses for an `Array(UUID)` query parameter:
+/// `['<uuid>','<uuid>']`, UUIDs single-quoted. This builds a parameter
+/// *value*, never SQL text, and a `Uuid` renders as hex digits and dashes
+/// only, so nothing in it can break out of its quotes.
+fn uuid_array_param(ids: &[Uuid]) -> String {
+    let quoted: Vec<String> = ids.iter().map(|id| format!("'{id}'")).collect();
+    format!("[{}]", quoted.join(","))
+}
+
+/// 24-hour uptime of the given monitors of one project, from one grouped
+/// query. `monitor_ids` are the project's own monitor ids, which the caller
+/// has from Postgres: filtering on them lets ClickHouse use the
+/// `(monitor_id, checked_at)` sort key instead of reading every check of the
+/// project. `project_id` still filters too, so an id that belongs to another
+/// project returns nothing. Monitors with no checks in the window are absent
+/// from the map; with no ids no query is sent.
 pub async fn uptime_24h_by_monitor(
     ch: &ClickHouse,
     project_id: Uuid,
+    monitor_ids: &[Uuid],
     now: DateTime<Utc>,
-) -> Result<std::collections::HashMap<Uuid, f64>, ClickHouseError> {
+) -> Result<HashMap<Uuid, f64>, ClickHouseError> {
     #[derive(Deserialize)]
     struct Row {
         monitor_id: Uuid,
         up: u64,
         total: u64,
     }
+    if monitor_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
     let rows: Vec<Row> = ch
         .query_rows(
             "SELECT monitor_id, countIf(status = 'up') AS up, count() AS total
              FROM uptime_checks
              WHERE project_id = {project_id:UUID}
+               AND monitor_id IN {ids:Array(UUID)}
                AND checked_at >= fromUnixTimestamp64Milli({since_ms:Int64}, 'UTC')
                AND checked_at <= fromUnixTimestamp64Milli({now_ms:Int64}, 'UTC')
              GROUP BY monitor_id",
             &[
                 ("project_id", project_id.to_string()),
+                ("ids", uuid_array_param(monitor_ids)),
                 (
                     "since_ms",
                     (now - chrono::Duration::hours(24))
@@ -135,6 +159,10 @@ pub async fn recent_checks(
 /// that contains `now`. Buckets without checks are present with nulls, so a
 /// chart always gets a stable x-axis. `now` is a parameter so tests can pin
 /// the bucket boundaries.
+///
+/// The series starts on a bucket boundary, so it covers between 23.5 and 24
+/// hours (the last bucket is partial): its counts need not add up to the
+/// rolling 24 h window behind `uptime_24h`.
 pub async fn monitor_stats(
     ch: &ClickHouse,
     project_id: Uuid,
@@ -190,7 +218,7 @@ pub async fn monitor_stats(
     let first_bucket = current_bucket - (SERIES_BUCKETS - 1) * BUCKET_SECONDS;
     let rows: Vec<BucketRow> = ch
         .query_rows(
-            "SELECT toUnixTimestamp(toStartOfInterval(checked_at, INTERVAL 30 MINUTE)) AS bucket,
+            "SELECT toUnixTimestamp(toStartOfInterval(checked_at, toIntervalSecond({bucket_seconds:UInt32}))) AS bucket,
                     avg(response_time_ms) AS avg_response_ms,
                     countIf(status = 'up') AS up,
                     count() AS total
@@ -202,13 +230,13 @@ pub async fn monitor_stats(
             &[
                 ("project_id", project_id.to_string()),
                 ("monitor_id", monitor_id.to_string()),
+                ("bucket_seconds", BUCKET_SECONDS.to_string()),
                 ("from_ms", (first_bucket * 1000).to_string()),
                 ("now_ms", millis(now)),
             ],
         )
         .await?;
-    let by_bucket: std::collections::HashMap<i64, BucketRow> =
-        rows.into_iter().map(|r| (r.bucket, r)).collect();
+    let by_bucket: HashMap<i64, BucketRow> = rows.into_iter().map(|r| (r.bucket, r)).collect();
     let series = (0..SERIES_BUCKETS)
         .map(|i| {
             let start = first_bucket + i * BUCKET_SECONDS;
@@ -288,6 +316,17 @@ mod tests {
                 error: Some("expected status 200-399, got 503".to_string()),
             }
         );
+    }
+
+    /// ClickHouse parses an `Array(UUID)` query parameter from text and
+    /// rejects UUIDs that are not single-quoted.
+    #[test]
+    fn a_uuid_list_is_sent_as_a_quoted_clickhouse_array() {
+        assert_eq!(
+            uuid_array_param(&[Uuid::from_u128(1), Uuid::from_u128(0xabc)]),
+            "['00000000-0000-0000-0000-000000000001','00000000-0000-0000-0000-000000000abc']"
+        );
+        assert_eq!(uuid_array_param(&[]), "[]");
     }
 
     /// The JSON keys are the `uptime_checks` column names and `status` is an
