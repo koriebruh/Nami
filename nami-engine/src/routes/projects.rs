@@ -60,7 +60,22 @@ async fn add_member(
     Json(payload): Json<AddMemberRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     require_project_role(&state.db, &user, id, "admin").await?;
-    models::project::upsert_member(&state.db, id, payload.user_id, &payload.project_role).await?;
+
+    if !matches!(payload.project_role.as_str(), "admin" | "member" | "viewer") {
+        return Err(AppError::Validation("invalid project_role".into()));
+    }
+
+    models::project::upsert_member(&state.db, id, payload.user_id, &payload.project_role)
+        .await
+        .map_err(|e| match &e {
+            // Postgres SQLSTATE 23503 = foreign_key_violation: project_id or
+            // user_id doesn't exist. The DB correctly refuses the write; map
+            // it to 404 instead of letting it surface as a raw 500.
+            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
+                AppError::NotFound
+            }
+            _ => AppError::Database(e),
+        })?;
     Ok(Json(serde_json::json!({ "added": true })))
 }
 

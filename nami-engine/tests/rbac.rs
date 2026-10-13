@@ -161,6 +161,52 @@ async fn member_without_project_row_gets_forbidden(pool: sqlx::PgPool) {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
+// Positive-coverage counterpart to `member_without_project_row_gets_forbidden`:
+// proves a user WITH a project_members row can actually get in. Without this,
+// a regression that made `require_project_role` always deny non-global-admins
+// would still pass every existing test (they all assert denial).
+#[sqlx::test]
+async fn member_with_viewer_project_row_can_access_project(pool: sqlx::PgPool) {
+    let hash = nami_engine::auth::password::hash_password("password123").unwrap();
+    let user_id: (uuid::Uuid,) = sqlx::query_as(
+        "insert into users (email, password_hash, email_verified_at, global_role) values ($1, $2, now(), 'member') returning id",
+    )
+    .bind("viewer-member@example.com")
+    .bind(&hash)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let project_id: (uuid::Uuid,) = sqlx::query_as(
+        "insert into projects (name, slug) values ('Test3', 'test3') returning id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into project_members (project_id, user_id, project_role) values ($1, $2, 'viewer')",
+    )
+    .bind(project_id.0)
+    .bind(user_id.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let app = test_app(pool.clone());
+    let cookie = login_as(app.clone(), "viewer-member@example.com").await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/projects/{}", project_id.0))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[sqlx::test]
 async fn global_admin_bypasses_project_membership(pool: sqlx::PgPool) {
     let hash = nami_engine::auth::password::hash_password("password123").unwrap();
