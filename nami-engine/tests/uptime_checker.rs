@@ -1,0 +1,519 @@
+use std::{
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use chrono::Utc;
+use nami_engine::{
+    models::monitor::Monitor,
+    uptime::checker::{CheckStatus, MAX_BODY_BYTES, build_http_client, perform_check},
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use uuid::Uuid;
+use wiremock::{
+    Mock, MockServer, ResponseTemplate,
+    matchers::{method, path},
+};
+
+fn monitor(check_type: &str) -> Monitor {
+    Monitor {
+        id: Uuid::new_v4(),
+        project_id: Uuid::new_v4(),
+        name: "test".to_string(),
+        check_type: check_type.to_string(),
+        url: None,
+        host: None,
+        port: None,
+        http_method: "GET".to_string(),
+        keyword: None,
+        keyword_mode: "contains".to_string(),
+        expected_status_min: 200,
+        expected_status_max: 399,
+        interval_seconds: 60,
+        timeout_seconds: 5,
+        confirmation_threshold: 2,
+        paused: false,
+        current_status: "pending".to_string(),
+        consecutive_failures: 0,
+        last_checked_at: None,
+        next_check_at: Utc::now(),
+        created_at: Utc::now(),
+    }
+}
+
+fn http_monitor(url: String) -> Monitor {
+    Monitor {
+        url: Some(url),
+        ..monitor("http")
+    }
+}
+
+fn keyword_monitor(url: String, keyword: &str, mode: &str) -> Monitor {
+    Monitor {
+        url: Some(url),
+        keyword: Some(keyword.to_string()),
+        keyword_mode: mode.to_string(),
+        ..monitor("keyword")
+    }
+}
+
+async fn server_returning(template: ResponseTemplate) -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(template)
+        .mount(&server)
+        .await;
+    server
+}
+
+/// A local port with nothing listening on it.
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+/// A local server for behaviour wiremock cannot produce (a reset, a body that
+/// never ends, connections that stay open). `handle` gets every accepted
+/// connection. Returns the port and the number of connections accepted so far.
+async fn raw_server<H, F>(handle: H) -> (u16, Arc<AtomicUsize>)
+where
+    H: Fn(tokio::net::TcpStream) -> F + Send + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(handle(stream));
+        }
+    });
+    (port, accepted)
+}
+
+async fn read_request(stream: &mut tokio::net::TcpStream) {
+    let mut buf = [0u8; 4096];
+    let _ = stream.read(&mut buf).await;
+}
+
+/// Makes closing the stream send a TCP RST instead of a FIN. `set_linger` is
+/// deprecated because a non-zero linger blocks the thread on drop; a zero
+/// linger is the only way to force an RST from tokio's API.
+#[allow(deprecated)]
+fn reset_on_close(stream: &tokio::net::TcpStream) {
+    stream.set_linger(Some(Duration::ZERO)).unwrap();
+}
+
+#[tokio::test]
+async fn status_inside_the_expected_range_is_up() {
+    let server = server_returning(ResponseTemplate::new(204)).await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &http_monitor(format!("{}/", server.uri())),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Up);
+    assert_eq!(outcome.status_code, Some(204));
+    assert!(outcome.response_time_ms.is_some());
+    assert_eq!(outcome.error, None);
+}
+
+#[tokio::test]
+async fn status_outside_the_expected_range_is_down_with_the_reason() {
+    let server = server_returning(ResponseTemplate::new(503)).await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &http_monitor(format!("{}/", server.uri())),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(outcome.status_code, Some(503));
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some("expected status 200-399, got 503")
+    );
+}
+
+#[tokio::test]
+async fn a_custom_expected_range_is_honoured() {
+    let server = server_returning(ResponseTemplate::new(204)).await;
+    let only_200 = Monitor {
+        expected_status_min: 200,
+        expected_status_max: 200,
+        ..http_monitor(format!("{}/", server.uri()))
+    };
+    let outcome = perform_check(&build_http_client(), &only_200).await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some("expected status 200-200, got 204")
+    );
+}
+
+#[tokio::test]
+async fn redirects_are_followed_to_the_final_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/old"))
+        .respond_with(
+            ResponseTemplate::new(301).insert_header("Location", format!("{}/new", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/new"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &http_monitor(format!("{}/old", server.uri())),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Up);
+    assert_eq!(outcome.status_code, Some(200));
+}
+
+#[tokio::test]
+async fn head_monitors_send_head_requests() {
+    let server = MockServer::start().await;
+    // Only HEAD is mocked: a GET would get wiremock's default 404.
+    Mock::given(method("HEAD"))
+        .and(path("/"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let head = Monitor {
+        http_method: "HEAD".to_string(),
+        ..http_monitor(format!("{}/", server.uri()))
+    };
+    let outcome = perform_check(&build_http_client(), &head).await;
+    assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
+}
+
+#[tokio::test]
+async fn keyword_present_is_up_and_absent_is_down() {
+    let server =
+        server_returning(ResponseTemplate::new(200).set_body_string("status: all systems go"))
+            .await;
+    let url = format!("{}/", server.uri());
+
+    let present = perform_check(
+        &build_http_client(),
+        &keyword_monitor(url.clone(), "systems go", "contains"),
+    )
+    .await;
+    assert_eq!(present.status, CheckStatus::Up, "{:?}", present.error);
+
+    let absent = perform_check(
+        &build_http_client(),
+        &keyword_monitor(url, "maintenance", "contains"),
+    )
+    .await;
+    assert_eq!(absent.status, CheckStatus::Down);
+    assert_eq!(
+        absent.error.as_deref(),
+        Some("keyword \"maintenance\" not found")
+    );
+    assert_eq!(absent.status_code, Some(200));
+}
+
+#[tokio::test]
+async fn keyword_matching_is_case_sensitive() {
+    let server = server_returning(ResponseTemplate::new(200).set_body_string("Status: OK")).await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &keyword_monitor(format!("{}/", server.uri()), "ok", "contains"),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(outcome.error.as_deref(), Some("keyword \"ok\" not found"));
+}
+
+#[tokio::test]
+async fn not_contains_mode_inverts_the_keyword_check() {
+    let server =
+        server_returning(ResponseTemplate::new(200).set_body_string("database error")).await;
+    let url = format!("{}/", server.uri());
+
+    let found = perform_check(
+        &build_http_client(),
+        &keyword_monitor(url.clone(), "error", "not_contains"),
+    )
+    .await;
+    assert_eq!(found.status, CheckStatus::Down);
+    assert_eq!(found.error.as_deref(), Some("keyword \"error\" found"));
+
+    let missing = perform_check(
+        &build_http_client(),
+        &keyword_monitor(url, "panic", "not_contains"),
+    )
+    .await;
+    assert_eq!(missing.status, CheckStatus::Up, "{:?}", missing.error);
+}
+
+#[tokio::test]
+async fn a_keyword_beyond_the_body_cap_is_not_found() {
+    let body = format!("{}NEEDLE", "a".repeat(MAX_BODY_BYTES));
+    let server = server_returning(ResponseTemplate::new(200).set_body_string(body)).await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &keyword_monitor(format!("{}/", server.uri()), "NEEDLE", "contains"),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+}
+
+#[tokio::test]
+async fn a_keyword_match_still_needs_an_expected_status() {
+    let server =
+        server_returning(ResponseTemplate::new(500).set_body_string("all systems go")).await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &keyword_monitor(format!("{}/", server.uri()), "systems go", "contains"),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some("expected status 200-399, got 500")
+    );
+}
+
+#[tokio::test]
+async fn a_slow_response_times_out_within_the_monitor_timeout() {
+    let server =
+        server_returning(ResponseTemplate::new(200).set_delay(Duration::from_secs(5))).await;
+    let slow = Monitor {
+        timeout_seconds: 1,
+        ..http_monitor(format!("{}/", server.uri()))
+    };
+    let started = Instant::now();
+    let outcome = perform_check(&build_http_client(), &slow).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(outcome.error.as_deref(), Some("timeout after 1s"));
+    assert_eq!(outcome.response_time_ms, None);
+}
+
+#[tokio::test]
+async fn http_connection_refused_is_down() {
+    let outcome = perform_check(
+        &build_http_client(),
+        &http_monitor(format!("http://127.0.0.1:{}/", closed_port())),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(outcome.error.as_deref(), Some("connection refused"));
+    assert_eq!(outcome.status_code, None);
+}
+
+#[tokio::test]
+async fn tcp_open_port_is_up() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let tcp = Monitor {
+        host: Some("127.0.0.1".to_string()),
+        port: Some(i32::from(port)),
+        ..monitor("tcp")
+    };
+    let outcome = perform_check(&build_http_client(), &tcp).await;
+    assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
+    assert!(outcome.response_time_ms.is_some());
+    drop(listener);
+}
+
+#[tokio::test]
+async fn tcp_closed_port_is_down_with_connection_refused() {
+    let tcp = Monitor {
+        host: Some("127.0.0.1".to_string()),
+        port: Some(i32::from(closed_port())),
+        ..monitor("tcp")
+    };
+    let outcome = perform_check(&build_http_client(), &tcp).await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(outcome.error.as_deref(), Some("connection refused"));
+}
+
+#[tokio::test]
+async fn a_redirect_loop_is_down_with_too_many_redirects() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/"))
+        .respond_with(
+            ResponseTemplate::new(302).insert_header("Location", format!("{}/", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &http_monitor(format!("{}/", server.uri())),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(outcome.error.as_deref(), Some("too many redirects"));
+    assert_eq!(outcome.status_code, None);
+}
+
+#[tokio::test]
+async fn a_reset_connection_is_down() {
+    let (port, _) = raw_server(|mut stream| async move {
+        read_request(&mut stream).await;
+        reset_on_close(&stream);
+    })
+    .await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &http_monitor(format!("http://127.0.0.1:{port}/")),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(outcome.error.as_deref(), Some("connection reset"));
+    assert_eq!(outcome.status_code, None);
+}
+
+#[tokio::test]
+async fn a_failed_tls_handshake_is_down_with_the_cause() {
+    // https against a plain-http port: the TCP connect succeeds, the TLS
+    // handshake does not.
+    let server = MockServer::start().await;
+    let target = http_monitor(format!("https://127.0.0.1:{}/", server.address().port()));
+    let outcome = perform_check(&build_http_client(), &target).await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    let error = outcome.error.expect("a failed check carries an error");
+    assert!(error.starts_with("connection failed: "), "{error}");
+}
+
+#[tokio::test]
+async fn a_body_that_never_finishes_times_out_within_the_monitor_timeout() {
+    let (port, _) = raw_server(|mut stream| async move {
+        read_request(&mut stream).await;
+        // Promises a megabyte, sends five bytes, then goes silent.
+        let _ = stream
+            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000000\r\n\r\nhello")
+            .await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    })
+    .await;
+    let stalled = Monitor {
+        timeout_seconds: 1,
+        ..keyword_monitor(format!("http://127.0.0.1:{port}/"), "needle", "contains")
+    };
+    let started = Instant::now();
+    let outcome = perform_check(&build_http_client(), &stalled).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(outcome.error.as_deref(), Some("timeout after 1s"));
+}
+
+#[tokio::test]
+async fn every_check_opens_a_fresh_connection() {
+    let (port, accepted) = raw_server(|mut stream| async move {
+        // Keep-alive: answer every request that arrives on this connection.
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stream.read(&mut buf).await {
+            if n == 0
+                || stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    let client = build_http_client();
+    let target = http_monitor(format!("http://127.0.0.1:{port}/"));
+    for _ in 0..2 {
+        let outcome = perform_check(&client, &target).await;
+        assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
+    }
+    assert_eq!(
+        accepted.load(Ordering::SeqCst),
+        2,
+        "the second check reused a pooled connection"
+    );
+}
+
+#[tokio::test]
+async fn a_monitor_that_cannot_be_checked_is_down_instead_of_panicking() {
+    let local = || Some("127.0.0.1".to_string());
+    let cases = [
+        (monitor("http"), "monitor has no url"),
+        (monitor("keyword"), "monitor has no url"),
+        (monitor("tcp"), "monitor has no host/port"),
+        (
+            Monitor {
+                host: local(),
+                ..monitor("tcp")
+            },
+            "monitor has no host/port",
+        ),
+        (
+            Monitor {
+                port: Some(80),
+                ..monitor("tcp")
+            },
+            "monitor has no host/port",
+        ),
+        (
+            Monitor {
+                host: local(),
+                port: Some(70_000),
+                ..monitor("tcp")
+            },
+            "invalid port 70000",
+        ),
+        (
+            Monitor {
+                host: local(),
+                port: Some(-1),
+                ..monitor("tcp")
+            },
+            "invalid port -1",
+        ),
+        (monitor("ping"), "unsupported check type \"ping\""),
+    ];
+    let client = build_http_client();
+    for (case, expected) in cases {
+        let outcome = perform_check(&client, &case).await;
+        assert_eq!(outcome.status, CheckStatus::Down, "{expected}");
+        assert_eq!(outcome.error.as_deref(), Some(expected));
+        assert_eq!(outcome.status_code, None, "{expected}");
+        assert_eq!(outcome.response_time_ms, None, "{expected}");
+    }
+}
+
+#[test]
+fn check_status_serializes_as_the_clickhouse_enum_labels() {
+    // `uptime_checks.status` is `Enum8('up' = 1, 'down' = 2)`.
+    assert_eq!(serde_json::to_string(&CheckStatus::Up).unwrap(), "\"up\"");
+    assert_eq!(
+        serde_json::to_string(&CheckStatus::Down).unwrap(),
+        "\"down\""
+    );
+    assert_eq!(
+        serde_json::from_str::<CheckStatus>("\"up\"").unwrap(),
+        CheckStatus::Up
+    );
+    assert_eq!(
+        serde_json::from_str::<CheckStatus>("\"down\"").unwrap(),
+        CheckStatus::Down
+    );
+}
