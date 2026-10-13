@@ -31,7 +31,9 @@ pub struct Heartbeat {
     pub current_status: String,
     pub last_ping_at: Option<DateTime<Utc>>,
     /// When it was last resumed from a pause (`None`: never). The sweep counts
-    /// from the latest of this, `last_ping_at` and `created_at`.
+    /// from the latest of this, `last_ping_at`, `created_at` and the end of the
+    /// last engine outage its deadline fell into (`outage_anchor_at`, a column
+    /// only the sweep reads, see `uptime::heartbeat::note_worker_alive`).
     pub resumed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }

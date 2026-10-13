@@ -19,11 +19,8 @@ use nami_engine::{
     state::AppState,
     uptime::{
         alerts::{Subject, Transition, TransitionKind},
-        heartbeat::{PingOutcome, record_ping, sweep_overdue},
-        worker::{
-            Notifications, SWEEP_BATCH, run_forever, run_forever_since, sweep_heartbeats,
-            sweep_pass,
-        },
+        heartbeat::{OUTAGE_GAP, PingOutcome, note_worker_alive, record_ping, sweep_overdue},
+        worker::{Notifications, SWEEP_BATCH, run_forever, sweep_heartbeats, sweep_pass},
     },
 };
 use serde_json::{Value, json};
@@ -665,9 +662,7 @@ fn heartbeats_of(transitions: &[Transition]) -> Vec<Uuid> {
 
 /// One sweep as the worker runs it, but with no restart bound.
 async fn sweep(pool: &sqlx::PgPool) -> Vec<Transition> {
-    sweep_overdue(pool, DateTime::UNIX_EPOCH, SWEEP_BATCH)
-        .await
-        .unwrap()
+    sweep_overdue(pool, SWEEP_BATCH).await.unwrap()
 }
 
 /// A ping racing a sweep (`record_ping` takes the heartbeat's row lock first):
@@ -790,7 +785,7 @@ async fn sweeps_running_at_the_same_time_flip_each_heartbeat_once(pool: sqlx::Pg
     let sweeps: Vec<_> = (0..4)
         .map(|_| {
             let pool = pool.clone();
-            tokio::spawn(async move { sweep_overdue(&pool, DateTime::UNIX_EPOCH, 4).await })
+            tokio::spawn(async move { sweep_overdue(&pool, 4).await })
         })
         .collect();
     let mut flipped = Vec::new();
@@ -803,7 +798,7 @@ async fn sweeps_running_at_the_same_time_flip_each_heartbeat_once(pool: sqlx::Pg
     assert_eq!(distinct.len(), flipped.len(), "flipped twice: {flipped:?}");
 
     loop {
-        let more = sweep_overdue(&pool, DateTime::UNIX_EPOCH, 4).await.unwrap();
+        let more = sweep_overdue(&pool, 4).await.unwrap();
         if more.is_empty() {
             break;
         }
@@ -883,9 +878,7 @@ async fn a_hung_smtp_server_does_not_hold_up_the_sweep(pool: sqlx::PgPool) {
     let notifications = Notifications::new();
 
     let started = Instant::now();
-    let swept = sweep_pass(&state, &notifications, DateTime::UNIX_EPOCH)
-        .await
-        .unwrap();
+    let swept = sweep_pass(&state, &notifications).await.unwrap();
     let elapsed = started.elapsed();
 
     assert_eq!(swept, 1);
@@ -915,7 +908,7 @@ async fn heartbeat_alerts_are_dropped_and_logged_when_too_many_batches_are_sendi
     let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
 
     assert_eq!(
-        sweep_pass(&state, &Notifications::with_limit(0), DateTime::UNIX_EPOCH)
+        sweep_pass(&state, &Notifications::with_limit(0))
             .await
             .unwrap(),
         1
@@ -945,7 +938,7 @@ async fn run_forever_sweeps_overdue_heartbeats_by_itself(pool: sqlx::PgPool) {
     let (project, recipient) = project_with_recipient(&pool).await;
     let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
 
-    let worker = tokio::spawn(run_forever_since(state.clone(), DateTime::UNIX_EPOCH));
+    let worker = tokio::spawn(run_forever(state.clone()));
     // Waited for before stopping the worker: it owns the tasks that send.
     let mail = settled_mail(&recipient, 1).await;
     worker.abort();
@@ -1897,100 +1890,211 @@ async fn the_sweep_counts_from_the_latest_of_ping_resume_and_creation(pool: sqlx
     }
 }
 
-/// After the engine has been down, jobs that kept running could not reach it:
-/// a heartbeat is never judged from a moment before the worker started, so
-/// nothing goes down for pings that could not be received. The bound is the
-/// latest of the anchors, not an extra deadline: it only ever pushes one back.
+/// Pretends the worker last recorded that it was alive `seconds_ago` seconds
+/// ago.
+async fn set_last_alive(pool: &sqlx::PgPool, seconds_ago: i32) {
+    sqlx::query(
+        "insert into worker_state (id, last_alive_at)
+         values (1, now() - make_interval(secs => $1))
+         on conflict (id) do update set last_alive_at = excluded.last_alive_at",
+    )
+    .bind(f64::from(seconds_ago))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn outage_anchor(pool: &sqlx::PgPool, id: Uuid) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar("select outage_anchor_at from heartbeats where id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The first start ever has no outage to make up for: it records the liveness
+/// and leaves every deadline alone, so an overdue heartbeat goes down.
 #[sqlx::test]
-async fn a_sweep_never_judges_a_heartbeat_from_before_the_worker_started(pool: sqlx::PgPool) {
+async fn the_first_start_ever_gives_no_heartbeat_extra_time(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let project = seed_project(&pool).await;
+    let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
+
+    assert_eq!(note_worker_alive(&pool, true).await.unwrap(), None);
+
+    let recorded: bool = sqlx::query_scalar(
+        "select last_alive_at > now() - interval '5 seconds' from worker_state where id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(recorded);
+    assert_eq!(outage_anchor(&pool, id).await, None);
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 1);
+    assert_eq!(heartbeat_state(&pool, id).await.0, "down");
+}
+
+/// The worker was alive until 50 s ago. Only the heartbeat whose deadline
+/// fell inside the outage gets a fresh period; one overdue before the outage
+/// goes down, one due later keeps its deadline, and paused or down heartbeats
+/// are left alone.
+#[sqlx::test]
+async fn a_restart_gives_a_fresh_period_only_to_heartbeats_due_during_the_outage(
+    pool: sqlx::PgPool,
+) {
+    let state = AppState::for_test(pool.clone());
+    let project = seed_project(&pool).await;
+    // Period 30 s, no grace: due 30 s after creation.
+    let (before, _) = seed_heartbeat(&pool, project, "due 90 s ago", 30, 0, 120).await;
+    let (during, _) = seed_heartbeat(&pool, project, "due 30 s ago", 30, 0, 60).await;
+    let (later, _) = seed_heartbeat(&pool, project, "due in 20 s", 30, 0, 10).await;
+    let (paused, _) = seed_heartbeat(&pool, project, "paused", 30, 0, 60).await;
+    sqlx::query("update heartbeats set paused = true where id = $1")
+        .bind(paused)
+        .execute(&pool)
+        .await
+        .unwrap();
+    set_last_alive(&pool, 50).await;
+
+    let outage = note_worker_alive(&pool, true)
+        .await
+        .unwrap()
+        .expect("the time since the last record is an outage");
+
+    assert_eq!(outage.extended, 1);
+    let length = (outage.to - outage.from).num_seconds();
+    assert!((49..=52).contains(&length), "an outage of {length} s");
+    assert_eq!(outage_anchor(&pool, during).await, Some(outage.to));
+    for untouched in [before, later, paused] {
+        assert_eq!(outage_anchor(&pool, untouched).await, None);
+    }
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 1);
+    assert_eq!(heartbeat_state(&pool, before).await.0, "down");
+    for alive in [during, later, paused] {
+        assert_eq!(heartbeat_state(&pool, alive).await.0, "pending");
+    }
+}
+
+/// An engine that restarts every 20 s must not hide a dead job: the heartbeat
+/// overdue before the first outage goes down at the first restart, and the one
+/// whose deadline fell inside it gets one fresh period, not one per restart:
+/// once that period has passed while the worker was alive, it goes down too.
+#[sqlx::test]
+async fn frequent_restarts_cannot_hide_a_dead_job(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let project = seed_project(&pool).await;
+    let (overdue, _) = seed_heartbeat(&pool, project, "overdue", 30, 0, 120).await;
+    let (during, _) = seed_heartbeat(&pool, project, "due during", 30, 0, 40).await;
+
+    for restart in 0..5 {
+        // Alive until 20 s ago, starting again now.
+        set_last_alive(&pool, 20).await;
+        note_worker_alive(&pool, true).await.unwrap();
+        sweep_heartbeats(&state).await.unwrap();
+        assert_eq!(
+            heartbeat_state(&pool, overdue).await.0,
+            "down",
+            "restart {restart}"
+        );
+        assert_eq!(
+            heartbeat_state(&pool, during).await.0,
+            "pending",
+            "restart {restart}"
+        );
+    }
+    assert_eq!(incidents_of(&pool, overdue).await.len(), 1);
+
+    // Its fresh period ran out 20 s ago, while the worker was alive (it last
+    // recorded so 2 s ago): the next restart gives it no other one.
+    sqlx::query(
+        "update heartbeats set outage_anchor_at = now() - interval '50 seconds' where id = $1",
+    )
+    .bind(during)
+    .execute(&pool)
+    .await
+    .unwrap();
+    set_last_alive(&pool, 2).await;
+    assert_eq!(
+        note_worker_alive(&pool, true)
+            .await
+            .unwrap()
+            .map(|o| o.extended),
+        Some(0)
+    );
+    sweep_heartbeats(&state).await.unwrap();
+    assert_eq!(heartbeat_state(&pool, during).await.0, "down");
+}
+
+/// While the worker keeps running, a short gap between two records is normal
+/// (they come every few seconds) and makes up for nothing. A gap longer than
+/// `OUTAGE_GAP` means the database was out of reach, and pings with it: the
+/// heartbeats that fell due during it get a fresh period.
+#[sqlx::test]
+async fn only_a_long_gap_while_running_counts_as_an_outage(pool: sqlx::PgPool) {
+    let project = seed_project(&pool).await;
+    let (due, _) = seed_heartbeat(&pool, project, "due 5 s ago", 30, 0, 35).await;
+
+    set_last_alive(&pool, 10).await;
+    assert_eq!(note_worker_alive(&pool, false).await.unwrap(), None);
+    assert_eq!(outage_anchor(&pool, due).await, None);
+
+    let gap = OUTAGE_GAP.as_secs() as i32 + 30;
+    set_last_alive(&pool, gap).await;
+    let outage = note_worker_alive(&pool, false)
+        .await
+        .unwrap()
+        .expect("a gap longer than OUTAGE_GAP is an outage");
+    assert_eq!(outage.extended, 1);
+    assert_eq!(outage_anchor(&pool, due).await, Some(outage.to));
+}
+
+/// A heartbeat pinged after the fresh period began counts from its ping, like
+/// any other: the outage anchor only ever pushes a deadline back.
+#[sqlx::test]
+async fn the_outage_anchor_is_one_more_anchor_not_a_deadline(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
     let project = seed_project(&pool).await;
     let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 60, 0, 86_400).await;
     sqlx::query(
-        "update heartbeats set last_ping_at = now() - interval '100 seconds' where id = $1",
+        "update heartbeats
+         set outage_anchor_at = now() - interval '100 seconds',
+             last_ping_at = now() - interval '10 seconds'
+         where id = $1",
     )
     .bind(id)
     .execute(&pool)
     .await
     .unwrap();
-    let ago = |seconds: i64| Utc::now() - chrono::Duration::seconds(seconds);
-
-    // Overdue by its last ping (due 40 s ago), but the worker started 50 s ago:
-    // due in 10 s.
-    let swept = sweep_overdue(&pool, ago(50), SWEEP_BATCH).await.unwrap();
-    assert_eq!(swept, vec![]);
-    assert_eq!(heartbeat_state(&pool, id).await.0, "pending");
-    // Started 70 s ago: due 10 s ago.
-    let swept = sweep_overdue(&pool, ago(70), SWEEP_BATCH).await.unwrap();
-    assert_eq!(heartbeats_of(&swept), vec![id]);
-    assert_eq!(heartbeat_state(&pool, id).await.0, "down");
-}
-
-/// The same through `sweep_pass`, which the worker calls with its start time:
-/// a recent start saves a heartbeat that was overdue, and no alert is sent.
-#[sqlx::test]
-async fn a_pass_after_a_restart_leaves_overdue_heartbeats_alone(pool: sqlx::PgPool) {
-    let state = AppState::for_test(pool.clone());
-    let (project, recipient) = project_with_recipient(&pool).await;
-    let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
-    let notifications = Notifications::new();
-
     assert_eq!(
-        sweep_pass(&state, &notifications, Utc::now())
-            .await
-            .unwrap(),
-        0
+        sweep_heartbeats(&state).await.unwrap(),
+        0,
+        "pinged 10 s ago"
     );
-    notifications.drain().await;
 
-    assert_eq!(heartbeat_state(&pool, id).await.0, "pending");
-    assert!(incidents_of(&pool, id).await.is_empty());
-    assert!(settled_mail(&recipient, 0).await.is_empty());
+    sqlx::query(
+        "update heartbeats
+         set outage_anchor_at = now() - interval '10 seconds',
+             last_ping_at = now() - interval '100 seconds'
+         where id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        sweep_pass(&state, &notifications, DateTime::UNIX_EPOCH)
-            .await
-            .unwrap(),
-        1,
-        "without the bound it is overdue"
+        sweep_heartbeats(&state).await.unwrap(),
+        0,
+        "a fresh period that began 10 s ago"
     );
-}
 
-/// The real worker counts itself started when `run_forever` is called: its
-/// first tick, which runs at once, leaves a heartbeat that is overdue by its
-/// last ping alone. (The monitor proves the tick ran, since the sweep is its
-/// first half.)
-#[sqlx::test]
-async fn run_forever_gives_heartbeats_a_full_period_after_the_worker_starts(pool: sqlx::PgPool) {
-    let state = AppState::for_test(pool.clone());
-    let project = seed_project(&pool).await;
-    let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
-    // Port 9 refuses connections: the check fails at once.
-    let monitor = seed_http_monitor(&pool, project, "Refused", "http://127.0.0.1:9/", 2).await;
-
-    let worker = tokio::spawn(run_forever(state));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let checked: bool =
-            sqlx::query_scalar("select last_checked_at is not null from monitors where id = $1")
-                .bind(monitor)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        if checked || Instant::now() > deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    worker.abort();
-
-    let checked: bool =
-        sqlx::query_scalar("select last_checked_at is not null from monitors where id = $1")
-            .bind(monitor)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(checked, "the first tick never ran");
-    assert_eq!(heartbeat_state(&pool, id).await.0, "pending");
-    assert!(incidents_of(&pool, id).await.is_empty());
+    sqlx::query(
+        "update heartbeats set outage_anchor_at = now() - interval '61 seconds' where id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 1);
 }
 
 /// One sweep takes at most `limit` heartbeats, the most overdue first, so a
@@ -2012,20 +2116,17 @@ async fn a_sweep_takes_at_most_its_limit_the_most_overdue_first(pool: sqlx::PgPo
         picked
     };
 
-    let first = sweep_overdue(&pool, DateTime::UNIX_EPOCH, 2).await.unwrap();
+    let first = sweep_overdue(&pool, 2).await.unwrap();
     assert_eq!(heartbeats_of(&first), most_overdue(3..5), "500 s and 400 s");
-    let second = sweep_overdue(&pool, DateTime::UNIX_EPOCH, 2).await.unwrap();
+    let second = sweep_overdue(&pool, 2).await.unwrap();
     assert_eq!(
         heartbeats_of(&second),
         most_overdue(1..3),
         "300 s and 200 s"
     );
-    let third = sweep_overdue(&pool, DateTime::UNIX_EPOCH, 2).await.unwrap();
+    let third = sweep_overdue(&pool, 2).await.unwrap();
     assert_eq!(heartbeats_of(&third), most_overdue(0..1), "100 s");
-    assert_eq!(
-        sweep_overdue(&pool, DateTime::UNIX_EPOCH, 2).await.unwrap(),
-        vec![]
-    );
+    assert_eq!(sweep_overdue(&pool, 2).await.unwrap(), vec![]);
     for id in ids {
         assert_eq!(incidents_of(&pool, id).await.len(), 1);
     }
@@ -2069,9 +2170,10 @@ async fn a_pass_flips_a_bounded_batch_and_the_next_takes_the_rest(pool: sqlx::Pg
     assert_eq!(incidents, SWEEP_BATCH + extra, "one incident each");
 }
 
-/// A slow check pass must not delay DOWN detection: each tick sweeps the
-/// heartbeats first. The monitor's check hangs (a silent server, up to its
-/// 5 s timeout), so the pass is still running when the heartbeat goes down.
+/// A slow check pass must not delay DOWN detection: the sweep runs on its own
+/// schedule, and its first run is at once. The monitor's check hangs (a silent
+/// server, up to its 5 s timeout), so the pass is still running when the
+/// heartbeat goes down.
 #[sqlx::test]
 async fn the_sweep_runs_before_a_slow_check_pass(pool: sqlx::PgPool) {
     let (port, _silent) = silent_server().await;
@@ -2087,7 +2189,7 @@ async fn the_sweep_runs_before_a_slow_check_pass(pool: sqlx::PgPool) {
     .await;
     let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
 
-    let worker = tokio::spawn(run_forever_since(state, DateTime::UNIX_EPOCH));
+    let worker = tokio::spawn(run_forever(state));
     let deadline = Instant::now() + Duration::from_secs(3);
     while heartbeat_state(&pool, id).await.0 != "down" && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
