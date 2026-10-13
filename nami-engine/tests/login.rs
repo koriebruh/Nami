@@ -1,10 +1,10 @@
 use axum::{body::Body, http::{Request, StatusCode, header}};
 use tower::ServiceExt;
-use nami_engine::{state::AppState, email::Mailer, routes};
+use nami_engine::{state::AppState, email::Mailer, routes, config::Config};
 use serde_json::json;
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
-    let state = AppState { db: pool, mailer: Mailer::new("localhost", 1025) };
+    let state = AppState { db: pool, mailer: Mailer::new("localhost", 1025), config: Config::from_env_for_test() };
     axum::Router::new()
         .merge(routes::auth::router())
         .layer(tower_sessions::SessionManagerLayer::new(
