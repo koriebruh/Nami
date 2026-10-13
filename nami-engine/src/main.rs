@@ -34,7 +34,12 @@ async fn main() {
 
     let session_layer = SessionManagerLayer::new(session_store)
         .with_secure(false) // set true once served over HTTPS in production
-        .with_expiry(Expiry::OnInactivity(TimeDuration::hours(24)));
+        .with_expiry(Expiry::OnInactivity(TimeDuration::hours(24)))
+        // tower-sessions defaults to `always_save = false`, so a read-only
+        // request (e.g. /auth/me) never re-persists the session and the
+        // "inactivity" expiry becomes a fixed window from the last write,
+        // not a real sliding expiry. Force a save on every request instead.
+        .with_always_save(true);
 
     let mailer = email::Mailer::new(&config.smtp_host, config.smtp_port);
     let state = AppState { db: pool, mailer };

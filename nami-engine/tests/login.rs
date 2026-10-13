@@ -76,3 +76,59 @@ async fn login_rejects_oauth_only_account(pool: sqlx::PgPool) {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[sqlx::test]
+async fn logout_invalidates_the_cookie(pool: sqlx::PgPool) {
+    let password_hash = nami_engine::auth::password::hash_password("password123").unwrap();
+    sqlx::query("insert into users (email, password_hash, email_verified_at) values ($1, $2, now())")
+        .bind("logout@example.com")
+        .bind(&password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let app = test_app(pool.clone());
+    let login_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"email": "logout@example.com", "password": "password123"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(login_res.status(), StatusCode::OK);
+
+    let cookie = login_res.headers().get(header::SET_COOKIE).unwrap().clone();
+
+    let logout_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/logout")
+                .header(header::COOKIE, cookie.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(logout_res.status(), StatusCode::OK);
+
+    // Replay the OLD (now-stale) cookie against /auth/me: logout must have
+    // invalidated the server-side session, so this must be rejected.
+    let me_res = app
+        .oneshot(
+            Request::builder()
+                .uri("/auth/me")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me_res.status(), StatusCode::UNAUTHORIZED);
+}

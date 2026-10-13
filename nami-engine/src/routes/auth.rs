@@ -88,12 +88,27 @@ async fn login(
     }
 
     if user.totp_enabled {
+        // Flush any prior authenticated session before stashing the pending
+        // TOTP state, so a stale `user_id` from an earlier login can't
+        // survive into this "awaiting 2FA" state.
+        session
+            .flush()
+            .await
+            .map_err(|_| AppError::Validation("session error".into()))?;
         session
             .insert("pending_user_id", user.id)
             .await
             .map_err(|_| AppError::Validation("session error".into()))?;
         return Ok(Json(json!({ "requires_totp": true })));
     }
+
+    // Rotate the session ID on authentication to prevent session fixation
+    // (a session ID set before login, e.g. by an attacker, must not be
+    // reusable as the authenticated session).
+    session
+        .cycle_id()
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
 
     session
         .insert("user_id", user.id)
@@ -108,8 +123,11 @@ async fn login(
 }
 
 async fn logout(session: Session) -> Result<Json<Value>, AppError> {
+    // `.flush()` (not `.delete()`) clears the session server-side AND marks
+    // it so the middleware removes the client's cookie, instead of leaving a
+    // stale (now-useless) cookie around until its Max-Age.
     session
-        .delete()
+        .flush()
         .await
         .map_err(|_| AppError::Validation("session error".into()))?;
     Ok(Json(json!({ "message": "logged out" })))
