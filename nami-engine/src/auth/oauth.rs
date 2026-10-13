@@ -11,7 +11,11 @@ pub enum Provider {
 }
 
 impl Provider {
-    pub fn from_str(s: &str) -> Option<Self> {
+    // Named `parse` rather than `from_str` to avoid the clippy
+    // `should_implement_trait` lint (`from_str` is the recognized
+    // `std::str::FromStr` trait method name); this type intentionally
+    // doesn't implement that trait (it returns `Option`, not `Result`).
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "google" => Some(Provider::Google),
             "github" => Some(Provider::Github),

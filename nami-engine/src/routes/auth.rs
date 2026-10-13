@@ -360,7 +360,7 @@ async fn oauth_start(
     Path(provider): Path<String>,
     session: Session,
 ) -> Result<axum::response::Redirect, AppError> {
-    let provider = auth::oauth::Provider::from_str(&provider)
+    let provider = auth::oauth::Provider::parse(&provider)
         .ok_or_else(|| AppError::Validation("unknown provider".into()))?;
     let client = provider.client(&state.config);
 
@@ -383,10 +383,20 @@ struct OAuthCallbackQuery {
     state: String,
 }
 
+// Google's OIDC userinfo endpoint returns the subject identifier as `sub`
+// (there is no `id` field).
 #[derive(serde::Deserialize)]
-struct OAuthUserInfo {
-    id: String,
+struct GoogleUserInfo {
+    sub: String,
     email: String,
+}
+
+// GitHub's `GET /user` returns `id` as a JSON integer, not a string, and
+// `email` is nullable (many users don't have a public email set).
+#[derive(serde::Deserialize)]
+struct GitHubUserInfo {
+    id: u64,
+    email: Option<String>,
 }
 
 async fn oauth_callback(
@@ -395,7 +405,7 @@ async fn oauth_callback(
     Query(query): Query<OAuthCallbackQuery>,
     session: Session,
 ) -> Result<Json<Value>, AppError> {
-    let provider = auth::oauth::Provider::from_str(&provider)
+    let provider = auth::oauth::Provider::parse(&provider)
         .ok_or_else(|| AppError::Validation("unknown provider".into()))?;
 
     let expected_csrf: String = session
@@ -406,6 +416,14 @@ async fn oauth_callback(
     if expected_csrf != query.state {
         return Err(AppError::Validation("csrf mismatch".into()));
     }
+
+    // Remove the stored CSRF value as soon as it's validated (matched),
+    // regardless of what happens afterward in this function (token exchange
+    // or userinfo fetch failing, etc). Previously this was only removed on
+    // the full success path at the end, so a failed token exchange left the
+    // CSRF token in the session indefinitely, letting it be reused if a
+    // later `/token` call succeeded.
+    session.remove::<String>("oauth_csrf").await.ok();
 
     let client = provider.client(&state.config);
     // oauth2's `reqwest` feature vendors its own reqwest dependency (0.12.x), a
@@ -420,25 +438,46 @@ async fn oauth_callback(
         .await
         .map_err(|_| AppError::Validation("token exchange failed".into()))?;
 
-    let userinfo: OAuthUserInfo = reqwest::Client::new()
+    let userinfo_response = reqwest::Client::new()
         .get(provider.userinfo_url(&state.config))
         .bearer_auth(token.access_token().secret())
         .send()
         .await
-        .map_err(|_| AppError::Validation("userinfo request failed".into()))?
-        .json()
-        .await
-        .map_err(|_| AppError::Validation("invalid userinfo response".into()))?;
+        .map_err(|_| AppError::Validation("userinfo request failed".into()))?;
+
+    // Each provider's userinfo endpoint returns a different shape; parse
+    // with the matching struct and normalize to a (provider_user_id, email)
+    // pair before calling `find_or_create_oauth_user`.
+    let (provider_user_id, email) = match provider {
+        auth::oauth::Provider::Google => {
+            let info: GoogleUserInfo = userinfo_response
+                .json()
+                .await
+                .map_err(|_| AppError::Validation("invalid userinfo response".into()))?;
+            (info.sub, info.email)
+        }
+        auth::oauth::Provider::Github => {
+            let info: GitHubUserInfo = userinfo_response
+                .json()
+                .await
+                .map_err(|_| AppError::Validation("invalid userinfo response".into()))?;
+            let email = info.email.ok_or_else(|| {
+                AppError::Validation(
+                    "GitHub account has no public email; please make an email public on GitHub or register with email/password instead"
+                        .into(),
+                )
+            })?;
+            (info.id.to_string(), email)
+        }
+    };
 
     let user = models::user::find_or_create_oauth_user(
         &state.db,
         provider.as_str(),
-        &userinfo.id,
-        &userinfo.email,
+        &provider_user_id,
+        &email,
     )
     .await?;
-
-    session.remove::<String>("oauth_csrf").await.ok();
 
     // Rotate the session ID before promoting to a fully authenticated session,
     // mirroring `login`'s and `totp_verify`'s success paths. Without this, a

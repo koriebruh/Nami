@@ -38,15 +38,11 @@ impl Config {
 
     /// Test-only constructor: doesn't require `DATABASE_URL`/`GOOGLE_CLIENT_ID`/etc. to be
     /// set, so tests don't need a `.env` file. `sqlx::test` supplies its own pool directly,
-    /// so `database_url` is unused in tests.
+    /// so `database_url` is unused in tests. Identical to `from_env_defaults_only()` (which
+    /// already defaults `database_url`/`port`/`smtp_host`/`smtp_port`), kept as its own named
+    /// constructor for call-site clarity at test sites.
     pub fn from_env_for_test() -> Self {
-        Self {
-            database_url: String::new(),
-            port: 8080,
-            smtp_host: "localhost".to_string(),
-            smtp_port: 1025,
-            ..Self::from_env_defaults_only()
-        }
+        Self::from_env_defaults_only()
     }
 
     /// Shared OAuth-defaults block for `from_env()` and `from_env_for_test()`: each
