@@ -657,3 +657,162 @@ fn check_status_serializes_as_the_clickhouse_enum_labels() {
         CheckStatus::Down
     );
 }
+
+// ---------------------------------------------------------------------------
+// Final review: error text cleaned at the source, and destinations no check
+// may contact (link-local and cloud metadata addresses, "this network").
+// ---------------------------------------------------------------------------
+
+/// Error text is one line that reads as written: control characters, the line
+/// and paragraph separators and the bidirectional controls become spaces,
+/// wherever they come from (here: the keyword, quoted in the error).
+#[tokio::test]
+async fn error_text_carries_no_line_breaks_or_direction_controls() {
+    let server = server_returning(ResponseTemplate::new(200).set_body_string("ok")).await;
+    let keyword = "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200F}f\u{061C}g";
+    let outcome = perform_check(
+        &build_http_client(),
+        &keyword_monitor(format!("{}/", server.uri()), keyword, "contains"),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some("keyword \"a b c d e f g\" not found")
+    );
+}
+
+const NOT_ALLOWED: &str = "destination not allowed";
+
+/// Asserts that `outcome` is a refusal: down, the generic message, and no
+/// status code or response time, since nothing was contacted.
+fn assert_refused(outcome: &nami_engine::uptime::checker::CheckOutcome, label: &str) {
+    assert_eq!(outcome.status, CheckStatus::Down, "{label}");
+    assert_eq!(outcome.error.as_deref(), Some(NOT_ALLOWED), "{label}");
+    assert_eq!(outcome.status_code, None, "{label}");
+    assert_eq!(outcome.response_time_ms, None, "{label}");
+}
+
+/// Link-local addresses (where cloud metadata services answer), "this
+/// network" and the unspecified address are refused when the URL names them
+/// directly, in IPv4, IPv6 or IPv4-mapped form, before any request is made.
+#[tokio::test]
+async fn literal_metadata_and_link_local_addresses_are_refused() {
+    for url in [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://169.254.0.1/",
+        "http://[fe80::1]/",
+        "http://[fd00:ec2::254]/latest/meta-data/",
+        "http://[::ffff:169.254.169.254]/",
+        "http://[::ffff:a9fe:a9fe]/",
+        "http://0x0a9fea9fe/",
+        "http://2852039166/",
+        "http://0.0.0.0/",
+        "http://0.1.2.3/",
+        "http://[::]/",
+    ] {
+        let started = Instant::now();
+        let outcome = perform_check(&build_http_client(), &http_monitor(url.to_string())).await;
+        assert_refused(&outcome, url);
+        assert!(started.elapsed() < Duration::from_secs(1), "{url}");
+    }
+}
+
+/// `0.0.0.0` reaches this machine's own services, so a refusal is the only
+/// thing standing between the check and a server that would answer: here one
+/// that answers 200.
+#[tokio::test]
+async fn this_network_is_refused_even_where_a_server_would_answer() {
+    let server = server_returning(ResponseTemplate::new(200)).await;
+    let port = server.address().port();
+    for url in [
+        format!("http://0.0.0.0:{port}/"),
+        format!("http://[::ffff:0.0.0.0]:{port}/"),
+    ] {
+        let outcome = perform_check(&build_http_client(), &http_monitor(url.clone())).await;
+        assert_refused(&outcome, &url);
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// Every redirect hop is checked: a redirect to a metadata address (or to
+/// this network, where a server would answer) is refused, not followed.
+#[tokio::test]
+async fn a_redirect_to_a_refused_address_is_not_followed() {
+    let target = server_returning(ResponseTemplate::new(200)).await;
+    let port = target.address().port();
+    for location in [
+        "http://169.254.169.254/latest/meta-data/iam/security-credentials/".to_string(),
+        "http://[fd00:ec2::254]/".to_string(),
+        format!("http://0.0.0.0:{port}/"),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", location.as_str()))
+            .mount(&server)
+            .await;
+        let outcome = perform_check(
+            &build_http_client(),
+            &http_monitor(format!("{}/", server.uri())),
+        )
+        .await;
+        assert_refused(&outcome, &location);
+    }
+    assert!(target.received_requests().await.unwrap().is_empty());
+}
+
+/// tcp checks resolve the host and refuse the same addresses, literal or
+/// IPv4-mapped; on `0.0.0.0` a listener would otherwise accept.
+#[tokio::test]
+async fn tcp_checks_refuse_the_same_addresses() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = i32::from(listener.local_addr().unwrap().port());
+    for (host, port) in [
+        ("169.254.169.254", 80),
+        ("fe80::1", 22),
+        ("::ffff:169.254.169.254", 80),
+        ("fd00:ec2::254", 80),
+        ("0.0.0.0", port),
+        ("::", port),
+    ] {
+        let tcp = Monitor {
+            host: Some(host.to_string()),
+            port: Some(port),
+            ..monitor("tcp")
+        };
+        let started = Instant::now();
+        let outcome = perform_check(&build_http_client(), &tcp).await;
+        assert_refused(&outcome, host);
+        assert!(started.elapsed() < Duration::from_secs(1), "{host}");
+    }
+    drop(listener);
+}
+
+/// Everything else stays allowed, loopback and names that resolve to it
+/// included: internal services are legitimate targets.
+#[tokio::test]
+async fn loopback_by_name_or_address_is_still_checked() {
+    let server = server_returning(ResponseTemplate::new(200)).await;
+    let port = server.address().port();
+    for url in [
+        format!("http://127.0.0.1:{port}/"),
+        format!("http://localhost:{port}/"),
+    ] {
+        let outcome = perform_check(&build_http_client(), &http_monitor(url.clone())).await;
+        assert_eq!(
+            outcome.status,
+            CheckStatus::Up,
+            "{url}: {:?}",
+            outcome.error
+        );
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp = Monitor {
+        host: Some("localhost".to_string()),
+        port: Some(i32::from(listener.local_addr().unwrap().port())),
+        ..monitor("tcp")
+    };
+    let outcome = perform_check(&build_http_client(), &tcp).await;
+    assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
+}

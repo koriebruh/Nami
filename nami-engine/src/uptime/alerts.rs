@@ -6,6 +6,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use super::checker::is_unsafe_in_text;
 use crate::state::AppState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,26 +89,29 @@ pub async fn notify_transition(state: &AppState, transition: &Transition) {
 }
 
 /// Text a monitored server can influence (a check's error message) as one
-/// line of plain text: every control character (NUL, CR, LF, ESC, DEL, ...)
-/// becomes a space and everything else is kept. Postgres text cannot hold NUL,
-/// and a line break would let the text start lines of its own in the email
-/// body.
+/// line of plain text: every control character (NUL, CR, LF, ESC, DEL, ...),
+/// line or paragraph separator and bidirectional control becomes a space (see
+/// [`is_unsafe_in_text`]) and everything else is kept. Postgres text cannot
+/// hold NUL, a line break would let the text start lines of its own in the
+/// email body, and a direction control would make it read as something else.
+/// The checker already cleans its errors this way; this covers a cause that
+/// reaches a transition any other way.
 pub fn sanitize_cause(cause: &str) -> String {
     cause
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if is_unsafe_in_text(c) { ' ' } else { c })
         .collect()
 }
 
 /// Subject and plain-text body for a transition's email.
 pub fn render(ui_base_url: &str, transition: &Transition) -> (String, String) {
-    // Names are validated to contain no control characters; stripping them
-    // again here keeps a header-injection attempt out of the subject even
-    // for rows written some other way.
+    // Names are validated to contain no control, separator or direction
+    // characters; stripping them again here keeps a header-injection attempt
+    // out of the subject even for rows written some other way.
     let name: String = transition
         .name
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !is_unsafe_in_text(*c))
         .collect();
     let base = ui_base_url.trim_end_matches('/');
     let link = match transition.subject {
@@ -266,6 +270,23 @@ mod tests {
             format!("a{}b", " ".repeat(controls.chars().count()))
         );
         assert_eq!(sanitize_cause("a\0b\r\nc\u{1b}[31md"), "a b  c [31md");
+    }
+
+    #[test]
+    fn separators_and_direction_controls_in_a_cause_become_spaces() {
+        assert_eq!(
+            sanitize_cause("a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200E}f"),
+            "a b c d e f"
+        );
+        let (subject, body) = render(
+            "http://ui.test",
+            &Transition {
+                cause: Some("evil\u{2028}Bcc: x@evil.test".to_string()),
+                ..transition(TransitionKind::Down, "API\u{202E}gnp.exe\u{2029}")
+            },
+        );
+        assert_eq!(subject, "[Nami] APIgnp.exe is DOWN");
+        assert!(body.contains("Cause: evil Bcc: x@evil.test\n"), "{body:?}");
     }
 
     #[test]
