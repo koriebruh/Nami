@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod email;
 pub mod error;
+pub mod middleware;
 pub mod state;
 pub mod routes;
 pub mod models;
