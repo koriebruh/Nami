@@ -50,6 +50,7 @@ async fn main() {
     let app = Router::new()
         .merge(routes::health::router())
         .merge(routes::auth::router())
+        .merge(routes::projects::router())
         .layer(session_layer)
         .with_state(state);
 
