@@ -31,6 +31,23 @@ describe.each([
 		const { event } = fakeEvent({ status: 401, body: '{"error":"unauthorized"}' });
 		await expect(load(event)).rejects.toMatchObject({ status: 303, location: '/login' });
 	});
+
+	// A member's page carries the monitor URL as saved, credentials and query
+	// string included: no browser or proxy may keep it. Set before anything can
+	// fail, and only once (SvelteKit throws when a header is set twice).
+	it.each([
+		['a monitor', { body: JSON.stringify({ id: MONITOR_ID, name: 'API', url: 'https://u:p@example.com/' }) }, null],
+		['a caller the engine refuses', { status: 403, body: '{"error":"forbidden"}' }, { status: 403 }],
+		['a monitor the engine does not have', { status: 404, body: '{"error":"not found"}' }, { status: 404 }],
+		['an engine failure', { status: 500, body: '{"error":"internal error"}' }, { status: 500 }],
+		['a session that is gone', { status: 401, body: '{"error":"unauthorized"}' }, { status: 303 }]
+	] as const)('forbids caching for %s', async (_case, engine, rejection) => {
+		const { event, setHeaders } = fakeEvent(engine);
+		if (rejection) await expect(load(event)).rejects.toMatchObject(rejection);
+		else await load(event);
+		expect(setHeaders).toHaveBeenCalledTimes(1);
+		expect(setHeaders).toHaveBeenCalledWith({ 'cache-control': 'private, no-store' });
+	});
 });
 
 describe('detail page load', () => {

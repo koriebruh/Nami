@@ -11,6 +11,12 @@ import type { Monitor } from '#lib/uptime';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {
+	// The page carries the monitor URL as saved for members, credentials and
+	// query string included: no browser or proxy may keep it. Set first, so
+	// that every response of this load has it (an error page and a redirect
+	// too), and only here: SvelteKit throws when a header is set twice.
+	event.setHeaders({ 'cache-control': 'private, no-store' });
+
 	const response = await callEngine(
 		event,
 		enginePath`/projects/${event.params.id}/monitors/${event.params.monitorId}`

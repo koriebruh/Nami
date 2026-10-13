@@ -17,16 +17,23 @@ export async function callEngine(
 	const headers = new Headers(init.headers);
 	const incomingCookie = event.request.headers.get('cookie');
 	if (incomingCookie) headers.set('cookie', incomingCookie);
-	if (!headers.has('content-type') && init.body) headers.set('content-type', 'application/json');
+	// nami-engine accepts a state-changing request only with a JSON body (415
+	// otherwise), so that no form on another site can ever drive it: an action
+	// that has no body of its own (logout, rotate-token, 2FA setup) sends `{}`.
+	let body = init.body;
+	const method = (init.method ?? 'GET').toUpperCase();
+	if (body == null && (method === 'POST' || method === 'PUT' || method === 'PATCH')) body = '{}';
+	if (!headers.has('content-type') && body) headers.set('content-type', 'application/json');
 
 	// nami-engine rate-limits /auth/register and /auth/login per client IP
-	// (SmartIpKeyExtractor, reading X-Forwarded-For). Since nami-ui is the
-	// only caller of nami-engine, we must forward the real end-user IP here,
-	// or every user would collapse into nami-ui's own address for limiting.
+	// (SmartIpKeyExtractor, reading X-Forwarded-For). nami-ui is the only
+	// caller of nami-engine's API port (ENGINE_URL), which must never be
+	// exposed, so we must forward the real end-user IP here, or every user
+	// would collapse into nami-ui's own address for limiting.
 	const clientAddress = event.getClientAddress?.();
 	if (clientAddress) headers.set('x-forwarded-for', clientAddress);
 
-	const response = await (event.fetch ?? fetch)(`${engineUrl}${path}`, { ...init, headers });
+	const response = await (event.fetch ?? fetch)(`${engineUrl}${path}`, { ...init, body, headers });
 
 	const setCookie = response.headers.get('set-cookie');
 	if (setCookie) {
@@ -133,9 +140,11 @@ export async function engineFailure(response: Response, fallback: string) {
 }
 
 /**
- * nami-engine's URL as your cron jobs reach it, for heartbeat ping URLs.
- * Pings go straight to the engine (cron jobs are not browser sessions), so
- * this can differ from the internal ENGINE_URL this BFF calls.
+ * nami-engine's public listener (its PUBLIC_PORT, 8081 by default) as your
+ * cron jobs reach it, for heartbeat ping URLs. Pings go straight to the engine
+ * (cron jobs are not browser sessions), but never to the API port this BFF
+ * calls (ENGINE_URL), which stays private: the public listener serves the
+ * ping endpoint and nothing of the API.
  *
  * An empty or blank `PUBLIC_ENGINE_URL` (`PUBLIC_ENGINE_URL=` in an env file)
  * counts as unset. Anything else must be an absolute http(s) URL, a base that
@@ -146,7 +155,7 @@ export async function engineFailure(response: Response, fallback: string) {
  */
 export function publicEngineUrl(): string {
 	const configured = (process.env.PUBLIC_ENGINE_URL ?? '').trim();
-	if (configured === '') return 'http://localhost:8080';
+	if (configured === '') return 'http://localhost:8081';
 
 	let url: URL | undefined;
 	try {

@@ -32,7 +32,7 @@ describe('heartbeat detail load', () => {
 		const heartbeat = { id: HEARTBEAT_ID, name: 'Backup', token: null };
 		const { event } = fakeEvent({ body: JSON.stringify(heartbeat) });
 		const data = await load(event);
-		expect(data).toEqual({ heartbeat, engineUrl: 'http://localhost:8080' });
+		expect(data).toEqual({ heartbeat, engineUrl: 'http://localhost:8081' });
 		expect(data).toHaveProperty('heartbeat.token', null);
 	});
 
@@ -267,7 +267,8 @@ describe('heartbeat rotate-token action', () => {
 			body: JSON.stringify({ id: HEARTBEAT_ID, token: 'c'.repeat(64) })
 		});
 		expect(await actions.rotate(event)).toEqual({ rotated: true });
-		expect(calls()).toEqual([{ method: 'POST', path: rotatePath, search: '', body: undefined }]);
+		// The engine takes only JSON bodies, so the body-less action sends `{}`.
+		expect(calls()).toEqual([{ method: 'POST', path: rotatePath, search: '', body: '{}' }]);
 	});
 
 	it("shows the engine's refusal for a viewer", async () => {
