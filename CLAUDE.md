@@ -28,7 +28,11 @@ several independent products, too large for one spec/plan):
 6. Metrics/APM
 
 Each sub-project gets its own spec → plan → implementation cycle under
-`docs/superpowers/specs/` and `docs/superpowers/plans/`.
+`docs/superpowers/specs/` and `docs/superpowers/plans/`. The feature-parity
+checklist that defines "done" for the whole rebuild (8 sub-projects, incl.
+traces and a final production-hardening pass) is
+`docs/superpowers/roadmap.md` — tick items there as their PRs merge. Every
+sub-project ends with a dedicated security review + fix wave.
 
 Completed sub-project: **Foundation** (14 tasks, PRs #1-#15, all merged to
 `main`). Per-task review findings and fix rounds are in each PR's
