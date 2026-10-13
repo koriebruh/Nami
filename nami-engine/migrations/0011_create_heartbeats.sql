@@ -9,6 +9,10 @@ create table heartbeats (
     current_status text not null default 'pending'
         check (current_status in ('pending', 'up', 'down')),
     last_ping_at timestamptz,
+    -- When the heartbeat was last resumed from a pause (null: never). The
+    -- sweep counts a heartbeat's period from the latest of this, the last
+    -- ping and the creation, so a resume gives the job a fresh period.
+    resumed_at timestamptz,
     created_at timestamptz not null default now()
 );
 

@@ -33,11 +33,23 @@ fn could_be_a_token(token: &str) -> bool {
 /// Records a ping in one transaction, under the heartbeat's row lock so a
 /// ping and a concurrent sweep apply one after the other.
 ///
-/// Paused heartbeats keep accepting pings — `last_ping_at` stays fresh, so
-/// resuming does not immediately trip the sweep — but their state is frozen:
-/// no status change, no incident change, no alert.
+/// An unknown token costs one plain indexed lookup and no transaction: only a
+/// token that exists gets the locking transaction, which looks it up again
+/// (so a heartbeat deleted, or its token rotated, in between is unknown too:
+/// once a rotation has committed, the old token records nothing).
+///
+/// Paused heartbeats keep accepting pings — `last_ping_at` stays fresh — but
+/// their state is frozen: no status change, no incident change, no alert.
 pub async fn record_ping(pool: &PgPool, token: &str) -> Result<PingOutcome, sqlx::Error> {
     if !could_be_a_token(token) {
+        return Ok(PingOutcome::UnknownToken);
+    }
+    let known: bool =
+        sqlx::query_scalar("select exists (select 1 from heartbeats where token = $1)")
+            .bind(token)
+            .fetch_one(pool)
+            .await?;
+    if !known {
         return Ok(PingOutcome::UnknownToken);
     }
     let mut tx = pool.begin().await?;
@@ -83,23 +95,59 @@ pub async fn record_ping(pool: &PgPool, token: &str) -> Result<PingOutcome, sqlx
     Ok(PingOutcome::Recorded { transition })
 }
 
-/// Marks every unpaused heartbeat whose last ping (or creation, if it never
-/// pinged) is older than `period + grace` as down and opens its incident,
-/// in one transaction. The `current_status <> 'down'` guard is re-checked
-/// under each row's lock, so two concurrent sweeps cannot both flip (and
-/// alert on) the same heartbeat. The interval is computed in float8 so a
-/// huge period plus grace cannot overflow int4 and break the sweep for
-/// every heartbeat.
-pub async fn sweep_overdue(pool: &PgPool) -> Result<Vec<Transition>, sqlx::Error> {
+/// When a heartbeat is due: its period and grace after its anchor. The anchor
+/// is the latest of its last ping, its last resume from a pause and its
+/// creation (a missing ping or resume counts as the creation), and `$1`, the
+/// bound the sweep is given. The interval is computed in float8 so a huge
+/// period plus grace cannot overflow int4 and break the sweep for every
+/// heartbeat. One text, used by both the filter and the ordering below.
+macro_rules! due_at {
+    () => {
+        "greatest(coalesce(last_ping_at, created_at), coalesce(resumed_at, created_at), $1)
+         + make_interval(secs => period_seconds::float8 + grace_seconds::float8)"
+    };
+}
+
+/// Marks up to `limit` overdue heartbeats as down, the most overdue first, and
+/// opens their incidents, in one transaction. A heartbeat is overdue when it
+/// is unpaused, not down yet, and past its due time (`due_at!`).
+///
+/// `not_before` is the earliest moment a heartbeat may be judged from: the
+/// worker passes its own start, so that after downtime of the engine every job
+/// gets a full period to ping again before anyone is told about pings that
+/// could not be received.
+///
+/// The heartbeats are claimed with `for update skip locked`, and the
+/// `current_status <> 'down'` guard is re-checked under each row's lock. A
+/// heartbeat another transaction holds (a ping, an edit, a concurrent sweep) is
+/// skipped, not waited for: the next sweep takes it, and no sweep can be stuck
+/// behind one row, delaying every other heartbeat. Two concurrent sweeps take
+/// different heartbeats, so none is flipped (or alerted on) twice.
+pub async fn sweep_overdue(
+    pool: &PgPool,
+    not_before: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<Transition>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let overdue: Vec<(Uuid, Uuid, String, i32, i32)> = sqlx::query_as(
+    let overdue: Vec<(Uuid, Uuid, String, i32, i32)> = sqlx::query_as(concat!(
         "update heartbeats set current_status = 'down'
-         where not paused
-           and current_status <> 'down'
-           and coalesce(last_ping_at, created_at)
-               + make_interval(secs => period_seconds::float8 + grace_seconds::float8) < now()
-         returning id, project_id, name, period_seconds, grace_seconds",
-    )
+         where id in (
+             select id from heartbeats
+             where not paused
+               and current_status <> 'down'
+               and ",
+        due_at!(),
+        " < now()
+             order by ",
+        due_at!(),
+        "
+             limit $2
+             for update skip locked
+         )
+         returning id, project_id, name, period_seconds, grace_seconds"
+    ))
+    .bind(not_before)
+    .bind(limit)
     .fetch_all(&mut *tx)
     .await?;
     // now() is the transaction's start time: the same instant the UPDATE used.

@@ -1,8 +1,10 @@
 use axum::{
     Json, Router,
-    extract::{Path, State, rejection::PathRejection},
-    http::StatusCode,
-    routing::get,
+    extract::{Path, Request, State, rejection::PathRejection},
+    http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
+    response::Response,
+    routing::{get, post},
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -10,7 +12,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     middleware::rbac::{CurrentUser, require_project_role},
-    models::heartbeat::{self, CreateHeartbeatRequest, Heartbeat, PatchHeartbeatRequest},
+    models::heartbeat::{self, CreateHeartbeatRequest, HeartbeatView, PatchHeartbeatRequest},
     state::AppState,
     uptime::{
         alerts,
@@ -18,7 +20,8 @@ use crate::{
     },
 };
 
-// Same RBAC as monitors: viewer reads, member creates/edits, admin deletes.
+// Same RBAC as monitors: viewer reads, member creates/edits (and rotates the
+// ping token), admin deletes. Viewers read heartbeats without their ping token.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -31,22 +34,62 @@ pub fn router() -> Router<AppState> {
                 .patch(patch_heartbeat)
                 .delete(delete_heartbeat),
         )
+        .route(
+            "/projects/{id}/heartbeats/{heartbeat_id}/rotate-token",
+            post(rotate_heartbeat_token),
+        )
 }
 
 /// The public ping endpoint. No session: the token in the path is the
-/// secret, and cron jobs call the engine directly.
+/// secret, and cron jobs call the engine directly. Every reply says
+/// `Cache-Control: no-store`: a ping is a GET with a side effect, which no
+/// cache may answer or keep.
 pub fn public_router() -> Router<AppState> {
-    Router::new().route("/api/v1/heartbeat/{token}", get(ping).post(ping))
+    Router::new()
+        .route("/api/v1/heartbeat/{token}", get(ping).post(ping))
+        .layer(middleware::from_fn(no_store))
+}
+
+async fn no_store(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Checks that the caller may read the heartbeats of `project_id` and says
+/// whether they may also see the ping tokens: only a member of the project or
+/// above may (a global admin counts). Whoever holds a token can ping, and a
+/// ping can resolve an incident or hide a dead job, so a viewer, who may only
+/// read, must not get one.
+async fn read_access(
+    state: &AppState,
+    user: &CurrentUser,
+    project_id: Uuid,
+) -> Result<bool, AppError> {
+    match require_project_role(&state.db, user, project_id, "member").await {
+        Ok(()) => Ok(true),
+        Err(AppError::Forbidden) => {
+            require_project_role(&state.db, user, project_id, "viewer").await?;
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 async fn list_heartbeats(
     State(state): State<AppState>,
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Vec<Heartbeat>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+) -> Result<Json<Vec<HeartbeatView>>, AppError> {
+    let with_token = read_access(&state, &user, project_id).await?;
+    let heartbeats = heartbeat::list_for_project(&state.db, project_id).await?;
     Ok(Json(
-        heartbeat::list_for_project(&state.db, project_id).await?,
+        heartbeats
+            .into_iter()
+            .map(|heartbeat| heartbeat.into_view(with_token))
+            .collect(),
     ))
 }
 
@@ -55,7 +98,7 @@ async fn create_heartbeat(
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
     Json(payload): Json<CreateHeartbeatRequest>,
-) -> Result<(StatusCode, Json<Heartbeat>), AppError> {
+) -> Result<(StatusCode, Json<HeartbeatView>), AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
     let config = heartbeat::validate(payload.into_config()).map_err(AppError::Validation)?;
     let created = heartbeat::insert_heartbeat(&state.db, project_id, &config)
@@ -67,19 +110,19 @@ async fn create_heartbeat(
             }
             _ => AppError::Database(e),
         })?;
-    Ok((StatusCode::CREATED, Json(created)))
+    Ok((StatusCode::CREATED, Json(created.into_view(true))))
 }
 
 async fn get_heartbeat(
     State(state): State<AppState>,
     user: CurrentUser,
     Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<Heartbeat>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+) -> Result<Json<HeartbeatView>, AppError> {
+    let with_token = read_access(&state, &user, project_id).await?;
     let found = heartbeat::find_in_project(&state.db, project_id, heartbeat_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(found))
+    Ok(Json(found.into_view(with_token)))
 }
 
 async fn patch_heartbeat(
@@ -87,12 +130,26 @@ async fn patch_heartbeat(
     user: CurrentUser,
     Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PatchHeartbeatRequest>,
-) -> Result<Json<Heartbeat>, AppError> {
+) -> Result<Json<HeartbeatView>, AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
     let updated = heartbeat::update_in_project(&state.db, project_id, heartbeat_id, payload)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(updated))
+    Ok(Json(updated.into_view(true)))
+}
+
+/// Replaces the ping token; the old one stops working at once. The reply is
+/// the heartbeat with its new token, so the caller can show the new ping URL.
+async fn rotate_heartbeat_token(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<HeartbeatView>, AppError> {
+    require_project_role(&state.db, &user, project_id, "member").await?;
+    let rotated = heartbeat::rotate_token(&state.db, project_id, heartbeat_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(rotated.into_view(true)))
 }
 
 async fn delete_heartbeat(
