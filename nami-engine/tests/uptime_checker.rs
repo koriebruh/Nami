@@ -10,7 +10,9 @@ use std::{
 use chrono::Utc;
 use nami_engine::{
     models::monitor::Monitor,
-    uptime::checker::{CheckStatus, MAX_BODY_BYTES, build_http_client, perform_check},
+    uptime::checker::{
+        CheckStatus, MAX_BODY_BYTES, MAX_ERROR_CHARS, build_http_client, perform_check,
+    },
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
@@ -269,6 +271,123 @@ async fn a_keyword_beyond_the_body_cap_is_not_found() {
     )
     .await;
     assert_eq!(outcome.status, CheckStatus::Down);
+    // Down because the keyword was not found, not because the read failed.
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some("keyword \"NEEDLE\" not found")
+    );
+    assert_eq!(outcome.status_code, Some(200));
+}
+
+#[tokio::test]
+async fn a_keyword_ending_exactly_at_the_body_cap_is_found() {
+    let padding = "a".repeat(MAX_BODY_BYTES - "NEEDLE".len());
+    let body = format!("{padding}NEEDLE");
+    assert_eq!(body.len(), MAX_BODY_BYTES);
+    let server = server_returning(ResponseTemplate::new(200).set_body_string(body)).await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &keyword_monitor(format!("{}/", server.uri()), "NEEDLE", "contains"),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
+    assert_eq!(outcome.status_code, Some(200));
+}
+
+#[tokio::test]
+async fn a_keyword_ending_one_byte_past_the_body_cap_is_not_found() {
+    let padding = "a".repeat(MAX_BODY_BYTES - "NEEDLE".len() + 1);
+    let body = format!("{padding}NEEDLE");
+    assert_eq!(body.len(), MAX_BODY_BYTES + 1);
+    let server = server_returning(ResponseTemplate::new(200).set_body_string(body)).await;
+    let outcome = perform_check(
+        &build_http_client(),
+        &keyword_monitor(format!("{}/", server.uri()), "NEEDLE", "contains"),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some("keyword \"NEEDLE\" not found")
+    );
+    assert_eq!(outcome.status_code, Some(200));
+}
+
+#[tokio::test]
+async fn an_endless_body_is_cut_at_the_cap_instead_of_being_read_forever() {
+    let (port, _) = raw_server(|mut stream| async move {
+        read_request(&mut stream).await;
+        // No content-length and no chunking: the body runs until the
+        // connection closes, and this server never closes it. The write
+        // fails once the client drops the connection.
+        let head = b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n";
+        if stream.write_all(head).await.is_err() {
+            return;
+        }
+        let block = vec![b'a'; 64 * 1024];
+        while stream.write_all(&block).await.is_ok() {}
+    })
+    .await;
+    let endless = Monitor {
+        timeout_seconds: 5,
+        ..keyword_monitor(format!("http://127.0.0.1:{port}/"), "needle", "contains")
+    };
+    let started = Instant::now();
+    let outcome = perform_check(&build_http_client(), &endless).await;
+    // Reading stops at the cap: the check ends in milliseconds, long before
+    // the 5 s deadline, and with "not found" rather than a timeout.
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some("keyword \"needle\" not found")
+    );
+    assert_eq!(outcome.status_code, Some(200));
+}
+
+#[tokio::test]
+async fn keyword_monitors_always_use_get_even_when_head_is_configured() {
+    // Only GET is mocked: a HEAD would get wiremock's default 404, and a
+    // HEAD response has no body to search anyway.
+    let server =
+        server_returning(ResponseTemplate::new(200).set_body_string("database error")).await;
+    let url = format!("{}/", server.uri());
+
+    let present = Monitor {
+        http_method: "HEAD".to_string(),
+        ..keyword_monitor(url.clone(), "database", "contains")
+    };
+    let outcome = perform_check(&build_http_client(), &present).await;
+    assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
+
+    // Without a body, not_contains would pass every page: it must see the body.
+    let forbidden = Monitor {
+        http_method: "HEAD".to_string(),
+        ..keyword_monitor(url, "error", "not_contains")
+    };
+    let outcome = perform_check(&build_http_client(), &forbidden).await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(outcome.error.as_deref(), Some("keyword \"error\" found"));
+}
+
+#[tokio::test]
+async fn error_text_is_capped_however_it_is_produced() {
+    let server = server_returning(ResponseTemplate::new(200).set_body_string("ok")).await;
+    let long_keyword = "k".repeat(10_000);
+    let outcome = perform_check(
+        &build_http_client(),
+        &keyword_monitor(format!("{}/", server.uri()), &long_keyword, "contains"),
+    )
+    .await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    let error = outcome.error.expect("a failed check carries an error");
+    assert_eq!(error.chars().count(), MAX_ERROR_CHARS + 1);
+    assert!(error.starts_with("keyword \"kkkk"), "{error}");
+    assert!(error.ends_with('…'), "{error}");
 }
 
 #[tokio::test]
@@ -419,6 +538,10 @@ async fn a_body_that_never_finishes_times_out_within_the_monitor_timeout() {
     );
     assert_eq!(outcome.status, CheckStatus::Down);
     assert_eq!(outcome.error.as_deref(), Some("timeout after 1s"));
+    // The one deadline around the whole check fired, so nothing is reported
+    // from the half-finished response: no status code, no response time.
+    assert_eq!(outcome.status_code, None);
+    assert_eq!(outcome.response_time_ms, None);
 }
 
 #[tokio::test]
@@ -454,9 +577,26 @@ async fn every_check_opens_a_fresh_connection() {
 #[tokio::test]
 async fn a_monitor_that_cannot_be_checked_is_down_instead_of_panicking() {
     let local = || Some("127.0.0.1".to_string());
+    // Never contacted: these monitors are rejected before any request is made.
+    let unused_url = || Some(format!("http://127.0.0.1:{}/", closed_port()));
     let cases = [
         (monitor("http"), "monitor has no url"),
         (monitor("keyword"), "monitor has no url"),
+        (
+            Monitor {
+                url: unused_url(),
+                ..monitor("keyword")
+            },
+            "monitor has no keyword",
+        ),
+        (
+            Monitor {
+                url: unused_url(),
+                keyword: Some(String::new()),
+                ..monitor("keyword")
+            },
+            "monitor has no keyword",
+        ),
         (monitor("tcp"), "monitor has no host/port"),
         (
             Monitor {
