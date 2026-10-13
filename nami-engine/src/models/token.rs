@@ -20,27 +20,25 @@ pub async fn insert_verification_token(
 }
 
 /// Returns the user_id if the token is valid and unconsumed, and marks it consumed.
+///
+/// Uses a single atomic `UPDATE ... RETURNING` (instead of a SELECT followed by
+/// a separate UPDATE) so the row is locked and consumed in one statement —
+/// two concurrent requests racing on the same token can no longer both pass
+/// a staleness-free read before either write lands.
 pub async fn consume_valid_verification_token(
     pool: &PgPool,
     token_hash: &str,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    let row: Option<(Uuid, Uuid)> = sqlx::query_as(
-        "select id, user_id from email_verification_tokens
-         where token_hash = $1 and expires_at > now() and consumed_at is null",
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "update email_verification_tokens set consumed_at = now()
+         where token_hash = $1 and expires_at > now() and consumed_at is null
+         returning user_id",
     )
     .bind(token_hash)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((token_id, user_id)) = row {
-        sqlx::query("update email_verification_tokens set consumed_at = now() where id = $1")
-            .bind(token_id)
-            .execute(pool)
-            .await?;
-        Ok(Some(user_id))
-    } else {
-        Ok(None)
-    }
+    Ok(row.map(|(user_id,)| user_id))
 }
 
 pub async fn insert_reset_token(pool: &PgPool, user_id: Uuid, token_hash: &str) -> Result<(), sqlx::Error> {
@@ -56,22 +54,20 @@ pub async fn insert_reset_token(pool: &PgPool, user_id: Uuid, token_hash: &str) 
     Ok(())
 }
 
+/// Returns the user_id if the token is valid and unconsumed, and marks it consumed.
+///
+/// Same atomic `UPDATE ... RETURNING` pattern as `consume_valid_verification_token`
+/// above — a single statement so the token can't be consumed twice by two
+/// concurrent requests racing on the same token.
 pub async fn consume_valid_reset_token(pool: &PgPool, token_hash: &str) -> Result<Option<Uuid>, sqlx::Error> {
-    let row: Option<(Uuid, Uuid)> = sqlx::query_as(
-        "select id, user_id from password_reset_tokens
-         where token_hash = $1 and expires_at > now() and consumed_at is null",
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "update password_reset_tokens set consumed_at = now()
+         where token_hash = $1 and expires_at > now() and consumed_at is null
+         returning user_id",
     )
     .bind(token_hash)
     .fetch_optional(pool)
     .await?;
 
-    if let Some((token_id, user_id)) = row {
-        sqlx::query("update password_reset_tokens set consumed_at = now() where id = $1")
-            .bind(token_id)
-            .execute(pool)
-            .await?;
-        Ok(Some(user_id))
-    } else {
-        Ok(None)
-    }
+    Ok(row.map(|(user_id,)| user_id))
 }

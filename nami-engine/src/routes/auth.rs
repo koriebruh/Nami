@@ -42,14 +42,21 @@ async fn register(
     let (raw_token, token_hash) = auth::token::new_opaque_token();
     models::token::insert_verification_token(&state.db, user.id, &token_hash).await?;
 
-    state
+    // Don't propagate a mailer error with `?` here: that would turn into a
+    // 400 response, distinguishable from the 200 generic response below for
+    // an already-registered email — a status-code oracle for account
+    // enumeration. Log and still return the generic success response.
+    if let Err(e) = state
         .mailer
         .send(
             &user.email,
             "Verify your Nami account",
             format!("Verify your email: /auth/verify-email?token={raw_token}"),
         )
-        .await?;
+        .await
+    {
+        tracing::error!(error = %e, "failed to send verification email");
+    }
 
     Ok(generic_response)
 }
@@ -168,19 +175,42 @@ async fn me(
     Ok(Json(json!({ "id": user.id, "email": user.email, "global_role": user.global_role })))
 }
 
-async fn current_user_id(session: &Session) -> Result<uuid::Uuid, AppError> {
-    session
+/// Same staleness check as `me`: a session authenticated before the user's
+/// last password reset must not be usable, here either — otherwise a reset
+/// doesn't actually invalidate old sessions for endpoints that only call
+/// this helper instead of `me` (e.g. TOTP setup/enable).
+async fn current_user_id(session: &Session, pool: &sqlx::PgPool) -> Result<uuid::Uuid, AppError> {
+    let user_id: uuid::Uuid = session
         .get("user_id")
         .await
         .map_err(|_| AppError::Validation("session error".into()))?
-        .ok_or(AppError::Unauthorized)
+        .ok_or(AppError::Unauthorized)?;
+
+    let auth_at: chrono::DateTime<chrono::Utc> = session
+        .get("auth_at")
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?
+        .ok_or(AppError::Unauthorized)?;
+
+    let user: models::user::User = sqlx::query_as("select * from users where id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+
+    if auth_at < user.password_changed_at {
+        session.delete().await.ok();
+        return Err(AppError::Unauthorized);
+    }
+
+    Ok(user_id)
 }
 
 async fn totp_setup(
     State(state): State<AppState>,
     session: Session,
 ) -> Result<Json<Value>, AppError> {
-    let user_id = current_user_id(&session).await?;
+    let user_id = current_user_id(&session, &state.db).await?;
     let user: models::user::User = sqlx::query_as("select * from users where id = $1")
         .bind(user_id)
         .fetch_one(&state.db)
@@ -206,7 +236,7 @@ async fn totp_enable(
     session: Session,
     Json(payload): Json<TotpCodeRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let user_id = current_user_id(&session).await?;
+    let user_id = current_user_id(&session, &state.db).await?;
     let user: models::user::User = sqlx::query_as("select * from users where id = $1")
         .bind(user_id)
         .fetch_one(&state.db)
@@ -285,10 +315,16 @@ async fn forgot_password(
 
     let (raw_token, token_hash) = auth::token::new_opaque_token();
     models::token::insert_reset_token(&state.db, user.id, &token_hash).await?;
-    state
+
+    // Same anti-enumeration reasoning as `register`: don't let a mailer
+    // failure propagate into a distinguishable error status.
+    if let Err(e) = state
         .mailer
         .send(&user.email, "Reset your Nami password", format!("Reset: /auth/password/reset?token={raw_token}"))
-        .await?;
+        .await
+    {
+        tracing::error!(error = %e, "failed to send password reset email");
+    }
 
     Ok(generic_response)
 }
