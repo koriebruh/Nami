@@ -36,6 +36,10 @@ pub struct Config {
     /// The sender of every email (`SMTP_FROM`, default
     /// `Nami <noreply@nami.local>`).
     pub smtp_from: lettre::message::Mailbox,
+    /// `SMTP_ALLOW_PLAINTEXT_AUTH=true` accepts sending SMTP credentials
+    /// without TLS to a server that is not this machine (refused otherwise,
+    /// see `email::check_plaintext_auth`). Default false.
+    pub smtp_allow_plaintext_auth: bool,
     pub cookie_secure: bool,
     pub oauth_redirect_base_url: String,
     pub google_client_id: String,
@@ -101,6 +105,7 @@ impl Config {
             smtp_from: or_stop(crate::email::parse_from(
                 std::env::var("SMTP_FROM").ok().as_deref(),
             )),
+            smtp_allow_plaintext_auth: env_flag("SMTP_ALLOW_PLAINTEXT_AUTH", false),
             cookie_secure: std::env::var("COOKIE_SECURE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
@@ -108,6 +113,19 @@ impl Config {
             ..Self::from_env_defaults_only()
         }
         .with_distinct_ports()
+        .with_safe_smtp_auth()
+    }
+
+    /// SMTP credentials never cross the network in the clear unless the
+    /// operator accepts it (see `email::check_plaintext_auth`).
+    fn with_safe_smtp_auth(self) -> Self {
+        or_stop(crate::email::check_plaintext_auth(
+            &self.smtp_host,
+            self.smtp_tls,
+            self.smtp_credentials.as_ref(),
+            self.smtp_allow_plaintext_auth,
+        ));
+        self
     }
 
     /// The API and the public listener cannot share a port: the API must stay
@@ -148,6 +166,7 @@ impl Config {
             smtp_from: crate::email::DEFAULT_FROM
                 .parse()
                 .expect("the default sender is valid"),
+            smtp_allow_plaintext_auth: false,
             cookie_secure: false,
             oauth_redirect_base_url: std::env::var("OAUTH_REDIRECT_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),

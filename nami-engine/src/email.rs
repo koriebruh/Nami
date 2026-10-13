@@ -1,4 +1,4 @@
-use std::{fmt, time::Duration};
+use std::{fmt, net::IpAddr, time::Duration};
 
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
@@ -90,6 +90,48 @@ pub fn parse_from(value: Option<&str>) -> Result<Mailbox, String> {
             value.unwrap_or_default()
         )
     })
+}
+
+/// Whether `host` is this machine: `localhost` or a loopback address
+/// (127.0.0.0/8, `::1`, also IPv4-mapped), bracketed or not. Any other name,
+/// a container's service name included, is another machine.
+pub fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if host.trim_end_matches('.').eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Refuses SMTP credentials that would cross the network in the clear: with
+/// `SMTP_TLS=none` the password reaches the server as plain text, which is only
+/// acceptable when the server is this machine (see [`is_loopback_host`]) or
+/// when the operator says so with `SMTP_ALLOW_PLAINTEXT_AUTH=true` (a relay on
+/// a network they trust). The message names the variables, never their values.
+pub fn check_plaintext_auth(
+    host: &str,
+    tls: SmtpTls,
+    credentials: Option<&SmtpCredentials>,
+    allow_plaintext_auth: bool,
+) -> Result<(), String> {
+    if credentials.is_none()
+        || tls != SmtpTls::None
+        || allow_plaintext_auth
+        || is_loopback_host(host)
+    {
+        return Ok(());
+    }
+    Err("SMTP_USERNAME and SMTP_PASSWORD are set with SMTP_TLS=none and an SMTP_HOST that is not this machine: the password would cross the network in the clear. Set SMTP_TLS=starttls or SMTP_TLS=tls, or SMTP_ALLOW_PLAINTEXT_AUTH=true to accept that".to_string())
 }
 
 /// Everything the mailer needs to reach the SMTP server and sign its emails.
@@ -343,6 +385,78 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    fn alerts_login() -> SmtpCredentials {
+        SmtpCredentials {
+            username: "alerts".to_string(),
+            password: "hunter2-secret".to_string(),
+        }
+    }
+
+    #[test]
+    fn plaintext_credentials_to_another_machine_are_refused() {
+        let credentials = alerts_login();
+        for host in [
+            "smtp.example.com",
+            "mailpit",
+            "localhost.example.com",
+            "127.0.0.1.nip.io",
+            "10.0.0.5",
+            "192.168.1.10",
+            "::2",
+            "[2001:db8::1]",
+        ] {
+            let message =
+                check_plaintext_auth(host, SmtpTls::None, Some(&credentials), false).unwrap_err();
+            for name in [
+                "SMTP_USERNAME",
+                "SMTP_PASSWORD",
+                "SMTP_TLS",
+                "SMTP_HOST",
+                "SMTP_ALLOW_PLAINTEXT_AUTH",
+            ] {
+                assert!(message.contains(name), "{host}: {message}");
+            }
+            assert!(!message.contains("hunter2"), "{message}");
+        }
+    }
+
+    #[test]
+    fn credentials_are_fine_over_tls_to_this_machine_or_when_allowed() {
+        let credentials = alerts_login();
+        for tls in [SmtpTls::StartTls, SmtpTls::Tls] {
+            assert_eq!(
+                check_plaintext_auth("smtp.example.com", tls, Some(&credentials), false),
+                Ok(())
+            );
+        }
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "[::1]",
+            "::ffff:127.0.0.1",
+        ] {
+            assert_eq!(
+                check_plaintext_auth(host, SmtpTls::None, Some(&credentials), false),
+                Ok(()),
+                "{host}"
+            );
+        }
+        assert_eq!(
+            check_plaintext_auth("smtp.example.com", SmtpTls::None, Some(&credentials), true),
+            Ok(()),
+            "allowed explicitly"
+        );
+        assert_eq!(
+            check_plaintext_auth("smtp.example.com", SmtpTls::None, None, false),
+            Ok(()),
+            "no credentials, nothing to protect"
+        );
     }
 
     #[test]

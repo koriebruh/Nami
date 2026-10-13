@@ -152,3 +152,43 @@ fn the_engine_reads_a_dotenv_file_to_its_last_line() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// SMTP credentials sent in the clear to another machine are refused at
+/// startup unless the operator accepts that explicitly. The message names the
+/// variables and never the password. With `SMTP_ALLOW_PLAINTEXT_AUTH=true` the
+/// engine gets past the check (and stops at the unreachable database).
+#[test]
+fn the_engine_refuses_plaintext_smtp_credentials_to_another_machine() {
+    let dir = scratch_dir("smtp-auth");
+    let key = base64::engine::general_purpose::STANDARD.encode([0x42u8; 32]);
+    let vars = [
+        ("NAMI_ENCRYPTION_KEY", key.as_str()),
+        ("SMTP_HOST", "smtp.example.com"),
+        ("SMTP_USERNAME", "alerts"),
+        ("SMTP_PASSWORD", "hunter2-secret"),
+    ];
+
+    let output = start_engine_in(&dir, &vars);
+
+    assert!(!output.status.success(), "the engine must not start");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for name in [
+        "SMTP_USERNAME",
+        "SMTP_PASSWORD",
+        "SMTP_TLS",
+        "SMTP_ALLOW_PLAINTEXT_AUTH",
+    ] {
+        assert!(stderr.contains(name), "{name} is named: {stderr}");
+    }
+    assert!(!stderr.contains("hunter2"), "the password leaked: {stderr}");
+
+    let mut allowed = vars.to_vec();
+    allowed.push(("SMTP_ALLOW_PLAINTEXT_AUTH", "true"));
+    // Gives up on the unreachable database after 1 s instead of 5.
+    allowed.push(("DATABASE_ACQUIRE_TIMEOUT_SECS", "1"));
+    let output = start_engine_in(&dir, &allowed);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("SMTP_ALLOW_PLAINTEXT_AUTH"), "{stderr}");
+    assert!(stderr.contains("failed to connect to database"), "{stderr}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
