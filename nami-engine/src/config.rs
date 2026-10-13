@@ -23,7 +23,9 @@ pub struct Config {
     /// Base URL of nami-ui, used to build links in alert emails.
     pub ui_base_url: String,
     /// `UPTIME_WORKER_ENABLED=false` serves the API without the background
-    /// uptime checker (e.g. a second, API-only replica).
+    /// uptime checker (e.g. a second, API-only replica). Accepts
+    /// `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`, case-insensitively; any
+    /// other value stops startup (see `env_flag`).
     pub uptime_worker_enabled: bool,
 }
 
@@ -95,9 +97,85 @@ impl Config {
                 .unwrap_or_else(|_| "nami".to_string()),
             ui_base_url: std::env::var("UI_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
-            uptime_worker_enabled: std::env::var("UPTIME_WORKER_ENABLED")
-                .map(|v| !(v == "false" || v == "0"))
-                .unwrap_or(true),
+            uptime_worker_enabled: env_flag("UPTIME_WORKER_ENABLED", true),
         }
+    }
+}
+
+/// Reads a boolean env flag, `default` when it is unset. A value that is not
+/// a recognised spelling (see `parse_bool_flag`) panics at startup instead of
+/// falling back to a guess: for `UPTIME_WORKER_ENABLED`, an "API-only" replica
+/// that silently kept its worker running would double-run every check.
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => flag_from_value(name, &value),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(value)) => {
+            panic!("{name} must be valid unicode, got {value:?}")
+        }
+    }
+}
+
+/// `parse_bool_flag`, panicking with a message that names the variable and
+/// the offending value when it is not recognised.
+fn flag_from_value(name: &str, value: &str) -> bool {
+    parse_bool_flag(value).unwrap_or_else(|| {
+        panic!(
+            "{name} must be one of true/false/1/0/yes/no/on/off (case-insensitive), got {value:?}"
+        )
+    })
+}
+
+/// `true`/`1`/`yes`/`on` and `false`/`0`/`no`/`off`, case-insensitively.
+/// Anything else (including an empty string or surrounding whitespace) is
+/// `None`.
+fn parse_bool_flag(value: &str) -> Option<bool> {
+    const TRUE: [&str; 4] = ["true", "1", "yes", "on"];
+    const FALSE: [&str; 4] = ["false", "0", "no", "off"];
+    if TRUE.iter().any(|spelling| value.eq_ignore_ascii_case(spelling)) {
+        Some(true)
+    } else if FALSE.iter().any(|spelling| value.eq_ignore_ascii_case(spelling)) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{flag_from_value, parse_bool_flag};
+
+    #[test]
+    fn parse_bool_flag_accepts_the_documented_spellings_case_insensitively() {
+        for value in ["true", "TRUE", "True", "1", "yes", "YES", "Yes", "on", "ON", "On"] {
+            assert_eq!(parse_bool_flag(value), Some(true), "{value:?}");
+        }
+        for value in ["false", "FALSE", "False", "0", "no", "NO", "No", "off", "OFF", "Off"] {
+            assert_eq!(parse_bool_flag(value), Some(false), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_flag_rejects_everything_else() {
+        for value in [
+            "", " ", "true ", " false", "treu", "fasle", "2", "-1", "01", "00", "y", "n", "t", "f",
+            "enabled", "disabled", "truee", "nope", "null", "none", "\u{ff54}rue",
+        ] {
+            assert_eq!(parse_bool_flag(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn flag_from_value_returns_the_parsed_value() {
+        assert!(flag_from_value("UPTIME_WORKER_ENABLED", "On"));
+        assert!(!flag_from_value("UPTIME_WORKER_ENABLED", "off"));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "UPTIME_WORKER_ENABLED must be one of true/false/1/0/yes/no/on/off (case-insensitive), got \"fasle\""
+    )]
+    fn flag_from_value_panics_with_a_clear_message_on_anything_else() {
+        flag_from_value("UPTIME_WORKER_ENABLED", "fasle");
     }
 }

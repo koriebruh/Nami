@@ -6,6 +6,7 @@ use nami_engine::{
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CheckRow {
@@ -21,6 +22,17 @@ struct CheckRow {
 #[derive(Debug, Deserialize)]
 struct Count {
     n: u64,
+}
+
+/// Like `CheckRow`, but with a misspelled field: the table column is
+/// `response_time_ms`.
+#[derive(Debug, Serialize)]
+struct MisspelledRow {
+    monitor_id: Uuid,
+    project_id: Uuid,
+    checked_at: DateTime<Utc>,
+    status: String,
+    respnse_time_ms: u32,
 }
 
 /// `checked_at` is `DateTime64(3)`: sub-millisecond precision is truncated
@@ -73,8 +85,13 @@ async fn parameter_values_are_matched_literally_never_executed() {
     let ch = ClickHouse::create_test_database().await.unwrap();
     // Quotes, a backslash sequence that TSV-unescaping would mangle
     // (`\n`, `\f`), a raw tab and newline, an embedded statement, and a
-    // placeholder-looking fragment.
-    let hostile = "it's \"quoted\" C:\\new\\folder\ttab\nline'; DROP TABLE uptime_checks; -- {error:String}";
+    // placeholder-looking fragment; then the characters that are special one
+    // layer up, in the URL's form encoding (`+` is a space, `&`/`=`/`#`
+    // delimit, `%20` is an escape), and multibyte UTF-8.
+    let hostile = concat!(
+        "it's \"quoted\" C:\\new\\folder\ttab\nline'; DROP TABLE uptime_checks; -- {error:String}",
+        " a+b c&d=e%20f%2Fg#frag é日本",
+    );
     let stored = row(Uuid::new_v4(), now_millis(), Some(hostile));
     ch.insert_rows("uptime_checks", &[stored]).await.unwrap();
 
@@ -98,6 +115,10 @@ async fn parameter_values_are_matched_literally_never_executed() {
         0,
         "a near-miss must not match: the value is compared, not reinterpreted"
     );
+    // `+` stays a plus (not a space) and `%20` stays three literal characters
+    // (not decoded a second time): each near-miss must differ from the stored value.
+    assert_eq!(count(hostile.replace("a+b", "a b")).await, 0, "`+` must not become a space");
+    assert_eq!(count(hostile.replace("e%20f", "e f")).await, 0, "`%20` must not be decoded");
     let all: Vec<Count> = ch
         .query_rows("SELECT count() AS n FROM uptime_checks", &[])
         .await
@@ -141,8 +162,186 @@ async fn migrate_is_idempotent() {
 #[tokio::test]
 #[should_panic(expected = "drop_database only drops")]
 async fn drop_database_refuses_anything_but_test_databases() {
-    let ch = ClickHouse::new("http://localhost:8123", "nami", "nami", "nami");
+    // A name that neither exists nor carries the test prefix, on a URL nothing
+    // listens on: if the guard ever broke, the DROP could neither find nor
+    // reach any real data (and the missing panic would fail this test).
+    let ch = ClickHouse::new("http://127.0.0.1:1", "nami", "nami", "nami_guard_probe");
     let _ = ch.drop_database().await;
+}
+
+#[tokio::test]
+async fn a_row_with_an_unknown_field_is_rejected_not_stored_with_defaults() {
+    let ch = ClickHouse::create_test_database().await.unwrap();
+    let typo = MisspelledRow {
+        monitor_id: Uuid::new_v4(),
+        project_id: Uuid::new_v4(),
+        checked_at: now_millis(),
+        status: "up".to_string(),
+        respnse_time_ms: 42,
+    };
+    let error = ch.insert_rows("uptime_checks", &[typo]).await.unwrap_err();
+    match error {
+        ClickHouseError::Server { status, body } => {
+            assert!((400..600).contains(&status), "status was {status}");
+            assert!(body.contains("respnse_time_ms"), "the error must name the field: {body:?}");
+        }
+        other => panic!("expected ClickHouseError::Server, got {other:?}"),
+    }
+    let stored: Vec<Count> = ch
+        .query_rows("SELECT count() AS n FROM uptime_checks", &[])
+        .await
+        .unwrap();
+    assert_eq!(stored[0].n, 0, "the rejected row must not be stored with a defaulted column");
+    ch.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn query_rows_is_read_only_so_ddl_and_writes_fail_on_the_read_path() {
+    let ch = ClickHouse::create_test_database().await.unwrap();
+    ch.insert_rows("uptime_checks", &[row(Uuid::new_v4(), now_millis(), None)])
+        .await
+        .unwrap();
+
+    for sql in [
+        "CREATE TABLE sneaky (x UInt8) ENGINE = Memory",
+        "INSERT INTO uptime_checks (monitor_id, project_id, checked_at, status) \
+         VALUES (generateUUIDv4(), generateUUIDv4(), now64(3), 'up')",
+        "ALTER TABLE uptime_checks DELETE WHERE 1",
+        "TRUNCATE TABLE uptime_checks",
+        "DROP TABLE uptime_checks",
+        // `readonly=2` lets a request change other settings, never `readonly` itself.
+        "SELECT 1 SETTINGS readonly = 0",
+    ] {
+        match ch.query_rows::<serde_json::Value>(sql, &[]).await.unwrap_err() {
+            ClickHouseError::Server { body, .. } => {
+                assert!(body.contains("READONLY"), "{sql}: body was {body:?}");
+            }
+            other => panic!("{sql}: expected ClickHouseError::Server, got {other:?}"),
+        }
+    }
+
+    // Nothing above took effect, and ordinary reads still work.
+    let tables: Vec<serde_json::Value> = ch
+        .query_rows(
+            "SELECT name FROM system.tables WHERE database = {db:String}",
+            &[("db", ch.database().to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(tables, vec![serde_json::json!({ "name": "uptime_checks" })]);
+    let rows: Vec<Count> = ch
+        .query_rows("SELECT count() AS n FROM uptime_checks", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows[0].n, 1);
+    ch.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn transport_errors_never_contain_parameter_values_or_credentials() {
+    // Nothing listens on port 1, so the request fails before reaching a server.
+    let ch = ClickHouse::new("http://127.0.0.1:1", "nami", "hunter2-password", "nami_guard_probe");
+    let error = ch
+        .query_rows::<serde_json::Value>(
+            "SELECT {x:String}",
+            &[("x", "secret-param-value".to_string())],
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, ClickHouseError::Transport(_)),
+        "expected a transport error, got {error:?}"
+    );
+    // The reqwest error carries the request URL, which holds every `param_*`
+    // value; it must be stripped from both renderings (logs use either).
+    for rendering in [error.to_string(), format!("{error:?}")] {
+        for leaked in ["secret-param-value", "param_x", "hunter2-password"] {
+            assert!(!rendering.contains(leaked), "{leaked:?} leaked into {rendering:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn credentials_travel_in_a_basic_auth_header_never_in_the_url() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let ch = ClickHouse::new(&server.uri(), "nami", "s3cret", "nami_guard_probe");
+    ch.execute("SELECT 1").await.unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(
+        request.headers.get("authorization").and_then(|v| v.to_str().ok()),
+        Some("Basic bmFtaTpzM2NyZXQ="), // base64("nami:s3cret")
+    );
+    assert!(request.headers.get("x-clickhouse-key").is_none());
+    assert!(request.headers.get("x-clickhouse-user").is_none());
+    assert!(!request.url.as_str().contains("s3cret"), "password in the URL: {}", request.url);
+}
+
+fn assert_invalid_identifier<T: std::fmt::Debug>(result: Result<T, ClickHouseError>, expected: &str) {
+    match result {
+        Err(ClickHouseError::InvalidIdentifier(name)) => assert_eq!(name, expected),
+        other => panic!("expected InvalidIdentifier({expected:?}), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn invalid_identifiers_are_rejected_before_any_request_is_sent() {
+    // A live server that records every request it receives. It has no mocks
+    // mounted, so a request that slipped through would come back as a 404 and
+    // show up in `received_requests` instead of as an `InvalidIdentifier`.
+    let server = MockServer::start().await;
+    let any_row = || row(Uuid::new_v4(), now_millis(), None);
+
+    let bad_names = [
+        "a\\b",  // a backslash
+        "a.b",    // a dot (would address another database's table)
+        "a b",    // a space
+        "a;b",    // a statement separator
+        "",       // empty
+        "1abc",   // leading digit
+        "a-b",
+        "a`b",
+        "a'b",
+        "a\"b",
+        "a\nb",
+        "a\n",    // trailing newline: `$` in a regex would let this through
+        "\u{e9}", // non-ASCII letter
+        "uptime_checks; DROP TABLE uptime_checks",
+    ];
+    for bad in bad_names {
+        // As a table name, with rows and with none: the empty-slice shortcut
+        // must not hide a bad name.
+        let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_guard_probe");
+        assert_invalid_identifier(ch.insert_rows(bad, &[any_row()]).await, bad);
+        assert_invalid_identifier(ch.insert_rows::<CheckRow>(bad, &[]).await, bad);
+
+        // As the database name, through every entry point that names it.
+        let ch = ClickHouse::new(&server.uri(), "nami", "nami", bad);
+        assert_invalid_identifier(ch.insert_rows("uptime_checks", &[any_row()]).await, bad);
+        assert_invalid_identifier(ch.migrate().await, bad);
+        assert_invalid_identifier(ch.execute("SELECT 1").await, bad);
+        assert_invalid_identifier(ch.query_rows::<serde_json::Value>("SELECT 1", &[]).await, bad);
+    }
+
+    // Passes `drop_database`'s test-prefix guard, so the identifier check is
+    // what stops it.
+    let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_test_a;b");
+    assert_invalid_identifier(ch.drop_database().await, "nami_test_a;b");
+
+    let received: Vec<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .map(|request| request.url.to_string())
+        .collect();
+    assert!(received.is_empty(), "requests reached the server: {received:?}");
 }
 
 #[sqlx::test]

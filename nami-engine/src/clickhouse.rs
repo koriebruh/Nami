@@ -4,9 +4,18 @@
 //!
 //! Every value reaches ClickHouse as a query parameter — a `{name:Type}`
 //! placeholder in the SQL plus a `param_name=value` URL parameter — never by
-//! string interpolation. Database and table names travel the same way, as
-//! `Identifier` parameters, so no SQL text in this module is built with
-//! `format!`.
+//! string interpolation, so no SQL text in this module is built with
+//! `format!`. The two kinds of parameter are handled differently on purpose:
+//!
+//! - Typed values (`String`, `UUID`, `Int64`, ...) are parsed by ClickHouse in
+//!   its TSV "escaped" text format, so they are TSV-escaped first (see
+//!   `escape_param_value`) and then arrive byte-for-byte.
+//! - Database and table names travel as `Identifier` parameters. ClickHouse
+//!   uses an `Identifier` value verbatim — it does not decode TSV escapes for
+//!   it, so escaping would corrupt the name — which leaves validation as the
+//!   defence: a name must match `[A-Za-z_][A-Za-z0-9_]*` (see
+//!   `validate_identifier`) and is then sent raw. Anything else is rejected
+//!   with [`ClickHouseError::InvalidIdentifier`] before any request is made.
 
 use std::time::Duration;
 
@@ -46,8 +55,10 @@ pub const TEST_DATABASE_PREFIX: &str = "nami_test_";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClickHouseError {
+    /// The request did not complete. The request URL is stripped from the
+    /// wrapped error (see the `From` impl below).
     #[error("clickhouse request failed: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(#[source] reqwest::Error),
     /// Non-2xx response; `body` is ClickHouse's own error text.
     #[error("clickhouse returned HTTP {status}: {body}")]
     Server { status: u16, body: String },
@@ -58,6 +69,20 @@ pub enum ClickHouseError {
         line: String,
         source: serde_json::Error,
     },
+    /// A database or table name that is not a plain `[A-Za-z_][A-Za-z0-9_]*`
+    /// identifier. Nothing was sent to ClickHouse.
+    #[error("invalid clickhouse identifier {0:?}: expected [A-Za-z_][A-Za-z0-9_]*")]
+    InvalidIdentifier(String),
+}
+
+impl From<reqwest::Error> for ClickHouseError {
+    /// `reqwest::Error`'s `Display` and `Debug` include the request URL, and
+    /// here the URL carries every `param_*` value (and would carry
+    /// credentials if the configured URL had any). Strip it so none of that
+    /// can reach a log line.
+    fn from(error: reqwest::Error) -> Self {
+        ClickHouseError::Transport(error.without_url())
+    }
 }
 
 #[derive(Clone)]
@@ -93,16 +118,33 @@ impl ClickHouse {
 
     /// Runs one statement (DDL, `OPTIMIZE`, ...) against this client's database.
     pub async fn execute(&self, sql: &str) -> Result<(), ClickHouseError> {
-        self.post(self.settings(true), sql.to_string()).await.map(|_| ())
+        let pairs = self.settings_with_database()?;
+        self.post(pairs, sql.to_string()).await.map(|_| ())
     }
 
     /// `INSERT INTO <database>.<table> FORMAT JSONEachRow`, one serde-encoded
-    /// JSON object per line. An empty slice is a no-op.
+    /// JSON object per line. An empty slice is a no-op, but `table` is still
+    /// validated first, so a bad name fails the same way whatever the data.
+    ///
+    /// Sent with `input_format_skip_unknown_fields=0`: ClickHouse defaults to
+    /// silently dropping keys that match no column, so a misspelled struct
+    /// field would be stored as the column's default instead of failing.
     pub async fn insert_rows<T: Serialize>(
         &self,
         table: &str,
         rows: &[T],
     ) -> Result<(), ClickHouseError> {
+        let mut pairs = self.settings_with_database()?;
+        pairs.push((
+            "input_format_skip_unknown_fields".to_string(),
+            "0".to_string(),
+        ));
+        pairs.push((
+            "query".to_string(),
+            "INSERT INTO {db:Identifier}.{table:Identifier} FORMAT JSONEachRow".to_string(),
+        ));
+        pairs.push(identifier_param("db", &self.database)?);
+        pairs.push(identifier_param("table", table)?);
         if rows.is_empty() {
             return Ok(());
         }
@@ -111,29 +153,29 @@ impl ClickHouse {
             body.push_str(&serde_json::to_string(row).map_err(ClickHouseError::Encode)?);
             body.push('\n');
         }
-        let mut pairs = self.settings(true);
-        pairs.push((
-            "query".to_string(),
-            "INSERT INTO {db:Identifier}.{table:Identifier} FORMAT JSONEachRow".to_string(),
-        ));
-        pairs.push(("param_db".to_string(), escape_param_value(&self.database)));
-        pairs.push(("param_table".to_string(), escape_param_value(table)));
         self.post(pairs, body).await.map(|_| ())
     }
 
     /// Runs a `SELECT` and deserializes each `JSONEachRow` line into `T`.
     /// Write placeholders as `{name:Type}` in `sql` and pass the values in
     /// `params` as `("name", value)` — never interpolate values into `sql`.
+    ///
+    /// Sent with `readonly=2`, so ClickHouse refuses DDL, inserts and
+    /// mutations on this path (error `READONLY`) and `SETTINGS readonly = 0`
+    /// cannot lift that: a statement smuggled into `sql` cannot change data.
+    /// (`readonly=2`, unlike `1`, still accepts the per-request settings sent
+    /// here.) Use [`Self::execute`] or [`Self::insert_rows`] to write.
     pub async fn query_rows<T: DeserializeOwned>(
         &self,
         sql: &str,
         params: &[(&str, String)],
     ) -> Result<Vec<T>, ClickHouseError> {
-        let mut pairs = self.settings(true);
+        let mut pairs = self.settings_with_database()?;
         pairs.push(("default_format".to_string(), "JSONEachRow".to_string()));
         // Buffer the whole result server-side, so an error raised mid-query
         // becomes a non-2xx status instead of trailing text in a 200 body.
         pairs.push(("wait_end_of_query".to_string(), "1".to_string()));
+        pairs.push(("readonly".to_string(), "2".to_string()));
         for (name, value) in params {
             pairs.push((format!("param_{name}"), escape_param_value(value)));
         }
@@ -152,10 +194,10 @@ impl ClickHouse {
     /// Creates the database if needed, then applies every migration.
     /// Idempotent: safe to run on every startup.
     pub async fn migrate(&self) -> Result<(), ClickHouseError> {
-        // Not `settings(true)`: the `database` setting would make ClickHouse
-        // reject the request while the database does not exist yet.
-        let mut pairs = self.settings(false);
-        pairs.push(("param_db".to_string(), escape_param_value(&self.database)));
+        // Not `settings_with_database()`: the `database` setting would make
+        // ClickHouse reject the request while the database does not exist yet.
+        let mut pairs = Self::base_settings();
+        pairs.push(identifier_param("db", &self.database)?);
         self.post(pairs, "CREATE DATABASE IF NOT EXISTS {db:Identifier}".to_string())
             .await?;
         for ddl in MIGRATIONS {
@@ -194,26 +236,37 @@ impl ClickHouse {
             "drop_database only drops {TEST_DATABASE_PREFIX}* databases, not {:?}",
             self.database
         );
-        let mut pairs = self.settings(false);
-        pairs.push(("param_db".to_string(), escape_param_value(&self.database)));
+        let mut pairs = Self::base_settings();
+        pairs.push(identifier_param("db", &self.database)?);
         self.post(pairs, "DROP DATABASE IF EXISTS {db:Identifier} SYNC".to_string())
             .await
             .map(|_| ())
     }
 
-    fn settings(&self, with_database: bool) -> Vec<(String, String)> {
-        let mut pairs: Vec<(String, String)> = BASE_SETTINGS
+    /// The settings every request carries (see `BASE_SETTINGS`).
+    fn base_settings() -> Vec<(String, String)> {
+        BASE_SETTINGS
             .iter()
             .map(|(name, value)| (name.to_string(), value.to_string()))
-            .collect();
-        if with_database {
-            pairs.push(("database".to_string(), self.database.clone()));
-        }
-        pairs
+            .collect()
+    }
+
+    /// `base_settings()` plus the `database` setting, which scopes unqualified
+    /// table names to this client's database. ClickHouse does not parse that
+    /// value as SQL, but it is validated like every other identifier so no
+    /// request ever carries an unchecked database name.
+    fn settings_with_database(&self) -> Result<Vec<(String, String)>, ClickHouseError> {
+        let mut pairs = Self::base_settings();
+        pairs.push((
+            "database".to_string(),
+            validate_identifier(&self.database)?.to_string(),
+        ));
+        Ok(pairs)
     }
 
     /// POSTs `body` with `pairs` as URL parameters. Always POST: ClickHouse
-    /// treats GET as read-only. Credentials go in headers, never the URL.
+    /// treats GET as read-only. Credentials go in an `Authorization: Basic`
+    /// header, never the URL.
     async fn post(
         &self,
         pairs: Vec<(String, String)>,
@@ -229,8 +282,9 @@ impl ClickHouse {
         let response = self
             .http
             .post(url)
-            .header("X-ClickHouse-User", &self.user)
-            .header("X-ClickHouse-Key", &self.password)
+            // `basic_auth` marks the header sensitive: it is redacted from
+            // `Debug` output and never put in HTTP/2's header compression table.
+            .basic_auth(&self.user, Some(&self.password))
             .body(body)
             .send()
             .await?;
@@ -246,12 +300,18 @@ impl ClickHouse {
     }
 }
 
-/// ClickHouse parses query-parameter values in its "escaped" (TSV) text
+/// Makes a typed query-parameter value (`String`, `UUID`, `Int64`, ...) arrive
+/// byte-for-byte. ClickHouse parses those values in its "escaped" (TSV) text
 /// format: a raw tab or newline is a parse error, and backslash sequences are
 /// decoded (`C:\new` would arrive as `C:` + newline + `ew`). Escaping these
-/// four characters makes every value arrive byte-for-byte (verified against
+/// four characters makes every value arrive intact (verified against
 /// ClickHouse 26.9). Quotes need no escaping — the value is never parsed as
 /// SQL.
+///
+/// Not for `Identifier` parameters: ClickHouse takes those verbatim, without
+/// decoding TSV escapes (verified against 26.9: `a\b` names an identifier with
+/// one backslash), so escaping would change the name. They go through
+/// [`identifier_param`] instead.
 fn escape_param_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for c in value.chars() {
@@ -266,14 +326,60 @@ fn escape_param_value(value: &str) -> String {
     escaped
 }
 
+/// The `param_<name>=<value>` pair for a `{name:Identifier}` placeholder.
+/// Unlike typed values it is not TSV-escaped (see [`escape_param_value`]):
+/// the value is validated and sent raw.
+fn identifier_param(name: &str, value: &str) -> Result<(String, String), ClickHouseError> {
+    Ok((format!("param_{name}"), validate_identifier(value)?.to_string()))
+}
+
+/// Accepts exactly the names matching `^[A-Za-z_][A-Za-z0-9_]*$` and rejects
+/// everything else (an empty string, a leading digit, `.`, `` ` ``, quotes,
+/// whitespace, `;`, `\`, control characters, non-ASCII). Hand-rolled rather
+/// than a regex: it needs no dependency, and a trailing newline cannot slip
+/// past a `$` anchor.
+fn validate_identifier(name: &str) -> Result<&str, ClickHouseError> {
+    let mut chars = name.chars();
+    let valid = matches!(chars.next(), Some(first) if first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if valid {
+        Ok(name)
+    } else {
+        Err(ClickHouseError::InvalidIdentifier(name.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::escape_param_value;
+    use super::{escape_param_value, validate_identifier, ClickHouseError};
 
     #[test]
     fn escapes_exactly_the_tsv_special_characters() {
         assert_eq!(escape_param_value("it's \"fine\""), "it's \"fine\"");
         assert_eq!(escape_param_value("C:\\new"), "C:\\\\new");
         assert_eq!(escape_param_value("a\tb\nc\rd"), "a\\tb\\nc\\rd");
+    }
+
+    #[test]
+    fn identifiers_are_limited_to_plain_ascii_names() {
+        for ok in [
+            "uptime_checks",
+            "_x",
+            "A",
+            "a1",
+            "Table_Name_2",
+            "nami_test_0123456789abcdef0123456789abcdef",
+        ] {
+            assert!(validate_identifier(ok).is_ok(), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "", "1a", "a b", "a.b", "a;b", "a\\b", "a-b", "a`b", "a'b", "a\"b", "a\nb", "a\n",
+            "a\tb", "a\0b", "a/b", "a$b", "a%b", "\u{e9}", "a\u{e9}",
+        ] {
+            assert!(
+                matches!(validate_identifier(bad), Err(ClickHouseError::InvalidIdentifier(ref name)) if name == bad),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 }
