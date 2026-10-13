@@ -55,6 +55,13 @@ async fn main() {
         config,
     };
 
+    if state.config.uptime_worker_enabled {
+        tokio::spawn(nami_engine::uptime::worker::run_forever(state.clone()));
+        tracing::info!("uptime worker started");
+    } else {
+        tracing::info!("uptime worker disabled (UPTIME_WORKER_ENABLED=false)");
+    }
+
     let app = router::build_router(state).layer(session_layer);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))

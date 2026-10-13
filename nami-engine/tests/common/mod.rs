@@ -175,3 +175,161 @@ pub async fn seed_http_monitor(
     .await
     .unwrap()
 }
+
+/// AppState whose ClickHouse client is bound to a fresh per-test database.
+/// Call `clickhouse.drop_database()` at the end of the test.
+pub async fn state_with_clickhouse(
+    pool: &sqlx::PgPool,
+) -> (AppState, nami_engine::clickhouse::ClickHouse) {
+    let clickhouse = nami_engine::clickhouse::ClickHouse::create_test_database()
+        .await
+        .expect("ClickHouse must be running: docker compose up -d clickhouse");
+    (
+        AppState {
+            clickhouse: clickhouse.clone(),
+            ..AppState::for_test(pool.clone())
+        },
+        clickhouse,
+    )
+}
+
+pub const MAILPIT: &str = "http://localhost:8025";
+
+/// Every message Mailpit holds for `recipient`, oldest first, as
+/// (subject, plain-text body).
+pub async fn mail_for(recipient: &str) -> Vec<(String, String)> {
+    let search = url::Url::parse_with_params(
+        &format!("{MAILPIT}/api/v1/search"),
+        &[
+            ("query", format!("to:\"{recipient}\"")),
+            ("limit", "50".to_string()),
+        ],
+    )
+    .unwrap();
+    let found: Value = reqwest::get(search).await.unwrap().json().await.unwrap();
+    let mut messages = Vec::new();
+    // Mailpit lists newest first.
+    for summary in found["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .rev()
+    {
+        let to_recipient = summary["To"]
+            .as_array()
+            .is_some_and(|to| to.iter().any(|address| address["Address"] == recipient));
+        if !to_recipient {
+            continue;
+        }
+        let id = summary["ID"].as_str().unwrap();
+        let full: Value = reqwest::get(format!("{MAILPIT}/api/v1/message/{id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        messages.push((
+            full["Subject"].as_str().unwrap_or_default().to_string(),
+            full["Text"].as_str().unwrap_or_default().to_string(),
+        ));
+    }
+    messages
+}
+
+/// Waits (up to 5 s) until `recipient` has at least `count` messages, then
+/// waits 500 ms more and returns everything — so a duplicate that arrives
+/// late still makes an exact-count assertion fail.
+pub async fn settled_mail(recipient: &str, count: usize) -> Vec<(String, String)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while mail_for(recipient).await.len() < count && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    mail_for(recipient).await
+}
+
+/// Makes the monitor due on the next `run_due_checks`.
+pub async fn make_due(pool: &sqlx::PgPool, monitor_id: Uuid) {
+    sqlx::query("update monitors set next_check_at = now() - interval '1 second' where id = $1")
+        .bind(monitor_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// A message as Mailpit stored it.
+pub struct StoredMail {
+    pub subject: String,
+    /// The plain-text body, with `\r\n` normalized to `\n`.
+    pub text: String,
+    /// The To, Cc and Bcc addresses Mailpit recorded. An envelope recipient
+    /// that no header names (for example one smuggled into the SMTP dialogue)
+    /// is listed under `bcc`.
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    /// The raw source, with `\r\n` normalized to `\n`.
+    pub raw: String,
+}
+
+/// Every message Mailpit holds that is addressed to `recipient`, oldest
+/// first, with the recipients it recorded and the raw source.
+pub async fn stored_mail_for(recipient: &str) -> Vec<StoredMail> {
+    let search = url::Url::parse_with_params(
+        &format!("{MAILPIT}/api/v1/search"),
+        &[
+            ("query", format!("to:\"{recipient}\"")),
+            ("limit", "50".to_string()),
+        ],
+    )
+    .unwrap();
+    let found: Value = reqwest::get(search).await.unwrap().json().await.unwrap();
+    let addresses = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| entry["Address"].as_str().map(str::to_string))
+            .collect()
+    };
+    let mut messages = Vec::new();
+    // Mailpit lists newest first.
+    for summary in found["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .rev()
+    {
+        let id = summary["ID"].as_str().unwrap();
+        let full: Value = reqwest::get(format!("{MAILPIT}/api/v1/message/{id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let to = addresses(&full["To"]);
+        if !to.iter().any(|address| address == recipient) {
+            continue;
+        }
+        let raw = reqwest::get(format!("{MAILPIT}/api/v1/message/{id}/raw"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        messages.push(StoredMail {
+            subject: full["Subject"].as_str().unwrap_or_default().to_string(),
+            text: full["Text"]
+                .as_str()
+                .unwrap_or_default()
+                .replace("\r\n", "\n"),
+            to,
+            cc: addresses(&full["Cc"]),
+            bcc: addresses(&full["Bcc"]),
+            raw: raw.replace("\r\n", "\n"),
+        });
+    }
+    messages
+}
