@@ -1,4 +1,10 @@
-use nami_engine::{clickhouse::ClickHouse, config::Config, db, email, router, state::AppState};
+use nami_engine::{
+    clickhouse::ClickHouse,
+    config::Config,
+    crypto::{Cipher, TEST_KEY},
+    db, email, router,
+    state::AppState,
+};
 use std::net::SocketAddr;
 use tower_sessions_sqlx_store::PostgresStore;
 
@@ -6,6 +12,12 @@ use tower_sessions_sqlx_store::PostgresStore;
 async fn main() {
     tracing_subscriber::fmt::init();
     let config = Config::from_env();
+    // The test key is public (it lives in this repository), so secrets sealed
+    // under it would not be secret: refuse to run on it. A plain `if` rather
+    // than `assert_ne!`, which would print both keys.
+    if config.encryption_key == TEST_KEY {
+        panic!("NAMI_ENCRYPTION_KEY must not be the built-in test key");
+    }
     let pool = db::connect_pool(&config.database_url)
         .await
         .expect("failed to connect to database");
@@ -52,6 +64,7 @@ async fn main() {
         db: pool,
         mailer: email::Mailer::new(&config.smtp_host, config.smtp_port),
         clickhouse,
+        cipher: Cipher::new(&config.encryption_key),
         config,
     };
 
