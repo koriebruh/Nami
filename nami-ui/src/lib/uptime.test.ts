@@ -93,6 +93,21 @@ describe('niceTicks', () => {
 	it('has a default scale when there is no data', () => {
 		expect(niceTicks(0)).toEqual([0, 50, 100, 150, 200]);
 	});
+	// Response times are whole milliseconds, so the axis never needs a step below 1.
+	it('uses whole-millisecond steps when the maximum is below one tick', () => {
+		expect(niceTicks(0.5)).toEqual([0, 1, 2, 3, 4]);
+		expect(niceTicks(0.0001)).toEqual([0, 1, 2, 3, 4]);
+		expect(niceTicks(3)).toEqual([0, 1, 2, 3, 4]);
+	});
+	it('never labels a tick with float noise', () => {
+		for (const max of [0.1, 0.3, 0.7, 1.5, 3.3, 9.9, 99.9, 123.456, 1999.9]) {
+			for (const tick of niceTicks(max)) expect(Number.isInteger(tick), `max ${max}: ${tick}`).toBe(true);
+		}
+	});
+	it('still ends on a round value for large maxima', () => {
+		expect(niceTicks(60_000)).toEqual([0, 20_000, 40_000, 60_000]);
+		expect(niceTicks(123_456_789)).toEqual([0, 50_000_000, 100_000_000, 150_000_000]);
+	});
 });
 
 describe('statusSince', () => {

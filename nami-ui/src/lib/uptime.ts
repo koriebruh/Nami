@@ -129,14 +129,20 @@ export function monitorTarget(m: Pick<Monitor, 'check_type' | 'url' | 'host' | '
 	return m.check_type === 'tcp' ? `${m.host ?? ''}:${m.port ?? ''}` : (m.url ?? '');
 }
 
-/** Clean y-axis ticks from 0 to a round value >= max (steps of 1/2/5 x 10^n). */
+/**
+ * Clean y-axis ticks from 0 to a round value >= max (steps of 1/2/5 x 10^n).
+ * Response times are whole milliseconds, so a step is never below 1: a maximum
+ * under `count` gets the axis 0..count instead of fractional ticks.
+ */
 export function niceTicks(max: number, count = 4): number[] {
 	if (!(max > 0)) return [0, 50, 100, 150, 200];
+	max = Math.max(max, count);
 	const rough = max / count;
 	const magnitude = 10 ** Math.floor(Math.log10(rough));
 	const step = [1, 2, 5, 10].map((m) => m * magnitude).find((s) => s >= rough) ?? 10 * magnitude;
 	const top = Math.ceil(max / step) * step;
-	return Array.from({ length: Math.round(top / step) + 1 }, (_, i) => i * step);
+	// toPrecision drops any float noise a multiplication leaves behind.
+	return Array.from({ length: Math.round(top / step) + 1 }, (_, i) => Number((i * step).toPrecision(12)));
 }
 
 /**

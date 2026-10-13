@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { enhance } from '$app/forms';
+	import { enhance, type SubmitFunction } from '$app/forms';
 	import { refreshAll } from '$app/navigation';
 	import ResponseTimeChart from '#lib/components/ResponseTimeChart.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
@@ -44,9 +44,38 @@
 		{ label: 'Avg response, 24 hours', value: formatMs(data.stats?.avg_response_ms_24h) }
 	]);
 
+	// The buttons stay disabled from a submit until its result is applied, so a
+	// double click cannot send an action twice.
+	let busy = $state(false);
+	const submit: SubmitFunction = () => {
+		busy = true;
+		return async ({ update }) => {
+			try {
+				await update();
+			} finally {
+				busy = false;
+			}
+		};
+	};
+
+	// Delete asks with confirm() first. The dialog is the confirmation, so the
+	// form sends `confirm=yes`; without JavaScript the action asks on the page.
+	const confirmDelete: SubmitFunction = (input) => {
+		if (!confirm(`Delete monitor "${data.monitor.name}"? Its incidents are deleted too.`)) {
+			input.cancel();
+			return;
+		}
+		input.formData.set('confirm', 'yes');
+		return submit(input);
+	};
+
 	const button =
-		'rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:border-teal-500/30 hover:text-neutral-100';
+		'rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:border-teal-500/30 hover:text-neutral-100 disabled:cursor-not-allowed disabled:opacity-50';
 </script>
+
+<svelte:head>
+	<title>{data.monitor.name} · Monitors</title>
+</svelte:head>
 
 <div class="space-y-6">
 	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
@@ -71,24 +100,19 @@
 			<div class="flex flex-wrap gap-2">
 				<a href="{base}/edit" class={button}>Edit</a>
 				{#if data.monitor.paused}
-					<form method="POST" action="?/resume" use:enhance>
-						<button type="submit" class={button}>Resume</button>
+					<form method="POST" action="?/resume" use:enhance={submit}>
+						<button type="submit" disabled={busy} class={button}>Resume</button>
 					</form>
 				{:else}
-					<form method="POST" action="?/pause" use:enhance>
-						<button type="submit" class={button}>Pause</button>
+					<form method="POST" action="?/pause" use:enhance={submit}>
+						<button type="submit" disabled={busy} class={button}>Pause</button>
 					</form>
 				{/if}
-				<form
-					method="POST"
-					action="?/delete"
-					use:enhance={({ cancel }) => {
-						if (!confirm(`Delete monitor "${data.monitor.name}"? Its incidents are deleted too.`)) cancel();
-					}}
-				>
+				<form method="POST" action="?/delete" use:enhance={confirmDelete}>
 					<button
 						type="submit"
-						class="rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-400 transition-colors hover:border-red-500/30 hover:text-red-400"
+						disabled={busy}
+						class="rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-400 transition-colors hover:border-red-500/30 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
 					>
 						Delete
 					</button>
@@ -99,6 +123,26 @@
 			<div role="alert" class="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">
 				{form.message}
 			</div>
+		{/if}
+		<!-- The second step of a delete without JavaScript (see the delete action). -->
+		{#if form?.confirmDelete}
+			<form
+				method="POST"
+				action="?/delete"
+				use:enhance={submit}
+				class="mt-4 flex flex-wrap items-center gap-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300"
+			>
+				<input type="hidden" name="confirm" value="yes" />
+				<span class="wrap-anywhere">Delete monitor "{data.monitor.name}"? Its incidents are deleted too.</span>
+				<button
+					type="submit"
+					disabled={busy}
+					class="rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-300 transition-colors hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-50"
+				>
+					Yes, delete
+				</button>
+				<a href={base} class="text-neutral-400 hover:text-neutral-200">Cancel</a>
+			</form>
 		{/if}
 	</div>
 

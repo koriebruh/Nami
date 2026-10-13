@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { enhance } from '$app/forms';
+	import { enhance, type SubmitFunction } from '$app/forms';
 	import type { CheckType, Monitor } from '#lib/uptime';
 
 	let {
@@ -21,6 +21,25 @@
 	}
 	let checkType = $state<CheckType>(initialCheckType());
 
+	// The submit button stays disabled from the submit until the result is
+	// applied, so a double click cannot send the form twice (two monitors).
+	// The button is in the `actions` snippet below on purpose: Svelte runs all
+	// of a template's dynamic attributes in one effect, and the first re-run
+	// of that effect after hydration rewrites every `value={...}` input with
+	// its initial value, wiping what the user typed. As a snippet, the button
+	// (and `submitLabel`, `cancelHref`) re-render without touching the inputs.
+	let submitting = $state(false);
+	const submit: SubmitFunction = () => {
+		submitting = true;
+		return async ({ update }) => {
+			try {
+				await update();
+			} finally {
+				submitting = false;
+			}
+		};
+	};
+
 	const input =
 		'w-full rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:border-teal-500/50 focus:ring-2 focus:ring-teal-500/50 focus:outline-none';
 	const label = 'mb-1.5 block text-sm font-medium text-neutral-300';
@@ -28,7 +47,7 @@
 
 <!-- use:enhance keeps the typed values and the selected check type on a
      validation error (the action returns fail(), so the form is not reset). -->
-<form method="POST" use:enhance class="space-y-5">
+<form method="POST" use:enhance={submit} class="space-y-5">
 	{#if message}
 		<div role="alert" class="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">
 			{message}
@@ -123,13 +142,18 @@
 		<p id="timeout-hint" class="text-xs text-neutral-500 sm:col-span-3">Timeout must be less than the interval.</p>
 	</div>
 
+	{@render actions()}
+</form>
+
+{#snippet actions()}
 	<div class="flex items-center gap-3">
 		<button
 			type="submit"
-			class="rounded-md bg-teal-500 px-4 py-2 text-sm font-medium text-neutral-950 transition-colors hover:bg-teal-400 focus:ring-2 focus:ring-teal-500/50 focus:ring-offset-2 focus:ring-offset-[#141414] focus:outline-none"
+			disabled={submitting}
+			class="rounded-md bg-teal-500 px-4 py-2 text-sm font-medium text-neutral-950 transition-colors hover:bg-teal-400 focus:ring-2 focus:ring-teal-500/50 focus:ring-offset-2 focus:ring-offset-[#141414] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
 		>
 			{submitLabel}
 		</button>
 		<a href={cancelHref} class="text-sm text-neutral-500 hover:text-neutral-300">Cancel</a>
 	</div>
-</form>
+{/snippet}

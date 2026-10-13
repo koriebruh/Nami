@@ -22,6 +22,10 @@
 	});
 </script>
 
+<svelte:head>
+	<title>Monitors · {data.project.name}</title>
+</svelte:head>
+
 <div class="rounded-xl border border-[#262626] bg-[#141414]">
 	<div class="flex items-center justify-between border-b border-[#262626] px-6 py-4">
 		<div>

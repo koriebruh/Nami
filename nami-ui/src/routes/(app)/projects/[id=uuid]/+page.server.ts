@@ -1,4 +1,5 @@
 import { redirect } from '@sveltejs/kit';
+import { enginePath } from '#lib/server/engine';
 import type { PageServerLoad } from './$types';
 
 // The project page is now a section (see +layout.svelte): land on its
@@ -10,5 +11,5 @@ export const load: PageServerLoad = async (event) => {
 	// on every visit. It also gives a project the user cannot open the
 	// layout's 403 here, instead of after the redirect.
 	await event.parent();
-	throw redirect(307, `/projects/${event.params.id}/monitors`);
+	throw redirect(307, enginePath`/projects/${event.params.id}/monitors`);
 };

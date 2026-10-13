@@ -51,13 +51,17 @@ describe('monitorPayloadFromForm', () => {
 		const result = monitorPayloadFromForm(
 			form({ name: 'Home', check_type: 'keyword', url: 'https://example.com', keyword: ' Welcome ' })
 		);
-		expect(result.ok && result.payload.keyword).toBe(' Welcome ');
-		expect(result.ok && result.payload.keyword_mode).toBe('contains');
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.payload.keyword).toBe(' Welcome ');
+		expect(result.payload.keyword_mode).toBe('contains');
 	});
 
 	it('omits blank numbers so the engine defaults apply', () => {
 		const result = monitorPayloadFromForm(form({ name: 'API', check_type: 'http', url: 'https://x.test', interval_seconds: '' }));
-		expect(result.ok && 'interval_seconds' in result.payload).toBe(false);
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.payload).not.toHaveProperty('interval_seconds');
 	});
 
 	it('rejects non-whole numbers', () => {

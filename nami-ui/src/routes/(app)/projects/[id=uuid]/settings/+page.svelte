@@ -1,8 +1,12 @@
 <script lang="ts">
 	import type { PageProps } from './$types';
 
-	let { form }: PageProps = $props();
+	let { data, form }: PageProps = $props();
 </script>
+
+<svelte:head>
+	<title>Settings · {data.project.name}</title>
+</svelte:head>
 
 <!-- The member forms, moved unchanged from the old project page. -->
 <div class="space-y-6">
