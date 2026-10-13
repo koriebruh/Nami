@@ -1,34 +1,20 @@
 use axum::{body::Body, http::{Request, StatusCode}};
 use tower::ServiceExt;
-use nami_engine::{state::AppState, email::Mailer, routes, config::Config};
-use tower_governor::{governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer};
-use std::sync::Arc;
+use nami_engine::{state::AppState, email::Mailer, config::Config};
 use serde_json::json;
 
 fn build_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState { db: pool, mailer: Mailer::new("localhost", 1025), config: Config::from_env_for_test() };
-    // Same key extractor as main.rs: `SmartIpKeyExtractor` checks
+    // Same governor config/error_handler and session-layer settings as
+    // main.rs, defined once in `nami_engine::router` and shared here (see
+    // Fix 4 in the final hardening round). `SmartIpKeyExtractor` checks
     // `X-Forwarded-For` / `X-Real-IP` / `Forwarded` before falling back to
-    // `ConnectInfo`, which `oneshot()` never supplies. Tests therefore drive
-    // the key via an explicit `X-Forwarded-For` header on each request.
-    let governor_conf = Arc::new(
-        GovernorConfigBuilder::default()
-            .key_extractor(SmartIpKeyExtractor)
-            .per_second(60)
-            .burst_size(5)
-            .finish()
-            .unwrap(),
-    );
-    routes::auth::rate_limited_router()
-        .layer(GovernorLayer::new(governor_conf))
-        // `login` always extracts `Session` (even on a bad-credentials path,
-        // which is what these tests exercise), so the router needs a session
-        // layer or extraction itself 500s before auth logic ever runs —
-        // mirrors the pattern in tests/login.rs's `test_app()`.
-        .layer(tower_sessions::SessionManagerLayer::new(
-            tower_sessions::MemoryStore::default(),
-        ))
-        .with_state(state)
+    // `ConnectInfo`, which `oneshot()` never supplies — these tests drive
+    // the key via an explicit `X-Forwarded-For` header on each request,
+    // which takes precedence over `with_fallback_connect_info`'s fallback.
+    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state)).layer(
+        nami_engine::router::configure_session_layer(tower_sessions::MemoryStore::default(), false),
+    )
 }
 
 fn login_request(forwarded_for: &str) -> Request<Body> {
@@ -91,4 +77,99 @@ async fn different_client_ip_has_an_independent_rate_limit_bucket(pool: sqlx::Pg
         StatusCode::UNAUTHORIZED,
         "a different client IP must not be affected by another client's rate limit"
     );
+}
+
+/// Fix 2 (final-fix-wave): `/auth/totp/verify` was previously completely
+/// unrated, letting an attacker who already has a stolen password brute-force
+/// the 6-digit TOTP code. Proves it now sits behind the same governor as
+/// login/register.
+#[sqlx::test]
+async fn sixth_rapid_totp_verify_attempt_is_rate_limited(pool: sqlx::PgPool) {
+    let app = build_app(pool);
+
+    let make_request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/auth/totp/verify")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "2.2.2.2")
+            .body(Body::from(json!({"code": "000000"}).to_string()))
+            .unwrap()
+    };
+
+    let mut statuses = Vec::with_capacity(6);
+    for _ in 0..6 {
+        let response = app.clone().oneshot(make_request()).await.unwrap();
+        statuses.push(response.status());
+    }
+
+    assert_eq!(
+        &statuses[0..5],
+        // No `pending_user_id` in session for any of these requests, so each
+        // fails auth normally (401) rather than being rate-limited.
+        &[StatusCode::UNAUTHORIZED; 5],
+        "first 5 requests should fail auth normally, not be rate-limited: {statuses:?}"
+    );
+    assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS, "6th request should be rate-limited: {statuses:?}");
+}
+
+/// Fix 2: `/auth/password/forgot` was previously unrated and could be used to
+/// mail-bomb any address. Proves it now sits behind the same governor.
+#[sqlx::test]
+async fn sixth_rapid_forgot_password_attempt_is_rate_limited(pool: sqlx::PgPool) {
+    let app = build_app(pool);
+
+    let make_request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/auth/password/forgot")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "3.3.3.3")
+            .body(Body::from(json!({"email": "nobody@example.com"}).to_string()))
+            .unwrap()
+    };
+
+    let mut statuses = Vec::with_capacity(6);
+    for _ in 0..6 {
+        let response = app.clone().oneshot(make_request()).await.unwrap();
+        statuses.push(response.status());
+    }
+
+    assert_eq!(
+        &statuses[0..5],
+        &[StatusCode::OK; 5],
+        "first 5 requests should succeed with the generic response, not be rate-limited: {statuses:?}"
+    );
+    assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS, "6th request should be rate-limited: {statuses:?}");
+}
+
+/// Fix 2: `/auth/password/reset` was previously unrated, letting an attacker
+/// brute-force a reset token unlimited. Proves it now sits behind the same
+/// governor.
+#[sqlx::test]
+async fn sixth_rapid_reset_password_attempt_is_rate_limited(pool: sqlx::PgPool) {
+    let app = build_app(pool);
+
+    let make_request = || {
+        Request::builder()
+            .method("POST")
+            .uri("/auth/password/reset")
+            .header("content-type", "application/json")
+            .header("x-forwarded-for", "4.4.4.4")
+            .body(Body::from(json!({"token": "not-a-real-token", "new_password": "whatever123"}).to_string()))
+            .unwrap()
+    };
+
+    let mut statuses = Vec::with_capacity(6);
+    for _ in 0..6 {
+        let response = app.clone().oneshot(make_request()).await.unwrap();
+        statuses.push(response.status());
+    }
+
+    assert_eq!(
+        &statuses[0..5],
+        &[StatusCode::BAD_REQUEST; 5],
+        "first 5 requests should fail normally (invalid token), not be rate-limited: {statuses:?}"
+    );
+    assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS, "6th request should be rate-limited: {statuses:?}");
 }

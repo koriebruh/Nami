@@ -9,7 +9,7 @@ async fn health_returns_ok(pool: sqlx::PgPool) {
         mailer,
         config: nami_engine::config::Config::from_env_for_test(),
     };
-    let app = nami_engine::routes::health::router().with_state(state);
+    let app = nami_engine::router::build_router(state);
 
     let response = app
         .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())

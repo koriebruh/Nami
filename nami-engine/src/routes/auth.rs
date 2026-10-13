@@ -12,19 +12,27 @@ pub fn router() -> Router<AppState> {
         .route("/auth/me", get(me))
         .route("/auth/totp/setup", post(totp_setup))
         .route("/auth/totp/enable", post(totp_enable))
-        .route("/auth/totp/verify", post(totp_verify))
-        .route("/auth/password/forgot", post(forgot_password))
-        .route("/auth/password/reset", post(reset_password))
         // axum 0.8 uses `{param}` path syntax (not the brief's `:param`, which is
         // the pre-0.8 axum/matchit syntax and panics at router-build time here).
         .route("/auth/oauth/{provider}/start", get(oauth_start))
         .route("/auth/oauth/{provider}/callback", get(oauth_callback))
 }
 
+// Routes behind the per-IP rate limiter (`SmartIpKeyExtractor`-based governor
+// in `main.rs`/`router::build_router`). `/auth/totp/verify` guards a 6-digit
+// code held by someone who already has a stolen password — exactly the case
+// 2FA exists to stop a brute force on — and `/auth/password/forgot`/`/reset`
+// can otherwise be used to mail-bomb an address or brute-force a reset token
+// unlimited. Per-IP rate limiting is the full scope of this fix; a
+// persistent per-user TOTP attempt-lockout system is a larger, separate
+// feature left out of scope here.
 pub fn rate_limited_router() -> Router<AppState> {
     Router::new()
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
+        .route("/auth/totp/verify", post(totp_verify))
+        .route("/auth/password/forgot", post(forgot_password))
+        .route("/auth/password/reset", post(reset_password))
 }
 
 #[derive(Deserialize)]
@@ -108,6 +116,18 @@ async fn login(
         return Err(AppError::Unauthorized);
     }
 
+    // Checked only after the password is confirmed correct, so this doesn't
+    // become a new enumeration oracle (an attacker without the right
+    // password still just gets the generic 401 above). The spec requires
+    // login to stay blocked until the email is verified; this is the one
+    // check every test in the repo seeded around (every fixture user sets
+    // `email_verified_at = now()`), so it was never previously enforced here.
+    if user.email_verified_at.is_none() {
+        return Err(AppError::Validation(
+            "please verify your email before logging in".into(),
+        ));
+    }
+
     if user.totp_enabled {
         // Flush any prior authenticated session before stashing the pending
         // TOTP state, so a stale `user_id` from an earlier login can't
@@ -177,7 +197,9 @@ async fn me(
         .ok_or(AppError::Unauthorized)?;
 
     if auth_at < user.password_changed_at {
-        session.delete().await.ok();
+        // `.flush()` not `.delete()`: delete only removes the server-side row
+        // and leaves a stale cookie on the client until its Max-Age expires.
+        session.flush().await.ok();
         return Err(AppError::Unauthorized);
     }
 
@@ -208,7 +230,8 @@ async fn current_user_id(session: &Session, pool: &sqlx::PgPool) -> Result<uuid:
         .ok_or(AppError::Unauthorized)?;
 
     if auth_at < user.password_changed_at {
-        session.delete().await.ok();
+        // `.flush()` not `.delete()`: same reasoning as `me` above.
+        session.flush().await.ok();
         return Err(AppError::Unauthorized);
     }
 

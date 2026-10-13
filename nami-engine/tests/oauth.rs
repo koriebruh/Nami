@@ -1,6 +1,6 @@
 use axum::{body::Body, http::{Request, StatusCode, header}};
 use tower::ServiceExt;
-use nami_engine::{state::AppState, email::Mailer, routes, config::Config};
+use nami_engine::{state::AppState, email::Mailer, config::Config};
 use wiremock::{MockServer, Mock, ResponseTemplate};
 use wiremock::matchers::{method, path};
 
@@ -17,10 +17,11 @@ fn test_config(mock_server_uri: &str) -> Config {
 
 fn test_app(pool: sqlx::PgPool, config: Config) -> axum::Router {
     let state = AppState { db: pool, mailer: Mailer::new("localhost", 1025), config };
-    axum::Router::new()
-        .merge(routes::auth::router())
-        .layer(tower_sessions::SessionManagerLayer::new(tower_sessions::MemoryStore::default()))
-        .with_state(state)
+    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state))
+        .layer(nami_engine::router::configure_session_layer(
+            tower_sessions::MemoryStore::default(),
+            false,
+        ))
 }
 
 /// Drives `/auth/oauth/{provider}/start` then `/callback` through the real
@@ -311,4 +312,43 @@ async fn find_or_create_oauth_user_does_not_duplicate_on_repeat_login(pool: sqlx
         .await
         .unwrap();
     assert_eq!(count.0, 1);
+}
+
+/// Companion to `register.rs`'s `first_registered_user_becomes_global_admin`,
+/// for the OAuth-first-login path: a deployment whose very first user signs in
+/// via Google/GitHub rather than email/password must still get a global admin,
+/// or `POST /projects` is 403 for everyone forever with no in-app recovery.
+#[sqlx::test]
+async fn first_oauth_user_becomes_global_admin(pool: sqlx::PgPool) {
+    let user = nami_engine::models::user::find_or_create_oauth_user(
+        &pool,
+        "google",
+        "google-first",
+        "firstoauth@example.com",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(user.global_role, "admin");
+}
+
+/// And the bootstrap applies to the FIRST user only — including when the
+/// first user arrived via the password path and the second via OAuth.
+#[sqlx::test]
+async fn second_oauth_user_stays_member(pool: sqlx::PgPool) {
+    let hash = nami_engine::auth::password::hash_password("password123").unwrap();
+    let first = nami_engine::models::user::insert_user(&pool, "pw-first@example.com", &hash)
+        .await
+        .unwrap();
+    assert_eq!(first.global_role, "admin");
+
+    let second = nami_engine::models::user::find_or_create_oauth_user(
+        &pool,
+        "google",
+        "google-second",
+        "secondoauth@example.com",
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.global_role, "member");
 }
