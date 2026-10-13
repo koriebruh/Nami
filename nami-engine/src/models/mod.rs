@@ -1,3 +1,4 @@
+pub mod incident;
 pub mod monitor;
 pub mod project;
 pub mod token;
