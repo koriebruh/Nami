@@ -65,7 +65,8 @@ async fn main() {
     let (port, public_port) = (config.port, config.public_port);
     let state = AppState {
         db: pool,
-        mailer: email::Mailer::new(&config.smtp_host, config.smtp_port),
+        mailer: email::Mailer::from_settings(&email::SmtpSettings::from_config(&config))
+            .unwrap_or_else(|message| panic!("{message}")),
         clickhouse,
         cipher: Cipher::new(&config.encryption_key),
         config,

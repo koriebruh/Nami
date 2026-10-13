@@ -22,6 +22,15 @@ pub struct Config {
     pub database_statement_timeout: Duration,
     pub smtp_host: String,
     pub smtp_port: u16,
+    /// How the SMTP connection is protected (`SMTP_TLS`: `none`, the default
+    /// for Mailpit in development, `starttls` or `tls`).
+    pub smtp_tls: crate::email::SmtpTls,
+    /// `SMTP_USERNAME` and `SMTP_PASSWORD`, set together or not at all. The
+    /// password is never logged (`SmtpCredentials`' `Debug` hides it).
+    pub smtp_credentials: Option<crate::email::SmtpCredentials>,
+    /// The sender of every email (`SMTP_FROM`, default
+    /// `Nami <noreply@nami.local>`).
+    pub smtp_from: lettre::message::Mailbox,
     pub cookie_secure: bool,
     pub oauth_redirect_base_url: String,
     pub google_client_id: String,
@@ -77,6 +86,16 @@ impl Config {
                 .unwrap_or_else(|_| "1025".to_string())
                 .parse()
                 .expect("SMTP_PORT must be a number"),
+            smtp_tls: or_stop(crate::email::parse_smtp_tls(
+                std::env::var("SMTP_TLS").ok().as_deref(),
+            )),
+            smtp_credentials: or_stop(crate::email::smtp_credentials(
+                std::env::var("SMTP_USERNAME").ok(),
+                std::env::var("SMTP_PASSWORD").ok(),
+            )),
+            smtp_from: or_stop(crate::email::parse_from(
+                std::env::var("SMTP_FROM").ok().as_deref(),
+            )),
             cookie_secure: std::env::var("COOKIE_SECURE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
@@ -119,6 +138,11 @@ impl Config {
             database_statement_timeout: Duration::from_secs(30),
             smtp_host: "localhost".to_string(),
             smtp_port: 1025,
+            smtp_tls: crate::email::SmtpTls::None,
+            smtp_credentials: None,
+            smtp_from: crate::email::DEFAULT_FROM
+                .parse()
+                .expect("the default sender is valid"),
             cookie_secure: false,
             oauth_redirect_base_url: std::env::var("OAUTH_REDIRECT_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
@@ -161,6 +185,12 @@ impl Config {
 fn encryption_key_from_env() -> [u8; crate::crypto::KEY_LEN] {
     let raw = std::env::var("NAMI_ENCRYPTION_KEY").unwrap_or_default();
     crate::crypto::parse_key(&raw).unwrap_or_else(|message| panic!("{message}"))
+}
+
+/// The setting, or a stop at startup with `parse`'s message (which names the
+/// variable and never holds a secret).
+fn or_stop<T>(parsed: Result<T, String>) -> T {
+    parsed.unwrap_or_else(|message| panic!("{message}"))
 }
 
 /// Reads a positive whole number from the environment, `default` when it is
