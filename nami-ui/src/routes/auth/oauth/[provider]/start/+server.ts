@@ -14,6 +14,14 @@ export const GET: RequestHandler = async (event) => {
 
 	const location = response.headers.get('location');
 	if (!location) {
+		// Not every non-redirect response here is an engine outage -- an
+		// unrecognized `provider` (e.g. a typo in a link) gets a real 400 from
+		// the engine, not a 3xx. Surface that actual reason instead of a
+		// generic 502 that would mask it.
+		if (response.status < 300 || response.status >= 400) {
+			const body = await response.json().catch(() => ({}));
+			throw error(response.status || 502, body.error ?? 'OAuth start failed');
+		}
 		throw error(502, 'nami-engine did not return a redirect for this OAuth provider');
 	}
 
