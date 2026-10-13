@@ -1,12 +1,16 @@
 use axum::{routing::{get, post}, Router, Json, extract::{State, Query}};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tower_sessions::Session;
 use crate::{state::AppState, error::AppError, auth, models};
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/auth/register", post(register))
         .route("/auth/verify-email", get(verify_email))
+        .route("/auth/login", post(login))
+        .route("/auth/logout", post(logout))
+        .route("/auth/me", get(me))
 }
 
 #[derive(Deserialize)]
@@ -61,4 +65,98 @@ async fn verify_email(
 
     models::user::mark_email_verified(&state.db, user_id).await?;
     Ok(Json(json!({ "message": "email verified" })))
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+async fn login(
+    State(state): State<AppState>,
+    session: Session,
+    Json(payload): Json<LoginRequest>,
+) -> Result<Json<Value>, AppError> {
+    let user = models::user::find_by_email(&state.db, &payload.email)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+
+    let password_hash = user.password_hash.as_deref().ok_or(AppError::Unauthorized)?;
+    if !auth::password::verify_password(&payload.password, password_hash)? {
+        return Err(AppError::Unauthorized);
+    }
+
+    if user.totp_enabled {
+        // Flush any prior authenticated session before stashing the pending
+        // TOTP state, so a stale `user_id` from an earlier login can't
+        // survive into this "awaiting 2FA" state.
+        session
+            .flush()
+            .await
+            .map_err(|_| AppError::Validation("session error".into()))?;
+        session
+            .insert("pending_user_id", user.id)
+            .await
+            .map_err(|_| AppError::Validation("session error".into()))?;
+        return Ok(Json(json!({ "requires_totp": true })));
+    }
+
+    // Rotate the session ID on authentication to prevent session fixation
+    // (a session ID set before login, e.g. by an attacker, must not be
+    // reusable as the authenticated session).
+    session
+        .cycle_id()
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+
+    session
+        .insert("user_id", user.id)
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+    session
+        .insert("auth_at", chrono::Utc::now())
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+
+    Ok(Json(json!({ "authenticated": true })))
+}
+
+async fn logout(session: Session) -> Result<Json<Value>, AppError> {
+    // `.flush()` (not `.delete()`) clears the session server-side AND marks
+    // it so the middleware removes the client's cookie, instead of leaving a
+    // stale (now-useless) cookie around until its Max-Age.
+    session
+        .flush()
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+    Ok(Json(json!({ "message": "logged out" })))
+}
+
+async fn me(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Json<Value>, AppError> {
+    let user_id: uuid::Uuid = session
+        .get("user_id")
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?
+        .ok_or(AppError::Unauthorized)?;
+
+    let auth_at: chrono::DateTime<chrono::Utc> = session
+        .get("auth_at")
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?
+        .ok_or(AppError::Unauthorized)?;
+
+    let user: models::user::User = sqlx::query_as("select * from users where id = $1")
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+
+    // Task 9 adds `password_changed_at`; until then this check is a no-op.
+    let _ = auth_at;
+
+    Ok(Json(json!({ "id": user.id, "email": user.email, "global_role": user.global_role })))
 }
