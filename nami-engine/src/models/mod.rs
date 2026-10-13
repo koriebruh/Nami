@@ -2,6 +2,7 @@ pub mod heartbeat;
 pub mod incident;
 pub mod monitor;
 pub mod project;
+pub mod source;
 pub mod token;
 pub mod user;
 

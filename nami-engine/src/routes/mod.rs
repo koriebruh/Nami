@@ -1,3 +1,4 @@
+pub mod sources;
 pub mod health;
 pub mod auth;
 pub mod projects;
