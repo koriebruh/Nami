@@ -73,7 +73,7 @@ before a `down` monitor recovers and its incident resolves (BetterStack
 
 ## Non-goals
 
-UDP/SMTP/POP3/IMAP checks, Playwright, multi-region, screenshots.
+Playwright, multi-region, screenshots.
 
 ## Data model changes
 
@@ -135,3 +135,31 @@ hickory test resolver; a self-signed TLS server with a short-lived cert for
 state-machine tests for recovery threshold and maintenance suppression,
 crypto round-trip/tamper tests, API redaction tests, and the UI verified
 live in a browser.
+
+## Amendments (2026-10-13)
+
+Controller rulings made while planning (the user asked for full BetterStack
+parity). They override the sections above where they differ; the plan is
+`docs/superpowers/plans/2026-10-13-uptime-phase2.md`.
+
+- **A. Mail and UDP checks.** New types `smtp`, `pop3`, `imap`: TCP connect
+  (implicit TLS when `use_tls`; ports default to 25/110/143, or 465/995/993
+  with TLS), read the greeting within the timeout; up when it starts with
+  `220` / `+OK` / `* OK` or `* PREAUTH`. New type `udp`: send the required
+  `udp_payload`, wait for a datagram within the timeout; up when one arrives
+  and, if `keyword` is set, it contains it. New columns `use_tls boolean not
+  null default false` and `udp_payload text`.
+- **B. Weekly maintenance windows.** A window's `kind` is `once`
+  (`starts_at`/`ends_at`) or `weekly`: `days_of_week` (ISO 1-7), local
+  `start_time`/`end_time` that may wrap past midnight, and an IANA `timezone`
+  validated with chrono-tz. Coverage is a pure function of wall-clock time
+  (DST-aware) with unit tests for DST, wrap and day boundaries. Schema: `kind`,
+  `days_of_week smallint[]`, `start_time time`, `end_time time`, `timezone
+  text`; `starts_at`/`ends_at` become nullable and a check constraint ties
+  each kind to its fields.
+- **C. Groups in the API.** `GET /projects/{id}/monitors` keeps returning a
+  flat array (each monitor carries `group_id`); groups come from
+  `GET /projects/{id}/monitor-groups`, ordered by position then name, and the
+  UI groups monitors client-side.
+- **D. SSRF** stays a non-goal for monitor targets, as in Phase 1: Nami is
+  self-hosted and internal hosts are legitimate targets.
