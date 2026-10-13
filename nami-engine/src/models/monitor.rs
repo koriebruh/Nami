@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::validate_name;
-use crate::error::AppError;
+use super::{is_invisible_or_bidi_char, validate_name};
+use crate::{error::AppError, middleware::rbac::ProjectReader};
 
 /// Size caps for the free-text target fields. Without them only the 2 MiB
 /// request-body limit bounds what is stored, returned to every viewer and
@@ -38,6 +38,56 @@ pub struct Monitor {
     pub last_checked_at: Option<DateTime<Utc>>,
     pub next_check_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+}
+
+/// What replaces each secret part of a URL a viewer reads (see
+/// [`redact_url`]).
+const REDACTED: &str = "***";
+
+impl Monitor {
+    /// The monitor as `reader` may see it: whole for a member or above; for a
+    /// viewer, with the secrets of its URL masked (see [`redact_url`]).
+    pub fn for_reader(mut self, reader: ProjectReader) -> Self {
+        if reader == ProjectReader::Viewer {
+            self.url = self.url.as_deref().map(redact_url);
+        }
+        self
+    }
+}
+
+/// A monitor URL as a viewer reads it: the password of the userinfo, every
+/// query-parameter value and the fragment become `***`, while the scheme,
+/// host, port, path and parameter names stay, so the target is still
+/// recognisable. A username on its own becomes `***` too (a token is often
+/// put there: `https://<token>@host/`), and so does a query item without `=`,
+/// which is all value. A URL that does not even parse (only a row written
+/// around the API can hold one) is masked whole.
+pub fn redact_url(url: &str) -> String {
+    let Ok(mut parsed) = reqwest::Url::parse(url) else {
+        return REDACTED.to_string();
+    };
+    // Neither can fail for the http(s) URLs a monitor holds; a URL that cannot
+    // carry credentials has none to mask.
+    if parsed.password().is_some() {
+        let _ = parsed.set_password(Some(REDACTED));
+    } else if !parsed.username().is_empty() {
+        let _ = parsed.set_username(REDACTED);
+    }
+    if let Some(query) = parsed.query() {
+        let masked: Vec<String> = query
+            .split('&')
+            .map(|item| match item.split_once('=') {
+                Some((name, _value)) => format!("{name}={REDACTED}"),
+                None if item.is_empty() => String::new(),
+                None => REDACTED.to_string(),
+            })
+            .collect();
+        parsed.set_query(Some(&masked.join("&")));
+    }
+    if parsed.fragment().is_some() {
+        parsed.set_fragment(Some(REDACTED));
+    }
+    parsed.to_string()
 }
 
 /// The user-editable fields of a monitor. Create and PATCH both build one,
@@ -229,6 +279,12 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
     }
     match c.check_type.as_str() {
         "http" | "keyword" => {
+            // Checked before trimming, like names: U+2028 and U+2029 are
+            // whitespace, so `trim` would drop them at the edges instead of
+            // rejecting them.
+            if c.url.as_deref().is_some_and(has_invisible_or_bidi_chars) {
+                return Err("url must not contain invisible or text-direction characters".into());
+            }
             let url = c
                 .url
                 .as_deref()
@@ -274,6 +330,9 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
             }
         }
         "tcp" => {
+            if c.host.as_deref().is_some_and(has_invisible_or_bidi_chars) {
+                return Err("host must not contain invisible or text-direction characters".into());
+            }
             let host = c
                 .host
                 .as_deref()
@@ -336,6 +395,10 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
         return Err("confirmation_threshold must be between 1 and 10".into());
     }
     Ok(c)
+}
+
+fn has_invisible_or_bidi_chars(text: &str) -> bool {
+    text.chars().any(is_invisible_or_bidi_char)
 }
 
 pub async fn insert_monitor(
@@ -461,4 +524,63 @@ pub async fn delete_in_project(
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_url;
+
+    #[test]
+    fn credentials_query_values_and_the_fragment_are_masked() {
+        for (url, masked) in [
+            (
+                "https://user:pass@example.com/health?token=abc&region=eu#frag",
+                "https://user:***@example.com/health?token=***&region=***#***",
+            ),
+            (
+                "https://example.com/a/b?key=",
+                "https://example.com/a/b?key=***",
+            ),
+            (
+                "https://example.com/?a=1&&b=2",
+                "https://example.com/?a=***&&b=***",
+            ),
+            ("https://example.com/?flag", "https://example.com/?***"),
+            ("https://example.com/?", "https://example.com/?"),
+            ("https://tok3n@example.com/", "https://***@example.com/"),
+            // An empty password is no password: the username stands alone.
+            ("https://user:@example.com/", "https://***@example.com/"),
+            (
+                "http://example.com:8080/x#",
+                "http://example.com:8080/x#***",
+            ),
+        ] {
+            assert_eq!(redact_url(url), masked, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_url_without_secrets_is_unchanged() {
+        for url in [
+            "https://example.com/",
+            "https://example.com/health/deep/path",
+            "http://10.0.0.5:8080/status",
+            "https://[::1]:8443/",
+        ] {
+            assert_eq!(redact_url(url), url);
+        }
+    }
+
+    #[test]
+    fn parameter_names_keep_their_encoding() {
+        assert_eq!(
+            redact_url("https://example.com/?api%20key=s3cret&x%3Dy=z"),
+            "https://example.com/?api%20key=***&x%3Dy=***"
+        );
+    }
+
+    #[test]
+    fn a_url_that_does_not_parse_is_masked_whole() {
+        assert_eq!(redact_url("not a url with secret=abc"), "***");
+    }
 }

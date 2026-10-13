@@ -120,6 +120,20 @@ describe('monitor list load', () => {
 		await loadMonitors(event);
 		expect(calls().map((call) => call.path + call.search)).toEqual(['/projects/..%2Fauth%2Fme%3F/monitors']);
 	});
+
+	// A member's list carries every monitor URL as saved (in the data sent with
+	// the page): no browser or proxy may keep it.
+	it.each([
+		['the monitors', { body: '[]' }, null],
+		['a caller the engine refuses', { status: 403, body: '{"error":"forbidden"}' }, { status: 403 }],
+		['a session that is gone', { status: 401, body: '{"error":"unauthorized"}' }, { status: 303 }]
+	] as const)('forbids caching for %s', async (_case, engine, rejection) => {
+		const { event, setHeaders } = fakeEvent(engine);
+		if (rejection) await expect(loadMonitors(event)).rejects.toMatchObject(rejection);
+		else await loadMonitors(event);
+		expect(setHeaders).toHaveBeenCalledTimes(1);
+		expect(setHeaders).toHaveBeenCalledWith({ 'cache-control': 'private, no-store' });
+	});
 });
 
 describe('new monitor action', () => {

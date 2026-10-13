@@ -143,9 +143,15 @@ async fn viewers_read_sources_but_never_their_tokens(pool: sqlx::PgPool) {
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        call(&app, "POST", &format!("{item}/rotate"), Some(&viewer), None)
-            .await
-            .0,
+        call(
+            &app,
+            "POST",
+            &format!("{item}/rotate"),
+            Some(&viewer),
+            Some(json!({}))
+        )
+        .await
+        .0,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
@@ -230,8 +236,14 @@ async fn members_reveal_and_rotate_and_a_rotated_token_stops_resolving_at_once(p
         source_id
     );
 
-    let (status, rotated) =
-        call(&app, "POST", &format!("{item}/rotate"), Some(&member), None).await;
+    let (status, rotated) = call(
+        &app,
+        "POST",
+        &format!("{item}/rotate"),
+        Some(&member),
+        Some(json!({})),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK, "{rotated}");
     assert_no_stored_token_columns(&rotated);
     let new_token = rotated["token"].as_str().unwrap().to_string();
@@ -305,7 +317,7 @@ async fn outsiders_get_403_everywhere(pool: sqlx::PgPool) {
         ("PATCH", item.clone(), Some(json!({ "name": "x" }))),
         ("DELETE", item.clone(), None),
         ("GET", format!("{item}/token"), None),
-        ("POST", format!("{item}/rotate"), None),
+        ("POST", format!("{item}/rotate"), Some(json!({}))),
     ] {
         assert_eq!(
             call(&app, method, &uri, Some(&outsider), body).await.0,
@@ -336,7 +348,7 @@ async fn requests_without_a_session_get_401_everywhere(pool: sqlx::PgPool) {
         ("PATCH", item.clone(), Some(json!({ "name": "x" }))),
         ("DELETE", item.clone(), None),
         ("GET", format!("{item}/token"), None),
-        ("POST", format!("{item}/rotate"), None),
+        ("POST", format!("{item}/rotate"), Some(json!({}))),
     ] {
         let (status, json) = call(&app, method, &uri, None, body).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
@@ -476,7 +488,7 @@ async fn sources_of_another_project_are_404(pool: sqlx::PgPool) {
         ("GET", item.clone(), None),
         ("PATCH", item.clone(), Some(json!({ "name": "mine" }))),
         ("GET", format!("{item}/token"), None),
-        ("POST", format!("{item}/rotate"), None),
+        ("POST", format!("{item}/rotate"), Some(json!({}))),
         ("DELETE", item.clone(), None),
     ] {
         assert_eq!(
@@ -590,7 +602,7 @@ async fn a_sealed_token_copied_to_another_source_cannot_be_revealed(pool: sqlx::
         "POST",
         &format!("/projects/{project}/sources/{second_id}/rotate"),
         Some(&member),
-        None,
+        Some(json!({})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{rotated}");

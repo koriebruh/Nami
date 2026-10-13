@@ -12,7 +12,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 dotenvy = "0.15.7"
 hex = "0.4.3"
 hkdf = "0.13.0"
-lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1"] }
+lettre = { version = "0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls", "aws-lc-rs", "rustls-platform-verifier"] }
 oauth2 = "5.0.0"
 password-hash = { version = "0.6.1", features = ["rand_core"] }
 rand = { version = "0.8", features = ["std_rng", "std"] }

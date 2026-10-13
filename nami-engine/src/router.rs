@@ -8,16 +8,21 @@
 //! router inline; test files' `test_app()`/`build_app()` helpers do too.
 
 use axum::{
+    Json, Router,
     extract::{ConnectInfo, Request},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    Router,
 };
+use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use time::Duration as TimeDuration;
-use tower_governor::{governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer};
-use tower_sessions::{cookie::SameSite, Expiry, SessionManagerLayer, SessionStore};
+use tokio::sync::Semaphore;
+use tower_governor::{
+    GovernorLayer, governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor,
+};
+use tower_sessions::{Expiry, SessionManagerLayer, SessionStore, cookie::SameSite};
 
 use crate::{error::AppError, routes, state::AppState};
 
@@ -50,17 +55,91 @@ fn rate_limited_with_governor(router: Router<AppState>) -> Router<AppState> {
 /// (`tower_sessions::MemoryStore`). Callers add the session layer via
 /// `configure_session_layer` below, which is itself shared so the layer's
 /// *settings* (as opposed to its store) are identical everywhere.
+///
+/// This is the private API (`PORT`): nami-ui is its only client, and it is
+/// never exposed directly. Its login rate limit is keyed on the client address
+/// nami-ui sends in `X-Forwarded-For`, which anyone reaching this port could
+/// forge. What outside clients must reach goes on the public listener instead
+/// ([`build_public_router`]).
+///
+/// Every state-changing request must carry a JSON body (see
+/// [`require_json_body`]).
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(routes::health::router())
         .merge(routes::auth::router())
-        .merge(rate_limited_with_governor(routes::auth::rate_limited_router()))
+        .merge(rate_limited_with_governor(
+            routes::auth::rate_limited_router(),
+        ))
         .merge(routes::projects::router())
         .merge(routes::sources::router())
         .merge(routes::monitors::router())
         .merge(routes::incidents::router())
         .merge(routes::heartbeats::router())
-        .merge(routes::heartbeats::public_router())
+        .layer(middleware::from_fn(require_json_body))
+        .with_state(state)
+}
+
+/// Refuses a state-changing request (POST, PUT, PATCH) whose body is not
+/// declared as JSON with `415`, before any handler, session check or rate
+/// limiter sees it. Browsers send forms across sites without asking first
+/// (`application/x-www-form-urlencoded`, `multipart/form-data`, `text/plain`),
+/// so this keeps a form on another site from ever driving the API with a
+/// visitor's session, also for actions that take no body: those send `{}`.
+/// Reads and DELETE are left alone: they carry no body, and no browser sends
+/// a cross-site DELETE without asking first.
+async fn require_json_body(request: Request, next: Next) -> Response {
+    let changes_state = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH
+    );
+    if changes_state && !declares_json(request.headers()) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({ "error": "send a JSON body (Content-Type: application/json)" })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Whether `Content-Type` is JSON, the way axum's `Json` extractor judges it:
+/// `application/json` or `application/<anything>+json`, parameters (such as
+/// `charset`) and case ignored.
+fn declares_json(headers: &HeaderMap) -> bool {
+    let Some(content_type) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    let Some((kind, subtype)) = essence.split_once('/') else {
+        return false;
+    };
+    let subtype = subtype.to_ascii_lowercase();
+    kind.eq_ignore_ascii_case("application") && (subtype == "json" || subtype.ends_with("+json"))
+}
+
+/// The public listener's router (`PUBLIC_PORT`): only what clients outside
+/// reach without a session, namely the heartbeat ping endpoint (later the log,
+/// OTLP and Sentry ingest endpoints) and a `/health` that does not touch the
+/// database. None of the API is served here, so the public port can be exposed
+/// to cron jobs and other machines without exposing the API with it. Pings
+/// share [`routes::heartbeats::MAX_PINGS_IN_FLIGHT`] places.
+pub fn build_public_router(state: AppState) -> Router {
+    build_public_router_with_ping_slots(
+        state,
+        Arc::new(Semaphore::new(routes::heartbeats::MAX_PINGS_IN_FLIGHT)),
+    )
+}
+
+/// [`build_public_router`] whose pings hold places of `ping_slots` (tests hold
+/// its places to fill the endpoint up).
+pub fn build_public_router_with_ping_slots(state: AppState, ping_slots: Arc<Semaphore>) -> Router {
+    Router::new()
+        .merge(routes::health::public_router())
+        .merge(routes::heartbeats::public_router(ping_slots))
         .with_state(state)
 }
 

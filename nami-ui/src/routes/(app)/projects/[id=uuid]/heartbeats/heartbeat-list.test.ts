@@ -30,7 +30,7 @@ describe('heartbeat list load', () => {
 		const heartbeats = [{ id: HEARTBEAT_ID, name: 'Backup', token: null }];
 		const { event } = fakeEvent({ body: JSON.stringify(heartbeats) });
 		const data = await load(event);
-		expect(data).toEqual({ heartbeats, engineUrl: 'http://localhost:8080' });
+		expect(data).toEqual({ heartbeats, engineUrl: 'http://localhost:8081' });
 		expect(data).toHaveProperty('heartbeats.0.token', null);
 	});
 

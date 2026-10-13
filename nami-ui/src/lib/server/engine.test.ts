@@ -82,6 +82,49 @@ describe('callEngine', () => {
 		expect(setCookie).toHaveBeenCalledWith('id', 'abc123', expect.objectContaining({ secure: true }));
 	});
 
+	// nami-engine accepts state-changing requests only with a JSON body (so a
+	// form on another site can never drive it): an action without a body of its
+	// own sends `{}`.
+	it('sends an empty JSON object for a state-changing request without a body', async () => {
+		for (const method of ['POST', 'PUT', 'PATCH', 'post']) {
+			const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+			const event = {
+				fetch: fetchMock,
+				request: { headers: new Headers() },
+				cookies: { set: vi.fn() },
+				getClientAddress: () => '203.0.113.5'
+			} as any;
+
+			await callEngine(event, '/auth/logout', { method });
+
+			const [, init] = fetchMock.mock.calls[0];
+			expect(init.body, method).toBe('{}');
+			expect((init.headers as Headers).get('content-type'), method).toBe('application/json');
+		}
+	});
+
+	it('keeps a body it was given, and sends none for reads and deletes', async () => {
+		const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+		const event = {
+			fetch: fetchMock,
+			request: { headers: new Headers() },
+			cookies: { set: vi.fn() },
+			getClientAddress: () => '203.0.113.5'
+		} as any;
+
+		await callEngine(event, '/auth/login', { method: 'POST', body: '{"email":"a@b.c"}' });
+		await callEngine(event, '/auth/me');
+		await callEngine(event, '/projects/x/monitors/y', { method: 'DELETE' });
+
+		const [login, me, remove] = fetchMock.mock.calls.map(([, init]) => init);
+		expect(login.body).toBe('{"email":"a@b.c"}');
+		expect((login.headers as Headers).get('content-type')).toBe('application/json');
+		for (const init of [me, remove]) {
+			expect(init.body).toBeUndefined();
+			expect((init.headers as Headers).get('content-type')).toBeNull();
+		}
+	});
+
 	it('sets x-forwarded-for from the real client address', async () => {
 		const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
 
@@ -225,16 +268,18 @@ describe('publicEngineUrl', () => {
 		return publicEngineUrl();
 	}
 
-	it('defaults to the local engine', () => {
+	// The engine's public listener (PUBLIC_PORT), not its private API port
+	// (8080), which only nami-ui may reach.
+	it("defaults to the local engine's public listener", () => {
 		delete process.env.PUBLIC_ENGINE_URL;
-		expect(publicEngineUrl()).toBe('http://localhost:8080');
+		expect(publicEngineUrl()).toBe('http://localhost:8081');
 	});
 
 	// `PUBLIC_ENGINE_URL=` in an env file is an empty string, not an unset
 	// variable: it must not turn every ping URL into a relative path.
 	it('treats an empty or blank value as unset', () => {
 		for (const blank of ['', ' ', '   ', '\t\n']) {
-			expect(configure(blank), JSON.stringify(blank)).toBe('http://localhost:8080');
+			expect(configure(blank), JSON.stringify(blank)).toBe('http://localhost:8081');
 		}
 	});
 

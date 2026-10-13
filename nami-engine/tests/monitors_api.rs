@@ -4,7 +4,9 @@ use axum::{
     Router,
     http::{HeaderValue, StatusCode},
 };
-use common::{call, seed_http_monitor, seed_project, test_app, user_with_role};
+use common::{
+    call, login, seed_http_monitor, seed_project, seed_user, test_app, unique_email, user_with_role,
+};
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -834,11 +836,13 @@ async fn names_with_invisible_or_text_direction_characters_are_rejected(pool: sq
     let named =
         |name: &str| json!({ "name": name, "check_type": "http", "url": "https://example.com" });
 
-    // Both ends of every rejected range, plus the single characters.
+    // Both ends of every rejected range, plus the single characters. (The
+    // zero-width non-joiner and joiner, U+200C/U+200D, are allowed: see below.)
     let chars = [
-        '\u{00AD}', '\u{061C}', '\u{180E}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}',
-        '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}', '\u{202D}', '\u{202E}', '\u{2060}',
-        '\u{2064}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+        '\u{00AD}', '\u{034F}', '\u{061C}', '\u{115F}', '\u{1160}', '\u{180E}', '\u{200B}',
+        '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}', '\u{202D}', '\u{202E}',
+        '\u{2060}', '\u{2064}', '\u{2066}', '\u{2069}', '\u{206A}', '\u{206F}', '\u{2800}',
+        '\u{3164}', '\u{FEFF}', '\u{FFA0}',
     ];
     for c in chars {
         let label = format!("U+{:04X} inside a name", c as u32);
@@ -883,6 +887,16 @@ async fn names_with_invisible_or_text_direction_characters_are_rejected(pool: sq
         StatusCode::CREATED,
         "ordinary non-ASCII names are fine: {created}"
     );
+    // Persian with a zero-width non-joiner, and an emoji joined by a ZWJ.
+    for name in [
+        "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}",
+        "\u{1f469}\u{200d}\u{1f4bb} on call",
+    ] {
+        let (status, body) =
+            call(&app, "POST", &collection, Some(&member), Some(named(name))).await;
+        assert_eq!(status, StatusCode::CREATED, "{name:?}: {body}");
+        assert_eq!(body["name"], name);
+    }
 
     let item = format!("{collection}/{}", created["id"].as_str().unwrap());
     let renamed = json!({ "name": "a\u{202E}b" });
@@ -1044,4 +1058,168 @@ async fn concurrent_patches_of_different_fields_are_all_applied(pool: sqlx::PgPo
             "round {round}: concurrent PATCHes lost the update to {lost:?}"
         );
     }
+}
+
+/// The URL and the host follow the same rule as names: no invisible or
+/// text-direction characters anywhere (they would make a target read as
+/// another one), at the edges included, where trimming must not hide them.
+/// The keyword may contain them: it is matched against page text, which can
+/// hold anything.
+#[sqlx::test]
+async fn urls_and_hosts_with_invisible_or_text_direction_characters_are_rejected(
+    pool: sqlx::PgPool,
+) {
+    const INVISIBLE: &str = "invisible or text-direction characters";
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let collection = format!("/projects/{project}/monitors");
+
+    for (label, url) in [
+        ("RLO in the path", "https://example.com/a\u{202E}b"),
+        (
+            "zero-width space in the host",
+            "https://exa\u{200B}mple.com/",
+        ),
+        ("isolate in the query", "https://example.com/?q=\u{2066}x"),
+        ("line separator at the end", "https://example.com/\u{2028}"),
+        ("Hangul filler", "https://example.com/\u{3164}"),
+        ("BOM at the start", "\u{FEFF}https://example.com/"),
+    ] {
+        let body = json!({ "name": "x", "check_type": "http", "url": url });
+        expect_400(&app, "POST", &collection, &member, label, body, INVISIBLE).await;
+    }
+    for (label, host) in [
+        ("zero-width space", "db\u{200B}.internal"),
+        ("RLO", "db\u{202E}.internal"),
+        ("paragraph separator at the start", "\u{2029}db.internal"),
+        ("soft hyphen", "db\u{00AD}internal"),
+    ] {
+        let body = json!({ "name": "x", "check_type": "tcp", "host": host, "port": 5432 });
+        expect_400(&app, "POST", &collection, &member, label, body, INVISIBLE).await;
+    }
+    assert_eq!(
+        monitor_count(&pool).await,
+        0,
+        "nothing rejected was written"
+    );
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(json!({
+            "name": "x",
+            "check_type": "keyword",
+            "url": "https://example.com/",
+            "keyword": "\u{5e9}\u{5dc}\u{5d5}\u{5dd}\u{200F} \u{202E}ok",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "keywords may: {created}");
+
+    let item = format!("{collection}/{}", created["id"].as_str().unwrap());
+    expect_patch_rejected(
+        &app,
+        &item,
+        &member,
+        "PATCH url with a right-to-left override",
+        json!({ "url": "https://example.com/\u{202E}" }),
+        INVISIBLE,
+    )
+    .await;
+}
+
+/// Viewers read monitors with the secrets taken out of the URL: the userinfo
+/// password, every query value and the fragment read `***`, while the scheme,
+/// host, port, path and parameter names stay, in the list and in the detail.
+/// Members, project admins and global admins get the URL as it was saved.
+#[sqlx::test]
+async fn viewers_get_monitor_urls_without_their_secrets(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let root_email = unique_email("root");
+    seed_user(&pool, &root_email, "admin").await;
+    let root = login(&app, &root_email).await;
+    let collection = format!("/projects/{project}/monitors");
+    let url = "https://alerts:s3cret-pw@status.example.com:8443/health?token=abc123&region=eu#frag-secret";
+    let redacted = "https://alerts:***@status.example.com:8443/health?token=***&region=***#***";
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(json!({ "name": "API", "check_type": "http", "url": url })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["url"], url, "the member who saved it sees it whole");
+    let item = format!("{collection}/{}", created["id"].as_str().unwrap());
+
+    let (status, detail) = call(&app, "GET", &item, Some(&viewer), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["url"], redacted);
+    let (status, list) = call(&app, "GET", &collection, Some(&viewer), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list[0]["url"], redacted);
+    for body in [&detail, &list] {
+        let text = body.to_string();
+        for secret in ["s3cret-pw", "abc123", "frag-secret", "=eu"] {
+            assert!(!text.contains(secret), "{secret} reached a viewer: {text}");
+        }
+    }
+    assert_eq!(detail["name"], "API", "everything else is as saved");
+
+    for (who, cookie) in [
+        ("member", &member),
+        ("project admin", &admin),
+        ("global admin", &root),
+    ] {
+        let (_, detail) = call(&app, "GET", &item, Some(cookie), None).await;
+        assert_eq!(detail["url"], url, "{who}");
+        let (_, list) = call(&app, "GET", &collection, Some(cookie), None).await;
+        assert_eq!(list[0]["url"], url, "{who}");
+    }
+}
+
+/// A URL without secrets reads the same for a viewer, and a username on its
+/// own (often a token, as in `https://<token>@host/`) is hidden too.
+#[sqlx::test]
+async fn a_viewer_sees_plain_urls_unchanged_and_a_lone_username_hidden(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let plain = seed_http_monitor(&pool, project, "plain", "https://example.com/health", 2).await;
+    let token = seed_http_monitor(
+        &pool,
+        project,
+        "token",
+        "https://ghp_tok3n@example.com/x?",
+        2,
+    )
+    .await;
+
+    let (_, plain) = call(
+        &app,
+        "GET",
+        &format!("/projects/{project}/monitors/{plain}"),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(plain["url"], "https://example.com/health");
+    let (_, token) = call(
+        &app,
+        "GET",
+        &format!("/projects/{project}/monitors/{token}"),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(token["url"], "https://***@example.com/x?");
 }

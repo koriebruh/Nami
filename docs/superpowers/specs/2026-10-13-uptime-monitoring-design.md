@@ -200,7 +200,11 @@ caller can access.
 - `POST|GET /projects/{id}/heartbeats`,
   `GET|PATCH|DELETE /projects/{id}/heartbeats/{heartbeat_id}`
 - `GET|POST /api/v1/heartbeat/{token}` — public ping (the token is the
-  secret; no session)
+  secret; no session). Served only by the engine's public listener
+  (`PUBLIC_PORT`, default 8081), never by the private API port (`PORT`,
+  which only nami-ui may reach); at most 4 pings run at once and the rest
+  get `503` + `Retry-After: 1`; only 64-lowercase-hex tokens reach the
+  database (amended by the Phase 1 final-review fix wave)
 - `GET /projects/{id}/incidents?status=open|resolved` — list
 
 ## UI (`nami-ui`)

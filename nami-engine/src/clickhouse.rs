@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 
 /// Settings sent with every request. ClickHouse 26.x already defaults to
 /// these, but sending them pins the wire format this client relies on:
@@ -34,6 +34,12 @@ const BASE_SETTINGS: [(&str, &str); 3] = [
     ("date_time_output_format", "iso"),
     ("output_format_json_quote_64bit_integers", "0"),
 ];
+
+/// The longest a `SELECT` may run on the server (`max_execution_time`): a
+/// little under the client's own 30 s timeout, so a slow query ends with
+/// ClickHouse's own `TIMEOUT_EXCEEDED` error, which says what happened, rather
+/// than with the client giving up first.
+pub const QUERY_MAX_EXECUTION_SECS: u64 = 25;
 
 /// Idempotent DDL applied by [`ClickHouse::migrate`], in order. Table names
 /// are unqualified because every request carries the `database` setting.
@@ -99,7 +105,10 @@ impl ClickHouse {
     /// `Config::from_env`, a broken `CLICKHOUSE_URL` is a startup error.
     pub fn new(url: &str, user: &str, password: &str, database: &str) -> Self {
         let url = reqwest::Url::parse(url).expect("CLICKHOUSE_URL must be a valid URL");
+        // Never through a proxy from the environment (`HTTP_PROXY`, ...): every
+        // request carries the credentials and the query parameters.
         let http = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(30))
             .build()
             .expect("failed to build the ClickHouse HTTP client");
@@ -165,6 +174,12 @@ impl ClickHouse {
     /// cannot lift that: a statement smuggled into `sql` cannot change data.
     /// (`readonly=2`, unlike `1`, still accepts the per-request settings sent
     /// here.) Use [`Self::execute`] or [`Self::insert_rows`] to write.
+    ///
+    /// Also sent with `max_execution_time` ([`QUERY_MAX_EXECUTION_SECS`]) and
+    /// `cancel_http_readonly_queries_on_client_close=1`: a SELECT stops on the
+    /// server once it runs too long, or once its caller has gone (a request
+    /// whose own deadline passed drops the connection), instead of running on
+    /// for nobody.
     pub async fn query_rows<T: DeserializeOwned>(
         &self,
         sql: &str,
@@ -176,6 +191,14 @@ impl ClickHouse {
         // becomes a non-2xx status instead of trailing text in a 200 body.
         pairs.push(("wait_end_of_query".to_string(), "1".to_string()));
         pairs.push(("readonly".to_string(), "2".to_string()));
+        pairs.push((
+            "max_execution_time".to_string(),
+            QUERY_MAX_EXECUTION_SECS.to_string(),
+        ));
+        pairs.push((
+            "cancel_http_readonly_queries_on_client_close".to_string(),
+            "1".to_string(),
+        ));
         for (name, value) in params {
             pairs.push((format!("param_{name}"), escape_param_value(value)));
         }
@@ -198,8 +221,11 @@ impl ClickHouse {
         // ClickHouse reject the request while the database does not exist yet.
         let mut pairs = Self::base_settings();
         pairs.push(identifier_param("db", &self.database)?);
-        self.post(pairs, "CREATE DATABASE IF NOT EXISTS {db:Identifier}".to_string())
-            .await?;
+        self.post(
+            pairs,
+            "CREATE DATABASE IF NOT EXISTS {db:Identifier}".to_string(),
+        )
+        .await?;
         for ddl in MIGRATIONS {
             self.execute(ddl).await?;
         }
@@ -238,9 +264,12 @@ impl ClickHouse {
         );
         let mut pairs = Self::base_settings();
         pairs.push(identifier_param("db", &self.database)?);
-        self.post(pairs, "DROP DATABASE IF EXISTS {db:Identifier} SYNC".to_string())
-            .await
-            .map(|_| ())
+        self.post(
+            pairs,
+            "DROP DATABASE IF EXISTS {db:Identifier} SYNC".to_string(),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// The settings every request carries (see `BASE_SETTINGS`).
@@ -330,7 +359,10 @@ fn escape_param_value(value: &str) -> String {
 /// Unlike typed values it is not TSV-escaped (see [`escape_param_value`]):
 /// the value is validated and sent raw.
 fn identifier_param(name: &str, value: &str) -> Result<(String, String), ClickHouseError> {
-    Ok((format!("param_{name}"), validate_identifier(value)?.to_string()))
+    Ok((
+        format!("param_{name}"),
+        validate_identifier(value)?.to_string(),
+    ))
 }
 
 /// Accepts exactly the names matching `^[A-Za-z_][A-Za-z0-9_]*$` and rejects
@@ -351,7 +383,50 @@ fn validate_identifier(name: &str) -> Result<&str, ClickHouseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_param_value, validate_identifier, ClickHouseError};
+    use super::{ClickHouse, ClickHouseError, escape_param_value, validate_identifier};
+
+    /// Every SELECT is bounded on the server and stops there when the client
+    /// gives up (say, a request whose own deadline passed): a slow query left
+    /// behind must not keep burning ClickHouse's CPU.
+    #[tokio::test]
+    async fn selects_are_bounded_and_cancelled_when_the_client_goes_away() {
+        use std::collections::HashMap;
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{\"n\":1}\n"))
+            .mount(&server)
+            .await;
+        let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_guard_probe");
+
+        let rows: Vec<serde_json::Value> = ch.query_rows("SELECT 1 AS n", &[]).await.unwrap();
+        assert_eq!(rows, vec![serde_json::json!({ "n": 1 })]);
+        ch.execute("SELECT 1").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let settings = |index: usize| -> HashMap<String, String> {
+            requests[index].url.query_pairs().into_owned().collect()
+        };
+        let select = settings(0);
+        assert_eq!(
+            select.get("max_execution_time").map(String::as_str),
+            Some("25")
+        );
+        assert_eq!(
+            select
+                .get("cancel_http_readonly_queries_on_client_close")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(select.get("readonly").map(String::as_str), Some("2"));
+        // DDL and inserts are not cut short: only reads are.
+        let statement = settings(1);
+        assert!(
+            !statement.contains_key("max_execution_time"),
+            "{statement:?}"
+        );
+    }
 
     #[test]
     fn escapes_exactly_the_tsv_special_characters() {

@@ -19,11 +19,8 @@ use nami_engine::{
     state::AppState,
     uptime::{
         alerts::{Subject, Transition, TransitionKind},
-        heartbeat::{PingOutcome, record_ping, sweep_overdue},
-        worker::{
-            Notifications, SWEEP_BATCH, run_forever, run_forever_since, sweep_heartbeats,
-            sweep_pass,
-        },
+        heartbeat::{OUTAGE_GAP, PingOutcome, note_worker_alive, record_ping, sweep_overdue},
+        worker::{Notifications, SWEEP_BATCH, run_forever, sweep_heartbeats, sweep_pass},
     },
 };
 use serde_json::{Value, json};
@@ -49,7 +46,8 @@ async fn seed_heartbeat(
     grace: i32,
     created_seconds_ago: i32,
 ) -> (Uuid, String) {
-    let token = Uuid::new_v4().simple().to_string();
+    // A real token's shape: 64 lowercase hex characters.
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let id = sqlx::query_scalar(
         "insert into heartbeats (project_id, name, token, period_seconds, grace_seconds, created_at)
          values ($1, $2, $3, $4, $5, now() - make_interval(secs => $6))
@@ -244,12 +242,12 @@ async fn invalid_heartbeats_are_rejected_and_nothing_is_written(pool: sqlx::PgPo
 
 #[sqlx::test]
 async fn a_ping_needs_no_session_and_marks_the_heartbeat_up(pool: sqlx::PgPool) {
-    let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
     let (project, recipient) = project_with_recipient(&pool).await;
     let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
 
     let (status, body) = call(
-        &app,
+        &public,
         "POST",
         &format!("/api/v1/heartbeat/{token}"),
         None,
@@ -261,7 +259,7 @@ async fn a_ping_needs_no_session_and_marks_the_heartbeat_up(pool: sqlx::PgPool) 
     assert_eq!(heartbeat_state(&pool, id).await, ("up".to_string(), true));
 
     let (status, _) = call(
-        &app,
+        &public,
         "GET",
         &format!("/api/v1/heartbeat/{token}"),
         None,
@@ -278,9 +276,9 @@ async fn a_ping_needs_no_session_and_marks_the_heartbeat_up(pool: sqlx::PgPool) 
 
 #[sqlx::test]
 async fn an_unknown_token_is_404(pool: sqlx::PgPool) {
-    let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
     let (status, body) = call(
-        &app,
+        &public,
         "POST",
         "/api/v1/heartbeat/not-a-real-token",
         None,
@@ -330,13 +328,13 @@ async fn the_sweep_marks_an_overdue_heartbeat_down_and_alerts_once(pool: sqlx::P
 #[sqlx::test]
 async fn a_ping_on_a_down_heartbeat_resolves_it_and_sends_a_recovery(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
-    let app = common::app(state.clone());
+    let public = common::public_app(state.clone());
     let (project, recipient) = project_with_recipient(&pool).await;
     let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
     sweep_heartbeats(&state).await.unwrap();
 
     let (status, _) = call(
-        &app,
+        &public,
         "POST",
         &format!("/api/v1/heartbeat/{token}"),
         None,
@@ -386,7 +384,7 @@ async fn fresh_recently_pinged_and_paused_heartbeats_are_not_swept(pool: sqlx::P
 
 #[sqlx::test]
 async fn a_paused_heartbeat_accepts_pings_without_changing_state(pool: sqlx::PgPool) {
-    let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
     let (project, recipient) = project_with_recipient(&pool).await;
     let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
     sweep_heartbeats(&AppState::for_test(pool.clone()))
@@ -399,7 +397,7 @@ async fn a_paused_heartbeat_accepts_pings_without_changing_state(pool: sqlx::PgP
         .unwrap();
 
     let (status, _) = call(
-        &app,
+        &public,
         "POST",
         &format!("/api/v1/heartbeat/{token}"),
         None,
@@ -458,7 +456,7 @@ async fn heartbeat_incidents_appear_in_the_incident_list(pool: sqlx::PgPool) {
 async fn text_that_cannot_be_a_token_is_an_ordinary_404_without_a_query(pool: sqlx::PgPool) {
     let log = LogCapture::default();
     let _logging = log.install_trace();
-    let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
     let lookups = || {
         log.lines()
             .iter()
@@ -469,7 +467,7 @@ async fn text_that_cannot_be_a_token_is_an_ordinary_404_without_a_query(pool: sq
     // Control: a well-formed token nobody holds is looked up, and the log shows it.
     let unknown = "a".repeat(64);
     let (status, _) = call(
-        &app,
+        &public,
         "GET",
         &format!("/api/v1/heartbeat/{unknown}"),
         None,
@@ -485,6 +483,8 @@ async fn text_that_cannot_be_a_token_is_an_ordinary_404_without_a_query(pool: sq
     );
 
     let too_long = "a".repeat(129);
+    let (one_short, one_over) = ("a".repeat(63), "a".repeat(65));
+    let (upper, not_hex) = ("A".repeat(64), "g".repeat(64));
     for token in [
         "abc%00def",
         "%0A",
@@ -492,11 +492,16 @@ async fn text_that_cannot_be_a_token_is_an_ordinary_404_without_a_query(pool: sq
         "a%20b",
         "%E2%82%AC",
         "%ff",
+        "not-a-real-token",
         too_long.as_str(),
+        one_short.as_str(),
+        one_over.as_str(),
+        upper.as_str(),
+        not_hex.as_str(),
     ] {
         for method in ["GET", "POST"] {
             let uri = format!("/api/v1/heartbeat/{token}");
-            let (status, body) = call(&app, method, &uri, None, None).await;
+            let (status, body) = call(&public, method, &uri, None, None).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{method} {token}");
             assert_eq!(body, json!({ "error": "not found" }), "{method} {token}");
         }
@@ -528,7 +533,7 @@ async fn ping_raw(app: &Router, method: &str, token: &str) -> (StatusCode, Heade
 /// session or cookie is ever created.
 #[sqlx::test]
 async fn the_ping_reply_is_the_same_whatever_state_the_heartbeat_is_in(pool: sqlx::PgPool) {
-    let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
     let project = seed_project(&pool).await;
     let mut replies = Vec::new();
     for (status, paused) in [
@@ -548,7 +553,7 @@ async fn the_ping_reply_is_the_same_whatever_state_the_heartbeat_is_in(pool: sql
             .await
             .unwrap();
         for method in ["GET", "POST"] {
-            let reply = ping_raw(&app, method, &token).await;
+            let reply = ping_raw(&public, method, &token).await;
             replies.push((format!("{method} {status} paused={paused}"), reply));
         }
     }
@@ -570,6 +575,7 @@ async fn no_token_ever_reaches_a_log_line(pool: sqlx::PgPool) {
     let _logging = log.install_trace();
     let state = AppState::for_test(pool.clone());
     let app = common::app(state.clone());
+    let public = common::public_app(state.clone());
     let (project, recipient) = project_with_recipient(&pool).await;
     let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
     let collection = format!("/projects/{project}/heartbeats");
@@ -589,12 +595,12 @@ async fn no_token_ever_reaches_a_log_line(pool: sqlx::PgPool) {
     let ping = format!("/api/v1/heartbeat/{token}");
 
     assert_eq!(
-        call(&app, "POST", &ping, None, None).await.0,
+        call(&public, "POST", &ping, None, None).await.0,
         StatusCode::OK
     );
     assert_eq!(
         call(
-            &app,
+            &public,
             "GET",
             &format!("/api/v1/heartbeat/{unknown}"),
             None,
@@ -618,7 +624,7 @@ async fn no_token_ever_reaches_a_log_line(pool: sqlx::PgPool) {
     .unwrap();
     assert_eq!(sweep_heartbeats(&state).await.unwrap(), 1);
     assert_eq!(
-        call(&app, "POST", &ping, None, None).await.0,
+        call(&public, "POST", &ping, None, None).await.0,
         StatusCode::OK
     );
     assert_eq!(settled_mail(&recipient, 2).await.len(), 2);
@@ -628,7 +634,10 @@ async fn no_token_ever_reaches_a_log_line(pool: sqlx::PgPool) {
         call(&app, "PATCH", &item, Some(&member), patch).await.0,
         StatusCode::OK
     );
-    assert_eq!(call(&app, "GET", &ping, None, None).await.0, StatusCode::OK);
+    assert_eq!(
+        call(&public, "GET", &ping, None, None).await.0,
+        StatusCode::OK
+    );
     assert_eq!(
         call(&app, "GET", &item, Some(&member), None).await.0,
         StatusCode::OK
@@ -665,9 +674,7 @@ fn heartbeats_of(transitions: &[Transition]) -> Vec<Uuid> {
 
 /// One sweep as the worker runs it, but with no restart bound.
 async fn sweep(pool: &sqlx::PgPool) -> Vec<Transition> {
-    sweep_overdue(pool, DateTime::UNIX_EPOCH, SWEEP_BATCH)
-        .await
-        .unwrap()
+    sweep_overdue(pool, SWEEP_BATCH).await.unwrap()
 }
 
 /// A ping racing a sweep (`record_ping` takes the heartbeat's row lock first):
@@ -790,7 +797,7 @@ async fn sweeps_running_at_the_same_time_flip_each_heartbeat_once(pool: sqlx::Pg
     let sweeps: Vec<_> = (0..4)
         .map(|_| {
             let pool = pool.clone();
-            tokio::spawn(async move { sweep_overdue(&pool, DateTime::UNIX_EPOCH, 4).await })
+            tokio::spawn(async move { sweep_overdue(&pool, 4).await })
         })
         .collect();
     let mut flipped = Vec::new();
@@ -803,7 +810,7 @@ async fn sweeps_running_at_the_same_time_flip_each_heartbeat_once(pool: sqlx::Pg
     assert_eq!(distinct.len(), flipped.len(), "flipped twice: {flipped:?}");
 
     loop {
-        let more = sweep_overdue(&pool, DateTime::UNIX_EPOCH, 4).await.unwrap();
+        let more = sweep_overdue(&pool, 4).await.unwrap();
         if more.is_empty() {
             break;
         }
@@ -883,9 +890,7 @@ async fn a_hung_smtp_server_does_not_hold_up_the_sweep(pool: sqlx::PgPool) {
     let notifications = Notifications::new();
 
     let started = Instant::now();
-    let swept = sweep_pass(&state, &notifications, DateTime::UNIX_EPOCH)
-        .await
-        .unwrap();
+    let swept = sweep_pass(&state, &notifications).await.unwrap();
     let elapsed = started.elapsed();
 
     assert_eq!(swept, 1);
@@ -915,7 +920,7 @@ async fn heartbeat_alerts_are_dropped_and_logged_when_too_many_batches_are_sendi
     let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
 
     assert_eq!(
-        sweep_pass(&state, &Notifications::with_limit(0), DateTime::UNIX_EPOCH)
+        sweep_pass(&state, &Notifications::with_limit(0))
             .await
             .unwrap(),
         1
@@ -945,7 +950,7 @@ async fn run_forever_sweeps_overdue_heartbeats_by_itself(pool: sqlx::PgPool) {
     let (project, recipient) = project_with_recipient(&pool).await;
     let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
 
-    let worker = tokio::spawn(run_forever_since(state.clone(), DateTime::UNIX_EPOCH));
+    let worker = tokio::spawn(run_forever(state.clone()));
     // Waited for before stopping the worker: it owns the tasks that send.
     let mail = settled_mail(&recipient, 1).await;
     worker.abort();
@@ -962,7 +967,7 @@ async fn run_forever_sweeps_overdue_heartbeats_by_itself(pool: sqlx::PgPool) {
 /// A ping only ever touches the heartbeat that holds its token.
 #[sqlx::test]
 async fn a_ping_touches_only_the_heartbeat_that_holds_the_token(pool: sqlx::PgPool) {
-    let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
     let (first_project, other_project) = (seed_project(&pool).await, seed_project(&pool).await);
     let (pinged, token) = seed_heartbeat(&pool, first_project, "pinged", 3600, 60, 0).await;
     let (same_project, _) = seed_heartbeat(&pool, first_project, "same project", 3600, 60, 0).await;
@@ -970,7 +975,7 @@ async fn a_ping_touches_only_the_heartbeat_that_holds_the_token(pool: sqlx::PgPo
 
     assert_eq!(
         call(
-            &app,
+            &public,
             "POST",
             &format!("/api/v1/heartbeat/{token}"),
             None,
@@ -1034,6 +1039,7 @@ async fn a_heartbeat_has_at_most_one_open_incident(pool: sqlx::PgPool) {
 async fn deleting_a_heartbeat_or_its_project_deletes_its_incidents(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = common::app(state.clone());
+    let public = common::public_app(state.clone());
     let project = seed_project(&pool).await;
     let (doomed, token) = seed_heartbeat(&pool, project, "doomed", 30, 0, 120).await;
     let (kept, _) = seed_heartbeat(&pool, project, "kept", 30, 0, 120).await;
@@ -1050,7 +1056,7 @@ async fn deleting_a_heartbeat_or_its_project_deletes_its_incidents(pool: sqlx::P
     assert_eq!(incidents_of(&pool, kept).await.len(), 1);
     assert_eq!(
         call(
-            &app,
+            &public,
             "POST",
             &format!("/api/v1/heartbeat/{token}"),
             None,
@@ -1374,6 +1380,7 @@ async fn members_get_the_token_from_create_and_edit_responses(pool: sqlx::PgPool
 #[sqlx::test]
 async fn rotating_the_token_replaces_it_at_once(pool: sqlx::PgPool) {
     let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
     let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
@@ -1391,7 +1398,7 @@ async fn rotating_the_token_replaces_it_at_once(pool: sqlx::PgPool) {
     let rotate = format!("{item}/rotate-token");
     assert_eq!(
         call(
-            &app,
+            &public,
             "POST",
             &format!("/api/v1/heartbeat/{first}"),
             None,
@@ -1403,7 +1410,7 @@ async fn rotating_the_token_replaces_it_at_once(pool: sqlx::PgPool) {
     );
     let (_, before) = call(&app, "GET", &item, Some(&member), None).await;
 
-    let (status, rotated) = call(&app, "POST", &rotate, Some(&member), None).await;
+    let (status, rotated) = call(&app, "POST", &rotate, Some(&member), Some(json!({}))).await;
 
     assert_eq!(status, StatusCode::OK, "{rotated}");
     let second = rotated["token"].as_str().unwrap().to_string();
@@ -1423,7 +1430,7 @@ async fn rotating_the_token_replaces_it_at_once(pool: sqlx::PgPool) {
         "a rotation is not a ping"
     );
     let (status, body) = call(
-        &app,
+        &public,
         "POST",
         &format!("/api/v1/heartbeat/{first}"),
         None,
@@ -1436,7 +1443,7 @@ async fn rotating_the_token_replaces_it_at_once(pool: sqlx::PgPool) {
     );
     assert_eq!(
         call(
-            &app,
+            &public,
             "GET",
             &format!("/api/v1/heartbeat/{second}"),
             None,
@@ -1453,12 +1460,12 @@ async fn rotating_the_token_replaces_it_at_once(pool: sqlx::PgPool) {
         Value::Null
     );
 
-    let (_, again) = call(&app, "POST", &rotate, Some(&member), None).await;
+    let (_, again) = call(&app, "POST", &rotate, Some(&member), Some(json!({}))).await;
     let third = again["token"].as_str().unwrap();
     assert!(third != second && third != first);
     assert_eq!(
         call(
-            &app,
+            &public,
             "GET",
             &format!("/api/v1/heartbeat/{second}"),
             None,
@@ -1499,20 +1506,24 @@ async fn only_members_rotate_and_only_within_their_project(pool: sqlx::PgPool) {
     };
 
     assert_eq!(
-        call(&app, "POST", &rotate, Some(&viewer), None).await.0,
+        call(&app, "POST", &rotate, Some(&viewer), Some(json!({})))
+            .await
+            .0,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        call(&app, "POST", &rotate, Some(&outsider), None).await.0,
+        call(&app, "POST", &rotate, Some(&outsider), Some(json!({})))
+            .await
+            .0,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        call(&app, "POST", &rotate, None, None).await.0,
+        call(&app, "POST", &rotate, None, Some(json!({}))).await.0,
         StatusCode::UNAUTHORIZED
     );
     let foreign_uri = format!("/projects/{project}/heartbeats/{foreign}/rotate-token");
     assert_eq!(
-        call(&app, "POST", &foreign_uri, Some(&member), None)
+        call(&app, "POST", &foreign_uri, Some(&member), Some(json!({})))
             .await
             .0,
         StatusCode::NOT_FOUND
@@ -1522,7 +1533,9 @@ async fn only_members_rotate_and_only_within_their_project(pool: sqlx::PgPool) {
         Uuid::new_v4()
     );
     assert_eq!(
-        call(&app, "POST", &unknown, Some(&member), None).await.0,
+        call(&app, "POST", &unknown, Some(&member), Some(json!({})))
+            .await
+            .0,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
@@ -1537,11 +1550,13 @@ async fn only_members_rotate_and_only_within_their_project(pool: sqlx::PgPool) {
     );
 
     assert_eq!(
-        call(&app, "POST", &rotate, Some(&member), None).await.0,
+        call(&app, "POST", &rotate, Some(&member), Some(json!({})))
+            .await
+            .0,
         StatusCode::OK
     );
     assert_ne!(token_of(id).await, token);
-    let (status, body) = call(&app, "POST", &rotate, Some(&root), None).await;
+    let (status, body) = call(&app, "POST", &rotate, Some(&root), Some(json!({}))).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -1646,7 +1661,7 @@ async fn period_and_grace_are_capped_at_31_days(pool: sqlx::PgPool) {
 /// whatever the reply.
 #[sqlx::test]
 async fn ping_replies_are_never_cacheable(pool: sqlx::PgPool) {
-    let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
     let unknown = "e".repeat(64);
@@ -1668,7 +1683,7 @@ async fn ping_replies_are_never_cacheable(pool: sqlx::PgPool) {
             StatusCode::METHOD_NOT_ALLOWED,
         ),
     ] {
-        let (status, headers, _) = ping_raw(&app, method, token).await;
+        let (status, headers, _) = ping_raw(&public, method, token).await;
         assert_eq!(status, expected, "{label}");
         assert_eq!(
             headers.get("cache-control").map(|v| v.to_str().unwrap()),
@@ -1688,7 +1703,7 @@ async fn an_unknown_token_is_answered_by_a_plain_lookup_not_a_locking_transactio
 ) {
     let log = LogCapture::default();
     let _logging = log.install_trace();
-    let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
     let statements_containing = |text: &str| {
@@ -1699,7 +1714,7 @@ async fn an_unknown_token_is_answered_by_a_plain_lookup_not_a_locking_transactio
     };
 
     let (status, _) = call(
-        &app,
+        &public,
         "POST",
         &format!("/api/v1/heartbeat/{token}"),
         None,
@@ -1713,7 +1728,7 @@ async fn an_unknown_token_is_answered_by_a_plain_lookup_not_a_locking_transactio
     let unknown = "d".repeat(64);
     for method in ["GET", "POST"] {
         let (status, _) = call(
-            &app,
+            &public,
             method,
             &format!("/api/v1/heartbeat/{unknown}"),
             None,
@@ -1897,100 +1912,211 @@ async fn the_sweep_counts_from_the_latest_of_ping_resume_and_creation(pool: sqlx
     }
 }
 
-/// After the engine has been down, jobs that kept running could not reach it:
-/// a heartbeat is never judged from a moment before the worker started, so
-/// nothing goes down for pings that could not be received. The bound is the
-/// latest of the anchors, not an extra deadline: it only ever pushes one back.
+/// Pretends the worker last recorded that it was alive `seconds_ago` seconds
+/// ago.
+async fn set_last_alive(pool: &sqlx::PgPool, seconds_ago: i32) {
+    sqlx::query(
+        "insert into worker_state (id, last_alive_at)
+         values (1, now() - make_interval(secs => $1))
+         on conflict (id) do update set last_alive_at = excluded.last_alive_at",
+    )
+    .bind(f64::from(seconds_ago))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn outage_anchor(pool: &sqlx::PgPool, id: Uuid) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar("select outage_anchor_at from heartbeats where id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The first start ever has no outage to make up for: it records the liveness
+/// and leaves every deadline alone, so an overdue heartbeat goes down.
 #[sqlx::test]
-async fn a_sweep_never_judges_a_heartbeat_from_before_the_worker_started(pool: sqlx::PgPool) {
+async fn the_first_start_ever_gives_no_heartbeat_extra_time(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let project = seed_project(&pool).await;
+    let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
+
+    assert_eq!(note_worker_alive(&pool, true).await.unwrap(), None);
+
+    let recorded: bool = sqlx::query_scalar(
+        "select last_alive_at > now() - interval '5 seconds' from worker_state where id = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(recorded);
+    assert_eq!(outage_anchor(&pool, id).await, None);
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 1);
+    assert_eq!(heartbeat_state(&pool, id).await.0, "down");
+}
+
+/// The worker was alive until 50 s ago. Only the heartbeat whose deadline
+/// fell inside the outage gets a fresh period; one overdue before the outage
+/// goes down, one due later keeps its deadline, and paused or down heartbeats
+/// are left alone.
+#[sqlx::test]
+async fn a_restart_gives_a_fresh_period_only_to_heartbeats_due_during_the_outage(
+    pool: sqlx::PgPool,
+) {
+    let state = AppState::for_test(pool.clone());
+    let project = seed_project(&pool).await;
+    // Period 30 s, no grace: due 30 s after creation.
+    let (before, _) = seed_heartbeat(&pool, project, "due 90 s ago", 30, 0, 120).await;
+    let (during, _) = seed_heartbeat(&pool, project, "due 30 s ago", 30, 0, 60).await;
+    let (later, _) = seed_heartbeat(&pool, project, "due in 20 s", 30, 0, 10).await;
+    let (paused, _) = seed_heartbeat(&pool, project, "paused", 30, 0, 60).await;
+    sqlx::query("update heartbeats set paused = true where id = $1")
+        .bind(paused)
+        .execute(&pool)
+        .await
+        .unwrap();
+    set_last_alive(&pool, 50).await;
+
+    let outage = note_worker_alive(&pool, true)
+        .await
+        .unwrap()
+        .expect("the time since the last record is an outage");
+
+    assert_eq!(outage.extended, 1);
+    let length = (outage.to - outage.from).num_seconds();
+    assert!((49..=52).contains(&length), "an outage of {length} s");
+    assert_eq!(outage_anchor(&pool, during).await, Some(outage.to));
+    for untouched in [before, later, paused] {
+        assert_eq!(outage_anchor(&pool, untouched).await, None);
+    }
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 1);
+    assert_eq!(heartbeat_state(&pool, before).await.0, "down");
+    for alive in [during, later, paused] {
+        assert_eq!(heartbeat_state(&pool, alive).await.0, "pending");
+    }
+}
+
+/// An engine that restarts every 20 s must not hide a dead job: the heartbeat
+/// overdue before the first outage goes down at the first restart, and the one
+/// whose deadline fell inside it gets one fresh period, not one per restart:
+/// once that period has passed while the worker was alive, it goes down too.
+#[sqlx::test]
+async fn frequent_restarts_cannot_hide_a_dead_job(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let project = seed_project(&pool).await;
+    let (overdue, _) = seed_heartbeat(&pool, project, "overdue", 30, 0, 120).await;
+    let (during, _) = seed_heartbeat(&pool, project, "due during", 30, 0, 40).await;
+
+    for restart in 0..5 {
+        // Alive until 20 s ago, starting again now.
+        set_last_alive(&pool, 20).await;
+        note_worker_alive(&pool, true).await.unwrap();
+        sweep_heartbeats(&state).await.unwrap();
+        assert_eq!(
+            heartbeat_state(&pool, overdue).await.0,
+            "down",
+            "restart {restart}"
+        );
+        assert_eq!(
+            heartbeat_state(&pool, during).await.0,
+            "pending",
+            "restart {restart}"
+        );
+    }
+    assert_eq!(incidents_of(&pool, overdue).await.len(), 1);
+
+    // Its fresh period ran out 20 s ago, while the worker was alive (it last
+    // recorded so 2 s ago): the next restart gives it no other one.
+    sqlx::query(
+        "update heartbeats set outage_anchor_at = now() - interval '50 seconds' where id = $1",
+    )
+    .bind(during)
+    .execute(&pool)
+    .await
+    .unwrap();
+    set_last_alive(&pool, 2).await;
+    assert_eq!(
+        note_worker_alive(&pool, true)
+            .await
+            .unwrap()
+            .map(|o| o.extended),
+        Some(0)
+    );
+    sweep_heartbeats(&state).await.unwrap();
+    assert_eq!(heartbeat_state(&pool, during).await.0, "down");
+}
+
+/// While the worker keeps running, a short gap between two records is normal
+/// (they come every few seconds) and makes up for nothing. A gap longer than
+/// `OUTAGE_GAP` means the database was out of reach, and pings with it: the
+/// heartbeats that fell due during it get a fresh period.
+#[sqlx::test]
+async fn only_a_long_gap_while_running_counts_as_an_outage(pool: sqlx::PgPool) {
+    let project = seed_project(&pool).await;
+    let (due, _) = seed_heartbeat(&pool, project, "due 5 s ago", 30, 0, 35).await;
+
+    set_last_alive(&pool, 10).await;
+    assert_eq!(note_worker_alive(&pool, false).await.unwrap(), None);
+    assert_eq!(outage_anchor(&pool, due).await, None);
+
+    let gap = OUTAGE_GAP.as_secs() as i32 + 30;
+    set_last_alive(&pool, gap).await;
+    let outage = note_worker_alive(&pool, false)
+        .await
+        .unwrap()
+        .expect("a gap longer than OUTAGE_GAP is an outage");
+    assert_eq!(outage.extended, 1);
+    assert_eq!(outage_anchor(&pool, due).await, Some(outage.to));
+}
+
+/// A heartbeat pinged after the fresh period began counts from its ping, like
+/// any other: the outage anchor only ever pushes a deadline back.
+#[sqlx::test]
+async fn the_outage_anchor_is_one_more_anchor_not_a_deadline(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
     let project = seed_project(&pool).await;
     let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 60, 0, 86_400).await;
     sqlx::query(
-        "update heartbeats set last_ping_at = now() - interval '100 seconds' where id = $1",
+        "update heartbeats
+         set outage_anchor_at = now() - interval '100 seconds',
+             last_ping_at = now() - interval '10 seconds'
+         where id = $1",
     )
     .bind(id)
     .execute(&pool)
     .await
     .unwrap();
-    let ago = |seconds: i64| Utc::now() - chrono::Duration::seconds(seconds);
-
-    // Overdue by its last ping (due 40 s ago), but the worker started 50 s ago:
-    // due in 10 s.
-    let swept = sweep_overdue(&pool, ago(50), SWEEP_BATCH).await.unwrap();
-    assert_eq!(swept, vec![]);
-    assert_eq!(heartbeat_state(&pool, id).await.0, "pending");
-    // Started 70 s ago: due 10 s ago.
-    let swept = sweep_overdue(&pool, ago(70), SWEEP_BATCH).await.unwrap();
-    assert_eq!(heartbeats_of(&swept), vec![id]);
-    assert_eq!(heartbeat_state(&pool, id).await.0, "down");
-}
-
-/// The same through `sweep_pass`, which the worker calls with its start time:
-/// a recent start saves a heartbeat that was overdue, and no alert is sent.
-#[sqlx::test]
-async fn a_pass_after_a_restart_leaves_overdue_heartbeats_alone(pool: sqlx::PgPool) {
-    let state = AppState::for_test(pool.clone());
-    let (project, recipient) = project_with_recipient(&pool).await;
-    let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
-    let notifications = Notifications::new();
-
     assert_eq!(
-        sweep_pass(&state, &notifications, Utc::now())
-            .await
-            .unwrap(),
-        0
+        sweep_heartbeats(&state).await.unwrap(),
+        0,
+        "pinged 10 s ago"
     );
-    notifications.drain().await;
 
-    assert_eq!(heartbeat_state(&pool, id).await.0, "pending");
-    assert!(incidents_of(&pool, id).await.is_empty());
-    assert!(settled_mail(&recipient, 0).await.is_empty());
+    sqlx::query(
+        "update heartbeats
+         set outage_anchor_at = now() - interval '10 seconds',
+             last_ping_at = now() - interval '100 seconds'
+         where id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
     assert_eq!(
-        sweep_pass(&state, &notifications, DateTime::UNIX_EPOCH)
-            .await
-            .unwrap(),
-        1,
-        "without the bound it is overdue"
+        sweep_heartbeats(&state).await.unwrap(),
+        0,
+        "a fresh period that began 10 s ago"
     );
-}
 
-/// The real worker counts itself started when `run_forever` is called: its
-/// first tick, which runs at once, leaves a heartbeat that is overdue by its
-/// last ping alone. (The monitor proves the tick ran, since the sweep is its
-/// first half.)
-#[sqlx::test]
-async fn run_forever_gives_heartbeats_a_full_period_after_the_worker_starts(pool: sqlx::PgPool) {
-    let state = AppState::for_test(pool.clone());
-    let project = seed_project(&pool).await;
-    let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
-    // Port 9 refuses connections: the check fails at once.
-    let monitor = seed_http_monitor(&pool, project, "Refused", "http://127.0.0.1:9/", 2).await;
-
-    let worker = tokio::spawn(run_forever(state));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let checked: bool =
-            sqlx::query_scalar("select last_checked_at is not null from monitors where id = $1")
-                .bind(monitor)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        if checked || Instant::now() > deadline {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    worker.abort();
-
-    let checked: bool =
-        sqlx::query_scalar("select last_checked_at is not null from monitors where id = $1")
-            .bind(monitor)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(checked, "the first tick never ran");
-    assert_eq!(heartbeat_state(&pool, id).await.0, "pending");
-    assert!(incidents_of(&pool, id).await.is_empty());
+    sqlx::query(
+        "update heartbeats set outage_anchor_at = now() - interval '61 seconds' where id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 1);
 }
 
 /// One sweep takes at most `limit` heartbeats, the most overdue first, so a
@@ -2012,20 +2138,17 @@ async fn a_sweep_takes_at_most_its_limit_the_most_overdue_first(pool: sqlx::PgPo
         picked
     };
 
-    let first = sweep_overdue(&pool, DateTime::UNIX_EPOCH, 2).await.unwrap();
+    let first = sweep_overdue(&pool, 2).await.unwrap();
     assert_eq!(heartbeats_of(&first), most_overdue(3..5), "500 s and 400 s");
-    let second = sweep_overdue(&pool, DateTime::UNIX_EPOCH, 2).await.unwrap();
+    let second = sweep_overdue(&pool, 2).await.unwrap();
     assert_eq!(
         heartbeats_of(&second),
         most_overdue(1..3),
         "300 s and 200 s"
     );
-    let third = sweep_overdue(&pool, DateTime::UNIX_EPOCH, 2).await.unwrap();
+    let third = sweep_overdue(&pool, 2).await.unwrap();
     assert_eq!(heartbeats_of(&third), most_overdue(0..1), "100 s");
-    assert_eq!(
-        sweep_overdue(&pool, DateTime::UNIX_EPOCH, 2).await.unwrap(),
-        vec![]
-    );
+    assert_eq!(sweep_overdue(&pool, 2).await.unwrap(), vec![]);
     for id in ids {
         assert_eq!(incidents_of(&pool, id).await.len(), 1);
     }
@@ -2069,9 +2192,10 @@ async fn a_pass_flips_a_bounded_batch_and_the_next_takes_the_rest(pool: sqlx::Pg
     assert_eq!(incidents, SWEEP_BATCH + extra, "one incident each");
 }
 
-/// A slow check pass must not delay DOWN detection: each tick sweeps the
-/// heartbeats first. The monitor's check hangs (a silent server, up to its
-/// 5 s timeout), so the pass is still running when the heartbeat goes down.
+/// A slow check pass must not delay DOWN detection: the sweep runs on its own
+/// schedule, and its first run is at once. The monitor's check hangs (a silent
+/// server, up to its 5 s timeout), so the pass is still running when the
+/// heartbeat goes down.
 #[sqlx::test]
 async fn the_sweep_runs_before_a_slow_check_pass(pool: sqlx::PgPool) {
     let (port, _silent) = silent_server().await;
@@ -2087,7 +2211,7 @@ async fn the_sweep_runs_before_a_slow_check_pass(pool: sqlx::PgPool) {
     .await;
     let (id, _) = seed_heartbeat(&pool, project, "Nightly backup", 30, 0, 120).await;
 
-    let worker = tokio::spawn(run_forever_since(state, DateTime::UNIX_EPOCH));
+    let worker = tokio::spawn(run_forever(state));
     let deadline = Instant::now() + Duration::from_secs(3);
     while heartbeat_state(&pool, id).await.0 != "down" && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -2109,4 +2233,173 @@ async fn the_sweep_runs_before_a_slow_check_pass(pool: sqlx::PgPool) {
         !checked,
         "the check pass had not finished when the heartbeat went down"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Final review: pings live on the public listener only, and shed load.
+// ---------------------------------------------------------------------------
+
+/// The ping endpoint is served by the public listener and by nothing else: the
+/// private API answers 404 for it and the heartbeat is not touched.
+#[sqlx::test]
+async fn pings_are_served_on_the_public_listener_only(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let public = common::test_public_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
+    let ping = format!("/api/v1/heartbeat/{token}");
+
+    // The POST carries JSON: the API refuses anything else with 415 before
+    // routing, which would hide whether the route exists.
+    for (method, body) in [("GET", None), ("POST", Some(json!({})))] {
+        let (status, _) = call(&app, method, &ping, None, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} on the API");
+    }
+    assert_eq!(
+        heartbeat_state(&pool, id).await,
+        ("pending".to_string(), false)
+    );
+
+    assert_eq!(
+        call(&public, "POST", &ping, None, None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(heartbeat_state(&pool, id).await, ("up".to_string(), true));
+}
+
+/// Nothing of the API is reachable through the public listener, so exposing
+/// it to cron jobs exposes nothing else (in particular not the login, whose
+/// rate limit trusts the `X-Forwarded-For` nami-ui sends). Its `/health` says
+/// the listener is up without touching the database: it answers even when the
+/// database cannot be reached at all.
+#[sqlx::test]
+async fn the_public_listener_serves_none_of_the_api(pool: sqlx::PgPool) {
+    let public = common::test_public_app(pool.clone());
+    let project = seed_project(&pool).await;
+    for (method, uri, body) in [
+        (
+            "POST",
+            "/auth/login".to_string(),
+            Some(json!({ "email": "a@example.com", "password": "x" })),
+        ),
+        (
+            "POST",
+            "/auth/register".to_string(),
+            Some(json!({ "email": "a@example.com", "password": "x" })),
+        ),
+        ("GET", "/auth/me".to_string(), None),
+        ("GET", "/projects".to_string(), None),
+        ("GET", format!("/projects/{project}/monitors"), None),
+        ("GET", format!("/projects/{project}/heartbeats"), None),
+        ("GET", format!("/projects/{project}/incidents"), None),
+        ("GET", format!("/projects/{project}/sources"), None),
+        (
+            "POST",
+            format!("/projects/{project}/sources"),
+            Some(json!({ "name": "x" })),
+        ),
+    ] {
+        let (status, _) = call(&public, method, &uri, None, body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+    }
+
+    let unreachable = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(200))
+        .connect_lazy("postgres://nami:nami@127.0.0.1:1/nami")
+        .unwrap();
+    let public = common::test_public_app(unreachable);
+    let (status, body) = call(&public, "GET", "/health", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({ "status": "ok" }));
+}
+
+/// With every ping place taken, a ping is turned away at once with 503 and
+/// `Retry-After: 1`, before any database work, and the heartbeat is not
+/// touched. Text that is not a token is still an ordinary 404: it needs no
+/// place. Once a place is free, pings are served again.
+#[sqlx::test]
+async fn a_full_ping_endpoint_turns_pings_away_with_retry_after(pool: sqlx::PgPool) {
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
+    let public = nami_engine::router::build_public_router_with_ping_slots(
+        AppState::for_test(pool.clone()),
+        slots.clone(),
+    );
+    let project = seed_project(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
+    let held = slots.clone().acquire_many_owned(2).await.unwrap();
+
+    for method in ["GET", "POST"] {
+        let started = Instant::now();
+        let (status, headers, body) = ping_raw(&public, method, &token).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "answered at once"
+        );
+        assert_eq!(
+            headers.get("retry-after").map(|v| v.to_str().unwrap()),
+            Some("1")
+        );
+        assert_eq!(
+            headers.get("cache-control").map(|v| v.to_str().unwrap()),
+            Some("no-store")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({ "error": "busy, retry shortly" })
+        );
+    }
+    assert_eq!(
+        heartbeat_state(&pool, id).await,
+        ("pending".to_string(), false),
+        "nothing was recorded"
+    );
+    let (status, _, _) = ping_raw(&public, "GET", "not-a-real-token").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    drop(held);
+    let (status, _, _) = ping_raw(&public, "POST", &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(heartbeat_state(&pool, id).await, ("up".to_string(), true));
+}
+
+/// A ping holds its place for as long as it runs, database work included: with
+/// one place, a ping stuck on the heartbeat's row lock keeps it, and a second
+/// ping meanwhile is turned away instead of queueing for a connection. Once
+/// the lock is released, the first ping completes.
+#[sqlx::test]
+async fn a_ping_holds_its_place_while_it_waits_for_the_database(pool: sqlx::PgPool) {
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let public = nami_engine::router::build_public_router_with_ping_slots(
+        AppState::for_test(pool.clone()),
+        slots,
+    );
+    let project = seed_project(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
+    let (_, other) = seed_heartbeat(&pool, project, "Other job", 3600, 60, 0).await;
+
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("select 1 from heartbeats where id = $1 for update")
+        .bind(id)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let first = tokio::spawn({
+        let public = public.clone();
+        let token = token.clone();
+        async move { ping_raw(&public, "POST", &token).await.0 }
+    });
+    wait_for_a_lock_wait(&pool, "from heartbeats where token = $1 for update").await;
+
+    let (status, _, _) = ping_raw(&public, "POST", &other).await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the only place is taken"
+    );
+
+    lock.rollback().await.unwrap();
+    assert_eq!(first.await.unwrap(), StatusCode::OK);
+    let (status, _, _) = ping_raw(&public, "POST", &other).await;
+    assert_eq!(status, StatusCode::OK, "the place was given back");
 }

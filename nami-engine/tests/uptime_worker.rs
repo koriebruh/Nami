@@ -1587,3 +1587,77 @@ async fn alerts_are_dropped_and_logged_when_too_many_batches_are_still_sending(p
     assert!(dropped[0].contains(&monitor.to_string()), "{}", dropped[0]);
     ch.drop_database().await.unwrap();
 }
+
+/// A burst of transitions in one pass is one alert batch: one sending task,
+/// handed each alert as its check ends. With the SMTP server silent, three
+/// monitors going down take one place in the bounded set, not three.
+#[sqlx::test]
+async fn a_pass_sends_all_its_alerts_from_one_task(pool: sqlx::PgPool) {
+    let (smtp_port, _silent) = silent_server().await;
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let state = AppState {
+        mailer: Mailer::new("127.0.0.1", smtp_port),
+        ..state
+    };
+    let (project, _recipient) = project_with_recipient(&pool).await;
+    let server = server_with_status(503).await;
+    let mut monitors = Vec::new();
+    for i in 0..3 {
+        monitors.push(seed_http_monitor(&pool, project, &format!("m{i}"), &server.uri(), 1).await);
+    }
+    let notifications = Notifications::new();
+
+    assert_eq!(run_pass(&state, &notifications).await.unwrap(), 3);
+
+    for monitor in monitors {
+        assert_eq!(monitor_state(&pool, monitor).await.0, "down");
+    }
+    assert_eq!(
+        notifications.reap(),
+        1,
+        "the pass's three alerts wait in one task"
+    );
+    ch.drop_database().await.unwrap();
+}
+
+/// An alert leaves as soon as its outcome is applied, not when the pass ends:
+/// the refused monitor's DOWN email arrives while the pass still waits for the
+/// hung monitor's check (5 s timeout).
+#[sqlx::test]
+async fn an_alert_does_not_wait_for_the_rest_of_its_pass(pool: sqlx::PgPool) {
+    let (hung_port, _silent) = silent_server().await;
+    let state = AppState::for_test(pool.clone());
+    let (project, recipient) = project_with_recipient(&pool).await;
+    seed_http_monitor(
+        &pool,
+        project,
+        "Hung API",
+        &format!("http://127.0.0.1:{hung_port}/"),
+        1,
+    )
+    .await;
+    // Port 9 refuses connections: the check fails at once.
+    seed_http_monitor(&pool, project, "Refused API", "http://127.0.0.1:9/", 1).await;
+
+    let pass = tokio::spawn({
+        let state = state.clone();
+        async move { run_due_checks(&state).await }
+    });
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while mail_for(&recipient).await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mail = mail_for(&recipient).await;
+
+    assert!(
+        !pass.is_finished(),
+        "the pass still waits for the hung check"
+    );
+    assert_eq!(
+        mail.iter()
+            .map(|(subject, _)| subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["[Nami] Refused API is DOWN"]
+    );
+    pass.abort();
+}

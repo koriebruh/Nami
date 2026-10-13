@@ -1,9 +1,17 @@
-use axum::{routing::get, Router, Json};
+use crate::{error::AppError, state::AppState};
+use axum::{Json, Router, routing::get};
 use serde_json::json;
-use crate::{state::AppState, error::AppError};
 
+/// `/health` on the private API: the engine is up and its database answers.
 pub fn router() -> Router<AppState> {
     Router::new().route("/health", get(health))
+}
+
+/// `/health` on the public listener: says only that the listener is up. It
+/// never touches the database, so asking costs an anonymous caller's flood
+/// nothing that the API or the worker need.
+pub fn public_router() -> Router<AppState> {
+    Router::new().route("/health", get(|| async { Json(json!({ "status": "ok" })) }))
 }
 
 async fn health(

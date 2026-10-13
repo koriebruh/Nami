@@ -35,6 +35,16 @@ pub fn test_app(pool: sqlx::PgPool) -> Router {
     app(AppState::for_test(pool))
 }
 
+/// The public listener's router (`PUBLIC_PORT`) over `state`, exactly as
+/// `main.rs` serves it: the heartbeat ping endpoint and `/health`, no session.
+pub fn public_app(state: AppState) -> Router {
+    nami_engine::router::build_public_router(state)
+}
+
+pub fn test_public_app(pool: sqlx::PgPool) -> Router {
+    public_app(AppState::for_test(pool))
+}
+
 /// Unique per call: Mailpit keeps messages across test runs and tests run
 /// in parallel, so mail assertions always filter by their own recipient.
 pub fn unique_email(prefix: &str) -> String {
