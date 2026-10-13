@@ -63,6 +63,48 @@ pub fn require_global_role(user: &CurrentUser, min: &str) -> Result<(), AppError
     }
 }
 
+// Project-scoped counterpart to `require_global_role`. A global admin
+// bypasses the membership check entirely (consistent with
+// `list_projects_for_user`'s global-admin bypass). Otherwise the caller must
+// hold a `project_members` row for this project, and its role must rank at
+// or above `min`. Mirrors `require_global_role`'s fail-closed rank
+// comparison (`Option<i32>`, `None` on an unrecognized role string) rather
+// than the brief's original `-1`-sentinel version, which fails open when
+// `min` itself is unrecognized (any known role ranks >= -1).
+pub async fn require_project_role(
+    pool: &sqlx::PgPool,
+    user: &CurrentUser,
+    project_id: uuid::Uuid,
+    min: &str,
+) -> Result<(), crate::error::AppError> {
+    if user.global_role == "admin" {
+        return Ok(());
+    }
+
+    let row: Option<(String,)> = sqlx::query_as(
+        "select project_role from project_members where project_id = $1 and user_id = $2",
+    )
+    .bind(project_id)
+    .bind(user.id)
+    .fetch_optional(pool)
+    .await?;
+
+    let rank = |role: &str| match role {
+        "admin" => Some(2),
+        "member" => Some(1),
+        "viewer" => Some(0),
+        _ => None,
+    };
+
+    match row {
+        Some((role,)) => match (rank(&role), rank(min)) {
+            (Some(user_rank), Some(min_rank)) if user_rank >= min_rank => Ok(()),
+            _ => Err(crate::error::AppError::Forbidden),
+        },
+        None => Err(crate::error::AppError::Forbidden),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

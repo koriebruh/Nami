@@ -128,3 +128,67 @@ async fn stale_session_after_password_change_is_rejected(pool: sqlx::PgPool) {
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[sqlx::test]
+async fn member_without_project_row_gets_forbidden(pool: sqlx::PgPool) {
+    let hash = nami_engine::auth::password::hash_password("password123").unwrap();
+    sqlx::query("insert into users (email, password_hash, email_verified_at, global_role) values ($1, $2, now(), 'member')")
+        .bind("member@example.com")
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let project_id: (uuid::Uuid,) = sqlx::query_as(
+        "insert into projects (name, slug) values ('Test', 'test') returning id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let app = test_app(pool.clone());
+    let cookie = login_as(app.clone(), "member@example.com").await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/projects/{}", project_id.0))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[sqlx::test]
+async fn global_admin_bypasses_project_membership(pool: sqlx::PgPool) {
+    let hash = nami_engine::auth::password::hash_password("password123").unwrap();
+    sqlx::query("insert into users (email, password_hash, email_verified_at, global_role) values ($1, $2, now(), 'admin')")
+        .bind("admin2@example.com")
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let project_id: (uuid::Uuid,) = sqlx::query_as(
+        "insert into projects (name, slug) values ('Test2', 'test2') returning id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let app = test_app(pool.clone());
+    let cookie = login_as(app.clone(), "admin2@example.com").await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/projects/{}", project_id.0))
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
