@@ -58,6 +58,8 @@ pub fn build_router(state: AppState) -> Router {
         .merge(routes::projects::router())
         .merge(routes::monitors::router())
         .merge(routes::incidents::router())
+        .merge(routes::heartbeats::router())
+        .merge(routes::heartbeats::public_router())
         .with_state(state)
 }
 

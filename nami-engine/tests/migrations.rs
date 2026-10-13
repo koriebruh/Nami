@@ -17,6 +17,7 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "password_reset_tokens",
         "monitors",
         "incidents",
+        "heartbeats",
     ] {
         assert!(
             names.contains(&expected.to_string()),

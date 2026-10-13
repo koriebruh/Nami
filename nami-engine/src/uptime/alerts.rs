@@ -18,6 +18,7 @@ pub enum TransitionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Subject {
     Monitor(Uuid),
+    Heartbeat(Uuid),
 }
 
 /// A state change worth telling people about: something went down (an
@@ -111,6 +112,9 @@ pub fn render(ui_base_url: &str, transition: &Transition) -> (String, String) {
     let base = ui_base_url.trim_end_matches('/');
     let link = match transition.subject {
         Subject::Monitor(id) => format!("{base}/projects/{}/monitors/{id}", transition.project_id),
+        Subject::Heartbeat(id) => {
+            format!("{base}/projects/{}/heartbeats/{id}", transition.project_id)
+        }
     };
     let at = transition.at.format("%Y-%m-%d %H:%M:%S UTC");
     match transition.kind {
@@ -178,6 +182,21 @@ mod tests {
         assert_eq!(subject, "[Nami] Checkout API is back UP");
         assert!(
             body.contains("Recovered at: 2026-10-14 17:46:40 UTC"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_emails_link_to_the_heartbeat_page() {
+        let heartbeat = Transition {
+            subject: Subject::Heartbeat(Uuid::nil()),
+            ..transition(TransitionKind::Down, "Nightly backup")
+        };
+        let (subject, body) = render("http://ui.test", &heartbeat);
+        assert_eq!(subject, "[Nami] Nightly backup is DOWN");
+        let nil = Uuid::nil();
+        assert!(
+            body.contains(&format!("http://ui.test/projects/{nil}/heartbeats/{nil}")),
             "{body}"
         );
     }

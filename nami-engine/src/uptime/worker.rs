@@ -1,6 +1,7 @@
 //! The background uptime worker: every tick it claims due monitors, checks
 //! them, applies the state machine, hands the alerts to a bounded set of
-//! background tasks, and finally stores the results.
+//! background tasks, and finally stores the results. Then it sweeps overdue
+//! heartbeats, whose alerts go through the same bounded set.
 
 use std::{
     collections::HashMap,
@@ -17,6 +18,7 @@ use uuid::Uuid;
 use super::{
     alerts::{self, Subject, Transition, TransitionKind},
     checker::{self, CheckOutcome, CheckStatus},
+    heartbeat,
     store::{self, UptimeCheckRow},
 };
 use crate::{
@@ -325,6 +327,30 @@ where
     results
 }
 
+/// Hands `transitions` to `notifications` as one batch, which a background
+/// task sends one alert after the other. Never waits: when
+/// `MAX_NOTIFICATION_BATCHES` batches are still sending, the new batch is
+/// refused and its alerts are logged as dropped.
+fn spawn_alerts(state: &AppState, notifications: &Notifications, transitions: Vec<Transition>) {
+    if transitions.is_empty() {
+        return;
+    }
+    let affected: Vec<_> = transitions.iter().map(|t| (t.kind, t.subject)).collect();
+    let alert_state = state.clone();
+    let started = notifications.spawn(async move {
+        for transition in &transitions {
+            alerts::notify_transition(&alert_state, transition).await;
+        }
+    });
+    if !started {
+        tracing::error!(
+            limit = MAX_NOTIFICATION_BATCHES,
+            alerts = ?affected,
+            "alerts dropped: too many alert batches are still sending (is the SMTP server hung?)"
+        );
+    }
+}
+
 /// One worker pass over due monitors. Returns how many checks ran.
 ///
 /// In this order: claim and check the monitors; apply every result to its
@@ -359,22 +385,7 @@ pub async fn run_pass(state: &AppState, notifications: &Notifications) -> Result
             }
         }
     }
-    if !transitions.is_empty() {
-        let affected: Vec<_> = transitions.iter().map(|t| (t.kind, t.subject)).collect();
-        let alert_state = state.clone();
-        let started = notifications.spawn(async move {
-            for transition in &transitions {
-                alerts::notify_transition(&alert_state, transition).await;
-            }
-        });
-        if !started {
-            tracing::error!(
-                limit = MAX_NOTIFICATION_BATCHES,
-                alerts = ?affected,
-                "alerts dropped: too many alert batches are still sending (is the SMTP server hung?)"
-            );
-        }
-    }
+    spawn_alerts(state, notifications, transitions);
 
     // ClickHouse holds history only: if it is unavailable, the state changes
     // and alerts above have already happened.
@@ -395,6 +406,29 @@ pub async fn run_due_checks(state: &AppState) -> Result<usize, AppError> {
     let ran = run_pass(state, &notifications).await?;
     notifications.drain().await;
     Ok(ran)
+}
+
+/// One heartbeat sweep: marks overdue heartbeats down (opening their
+/// incidents) and hands the alerts to `notifications`, which sends them in the
+/// background like the alerts of [`run_pass`]. Returns how many went down.
+pub async fn sweep_pass(
+    state: &AppState,
+    notifications: &Notifications,
+) -> Result<usize, AppError> {
+    let transitions = heartbeat::sweep_overdue(&state.db).await?;
+    let swept = transitions.len();
+    spawn_alerts(state, notifications, transitions);
+    Ok(swept)
+}
+
+/// [`sweep_pass`] that also waits for the alerts it started to be sent, so the
+/// caller knows they are out when it returns. Returns how many heartbeats went
+/// down.
+pub async fn sweep_heartbeats(state: &AppState) -> Result<usize, AppError> {
+    let notifications = Notifications::new();
+    let swept = sweep_pass(state, &notifications).await?;
+    notifications.drain().await;
+    Ok(swept)
 }
 
 /// Ticks every [`TICK`] forever. Each tick runs in its own task, so even a
@@ -421,6 +455,9 @@ pub async fn run_forever(state: AppState) {
 async fn tick(state: &AppState, notifications: &Notifications) {
     if let Err(e) = run_pass(state, notifications).await {
         tracing::error!(error = ?e, "uptime check pass failed");
+    }
+    if let Err(e) = sweep_pass(state, notifications).await {
+        tracing::error!(error = ?e, "heartbeat sweep failed");
     }
 }
 
