@@ -20,8 +20,8 @@ BetterStack subscription.
 The project is decomposed into sequential sub-projects (BetterStack bundles
 several independent products, too large for one spec/plan):
 
-1. **Foundation: auth, org, RBAC, session** — in progress, see below
-2. Uptime monitoring
+1. **Foundation: auth, org, RBAC, session** — done (see below)
+2. Uptime monitoring — next up
 3. Log management
 4. Incident management + on-call alerting
 5. Status page
@@ -30,10 +30,15 @@ several independent products, too large for one spec/plan):
 Each sub-project gets its own spec → plan → implementation cycle under
 `docs/superpowers/specs/` and `docs/superpowers/plans/`.
 
-Current sub-project: **Foundation**
+Completed sub-project: **Foundation** (14 tasks, PRs #1-#15, all merged to
+`main`). Per-task review findings and fix rounds are in each PR's
+description on GitHub; the working ledger used during execution was
+scratch and has been deleted.
 - Spec: `docs/superpowers/specs/2026-10-12-foundation-auth-rbac-design.md`
-- Plan: `docs/superpowers/plans/2026-10-12-foundation-auth-rbac.md` (14 tasks)
-- SDD ledger/progress: `.superpowers/sdd/2026-10-12-foundation-auth-rbac/progress.md`
+- Plan: `docs/superpowers/plans/2026-10-12-foundation-auth-rbac.md`
+
+Next sub-project: **Uptime monitoring** — not started. Brainstorm/spec it
+before implementing (see `superpowers:brainstorming`).
 
 ## Git branching workflow
 
