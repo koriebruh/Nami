@@ -1,7 +1,7 @@
 // Requires `docker compose up -d clickhouse` (user/password nami/nami).
 use chrono::{DateTime, Duration, Utc};
 use nami_engine::{
-    clickhouse::{ClickHouse, ClickHouseError},
+    clickhouse::{ClickHouse, ClickHouseError, QUERY_MAX_EXECUTION_SECS},
     state::AppState,
 };
 use serde::{Deserialize, Serialize};
@@ -150,12 +150,18 @@ async fn migrate_is_idempotent() {
     ch.migrate().await.unwrap(); // second run must be a no-op, not an error
     let tables: Vec<serde_json::Value> = ch
         .query_rows(
-            "SELECT name FROM system.tables WHERE database = {db:String}",
+            "SELECT name FROM system.tables WHERE database = {db:String} ORDER BY name",
             &[("db", ch.database().to_string())],
         )
         .await
         .unwrap();
-    assert_eq!(tables, vec![serde_json::json!({ "name": "uptime_checks" })]);
+    assert_eq!(
+        tables,
+        vec![
+            serde_json::json!({ "name": "logs" }),
+            serde_json::json!({ "name": "uptime_checks" })
+        ]
+    );
     ch.drop_database().await.unwrap();
 }
 
@@ -223,12 +229,18 @@ async fn query_rows_is_read_only_so_ddl_and_writes_fail_on_the_read_path() {
     // Nothing above took effect, and ordinary reads still work.
     let tables: Vec<serde_json::Value> = ch
         .query_rows(
-            "SELECT name FROM system.tables WHERE database = {db:String}",
+            "SELECT name FROM system.tables WHERE database = {db:String} ORDER BY name",
             &[("db", ch.database().to_string())],
         )
         .await
         .unwrap();
-    assert_eq!(tables, vec![serde_json::json!({ "name": "uptime_checks" })]);
+    assert_eq!(
+        tables,
+        vec![
+            serde_json::json!({ "name": "logs" }),
+            serde_json::json!({ "name": "uptime_checks" })
+        ]
+    );
     let rows: Vec<Count> = ch
         .query_rows("SELECT count() AS n FROM uptime_checks", &[])
         .await
@@ -281,6 +293,156 @@ async fn credentials_travel_in_a_basic_auth_header_never_in_the_url() {
     assert!(request.headers.get("x-clickhouse-key").is_none());
     assert!(request.headers.get("x-clickhouse-user").is_none());
     assert!(!request.url.as_str().contains("s3cret"), "password in the URL: {}", request.url);
+}
+
+/// The `name=value` pairs of the one request a mock server received.
+async fn received_settings(server: &MockServer) -> Vec<(String, String)> {
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    requests[0]
+        .url
+        .query_pairs()
+        .map(|(name, value)| (name.into_owned(), value.into_owned()))
+        .collect()
+}
+
+/// Where `name` appears in `pairs`: every settings name must appear once.
+fn only_position(pairs: &[(String, String)], name: &str) -> usize {
+    let at: Vec<usize> = pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, (key, _))| key == name)
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(at.len(), 1, "{name} must be sent exactly once: {pairs:?}");
+    at[0]
+}
+
+#[tokio::test]
+async fn query_rows_with_adds_its_settings_and_still_sends_the_ones_the_client_owns() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"n\":1}\n"))
+        .mount(&server)
+        .await;
+    let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_guard_probe");
+    let rows: Vec<serde_json::Value> = ch
+        .query_rows_with(
+            "SELECT 1 AS n",
+            &[],
+            &[
+                ("max_result_rows", "1000"),
+                ("max_bytes_to_read", "1000000"),
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows, vec![serde_json::json!({ "n": 1 })]);
+
+    let pairs = received_settings(&server).await;
+    for (name, value) in [
+        ("max_result_rows", "1000"),
+        ("max_bytes_to_read", "1000000"),
+    ] {
+        assert_eq!(pairs[only_position(&pairs, name)].1, value, "{pairs:?}");
+    }
+    // The settings the client owns still arrive, with their values, and after
+    // the extra ones, so nothing a caller passes can take their place. That
+    // includes the time limit and the cancel-on-disconnect every read carries.
+    let last_extra = only_position(&pairs, "max_bytes_to_read");
+    let time_limit = QUERY_MAX_EXECUTION_SECS.to_string();
+    for (name, value) in [
+        ("default_format", "JSONEachRow"),
+        ("wait_end_of_query", "1"),
+        ("readonly", "2"),
+        ("max_execution_time", time_limit.as_str()),
+        ("cancel_http_readonly_queries_on_client_close", "1"),
+    ] {
+        let at = only_position(&pairs, name);
+        assert!(
+            at > last_extra,
+            "{name} must come after the extra settings: {pairs:?}"
+        );
+        assert_eq!(pairs[at].1, value, "{pairs:?}");
+    }
+}
+
+/// The list of settings a caller may not pass is checked against what the
+/// client really puts on its requests, so a setting added to a request
+/// without being reserved, or dropped from the list, fails here.
+#[tokio::test]
+async fn every_setting_the_client_sends_on_its_own_is_refused_as_an_extra() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_guard_probe");
+    ch.execute("SELECT 1").await.unwrap();
+    ch.query_rows::<serde_json::Value>("SELECT 1", &[("x", "1".to_string())])
+        .await
+        .unwrap();
+    ch.insert_rows("uptime_checks", &[row(Uuid::new_v4(), now_millis(), None)])
+        .await
+        .unwrap();
+
+    let sent: std::collections::BTreeSet<String> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .flat_map(|request| request.url.query_pairs().map(|(name, _)| name.into_owned()))
+        .filter(|name| !name.starts_with("param_"))
+        .collect();
+    assert!(
+        sent.len() >= 11,
+        "expected the client's own settings, got {sent:?}"
+    );
+    for name in sent {
+        // Settings are `&'static str` by design; leaking a few test names is fine.
+        let name: &'static str = Box::leak(name.into_boxed_str());
+        let ch = ch.clone();
+        let outcome = tokio::spawn(async move {
+            ch.query_rows_with::<serde_json::Value>("SELECT 1", &[], &[(name, "1")])
+                .await
+        })
+        .await;
+        let refused = outcome.as_ref().is_err_and(|error| error.is_panic());
+        assert!(
+            refused,
+            "{name} is set by the client itself, so it must be refused as an extra setting"
+        );
+    }
+}
+
+#[tokio::test]
+async fn insert_rows_with_adds_its_settings_and_still_sends_the_ones_the_client_owns() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_guard_probe");
+    ch.insert_rows_with(
+        "uptime_checks",
+        &[row(Uuid::new_v4(), now_millis(), None)],
+        &[("async_insert", "1"), ("wait_for_async_insert", "1")],
+    )
+    .await
+    .unwrap();
+
+    let pairs = received_settings(&server).await;
+    for (name, value) in [("async_insert", "1"), ("wait_for_async_insert", "1")] {
+        assert_eq!(pairs[only_position(&pairs, name)].1, value, "{pairs:?}");
+    }
+    let last_extra = only_position(&pairs, "wait_for_async_insert");
+    let strict = only_position(&pairs, "input_format_skip_unknown_fields");
+    assert!(strict > last_extra, "{pairs:?}");
+    assert_eq!(pairs[strict].1, "0", "{pairs:?}");
+    assert_eq!(
+        pairs[only_position(&pairs, "query")].1,
+        "INSERT INTO {db:Identifier}.{table:Identifier} FORMAT JSONEachRow"
+    );
 }
 
 fn assert_invalid_identifier<T: std::fmt::Debug>(result: Result<T, ClickHouseError>, expected: &str) {

@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod db;
 pub mod email;
 pub mod error;
+pub mod logs;
 pub mod middleware;
 pub mod state;
 pub mod routes;

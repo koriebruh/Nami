@@ -1611,6 +1611,7 @@ dependencies = [
  "password-hash",
  "rand 0.8.8",
  "rand_core 0.10.1",
+ "regex",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
