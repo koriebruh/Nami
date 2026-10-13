@@ -333,3 +333,87 @@ pub async fn stored_mail_for(recipient: &str) -> Vec<StoredMail> {
     }
     messages
 }
+
+/// Collects what `tracing` would print, for the tests that look at the log.
+#[derive(Clone, Default)]
+pub struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+
+    fn make_writer(&'a self) -> LogCapture {
+        self.clone()
+    }
+}
+
+impl LogCapture {
+    /// Sends this thread's log output here, at INFO and above, until the guard
+    /// is dropped. A `sqlx::test` runs on one thread, so what it spawns logs
+    /// here too.
+    pub fn install(&self) -> tracing::subscriber::DefaultGuard {
+        self.install_at(tracing::Level::INFO)
+    }
+
+    /// Like [`LogCapture::install`], down to TRACE: the libraries' own debug
+    /// and trace lines (every SQL statement, for one) are captured too.
+    pub fn install_trace(&self) -> tracing::subscriber::DefaultGuard {
+        self.install_at(tracing::Level::TRACE)
+    }
+
+    fn install_at(&self, level: tracing::Level) -> tracing::subscriber::DefaultGuard {
+        keep_two_subscribers_registered();
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_writer(self.clone())
+                .with_ansi(false)
+                .finish(),
+        )
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        String::from_utf8(self.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+/// `tracing` remembers, per call site, whether any subscriber wants its events.
+/// While exactly one subscriber is registered in the process it asks the
+/// *calling thread's* current subscriber instead. A call site first reached by
+/// a test thread that has no capture installed is then remembered as "nobody
+/// wants this", and a capturing test running at the same time silently loses
+/// those events (the SQL statements of sqlx, say). One more registered
+/// subscriber, which wants nothing, keeps `tracing` asking all of them.
+fn keep_two_subscribers_registered() {
+    static SECOND: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    SECOND.get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+}
+
+/// A TCP server that accepts connections and never says a word: a server that
+/// is up but hung. It keeps the sockets open, so the peer sees silence and not
+/// a closed connection.
+pub async fn silent_server() -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepting = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    (port, accepting)
+}

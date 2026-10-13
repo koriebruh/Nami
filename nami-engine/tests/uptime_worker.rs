@@ -11,8 +11,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use common::{
-    add_member, mail_for, make_due, seed_http_monitor, seed_project, seed_user, settled_mail,
-    state_with_clickhouse, stored_mail_for, unique_email,
+    LogCapture, add_member, mail_for, make_due, seed_http_monitor, seed_project, seed_user,
+    settled_mail, silent_server, state_with_clickhouse, stored_mail_for, unique_email,
 };
 use nami_engine::{
     clickhouse::ClickHouse,
@@ -1363,21 +1363,6 @@ async fn a_nul_in_the_error_text_does_not_stop_the_transition(pool: sqlx::PgPool
     );
 }
 
-/// A TCP server that accepts connections and never says a word: a server
-/// that is up but hung. It keeps the sockets open, so the peer sees silence
-/// and not a closed connection.
-async fn silent_server() -> (u16, tokio::task::JoinHandle<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let accepting = tokio::spawn(async move {
-        let mut held = Vec::new();
-        while let Ok((stream, _)) = listener.accept().await {
-            held.push(stream);
-        }
-    });
-    (port, accepting)
-}
-
 /// The history insert comes last: with ClickHouse accepting connections and
 /// never answering (the client's own timeout is 30 s), the state change and
 /// the alert still happen while the pass is stuck on the insert.
@@ -1527,50 +1512,6 @@ async fn a_non_ascii_name_and_cause_are_mailed_intact(pool: sqlx::PgPool) {
             .contains("\ncontent-type: text/plain; charset=utf-8\n"),
         "{headers}"
     );
-}
-
-/// Collects what `tracing` would print, for the tests that look at the log.
-#[derive(Clone, Default)]
-struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for LogCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
-    type Writer = LogCapture;
-
-    fn make_writer(&'a self) -> LogCapture {
-        self.clone()
-    }
-}
-
-impl LogCapture {
-    /// Sends this thread's log output here until the guard is dropped. A
-    /// `sqlx::test` runs on one thread, so what it spawns logs here too.
-    fn install(&self) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_writer(self.clone())
-                .with_ansi(false)
-                .finish(),
-        )
-    }
-
-    fn lines(&self) -> Vec<String> {
-        String::from_utf8(self.0.lock().unwrap().clone())
-            .unwrap()
-            .lines()
-            .map(str::to_string)
-            .collect()
-    }
 }
 
 /// One line per failed transition, naming the monitor and the kind of

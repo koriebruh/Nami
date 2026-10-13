@@ -1,6 +1,7 @@
 //! The background uptime worker: every tick it claims due monitors, checks
 //! them, applies the state machine, hands the alerts to a bounded set of
-//! background tasks, and finally stores the results.
+//! background tasks, and finally stores the results. Then it sweeps overdue
+//! heartbeats, whose alerts go through the same bounded set.
 
 use std::{
     collections::HashMap,
@@ -17,6 +18,7 @@ use uuid::Uuid;
 use super::{
     alerts::{self, Subject, Transition, TransitionKind},
     checker::{self, CheckOutcome, CheckStatus},
+    heartbeat,
     store::{self, UptimeCheckRow},
 };
 use crate::{
@@ -28,6 +30,9 @@ use crate::{
 pub const TICK: Duration = Duration::from_secs(5);
 /// Monitors claimed per tick.
 pub const CLAIM_BATCH: i64 = 50;
+/// Overdue heartbeats the sweep marks down per tick; the next tick takes the
+/// rest.
+pub const SWEEP_BATCH: i64 = 100;
 /// Checks in flight at once.
 pub const MAX_IN_FLIGHT: usize = 20;
 /// Alert batches (one per pass that had transitions) allowed to be sending at
@@ -202,9 +207,10 @@ pub async fn apply_outcome(
 /// the set, and the tasks stop when the last handle is dropped.
 ///
 /// Bounded: at most `limit` batches send at once. A pass starts one batch for
-/// all of its transitions (up to `CLAIM_BATCH` of them), and a batch sends
-/// them one after the other, so a burst of alerts after a shared dependency
-/// fails is never refused, and never opens a stampede of SMTP connections.
+/// all of its transitions (up to `CLAIM_BATCH` of them for a check pass, up to
+/// `SWEEP_BATCH` for a heartbeat sweep), and a batch sends them one after the
+/// other, so a burst of alerts after a shared dependency fails is never
+/// refused, and never opens a stampede of SMTP connections.
 /// Only when `limit` batches are already stuck (an SMTP server that has not
 /// answered for a long while) is a new one refused, never waited for.
 #[derive(Clone)]
@@ -325,6 +331,30 @@ where
     results
 }
 
+/// Hands `transitions` to `notifications` as one batch, which a background
+/// task sends one alert after the other. Never waits: when
+/// `MAX_NOTIFICATION_BATCHES` batches are still sending, the new batch is
+/// refused and its alerts are logged as dropped.
+fn spawn_alerts(state: &AppState, notifications: &Notifications, transitions: Vec<Transition>) {
+    if transitions.is_empty() {
+        return;
+    }
+    let affected: Vec<_> = transitions.iter().map(|t| (t.kind, t.subject)).collect();
+    let alert_state = state.clone();
+    let started = notifications.spawn(async move {
+        for transition in &transitions {
+            alerts::notify_transition(&alert_state, transition).await;
+        }
+    });
+    if !started {
+        tracing::error!(
+            limit = MAX_NOTIFICATION_BATCHES,
+            alerts = ?affected,
+            "alerts dropped: too many alert batches are still sending (is the SMTP server hung?)"
+        );
+    }
+}
+
 /// One worker pass over due monitors. Returns how many checks ran.
 ///
 /// In this order: claim and check the monitors; apply every result to its
@@ -359,22 +389,7 @@ pub async fn run_pass(state: &AppState, notifications: &Notifications) -> Result
             }
         }
     }
-    if !transitions.is_empty() {
-        let affected: Vec<_> = transitions.iter().map(|t| (t.kind, t.subject)).collect();
-        let alert_state = state.clone();
-        let started = notifications.spawn(async move {
-            for transition in &transitions {
-                alerts::notify_transition(&alert_state, transition).await;
-            }
-        });
-        if !started {
-            tracing::error!(
-                limit = MAX_NOTIFICATION_BATCHES,
-                alerts = ?affected,
-                "alerts dropped: too many alert batches are still sending (is the SMTP server hung?)"
-            );
-        }
-    }
+    spawn_alerts(state, notifications, transitions);
 
     // ClickHouse holds history only: if it is unavailable, the state changes
     // and alerts above have already happened.
@@ -397,28 +412,86 @@ pub async fn run_due_checks(state: &AppState) -> Result<usize, AppError> {
     Ok(ran)
 }
 
-/// Ticks every [`TICK`] forever. Each tick runs in its own task, so even a
-/// panic inside it is logged here instead of stopping the worker. Alerts are
-/// sent by tasks that outlive the tick, so a slow SMTP server never delays the
-/// next one.
+/// One heartbeat sweep: marks up to [`SWEEP_BATCH`] overdue heartbeats down
+/// (opening their incidents) and hands the alerts to `notifications`, which
+/// sends them in the background like the alerts of [`run_pass`]. Returns how
+/// many went down.
+///
+/// `not_before` is the earliest moment a heartbeat may be judged from (see
+/// [`heartbeat::sweep_overdue`]): the worker passes the moment it started.
+pub async fn sweep_pass(
+    state: &AppState,
+    notifications: &Notifications,
+    not_before: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    let transitions = heartbeat::sweep_overdue(&state.db, not_before, SWEEP_BATCH).await?;
+    let swept = transitions.len();
+    spawn_alerts(state, notifications, transitions);
+    Ok(swept)
+}
+
+/// [`sweep_pass`] with no restart bound that also waits for the alerts it
+/// started to be sent, so the caller knows they are out when it returns.
+/// Returns how many heartbeats went down.
+pub async fn sweep_heartbeats(state: &AppState) -> Result<usize, AppError> {
+    let notifications = Notifications::new();
+    let swept = sweep_pass(state, &notifications, DateTime::UNIX_EPOCH).await?;
+    notifications.drain().await;
+    Ok(swept)
+}
+
+/// Ticks every [`TICK`] forever, counting itself started now: no heartbeat is
+/// judged from a moment before that (see [`run_forever_since`]).
 pub async fn run_forever(state: AppState) {
+    run_forever_since(state, Utc::now()).await;
+}
+
+/// [`run_forever`] with the moment the worker counts as started, below which
+/// the heartbeat sweep never judges a heartbeat (tests give an old one).
+///
+/// Each tick sweeps the heartbeats first and then runs the check pass, so a
+/// slow pass (checks may take a minute) never delays DOWN detection. Each half
+/// runs in a task of its own, so even a panic inside one is logged here instead
+/// of stopping the worker or skipping the other half. Alerts are sent by tasks
+/// that outlive the tick, so a slow SMTP server never delays the next one.
+pub async fn run_forever_since(state: AppState, started_at: DateTime<Utc>) {
     let notifications = Notifications::new();
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticker.tick().await;
         notifications.reap();
-        let tick_state = state.clone();
-        let tick_notifications = notifications.clone();
-        if let Err(e) =
-            tokio::spawn(async move { tick(&tick_state, &tick_notifications).await }).await
-        {
-            tracing::error!(error = %e, "uptime worker tick panicked");
-        }
+        let (sweep_state, sweep_notifications) = (state.clone(), notifications.clone());
+        let (check_state, check_notifications) = (state.clone(), notifications.clone());
+        run_in_turn(
+            async move { sweep_tick(&sweep_state, &sweep_notifications, started_at).await },
+            async move { check_tick(&check_state, &check_notifications).await },
+        )
+        .await;
     }
 }
 
-async fn tick(state: &AppState, notifications: &Notifications) {
+/// Runs `first` to its end, then `second`, each in a task of its own: a panic
+/// in either is logged here, and neither stops the other from running.
+async fn run_in_turn(
+    first: impl Future<Output = ()> + Send + 'static,
+    second: impl Future<Output = ()> + Send + 'static,
+) {
+    if let Err(e) = tokio::spawn(first).await {
+        tracing::error!(error = %e, "uptime worker task panicked");
+    }
+    if let Err(e) = tokio::spawn(second).await {
+        tracing::error!(error = %e, "uptime worker task panicked");
+    }
+}
+
+async fn sweep_tick(state: &AppState, notifications: &Notifications, started_at: DateTime<Utc>) {
+    if let Err(e) = sweep_pass(state, notifications, started_at).await {
+        tracing::error!(error = ?e, "heartbeat sweep failed");
+    }
+}
+
+async fn check_tick(state: &AppState, notifications: &Notifications) {
     if let Err(e) = run_pass(state, notifications).await {
         tracing::error!(error = ?e, "uptime check pass failed");
     }
@@ -566,6 +639,48 @@ mod tests {
         notifications.drain().await;
 
         assert_eq!(finished.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn the_two_halves_of_a_tick_run_in_the_order_given() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first = {
+            let order = Arc::clone(&order);
+            async move {
+                // Slow, so that a second half started alongside it would win.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                order.lock().unwrap().push("first");
+            }
+        };
+        let second = {
+            let order = Arc::clone(&order);
+            async move { order.lock().unwrap().push("second") }
+        };
+
+        run_in_turn(first, second).await;
+
+        assert_eq!(*order.lock().unwrap(), vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_one_half_of_a_tick_does_not_skip_the_other() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let count = |ran: &Arc<AtomicUsize>| {
+            let ran = Arc::clone(ran);
+            async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+
+        run_in_turn(async { panic!("a bug in the first half") }, count(&ran)).await;
+        assert_eq!(ran.load(Ordering::SeqCst), 1, "the second half still ran");
+
+        run_in_turn(count(&ran), async { panic!("a bug in the second half") }).await;
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            2,
+            "the first half ran, and the tick ended"
+        );
     }
 
     #[tokio::test]
