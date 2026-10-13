@@ -21,16 +21,21 @@ The project is decomposed into sequential sub-projects (BetterStack bundles
 several independent products, too large for one spec/plan):
 
 1. **Foundation: auth, org, RBAC, session** — done (see below)
-2. Uptime monitoring — in progress
+2. Uptime monitoring (Phases 1-3) — in progress
 3. Log management
 4. Incident management + on-call alerting
 5. Status page
-6. Metrics/APM
+6. Metrics + dashboards (+ collector bundle)
+7. Traces (OpenTelemetry)
+8. Error tracking (Sentry-compatible)
+9. Real user monitoring
+10. AI SRE (bring your own LLM)
+11. Platform + production hardening (last)
 
 Each sub-project gets its own spec → plan → implementation cycle under
 `docs/superpowers/specs/` and `docs/superpowers/plans/`. The feature-parity
-checklist that defines "done" for the whole rebuild (8 sub-projects, incl.
-traces and a final production-hardening pass) is
+checklist that defines "done" for the whole rebuild (11 sub-projects, incl.
+traces, error tracking, RUM, AI SRE and a final production-hardening pass) is
 `docs/superpowers/roadmap.md` — tick items there as their PRs merge. Every
 sub-project ends with a dedicated security review + fix wave.
 
@@ -46,9 +51,12 @@ Current sub-project: **Uptime monitoring**
 
 Task IDs per sub-project: `NAMI-UP-<n>` (uptime), `NAMI-LOG-<n>` (logs),
 `NAMI-INC-<n>` (incident/on-call), `NAMI-SP-<n>` (status page),
-`NAMI-MET-<n>` (metrics), where `<n>` is the task number in that
+`NAMI-MET-<n>` (metrics), `NAMI-TR-<n>` (traces), `NAMI-ERR-<n>` (error
+tracking), `NAMI-RUM-<n>` (RUM), `NAMI-AI-<n>` (AI SRE), `NAMI-PLT-<n>`
+(platform/hardening), where `<n>` is the task number in that
 sub-project's plan. Auto-merge on a clean review is pre-authorized for all
-of sub-projects 2-6 (user confirmed 2026-10-13).
+remaining sub-projects, 2-11 (user directive 2026-10-13: "jangan tunggu
+kongfirmasii ... looping terus").
 
 ## Git branching workflow
 
@@ -77,9 +85,9 @@ This project uses one-task-per-branch, one-PR-per-task. Rules:
 (TDD per the plan's steps) → commit (Conventional Commits) → task review
 (spec compliance + quality) → fix loop if needed → push → open PR (purpose/
 scope, implementation summary, tests executed + results, breaking changes,
-risks/follow-up) → **auto-merge once review is clean** (user has
-pre-authorized this for the current plan's execution — re-confirm if
-starting a new plan) → delete branch + worktree → next task branches from
+risks/follow-up) → **auto-merge once review is clean** (pre-authorized for
+every remaining sub-project's plans — user directive 2026-10-13) → delete
+branch + worktree → next task branches from
 updated `origin/main`.
 
 No CI is configured on this repo yet. "Required checks" currently means
