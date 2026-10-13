@@ -90,10 +90,24 @@ pub async fn find_or_create_oauth_user(
     }
 
     let mut tx = pool.begin().await?;
+
+    // Same first-registered-user-becomes-admin bootstrap as `insert_user`
+    // (the password-registration path). Without it, a deployment whose very
+    // first user signs in via OAuth instead of email/password ends up with no
+    // global admin at all, so `POST /projects` is 403 for everyone forever
+    // with no in-app recovery. Counted inside this transaction, so it can't
+    // observe a half-written user row from a concurrent OAuth signup.
+    let is_first_user = sqlx::query_scalar::<_, i64>("select count(*) from users")
+        .fetch_one(&mut *tx)
+        .await?
+        == 0;
+    let global_role = if is_first_user { "admin" } else { "member" };
+
     let user: User = sqlx::query_as(
-        "insert into users (email, email_verified_at) values ($1, now()) returning *",
+        "insert into users (email, email_verified_at, global_role) values ($1, now(), $2) returning *",
     )
     .bind(email)
+    .bind(global_role)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| {
