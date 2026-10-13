@@ -12,8 +12,8 @@ BetterStack subscription.
   auth calls to `nami-engine`, owns the session cookie on its own origin)
 - Postgres — users, sessions, RBAC
 - Mailpit — local SMTP catcher for verification/reset emails in dev
-- ClickHouse — reserved for the log-management/uptime sub-projects, unused
-  by the current (foundation) sub-project
+- ClickHouse — time-series store (uptime check results, then logs and
+  metrics), accessed over its HTTP interface via `nami-engine/src/clickhouse.rs`
 
 ## Project structure
 
@@ -21,7 +21,7 @@ The project is decomposed into sequential sub-projects (BetterStack bundles
 several independent products, too large for one spec/plan):
 
 1. **Foundation: auth, org, RBAC, session** — done (see below)
-2. Uptime monitoring — next up
+2. Uptime monitoring — in progress
 3. Log management
 4. Incident management + on-call alerting
 5. Status page
@@ -37,8 +37,14 @@ scratch and has been deleted.
 - Spec: `docs/superpowers/specs/2026-10-12-foundation-auth-rbac-design.md`
 - Plan: `docs/superpowers/plans/2026-10-12-foundation-auth-rbac.md`
 
-Next sub-project: **Uptime monitoring** — not started. Brainstorm/spec it
-before implementing (see `superpowers:brainstorming`).
+Current sub-project: **Uptime monitoring**
+- Spec: `docs/superpowers/specs/2026-10-13-uptime-monitoring-design.md`
+
+Task IDs per sub-project: `NAMI-UP-<n>` (uptime), `NAMI-LOG-<n>` (logs),
+`NAMI-INC-<n>` (incident/on-call), `NAMI-SP-<n>` (status page),
+`NAMI-MET-<n>` (metrics), where `<n>` is the task number in that
+sub-project's plan. Auto-merge on a clean review is pre-authorized for all
+of sub-projects 2-6 (user confirmed 2026-10-13).
 
 ## Git branching workflow
 
