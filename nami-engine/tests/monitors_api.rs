@@ -257,7 +257,7 @@ async fn invalid_configs_are_rejected_with_400_and_nothing_is_written(pool: sqlx
             "url",
         ),
         (
-            json!({ "name": "x", "check_type": "http", "url": url, "http_method": "POST" }),
+            json!({ "name": "x", "check_type": "http", "url": url, "http_method": "TRACE" }),
             "http_method",
         ),
         (
