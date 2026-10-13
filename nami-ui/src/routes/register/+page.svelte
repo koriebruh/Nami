@@ -50,6 +50,27 @@
 			</button>
 		</form>
 
+		<div class="my-6 flex items-center gap-3">
+			<div class="h-px flex-1 bg-[#262626]"></div>
+			<span class="text-xs text-neutral-600">or continue with</span>
+			<div class="h-px flex-1 bg-[#262626]"></div>
+		</div>
+
+		<div class="flex flex-col gap-2">
+			<a
+				href="/auth/oauth/google/start"
+				class="flex w-full items-center justify-center rounded-md border border-[#262626] px-3 py-2 text-sm text-neutral-200 transition-colors hover:border-teal-500/30 hover:text-neutral-100"
+			>
+				Google
+			</a>
+			<a
+				href="/auth/oauth/github/start"
+				class="flex w-full items-center justify-center rounded-md border border-[#262626] px-3 py-2 text-sm text-neutral-200 transition-colors hover:border-teal-500/30 hover:text-neutral-100"
+			>
+				GitHub
+			</a>
+		</div>
+
 		<p class="mt-6 text-center text-sm text-neutral-500">
 			Already have an account? <a href="/login" class="text-teal-400 hover:underline">Log in</a>
 		</p>

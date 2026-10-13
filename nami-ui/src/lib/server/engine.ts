@@ -47,3 +47,16 @@ export async function callEngine(
 
 	return response;
 }
+
+export type CurrentUser = {
+	id: string;
+	email: string;
+	global_role: string;
+};
+
+/** Returns the authenticated user via /auth/me, or null if not logged in. */
+export async function getCurrentUser(event: RequestEvent): Promise<CurrentUser | null> {
+	const response = await callEngine(event, '/auth/me');
+	if (!response.ok) return null;
+	return (await response.json()) as CurrentUser;
+}
