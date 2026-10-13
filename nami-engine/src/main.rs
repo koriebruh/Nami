@@ -1,6 +1,8 @@
 use nami_engine::{config::Config, db, email, state::AppState, routes};
 use axum::Router;
+use std::sync::Arc;
 use time::Duration as TimeDuration;
+use tower_governor::{governor::GovernorConfigBuilder, key_extractor::GlobalKeyExtractor, GovernorLayer};
 use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::PostgresStore;
 
@@ -47,9 +49,23 @@ async fn main() {
         mailer: email::Mailer::new(&config.smtp_host, config.smtp_port),
         config,
     };
+    // `GlobalKeyExtractor`, not the crate's default `PeerIpKeyExtractor`: the
+    // latter needs `ConnectInfo`, which plain `axum::serve` doesn't provide,
+    // and would collapse to a single key anyway since nami-ui's BFF proxies
+    // every auth call to this engine from one internal origin.
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(GlobalKeyExtractor)
+            .per_second(60)
+            .burst_size(5)
+            .finish()
+            .expect("failed to build rate limit config"),
+    );
+
     let app = Router::new()
         .merge(routes::health::router())
         .merge(routes::auth::router())
+        .merge(routes::auth::rate_limited_router().layer(GovernorLayer::new(governor_conf)))
         .merge(routes::projects::router())
         .layer(session_layer)
         .with_state(state);

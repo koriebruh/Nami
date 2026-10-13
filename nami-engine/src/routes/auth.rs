@@ -7,9 +7,7 @@ use crate::{state::AppState, error::AppError, auth, models};
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/auth/register", post(register))
         .route("/auth/verify-email", get(verify_email))
-        .route("/auth/login", post(login))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(me))
         .route("/auth/totp/setup", post(totp_setup))
@@ -21,6 +19,12 @@ pub fn router() -> Router<AppState> {
         // the pre-0.8 axum/matchit syntax and panics at router-build time here).
         .route("/auth/oauth/{provider}/start", get(oauth_start))
         .route("/auth/oauth/{provider}/callback", get(oauth_callback))
+}
+
+pub fn rate_limited_router() -> Router<AppState> {
+    Router::new()
+        .route("/auth/register", post(register))
+        .route("/auth/login", post(login))
 }
 
 #[derive(Deserialize)]
