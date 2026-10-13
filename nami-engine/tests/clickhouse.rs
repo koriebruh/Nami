@@ -150,12 +150,18 @@ async fn migrate_is_idempotent() {
     ch.migrate().await.unwrap(); // second run must be a no-op, not an error
     let tables: Vec<serde_json::Value> = ch
         .query_rows(
-            "SELECT name FROM system.tables WHERE database = {db:String}",
+            "SELECT name FROM system.tables WHERE database = {db:String} ORDER BY name",
             &[("db", ch.database().to_string())],
         )
         .await
         .unwrap();
-    assert_eq!(tables, vec![serde_json::json!({ "name": "uptime_checks" })]);
+    assert_eq!(
+        tables,
+        vec![
+            serde_json::json!({ "name": "logs" }),
+            serde_json::json!({ "name": "uptime_checks" })
+        ]
+    );
     ch.drop_database().await.unwrap();
 }
 
@@ -223,12 +229,18 @@ async fn query_rows_is_read_only_so_ddl_and_writes_fail_on_the_read_path() {
     // Nothing above took effect, and ordinary reads still work.
     let tables: Vec<serde_json::Value> = ch
         .query_rows(
-            "SELECT name FROM system.tables WHERE database = {db:String}",
+            "SELECT name FROM system.tables WHERE database = {db:String} ORDER BY name",
             &[("db", ch.database().to_string())],
         )
         .await
         .unwrap();
-    assert_eq!(tables, vec![serde_json::json!({ "name": "uptime_checks" })]);
+    assert_eq!(
+        tables,
+        vec![
+            serde_json::json!({ "name": "logs" }),
+            serde_json::json!({ "name": "uptime_checks" })
+        ]
+    );
     let rows: Vec<Count> = ch
         .query_rows("SELECT count() AS n FROM uptime_checks", &[])
         .await

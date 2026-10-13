@@ -43,7 +43,8 @@ pub const QUERY_MAX_EXECUTION_SECS: u64 = 25;
 
 /// Idempotent DDL applied by [`ClickHouse::migrate`], in order. Table names
 /// are unqualified because every request carries the `database` setting.
-const MIGRATIONS: [&str; 1] = ["CREATE TABLE IF NOT EXISTS uptime_checks (
+const MIGRATIONS: [&str; 2] = [
+    "CREATE TABLE IF NOT EXISTS uptime_checks (
     monitor_id UUID,
     project_id UUID,
     checked_at DateTime64(3, 'UTC'),
@@ -53,7 +54,44 @@ const MIGRATIONS: [&str; 1] = ["CREATE TABLE IF NOT EXISTS uptime_checks (
     error Nullable(String)
 ) ENGINE = MergeTree
 ORDER BY (monitor_id, checked_at)
-TTL toDateTime(checked_at) + INTERVAL 180 DAY"];
+TTL toDateTime(checked_at) + INTERVAL 180 DAY",
+    // Log events (see `logs::store`). `retention_days` is copied from the
+    // source onto each row at ingest, so the TTL is per row; `pattern_hash`
+    // is derived by ClickHouse and never inserted.
+    "CREATE TABLE IF NOT EXISTS logs (
+    id UUID,
+    project_id UUID,
+    source_id UUID,
+    dt DateTime64(3, 'UTC'),
+    level LowCardinality(String),
+    message String,
+    fields String,
+    trace_id String,
+    span_id String,
+    pattern String,
+    pattern_hash UInt64 MATERIALIZED cityHash64(pattern),
+    retention_days UInt16,
+    INDEX idx_message message TYPE tokenbf_v1(32768, 3, 0) GRANULARITY 4,
+    INDEX idx_level level TYPE set(16) GRANULARITY 4,
+    INDEX idx_trace trace_id TYPE bloom_filter(0.01) GRANULARITY 4,
+    INDEX idx_pattern pattern_hash TYPE bloom_filter(0.01) GRANULARITY 4
+) ENGINE = MergeTree
+PARTITION BY toYYYYMMDD(dt)
+ORDER BY (project_id, dt, id)
+TTL toDateTime(dt) + toIntervalDay(retention_days)",
+];
+
+/// Settings a caller may never pass as extra settings: they are owned by
+/// this client (the query text, its parameters, the output format and the
+/// read-only guard on [`ClickHouse::query_rows_with`]).
+const RESERVED_SETTINGS: [&str; 6] = [
+    "query",
+    "database",
+    "readonly",
+    "default_format",
+    "wait_end_of_query",
+    "input_format_skip_unknown_fields",
+];
 
 /// Prefix of the throwaway databases created by
 /// [`ClickHouse::create_test_database`].
@@ -143,7 +181,20 @@ impl ClickHouse {
         table: &str,
         rows: &[T],
     ) -> Result<(), ClickHouseError> {
+        self.insert_rows_with(table, rows, &[]).await
+    }
+
+    /// [`Self::insert_rows`] plus extra ClickHouse settings, e.g.
+    /// `async_insert`. Settings are fixed names and values from code, never
+    /// user input; panics on one this client owns (see `RESERVED_SETTINGS`).
+    pub async fn insert_rows_with<T: Serialize>(
+        &self,
+        table: &str,
+        rows: &[T],
+        settings: &[(&'static str, &'static str)],
+    ) -> Result<(), ClickHouseError> {
         let mut pairs = self.settings_with_database()?;
+        push_extra_settings(&mut pairs, settings);
         pairs.push((
             "input_format_skip_unknown_fields".to_string(),
             "0".to_string(),
@@ -185,7 +236,21 @@ impl ClickHouse {
         sql: &str,
         params: &[(&str, String)],
     ) -> Result<Vec<T>, ClickHouseError> {
+        self.query_rows_with(sql, params, &[]).await
+    }
+
+    /// [`Self::query_rows`] plus extra ClickHouse settings, e.g.
+    /// `max_execution_time`. Settings are fixed names and values from code,
+    /// never user input; panics on one this client owns (see
+    /// `RESERVED_SETTINGS`), so the read-only guard cannot be lifted.
+    pub async fn query_rows_with<T: DeserializeOwned>(
+        &self,
+        sql: &str,
+        params: &[(&str, String)],
+        settings: &[(&'static str, &'static str)],
+    ) -> Result<Vec<T>, ClickHouseError> {
         let mut pairs = self.settings_with_database()?;
+        push_extra_settings(&mut pairs, settings);
         pairs.push(("default_format".to_string(), "JSONEachRow".to_string()));
         // Buffer the whole result server-side, so an error raised mid-query
         // becomes a non-2xx status instead of trailing text in a 200 body.
@@ -355,6 +420,21 @@ fn escape_param_value(value: &str) -> String {
     escaped
 }
 
+/// Appends caller-supplied settings, refusing the ones this client owns and
+/// anything that would smuggle in a query parameter.
+fn push_extra_settings(
+    pairs: &mut Vec<(String, String)>,
+    settings: &[(&'static str, &'static str)],
+) {
+    for (name, value) in settings {
+        assert!(
+            !RESERVED_SETTINGS.contains(name) && !name.starts_with("param_"),
+            "the ClickHouse setting {name:?} is managed by the client and cannot be overridden"
+        );
+        pairs.push((name.to_string(), value.to_string()));
+    }
+}
+
 /// The `param_<name>=<value>` pair for a `{name:Identifier}` placeholder.
 /// Unlike typed values it is not TSV-escaped (see [`escape_param_value`]):
 /// the value is validated and sent raw.
@@ -383,7 +463,9 @@ fn validate_identifier(name: &str) -> Result<&str, ClickHouseError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClickHouse, ClickHouseError, escape_param_value, validate_identifier};
+    use super::{
+        ClickHouse, ClickHouseError, escape_param_value, push_extra_settings, validate_identifier,
+    };
 
     /// Every SELECT is bounded on the server and stops there when the client
     /// gives up (say, a request whose own deadline passed): a slow query left
@@ -426,6 +508,34 @@ mod tests {
             !statement.contains_key("max_execution_time"),
             "{statement:?}"
         );
+    }
+
+    #[test]
+    fn extra_settings_are_appended() {
+        let mut pairs = Vec::new();
+        push_extra_settings(
+            &mut pairs,
+            &[("async_insert", "1"), ("max_execution_time", "30")],
+        );
+        assert_eq!(
+            pairs,
+            vec![
+                ("async_insert".to_string(), "1".to_string()),
+                ("max_execution_time".to_string(), "30".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "managed by the client")]
+    fn extra_settings_cannot_lift_the_read_only_guard() {
+        push_extra_settings(&mut Vec::new(), &[("readonly", "0")]);
+    }
+
+    #[test]
+    #[should_panic(expected = "managed by the client")]
+    fn extra_settings_cannot_inject_query_parameters() {
+        push_extra_settings(&mut Vec::new(), &[("param_project_id", "x")]);
     }
 
     #[test]
