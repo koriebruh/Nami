@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { callEngine } from './engine';
+import { callEngine, engineErrorMessage } from './engine';
 
 describe('callEngine', () => {
 	it('forwards the cookie header and relays set-cookie back', async () => {
@@ -90,5 +90,17 @@ describe('callEngine', () => {
 		const [, init] = fetchMock.mock.calls[0];
 		const headers = init.headers as Headers;
 		expect(headers.get('x-forwarded-for')).toBe('198.51.100.7');
+	});
+});
+
+describe('engineErrorMessage', () => {
+	it("returns the engine's error message", async () => {
+		const response = new Response(JSON.stringify({ error: 'interval_seconds must be at least 30' }), { status: 400 });
+		expect(await engineErrorMessage(response, 'fallback')).toBe('interval_seconds must be at least 30');
+	});
+
+	it('falls back for a non-JSON body', async () => {
+		const response = new Response('Failed to deserialize the JSON body', { status: 422 });
+		expect(await engineErrorMessage(response, 'Could not save monitor.')).toBe('Could not save monitor.');
 	});
 });

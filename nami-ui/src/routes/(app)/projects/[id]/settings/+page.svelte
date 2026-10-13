@@ -1,18 +1,14 @@
 <script lang="ts">
-	import type { PageData, ActionData } from './$types';
+	import type { PageProps } from './$types';
 
-	let { data, form }: { data: PageData; form: ActionData } = $props();
+	let { form }: PageProps = $props();
 </script>
 
+<!-- The member forms, moved unchanged from the old project page. -->
 <div class="space-y-6">
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h1 class="text-lg font-semibold text-neutral-100">{data.project.name}</h1>
-		<p class="mt-1 text-sm text-neutral-500">{data.project.slug}</p>
-
-		<p class="mt-4 text-sm text-neutral-500">
-			This project has no visible member list yet — add or remove members by their user ID.
-		</p>
-	</div>
+	<p class="text-sm text-neutral-500">
+		This project has no visible member list yet — add or remove members by their user ID.
+	</p>
 
 	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
 		<h2 class="text-lg font-semibold text-neutral-100">Add member</h2>
@@ -99,6 +95,4 @@
 			</button>
 		</form>
 	</div>
-
-	<a href="/projects" class="inline-block text-sm text-neutral-500 hover:text-neutral-300">← Back to projects</a>
 </div>

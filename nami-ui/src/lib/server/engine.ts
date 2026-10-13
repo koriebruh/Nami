@@ -73,3 +73,17 @@ export async function getCurrentUser(event: RequestEvent): Promise<CurrentUser |
 	if (!response.ok) return null;
 	return (await response.json()) as CurrentUser;
 }
+
+/**
+ * The engine's `{ "error": "..." }` message, or `fallback` when the body is
+ * not that shape (axum's own extractor rejections are plain text).
+ */
+export async function engineErrorMessage(response: Response, fallback: string): Promise<string> {
+	try {
+		const body = await response.json();
+		if (body && typeof body.error === 'string') return body.error;
+	} catch {
+		// not JSON
+	}
+	return fallback;
+}
