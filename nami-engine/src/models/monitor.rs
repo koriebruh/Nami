@@ -1,3 +1,5 @@
+use std::net::Ipv6Addr;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -5,6 +7,13 @@ use uuid::Uuid;
 
 use super::validate_name;
 use crate::error::AppError;
+
+/// Size caps for the free-text target fields. Without them only the 2 MiB
+/// request-body limit bounds what is stored, returned to every viewer and
+/// put in alert emails.
+const MAX_URL_BYTES: usize = 2048;
+const MAX_HOST_CHARS: usize = 253;
+const MAX_KEYWORD_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow, Serialize)]
 pub struct Monitor {
@@ -206,7 +215,8 @@ impl PatchMonitorRequest {
     }
 }
 
-/// Fail-closed validation of a complete config. Returns the normalized
+/// Fail-closed validation of a complete config. PATCH validates the merged
+/// result, so every rule here also holds for edits. Returns the normalized
 /// config (trimmed name/url/host; fields irrelevant to the check type
 /// cleared) or a message for a 400.
 pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
@@ -225,6 +235,16 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
                 .map(str::trim)
                 .unwrap_or_default()
                 .to_string();
+            // `Url::parse` silently strips tabs and newlines and
+            // percent-encodes other control characters, so it accepts
+            // strings that must never be stored (and shown in alert emails)
+            // verbatim: check the string itself, not its parse.
+            if url.len() > MAX_URL_BYTES {
+                return Err(format!("url must be at most {MAX_URL_BYTES} bytes"));
+            }
+            if url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+                return Err("url must not contain whitespace or control characters".into());
+            }
             let parsed = reqwest::Url::parse(&url)
                 .map_err(|_| "url must be a valid http(s) URL".to_string())?;
             if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -234,8 +254,15 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
             c.host = None;
             c.port = None;
             if c.check_type == "keyword" {
-                if c.keyword.as_deref().is_none_or(|k| k.trim().is_empty()) {
+                let keyword = c.keyword.as_deref().unwrap_or_default();
+                if keyword.trim().is_empty() {
                     return Err("keyword is required for keyword monitors".into());
+                }
+                if keyword.len() > MAX_KEYWORD_BYTES {
+                    return Err(format!("keyword must be at most {MAX_KEYWORD_BYTES} bytes"));
+                }
+                if keyword.chars().any(char::is_control) {
+                    return Err("keyword must not contain control characters".into());
                 }
                 if c.http_method != "GET" {
                     return Err(
@@ -256,6 +283,26 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
             if host.is_empty() {
                 return Err("host is required for tcp monitors".into());
             }
+            if host.chars().count() > MAX_HOST_CHARS {
+                return Err(format!("host must be at most {MAX_HOST_CHARS} characters"));
+            }
+            // A bare hostname or IP literal: a scheme, path, query, fragment
+            // or credentials (`tcp://db/x`, `user@db`) can never be connected to.
+            if host.chars().any(|ch| {
+                ch.is_control() || ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@')
+            }) {
+                return Err(
+                    "host must not contain whitespace, control characters or any of / ? # @".into(),
+                );
+            }
+            // The port has its own field; a colon is only valid inside an
+            // IPv6 literal. Without this, `db:5432` is stored and then
+            // reports DOWN forever because no such name resolves.
+            if host.contains(':') && host.parse::<Ipv6Addr>().is_err() {
+                return Err(
+                    "host must be a hostname or IP address; put the port in the port field".into(),
+                );
+            }
             if !c.port.is_some_and(|p| (1..=65535).contains(&p)) {
                 return Err("port must be between 1 and 65535".into());
             }
@@ -270,6 +317,12 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
     }
     if !(1..=60).contains(&c.timeout_seconds) {
         return Err("timeout_seconds must be between 1 and 60".into());
+    }
+    // The worker re-claims a monitor `interval_seconds` after claiming it, so
+    // a check allowed to run as long as its interval would still be in
+    // flight when the next one starts.
+    if c.timeout_seconds >= c.interval_seconds {
+        return Err("timeout_seconds must be less than interval_seconds".into());
     }
     if !(100..=599).contains(&c.expected_status_min)
         || !(100..=599).contains(&c.expected_status_max)
