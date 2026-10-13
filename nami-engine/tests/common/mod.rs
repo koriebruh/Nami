@@ -257,3 +257,79 @@ pub async fn make_due(pool: &sqlx::PgPool, monitor_id: Uuid) {
         .await
         .unwrap();
 }
+
+/// A message as Mailpit stored it.
+pub struct StoredMail {
+    pub subject: String,
+    /// The plain-text body, with `\r\n` normalized to `\n`.
+    pub text: String,
+    /// The To, Cc and Bcc addresses Mailpit recorded. An envelope recipient
+    /// that no header names (for example one smuggled into the SMTP dialogue)
+    /// is listed under `bcc`.
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    /// The raw source, with `\r\n` normalized to `\n`.
+    pub raw: String,
+}
+
+/// Every message Mailpit holds that is addressed to `recipient`, oldest
+/// first, with the recipients it recorded and the raw source.
+pub async fn stored_mail_for(recipient: &str) -> Vec<StoredMail> {
+    let search = url::Url::parse_with_params(
+        &format!("{MAILPIT}/api/v1/search"),
+        &[
+            ("query", format!("to:\"{recipient}\"")),
+            ("limit", "50".to_string()),
+        ],
+    )
+    .unwrap();
+    let found: Value = reqwest::get(search).await.unwrap().json().await.unwrap();
+    let addresses = |list: &Value| -> Vec<String> {
+        list.as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|entry| entry["Address"].as_str().map(str::to_string))
+            .collect()
+    };
+    let mut messages = Vec::new();
+    // Mailpit lists newest first.
+    for summary in found["messages"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .rev()
+    {
+        let id = summary["ID"].as_str().unwrap();
+        let full: Value = reqwest::get(format!("{MAILPIT}/api/v1/message/{id}"))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let to = addresses(&full["To"]);
+        if !to.iter().any(|address| address == recipient) {
+            continue;
+        }
+        let raw = reqwest::get(format!("{MAILPIT}/api/v1/message/{id}/raw"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        messages.push(StoredMail {
+            subject: full["Subject"].as_str().unwrap_or_default().to_string(),
+            text: full["Text"]
+                .as_str()
+                .unwrap_or_default()
+                .replace("\r\n", "\n"),
+            to,
+            cc: addresses(&full["Cc"]),
+            bcc: addresses(&full["Bcc"]),
+            raw: raw.replace("\r\n", "\n"),
+        });
+    }
+    messages
+}

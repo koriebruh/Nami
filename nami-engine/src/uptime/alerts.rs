@@ -35,6 +35,11 @@ pub struct Transition {
 /// Emails every member of the transition's project. Failures are logged and
 /// swallowed: alert delivery must never abort the worker or undo the state
 /// change that triggered it.
+///
+/// A failed send is logged once per transition, with the monitor and the kind
+/// of transition but without the recipient's address: `Mailer::send` has
+/// already logged the cause itself, and an address is personal data that has
+/// no business in a log.
 pub async fn notify_transition(state: &AppState, transition: &Transition) {
     let recipients: Vec<String> = match sqlx::query_scalar(
         "select u.email from project_members pm
@@ -48,16 +53,49 @@ pub async fn notify_transition(state: &AppState, transition: &Transition) {
     {
         Ok(recipients) => recipients,
         Err(e) => {
-            tracing::error!(error = %e, project_id = %transition.project_id, "failed to load alert recipients");
+            tracing::error!(
+                error = %e,
+                kind = ?transition.kind,
+                subject = ?transition.subject,
+                project_id = %transition.project_id,
+                "failed to load alert recipients"
+            );
             return;
         }
     };
     let (subject, body) = render(&state.config.ui_base_url, transition);
-    for recipient in recipients {
-        if let Err(e) = state.mailer.send(&recipient, &subject, body.clone()).await {
-            tracing::error!(error = ?e, %recipient, "failed to send alert email");
+    let mut failed = 0;
+    for recipient in &recipients {
+        if state
+            .mailer
+            .send(recipient, &subject, body.clone())
+            .await
+            .is_err()
+        {
+            failed += 1;
         }
     }
+    if failed > 0 {
+        tracing::error!(
+            kind = ?transition.kind,
+            subject = ?transition.subject,
+            failed,
+            recipients = recipients.len(),
+            "alert email not delivered to every recipient"
+        );
+    }
+}
+
+/// Text a monitored server can influence (a check's error message) as one
+/// line of plain text: every control character (NUL, CR, LF, ESC, DEL, ...)
+/// becomes a space and everything else is kept. Postgres text cannot hold NUL,
+/// and a line break would let the text start lines of its own in the email
+/// body.
+pub fn sanitize_cause(cause: &str) -> String {
+    cause
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 /// Subject and plain-text body for a transition's email.
@@ -80,7 +118,14 @@ pub fn render(ui_base_url: &str, transition: &Transition) -> (String, String) {
             format!("[Nami] {name} is DOWN"),
             format!(
                 "{name} is DOWN.\n\nCause: {}\nSince: {at}\n\nDetails: {link}\n",
-                transition.cause.as_deref().unwrap_or("unknown")
+                // Already one line when it comes from `apply_outcome`; the
+                // same filter here covers a Transition built any other way.
+                transition
+                    .cause
+                    .as_deref()
+                    .map(sanitize_cause)
+                    .as_deref()
+                    .unwrap_or("unknown")
             ),
         ),
         TransitionKind::Recovered => (
@@ -166,11 +211,11 @@ mod tests {
         assert!(body.contains("Cause: unknown\n"), "{body}");
     }
 
-    /// The cause is partly chosen by the monitored server. It is only ever
-    /// text inside a plain-text body: nothing rewrites the subject, the link
-    /// or the rest of the message, and nothing is turned into markup.
+    /// The cause is partly chosen by the monitored server. It reaches the
+    /// email as one line of plain text: nothing in it can start a line of its
+    /// own, rewrite the subject or the link, or turn into markup.
     #[test]
-    fn a_hostile_cause_stays_plain_text_inside_the_body() {
+    fn a_hostile_cause_becomes_one_line_of_plain_text() {
         let hostile = "x\r\nSubject: pwned\r\nBcc: evil@evil.test\r\n\r\n<script>alert(1)</script>";
         let mut down = transition(TransitionKind::Down, "Checkout API");
         down.cause = Some(hostile.to_string());
@@ -178,7 +223,12 @@ mod tests {
         let (subject, body) = render("http://ui.test", &down);
 
         assert_eq!(subject, "[Nami] Checkout API is DOWN");
-        assert!(body.contains(&format!("Cause: {hostile}\n")), "{body:?}");
+        assert!(
+            body.contains(
+                "Cause: x  Subject: pwned  Bcc: evil@evil.test    <script>alert(1)</script>\nSince:"
+            ),
+            "{body:?}"
+        );
         let nil = Uuid::nil();
         assert!(
             body.ends_with(&format!(
@@ -186,6 +236,30 @@ mod tests {
             )),
             "the link is the last thing in the body and is built from ids only: {body:?}"
         );
+        assert_eq!(body.lines().count(), 6, "{body:?}");
+    }
+
+    #[test]
+    fn every_control_character_in_a_cause_becomes_a_space() {
+        let controls: String = ('\u{0}'..='\u{1f}').chain('\u{7f}'..='\u{9f}').collect();
+        assert_eq!(
+            sanitize_cause(&format!("a{controls}b")),
+            format!("a{}b", " ".repeat(controls.chars().count()))
+        );
+        assert_eq!(sanitize_cause("a\0b\r\nc\u{1b}[31md"), "a b  c [31md");
+    }
+
+    #[test]
+    fn printable_text_is_left_alone() {
+        for text in [
+            "",
+            "connection refused",
+            "expected status 200-399, got 503",
+            "certificate not valid for name \"a.test\"; only valid for DnsName(\"b.test\")",
+            "gagal: koneksi ditolak \u{2026} 日本語 \u{1f980}",
+        ] {
+            assert_eq!(sanitize_cause(text), text);
+        }
     }
 
     #[test]
