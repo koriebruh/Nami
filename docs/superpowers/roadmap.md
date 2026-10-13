@@ -37,15 +37,15 @@ Also out of scope (ruled 2026-10-13):
 
 ## 2. Uptime monitoring — in progress
 
-### Phase 1
+### Phase 1 — done (PRs #17-#27, security fix wave #30; decisions: `docs/superpowers/decisions/2026-10-13-uptime-phase1.md`)
 
-- [ ] Monitor types: HTTP status, keyword / keyword absence, TCP port
-- [ ] Interval (>= 30 s), timeout, confirmation threshold, pause/resume
-- [ ] Heartbeats (cron monitoring) with period + grace
-- [ ] Automatic incidents (open on down, resolve on recovery)
-- [ ] Email alerts on transitions
-- [ ] Uptime % (24 h / 7 d / 30 d), response-time history chart, check log
-- [ ] UI for all of the above, auto-refresh
+- [x] Monitor types: HTTP status, keyword / keyword absence, TCP port
+- [x] Interval (>= 30 s), timeout, confirmation threshold, pause/resume
+- [x] Heartbeats (cron monitoring) with period + grace
+- [x] Automatic incidents (open on down, resolve on recovery)
+- [x] Email alerts on transitions
+- [x] Uptime % (24 h / 7 d / 30 d), response-time history chart, check log
+- [x] UI for all of the above, auto-refresh
 
 ### Phase 2
 
