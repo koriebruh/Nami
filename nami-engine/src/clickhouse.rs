@@ -29,6 +29,9 @@ use serde::{Serialize, de::DeserializeOwned};
 ///   chrono's `DateTime<Utc>` deserializer accepts.
 /// - `output_format_json_quote_64bit_integers=0`: emit `count()` (UInt64)
 ///   as a JSON number, not a string (older servers quote by default).
+///
+/// All three names are in `RESERVED_SETTINGS`, so the extra settings of
+/// `insert_rows_with` / `query_rows_with` cannot override them.
 const BASE_SETTINGS: [(&str, &str); 3] = [
     ("date_time_input_format", "best_effort"),
     ("date_time_output_format", "iso"),
@@ -82,15 +85,21 @@ TTL toDateTime(dt) + toIntervalDay(retention_days)",
 ];
 
 /// Settings a caller may never pass as extra settings: they are owned by
-/// this client (the query text, its parameters, the output format and the
-/// read-only guard on [`ClickHouse::query_rows_with`]).
-const RESERVED_SETTINGS: [&str; 6] = [
+/// this client. That is the query text, its parameters and the database;
+/// the output format, buffering and read-only guard of
+/// [`ClickHouse::query_rows_with`]; the strict row parsing of
+/// [`ClickHouse::insert_rows_with`]; and the wire formats of
+/// [`BASE_SETTINGS`], which every request pins.
+const RESERVED_SETTINGS: [&str; 9] = [
     "query",
     "database",
     "readonly",
     "default_format",
     "wait_end_of_query",
     "input_format_skip_unknown_fields",
+    "date_time_input_format",
+    "date_time_output_format",
+    "output_format_json_quote_64bit_integers",
 ];
 
 /// Prefix of the throwaway databases created by
@@ -464,7 +473,8 @@ fn validate_identifier(name: &str) -> Result<&str, ClickHouseError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClickHouse, ClickHouseError, escape_param_value, push_extra_settings, validate_identifier,
+        BASE_SETTINGS, ClickHouse, ClickHouseError, RESERVED_SETTINGS, escape_param_value,
+        push_extra_settings, validate_identifier,
     };
 
     /// Every SELECT is bounded on the server and stops there when the client
@@ -536,6 +546,22 @@ mod tests {
     #[should_panic(expected = "managed by the client")]
     fn extra_settings_cannot_inject_query_parameters() {
         push_extra_settings(&mut Vec::new(), &[("param_project_id", "x")]);
+    }
+
+    #[test]
+    fn every_reserved_setting_is_refused() {
+        for name in RESERVED_SETTINGS {
+            let refused =
+                std::panic::catch_unwind(|| push_extra_settings(&mut Vec::new(), &[(name, "1")]));
+            assert!(refused.is_err(), "{name} was accepted as an extra setting");
+        }
+    }
+
+    #[test]
+    fn every_setting_sent_on_every_request_is_reserved() {
+        for (name, _) in BASE_SETTINGS {
+            assert!(RESERVED_SETTINGS.contains(&name), "{name} is not reserved");
+        }
     }
 
     #[test]

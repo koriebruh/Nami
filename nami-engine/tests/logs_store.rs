@@ -2,7 +2,7 @@
 // `docker compose up -d clickhouse`.
 use chrono::{DateTime, Duration, Utc};
 use nami_engine::{
-    clickhouse::ClickHouse,
+    clickhouse::{ClickHouse, ClickHouseError},
     logs::{
         normalize,
         store::{self, LogRow},
@@ -10,7 +10,7 @@ use nami_engine::{
     models::source::IngestSource,
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
@@ -56,8 +56,121 @@ fn build_row_carries_the_source_and_the_pattern() {
         built.stored_bytes(),
         (built.message.len() + built.fields.len()) as u64
     );
-    assert_eq!(built.id.get_version_num(), 7, "time-ordered UUIDv7 ids");
     assert_ne!(built.id, row(&source, json!({}), received).id);
+}
+
+/// ClickHouse orders UUIDs by their second 8 bytes first, which for a plain
+/// UUIDv7 (timestamp first, random bits second) would break `dt` ties at
+/// random. Row ids are UUIDv7s with the two halves swapped
+/// (`store::new_row_id`), so rows built in sequence sort in that sequence.
+#[tokio::test]
+async fn row_ids_sort_in_build_order_when_dt_ties() {
+    let ch = ClickHouse::create_test_database().await.unwrap();
+    let source = source();
+    let received = now_millis();
+    let rows: Vec<LogRow> = (0..300)
+        .map(|n| {
+            row(
+                &source,
+                json!({ "dt": received.to_rfc3339(), "message": format!("m{n:03}") }),
+                received,
+            )
+        })
+        .collect();
+    // Inserted in reverse, so the storage order cannot explain the result.
+    let reversed: Vec<LogRow> = rows.iter().rev().cloned().collect();
+    store::insert_logs(&ch, &reversed).await.unwrap();
+
+    let built: Vec<String> = rows.iter().map(|r| r.message.clone()).collect();
+    let by_id: Vec<Value> = ch
+        .query_rows(
+            "SELECT message FROM logs WHERE project_id = {p:UUID} ORDER BY id",
+            &[("p", source.project_id.to_string())],
+        )
+        .await
+        .unwrap();
+    let by_sorting_key: Vec<Value> = ch
+        .query_rows(
+            "SELECT message FROM logs WHERE project_id = {p:UUID} ORDER BY dt, id",
+            &[("p", source.project_id.to_string())],
+        )
+        .await
+        .unwrap();
+    for (order, stored) in [("id", by_id), ("dt, id", by_sorting_key)] {
+        let messages: Vec<&str> = stored
+            .iter()
+            .map(|row| row["message"].as_str().unwrap())
+            .collect();
+        assert_eq!(messages, built, "ORDER BY {order} must be the build order");
+    }
+    ch.drop_database().await.unwrap();
+}
+
+/// `dt` lies inside `[insert time - 365 days, insert time + 1 day]` whatever
+/// path built the event. The table's TTL goes through `toDateTime`, which
+/// wraps around outside 1970 to 2106 (1900 becomes 2036, 2200 becomes 2063),
+/// so a wild timestamp would keep a row decades beyond its retention.
+#[test]
+fn wild_timestamps_are_clamped_by_build_row() {
+    let source = source();
+    let event = |dt: &str| {
+        normalize::LogEvent::new(
+            dt.parse().unwrap(),
+            "info",
+            "m".to_string(),
+            Map::new(),
+            String::new(),
+            String::new(),
+        )
+    };
+    let before = Utc::now();
+    let oldest = store::build_row(event("1900-01-01T00:00:00Z"), &source);
+    let newest = store::build_row(event("2200-01-01T00:00:00Z"), &source);
+    let after = Utc::now();
+
+    let millisecond = Duration::milliseconds(1);
+    assert!(
+        oldest.dt >= before - normalize::MAX_PAST - millisecond
+            && oldest.dt <= after - normalize::MAX_PAST,
+        "{} is not insert time - 365 days",
+        oldest.dt
+    );
+    assert!(
+        newest.dt >= before + normalize::MAX_FUTURE - millisecond
+            && newest.dt <= after + normalize::MAX_FUTURE,
+        "{} is not insert time + 1 day",
+        newest.dt
+    );
+}
+
+/// The window of `dt` spans at most 367 calendar days (365 back, today,
+/// tomorrow), so the partition guard sits at 400: a wide backfill is
+/// accepted, a runaway fan-out still fails instead of piling up parts.
+#[tokio::test]
+async fn the_partition_guard_fits_the_dt_window_and_stops_a_runaway_fan_out() {
+    let ch = ClickHouse::create_test_database().await.unwrap();
+    let source = IngestSource {
+        retention_days: 365,
+        ..source()
+    };
+    let received = now_millis();
+    // One row per day straight into the table: nothing clamps `dt` here.
+    let days = |count: i64| -> Vec<LogRow> {
+        (0..count)
+            .map(|day| LogRow {
+                dt: received - Duration::days(day),
+                ..row(&source, json!({ "message": "m" }), received)
+            })
+            .collect()
+    };
+    store::insert_logs(&ch, &days(367)).await.unwrap();
+    match store::insert_logs(&ch, &days(401)).await.unwrap_err() {
+        ClickHouseError::Server { body, .. } => {
+            assert!(body.contains("TOO_MANY_PARTS"), "{body}");
+        }
+        other => panic!("expected a ClickHouse server error, got {other:?}"),
+    }
+    ch.drop_database().await.unwrap();
 }
 
 #[derive(Debug, Deserialize)]
@@ -216,7 +329,9 @@ async fn the_logs_table_has_the_spec_schema() {
 }
 
 /// The insert asks for an async insert that waits for the flush (so 202
-/// still means stored) and tolerates wide backfills.
+/// still means stored) but gives up after 25 s, before the client's own 30 s
+/// timeout, and tolerates wide backfills without switching the partition
+/// guard off.
 #[tokio::test]
 async fn inserts_use_waited_async_inserts() {
     let server = MockServer::start().await;
@@ -242,7 +357,8 @@ async fn inserts_use_waited_async_inserts() {
     for expected in [
         ("async_insert", "1"),
         ("wait_for_async_insert", "1"),
-        ("throw_on_max_partitions_per_insert_block", "0"),
+        ("wait_for_async_insert_timeout", "25"),
+        ("max_partitions_per_insert_block", "400"),
         ("input_format_skip_unknown_fields", "0"),
     ] {
         assert!(
@@ -252,6 +368,12 @@ async fn inserts_use_waited_async_inserts() {
             "missing {expected:?} in {params:?}"
         );
     }
+    assert!(
+        !params
+            .iter()
+            .any(|(k, _)| k == "throw_on_max_partitions_per_insert_block"),
+        "the partition guard must stay on: {params:?}"
+    );
     assert!(
         params
             .iter()

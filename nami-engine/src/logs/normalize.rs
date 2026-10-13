@@ -1,6 +1,8 @@
 //! Field mapping and size caps for one ingested event. Every ingest path
 //! (HTTP JSON, NDJSON and MessagePack, syslog, and later OTLP logs) ends in
-//! a [`LogEvent`] built here; `store::build_row` then turns it into a row.
+//! a [`LogEvent`] built here; `store::build_row` then turns it into a row,
+//! applying the size caps and the `dt` window ([`clamp_to_accepted_range`])
+//! once more, so a row respects them whatever built or edited the event.
 //!
 //! Mapping of a JSON object (`from_json`):
 //! - timestamp from the first of `dt` | `timestamp` | `time` that parses
@@ -9,7 +11,8 @@
 //!   time (and the unusable key stays in `fields`);
 //! - message from the first present of `message` | `msg` | `log`;
 //! - level from the first present of `level` | `severity` | `lvl`,
-//!   normalized to one of [`LEVELS`] (unknown -> `info`);
+//!   normalized to one of [`LEVELS`] (unknown -> `info`, and the value stays
+//!   in `fields` under its own key, as sent);
 //! - `trace_id` / `span_id` when they are 32 / 16 hex characters and not
 //!   all zeros (stored lowercase; otherwise they stay in `fields`);
 //! - every other key goes into `fields`.
@@ -67,7 +70,9 @@ pub struct LogEvent {
 impl LogEvent {
     /// Applies the size caps (message truncation, fields cap) and the
     /// millisecond precision of the `dt` column. Every way of building an
-    /// event goes through here.
+    /// event goes through here; `level`, `trace_id` and `span_id` are taken
+    /// as given, so callers outside [`from_json`] normalize them first
+    /// ([`level_from_name`], [`level_from_number`], [`is_hex_id`]).
     pub fn new(
         dt: DateTime<Utc>,
         level: &str,
@@ -93,18 +98,37 @@ pub fn from_json(mut object: Map<String, Value>, received_at: DateTime<Utc>) -> 
     let message = take_first(&mut object, &MESSAGE_KEYS)
         .map(message_text)
         .unwrap_or_default();
-    let level = take_first(&mut object, &LEVEL_KEYS)
-        .map(|value| normalize_level(&value))
-        .unwrap_or(DEFAULT_LEVEL);
+    let level = take_level(&mut object);
     let trace_id = take_hex_id(&mut object, "trace_id", 32);
     let span_id = take_hex_id(&mut object, "span_id", 16);
     LogEvent::new(dt, level, message, object, trace_id, span_id)
 }
 
 /// Removes and returns the value of the first of `keys` present.
-fn take_first(object: &mut Map<String, Value>, keys: &[&str]) -> Option<Value> {
-    let key = keys.iter().find(|key| object.contains_key(**key))?;
-    object.remove(*key)
+fn take_first(object: &mut Map<String, Value>, keys: &[&'static str]) -> Option<Value> {
+    take_first_entry(object, keys).map(|(_, value)| value)
+}
+
+/// [`take_first`] that also says which key it was.
+fn take_first_entry(
+    object: &mut Map<String, Value>,
+    keys: &[&'static str],
+) -> Option<(&'static str, Value)> {
+    let key = *keys.iter().find(|key| object.contains_key(**key))?;
+    object.remove(key).map(|value| (key, value))
+}
+
+/// The level of the first of [`LEVEL_KEYS`] present. A value that is not a
+/// known level (see [`known_level`]) gives `info` and goes back into
+/// `fields` under its own key, so nothing the sender wrote is lost.
+fn take_level(object: &mut Map<String, Value>) -> &'static str {
+    let Some((key, value)) = take_first_entry(object, &LEVEL_KEYS) else {
+        return DEFAULT_LEVEL;
+    };
+    known_level(&value).unwrap_or_else(|| {
+        object.insert(key.to_string(), value);
+        DEFAULT_LEVEL
+    })
 }
 
 fn take_timestamp(
@@ -147,8 +171,30 @@ pub fn in_accepted_range(dt: DateTime<Utc>, received_at: DateTime<Utc>) -> bool 
     dt >= received_at - MAX_PAST && dt <= received_at + MAX_FUTURE
 }
 
+/// Forces `dt` into the window of [`in_accepted_range`] around `now` (the
+/// insert time), on the millisecond grid of the `dt` column. The bounds are
+/// rounded inward, so `in_accepted_range(result, now)` always holds.
+///
+/// The table's TTL goes through ClickHouse's `toDateTime`, which wraps around
+/// outside 1970 to 2106 (a `dt` in 1900 becomes 2036, one in 2200 becomes
+/// 2063), so a wild `dt` would keep a row decades beyond its retention.
+pub fn clamp_to_accepted_range(dt: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    let oldest = ceil_to_millis(now - MAX_PAST);
+    let newest = truncate_to_millis(now + MAX_FUTURE);
+    truncate_to_millis(dt).clamp(oldest, newest)
+}
+
 fn truncate_to_millis(dt: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(dt.timestamp_millis()).unwrap_or(dt)
+}
+
+fn ceil_to_millis(dt: DateTime<Utc>) -> DateTime<Utc> {
+    let floor = truncate_to_millis(dt);
+    if floor < dt {
+        floor + Duration::milliseconds(1)
+    } else {
+        floor
+    }
 }
 
 /// Strings as they are; `null` as empty; anything else as its JSON text.
@@ -163,18 +209,26 @@ fn message_text(value: Value) -> String {
 /// Level names (case-insensitive, common aliases) and numbers (syslog
 /// severities 0-7, pino/bunyan levels 10-60); anything else is `info`.
 pub fn normalize_level(value: &Value) -> &'static str {
+    known_level(value).unwrap_or(DEFAULT_LEVEL)
+}
+
+/// The stored level a level value stands for, or `None` when it is neither
+/// a level name nor a level number [`normalize_level`] knows. It tells an
+/// unknown level from `info`, for paths that keep what they cannot map.
+pub fn known_level(value: &Value) -> Option<&'static str> {
     match value {
-        Value::String(name) => level_from_name(name),
-        Value::Number(number) => number
-            .as_u64()
-            .map(level_from_number)
-            .unwrap_or(DEFAULT_LEVEL),
-        _ => DEFAULT_LEVEL,
+        Value::String(name) => parse_level_name(name),
+        Value::Number(number) => number.as_u64().and_then(parse_level_number),
+        _ => None,
     }
 }
 
 pub fn level_from_name(name: &str) -> &'static str {
-    match name.trim().to_ascii_lowercase().as_str() {
+    parse_level_name(name).unwrap_or(DEFAULT_LEVEL)
+}
+
+fn parse_level_name(name: &str) -> Option<&'static str> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
         "trace" | "trc" => "trace",
         "debug" | "dbg" => "debug",
         "info" | "information" | "informational" => "info",
@@ -185,13 +239,17 @@ pub fn level_from_name(name: &str) -> &'static str {
         "alert" => "alert",
         "emergency" | "emerg" => "emergency",
         "fatal" | "panic" => "fatal",
-        _ => DEFAULT_LEVEL,
-    }
+        _ => return None,
+    })
 }
 
 /// Syslog severities 0-7 (RFC 5424) and pino/bunyan levels 10-60.
 pub fn level_from_number(number: u64) -> &'static str {
-    match number {
+    parse_level_number(number).unwrap_or(DEFAULT_LEVEL)
+}
+
+fn parse_level_number(number: u64) -> Option<&'static str> {
+    Some(match number {
         0 => "emergency",
         1 => "alert",
         2 => "critical",
@@ -206,8 +264,8 @@ pub fn level_from_number(number: u64) -> &'static str {
         40 => "warn",
         50 => "error",
         60 => "fatal",
-        _ => DEFAULT_LEVEL,
-    }
+        _ => return None,
+    })
 }
 
 /// `len` hex characters, not all zeros (W3C trace context rules).
@@ -520,5 +578,130 @@ mod tests {
         let e = event(json!({ "big": "x".repeat(200 * 1024) }));
         assert_eq!(e.fields.len(), 1);
         assert!(!e.fields.contains_key(FIELDS_TRUNCATED_KEY));
+    }
+
+    #[test]
+    fn truncation_never_splits_a_multi_byte_character() {
+        // The cut point (64 KiB minus the marker) falls inside a character
+        // for each of these, which a plain byte cut would panic on.
+        for message in [
+            format!("a{}", "é".repeat(70_000)),
+            "€".repeat(30_000),
+            "😀".repeat(20_000),
+        ] {
+            let truncated = truncate_message(message.clone());
+            assert!(truncated.len() <= MAX_MESSAGE_BYTES, "{}", truncated.len());
+            let body = truncated
+                .strip_suffix(TRUNCATION_MARKER)
+                .expect("ends with the marker");
+            assert!(message.starts_with(body), "a prefix of the original");
+            let next = message[body.len()..].chars().next().unwrap();
+            assert!(
+                truncated.len() + next.len_utf8() > MAX_MESSAGE_BYTES,
+                "keeps as much as fits: the next character would still have fitted"
+            );
+        }
+    }
+
+    #[test]
+    fn a_level_the_mapping_does_not_know_stays_in_fields_as_sent() {
+        for (key, raw) in [
+            ("level", json!("verbose")),
+            ("severity", json!("SEV9")),
+            ("lvl", json!(35)),
+            ("level", json!(-1)),
+            ("level", json!(1.5)),
+            ("level", json!(true)),
+            ("level", json!(null)),
+            ("level", json!("")),
+            ("level", json!({ "n": 1 })),
+        ] {
+            let e = event(json!({ key: raw.clone() }));
+            assert_eq!(e.level, "info", "{raw}");
+            assert_eq!(e.fields.get(key), Some(&raw), "{key}: the raw value stays");
+        }
+        for (raw, level) in [
+            (json!("WARNING"), "warn"),
+            (json!(50), "error"),
+            (json!("info"), "info"),
+        ] {
+            let e = event(json!({ "level": raw.clone() }));
+            assert_eq!(e.level, level, "{raw}");
+            assert!(e.fields.is_empty(), "{raw}: a known level is consumed");
+        }
+        // Only the first level key counts: an unknown value there does not
+        // let the next key win, and both stay.
+        let e = event(json!({ "level": "verbose", "severity": "error" }));
+        assert_eq!(e.level, "info");
+        assert_eq!(
+            Value::Object(e.fields),
+            json!({ "level": "verbose", "severity": "error" })
+        );
+    }
+
+    #[test]
+    fn known_level_tells_an_unknown_level_from_info() {
+        assert_eq!(known_level(&json!("info")), Some("info"));
+        assert_eq!(known_level(&json!(" ERR ")), Some("error"));
+        assert_eq!(known_level(&json!(6)), Some("info"));
+        assert_eq!(known_level(&json!("verbose")), None);
+        assert_eq!(known_level(&json!(35)), None);
+        assert_eq!(known_level(&json!(null)), None);
+        assert_eq!(normalize_level(&json!("verbose")), "info");
+    }
+
+    fn at(text: &str) -> DateTime<Utc> {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn dt_is_clamped_into_the_accepted_window_at_millisecond_precision() {
+        let now = received();
+        let millisecond = Duration::milliseconds(1);
+        let oldest = now - MAX_PAST;
+        let newest = now + MAX_FUTURE;
+        for (dt, expected) in [
+            (at("1900-01-01T00:00:00Z"), oldest),
+            (at("2200-01-01T00:00:00Z"), newest),
+            (DateTime::<Utc>::MIN_UTC, oldest),
+            (DateTime::<Utc>::MAX_UTC, newest),
+            (oldest - millisecond, oldest),
+            (newest + millisecond, newest),
+            (oldest, oldest),
+            (newest, newest),
+            (now, now),
+            (
+                at("2026-10-13T11:59:58.250Z"),
+                at("2026-10-13T11:59:58.250Z"),
+            ),
+            (
+                at("2026-10-13T11:59:59.123456789Z"),
+                at("2026-10-13T11:59:59.123Z"),
+            ),
+        ] {
+            let clamped = clamp_to_accepted_range(dt, now);
+            assert_eq!(clamped, expected, "{dt}");
+            assert!(in_accepted_range(clamped, now), "{dt}");
+        }
+    }
+
+    #[test]
+    fn the_clamped_window_stays_inside_the_accepted_range_for_any_reference_time() {
+        // A reference time with sub-millisecond digits must not push the
+        // millisecond-grid bounds outside `in_accepted_range`.
+        for now in [
+            at("2026-10-13T12:00:00.000000001Z"),
+            at("2026-10-13T12:00:00.123456789Z"),
+            at("2026-10-13T12:00:00.999999999Z"),
+        ] {
+            for dt in [at("1900-01-01T00:00:00Z"), at("2200-01-01T00:00:00Z")] {
+                let clamped = clamp_to_accepted_range(dt, now);
+                assert!(
+                    in_accepted_range(clamped, now),
+                    "{dt} against {now}: {clamped}"
+                );
+                assert_eq!(clamped.timestamp_subsec_nanos() % 1_000_000, 0, "{clamped}");
+            }
+        }
     }
 }
