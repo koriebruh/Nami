@@ -17,6 +17,7 @@ async fn main() {
     let state = AppState { db: pool, mailer };
     let app = Router::new()
         .merge(routes::health::router())
+        .merge(routes::auth::router())
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port))
