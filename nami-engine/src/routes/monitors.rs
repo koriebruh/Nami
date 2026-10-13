@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    middleware::rbac::{CurrentUser, require_project_role},
+    middleware::rbac::{CurrentUser, require_project_reader, require_project_role},
     models::monitor::{self, CreateMonitorRequest, Monitor, PatchMonitorRequest},
     state::AppState,
     uptime::store::{self, MonitorStats, UptimeCheckRow},
@@ -31,7 +31,8 @@ const MIN_CHECKS_LIMIT: u32 = 1;
 const MAX_CHECKS_LIMIT: u32 = 500;
 
 // RBAC mirrors routes/projects.rs: viewer reads, member creates/edits,
-// admin deletes. `require_project_role` runs before any database or
+// admin deletes. Viewers read monitors with the secrets of their URL masked
+// (`Monitor::for_reader`). `require_project_role` runs before any database or
 // ClickHouse lookup, so a caller without access gets 403 whether or not the
 // monitor exists. Extractors run before the handler body, so a malformed path
 // or query string (`?limit=abc`) is a 400 even for such a caller; that
@@ -67,7 +68,7 @@ async fn list_monitors(
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<Vec<MonitorSummary>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    let reader = require_project_reader(&state.db, &user, project_id).await?;
     let monitors = monitor::list_for_project(&state.db, project_id).await?;
     // Uptime decorates this list; current status comes from Postgres. If
     // ClickHouse is down, erroring or too slow, still list every monitor,
@@ -89,7 +90,7 @@ async fn list_monitors(
             .map(|monitor| {
                 let uptime_24h = uptime.get(&monitor.id).copied();
                 MonitorSummary {
-                    monitor,
+                    monitor: monitor.for_reader(reader),
                     uptime_24h,
                 }
             })
@@ -130,11 +131,11 @@ async fn get_monitor(
     user: CurrentUser,
     Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Monitor>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    let reader = require_project_reader(&state.db, &user, project_id).await?;
     let found = monitor::find_in_project(&state.db, project_id, monitor_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(found))
+    Ok(Json(found.for_reader(reader)))
 }
 
 async fn patch_monitor(

@@ -1,6 +1,6 @@
+use crate::{error::AppError, models, state::AppState};
 use axum::{extract::FromRequestParts, http::request::Parts};
 use tower_sessions::Session;
-use crate::{state::AppState, error::AppError, models};
 
 pub struct CurrentUser {
     pub id: uuid::Uuid,
@@ -11,7 +11,10 @@ pub struct CurrentUser {
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = AppError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let session = Session::from_request_parts(parts, state)
             .await
             .map_err(|_| AppError::Unauthorized)?;
@@ -48,7 +51,11 @@ impl FromRequestParts<AppState> for CurrentUser {
             return Err(AppError::Unauthorized);
         }
 
-        Ok(CurrentUser { id: user.id, email: user.email, global_role: user.global_role })
+        Ok(CurrentUser {
+            id: user.id,
+            email: user.email,
+            global_role: user.global_role,
+        })
     }
 }
 
@@ -103,6 +110,34 @@ pub async fn require_project_role(
             _ => Err(crate::error::AppError::Forbidden),
         },
         None => Err(crate::error::AppError::Forbidden),
+    }
+}
+
+/// What a caller who may read a project may see of its secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectReader {
+    /// A member of the project or above (a global admin counts): sees
+    /// everything, ping tokens and monitor URLs included.
+    Member,
+    /// A viewer: reads, without the secrets (no ping tokens, monitor URLs with
+    /// their credentials and query values masked).
+    Viewer,
+}
+
+/// Checks that the caller may read `project_id` (viewer or above; 403
+/// otherwise) and says which kind of reader they are.
+pub async fn require_project_reader(
+    pool: &sqlx::PgPool,
+    user: &CurrentUser,
+    project_id: uuid::Uuid,
+) -> Result<ProjectReader, AppError> {
+    match require_project_role(pool, user, project_id, "member").await {
+        Ok(()) => Ok(ProjectReader::Member),
+        Err(AppError::Forbidden) => {
+            require_project_role(pool, user, project_id, "viewer").await?;
+            Ok(ProjectReader::Viewer)
+        }
+        Err(e) => Err(e),
     }
 }
 

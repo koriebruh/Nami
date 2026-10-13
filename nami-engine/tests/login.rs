@@ -1,26 +1,29 @@
-use axum::{body::Body, http::{Request, StatusCode, header}};
-use tower::ServiceExt;
+use axum::{
+    body::Body,
+    http::{Request, StatusCode, header},
+};
 use nami_engine::state::AppState;
 use serde_json::json;
+use tower::ServiceExt;
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState::for_test(pool);
-    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state))
-        .layer(nami_engine::router::configure_session_layer(
-            tower_sessions::MemoryStore::default(),
-            false,
-        ))
+    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state)).layer(
+        nami_engine::router::configure_session_layer(tower_sessions::MemoryStore::default(), false),
+    )
 }
 
 #[sqlx::test]
 async fn login_then_me_succeeds(pool: sqlx::PgPool) {
     let password_hash = nami_engine::auth::password::hash_password("password123").unwrap();
-    sqlx::query("insert into users (email, password_hash, email_verified_at) values ($1, $2, now())")
-        .bind("user@example.com")
-        .bind(&password_hash)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "insert into users (email, password_hash, email_verified_at) values ($1, $2, now())",
+    )
+    .bind("user@example.com")
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let app = test_app(pool.clone());
     let login_res = app
@@ -30,7 +33,9 @@ async fn login_then_me_succeeds(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/login")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"email": "user@example.com", "password": "password123"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "user@example.com", "password": "password123"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -54,11 +59,13 @@ async fn login_then_me_succeeds(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn login_rejects_oauth_only_account(pool: sqlx::PgPool) {
-    sqlx::query("insert into users (email, password_hash, email_verified_at) values ($1, null, now())")
-        .bind("oauth-only@example.com")
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "insert into users (email, password_hash, email_verified_at) values ($1, null, now())",
+    )
+    .bind("oauth-only@example.com")
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let app = test_app(pool.clone());
     let response = app
@@ -67,7 +74,9 @@ async fn login_rejects_oauth_only_account(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/login")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"email": "oauth-only@example.com", "password": "anything"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "oauth-only@example.com", "password": "anything"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -85,12 +94,14 @@ async fn login_rejects_oauth_only_account(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn login_rejects_unverified_email(pool: sqlx::PgPool) {
     let password_hash = nami_engine::auth::password::hash_password("password123").unwrap();
-    sqlx::query("insert into users (email, password_hash, email_verified_at) values ($1, $2, null)")
-        .bind("unverified@example.com")
-        .bind(&password_hash)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "insert into users (email, password_hash, email_verified_at) values ($1, $2, null)",
+    )
+    .bind("unverified@example.com")
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let app = test_app(pool.clone());
     let response = app
@@ -100,7 +111,10 @@ async fn login_rejects_unverified_email(pool: sqlx::PgPool) {
                 .uri("/auth/login")
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", "10.0.0.1")
-                .body(Body::from(json!({"email": "unverified@example.com", "password": "password123"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "unverified@example.com", "password": "password123"})
+                        .to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -110,7 +124,9 @@ async fn login_rejects_unverified_email(pool: sqlx::PgPool) {
     // password here IS correct, so a flat 401 would be misleading/unactionable.
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["error"], "please verify your email before logging in");
 }
@@ -139,7 +155,9 @@ async fn login_succeeds_after_email_is_verified(pool: sqlx::PgPool) {
                 .uri("/auth/login")
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", "10.0.0.2")
-                .body(Body::from(json!({"email": "verifyme@example.com", "password": "password123"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "verifyme@example.com", "password": "password123"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -159,7 +177,9 @@ async fn login_succeeds_after_email_is_verified(pool: sqlx::PgPool) {
                 .uri("/auth/login")
                 .header("content-type", "application/json")
                 .header("x-forwarded-for", "10.0.0.2")
-                .body(Body::from(json!({"email": "verifyme@example.com", "password": "password123"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "verifyme@example.com", "password": "password123"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -170,12 +190,14 @@ async fn login_succeeds_after_email_is_verified(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn logout_invalidates_the_cookie(pool: sqlx::PgPool) {
     let password_hash = nami_engine::auth::password::hash_password("password123").unwrap();
-    sqlx::query("insert into users (email, password_hash, email_verified_at) values ($1, $2, now())")
-        .bind("logout@example.com")
-        .bind(&password_hash)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "insert into users (email, password_hash, email_verified_at) values ($1, $2, now())",
+    )
+    .bind("logout@example.com")
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let app = test_app(pool.clone());
     let login_res = app
@@ -185,7 +207,9 @@ async fn logout_invalidates_the_cookie(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/login")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"email": "logout@example.com", "password": "password123"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "logout@example.com", "password": "password123"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -201,7 +225,9 @@ async fn logout_invalidates_the_cookie(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/logout")
                 .header(header::COOKIE, cookie.clone())
-                .body(Body::empty())
+                // Body-less actions send `{}`: the API takes no other body.
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
                 .unwrap(),
         )
         .await

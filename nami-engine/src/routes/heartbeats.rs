@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    middleware::rbac::{CurrentUser, require_project_role},
+    middleware::rbac::{CurrentUser, ProjectReader, require_project_reader, require_project_role},
     models::heartbeat::{self, CreateHeartbeatRequest, HeartbeatView, PatchHeartbeatRequest},
     state::AppState,
     uptime::{
@@ -86,14 +86,8 @@ async fn read_access(
     user: &CurrentUser,
     project_id: Uuid,
 ) -> Result<bool, AppError> {
-    match require_project_role(&state.db, user, project_id, "member").await {
-        Ok(()) => Ok(true),
-        Err(AppError::Forbidden) => {
-            require_project_role(&state.db, user, project_id, "viewer").await?;
-            Ok(false)
-        }
-        Err(e) => Err(e),
-    }
+    let reader = require_project_reader(&state.db, user, project_id).await?;
+    Ok(reader == ProjectReader::Member)
 }
 
 async fn list_heartbeats(

@@ -1410,7 +1410,7 @@ async fn rotating_the_token_replaces_it_at_once(pool: sqlx::PgPool) {
     );
     let (_, before) = call(&app, "GET", &item, Some(&member), None).await;
 
-    let (status, rotated) = call(&app, "POST", &rotate, Some(&member), None).await;
+    let (status, rotated) = call(&app, "POST", &rotate, Some(&member), Some(json!({}))).await;
 
     assert_eq!(status, StatusCode::OK, "{rotated}");
     let second = rotated["token"].as_str().unwrap().to_string();
@@ -1460,7 +1460,7 @@ async fn rotating_the_token_replaces_it_at_once(pool: sqlx::PgPool) {
         Value::Null
     );
 
-    let (_, again) = call(&app, "POST", &rotate, Some(&member), None).await;
+    let (_, again) = call(&app, "POST", &rotate, Some(&member), Some(json!({}))).await;
     let third = again["token"].as_str().unwrap();
     assert!(third != second && third != first);
     assert_eq!(
@@ -1506,20 +1506,24 @@ async fn only_members_rotate_and_only_within_their_project(pool: sqlx::PgPool) {
     };
 
     assert_eq!(
-        call(&app, "POST", &rotate, Some(&viewer), None).await.0,
+        call(&app, "POST", &rotate, Some(&viewer), Some(json!({})))
+            .await
+            .0,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        call(&app, "POST", &rotate, Some(&outsider), None).await.0,
+        call(&app, "POST", &rotate, Some(&outsider), Some(json!({})))
+            .await
+            .0,
         StatusCode::FORBIDDEN
     );
     assert_eq!(
-        call(&app, "POST", &rotate, None, None).await.0,
+        call(&app, "POST", &rotate, None, Some(json!({}))).await.0,
         StatusCode::UNAUTHORIZED
     );
     let foreign_uri = format!("/projects/{project}/heartbeats/{foreign}/rotate-token");
     assert_eq!(
-        call(&app, "POST", &foreign_uri, Some(&member), None)
+        call(&app, "POST", &foreign_uri, Some(&member), Some(json!({})))
             .await
             .0,
         StatusCode::NOT_FOUND
@@ -1529,7 +1533,9 @@ async fn only_members_rotate_and_only_within_their_project(pool: sqlx::PgPool) {
         Uuid::new_v4()
     );
     assert_eq!(
-        call(&app, "POST", &unknown, Some(&member), None).await.0,
+        call(&app, "POST", &unknown, Some(&member), Some(json!({})))
+            .await
+            .0,
         StatusCode::NOT_FOUND
     );
     assert_eq!(
@@ -1544,11 +1550,13 @@ async fn only_members_rotate_and_only_within_their_project(pool: sqlx::PgPool) {
     );
 
     assert_eq!(
-        call(&app, "POST", &rotate, Some(&member), None).await.0,
+        call(&app, "POST", &rotate, Some(&member), Some(json!({})))
+            .await
+            .0,
         StatusCode::OK
     );
     assert_ne!(token_of(id).await, token);
-    let (status, body) = call(&app, "POST", &rotate, Some(&root), None).await;
+    let (status, body) = call(&app, "POST", &rotate, Some(&root), Some(json!({}))).await;
     assert_eq!(
         status,
         StatusCode::OK,
@@ -2241,8 +2249,10 @@ async fn pings_are_served_on_the_public_listener_only(pool: sqlx::PgPool) {
     let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
     let ping = format!("/api/v1/heartbeat/{token}");
 
-    for method in ["GET", "POST"] {
-        let (status, _) = call(&app, method, &ping, None, None).await;
+    // The POST carries JSON: the API refuses anything else with 415 before
+    // routing, which would hide whether the route exists.
+    for (method, body) in [("GET", None), ("POST", Some(json!({})))] {
+        let (status, _) = call(&app, method, &ping, None, body).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} on the API");
     }
     assert_eq!(

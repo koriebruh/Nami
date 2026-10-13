@@ -1,7 +1,10 @@
-use axum::{body::Body, http::{Request, StatusCode, header}};
-use tower::ServiceExt;
-use nami_engine::{state::AppState, email::Mailer};
+use axum::{
+    body::Body,
+    http::{Request, StatusCode, header},
+};
+use nami_engine::{email::Mailer, state::AppState};
 use serde_json::json;
+use tower::ServiceExt;
 
 async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::HeaderValue {
     let res = app
@@ -11,7 +14,9 @@ async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::H
                 .method("POST")
                 .uri("/auth/login")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"email": email, "password": password}).to_string()))
+                .body(Body::from(
+                    json!({"email": email, "password": password}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -22,11 +27,9 @@ async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::H
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState::for_test(pool);
-    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state))
-        .layer(nami_engine::router::configure_session_layer(
-            tower_sessions::MemoryStore::default(),
-            false,
-        ))
+    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state)).layer(
+        nami_engine::router::configure_session_layer(tower_sessions::MemoryStore::default(), false),
+    )
 }
 
 #[sqlx::test]
@@ -58,7 +61,9 @@ async fn expired_reset_token_is_rejected(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/password/reset")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"token": raw_token, "new_password": "newpass123"}).to_string()))
+                .body(Body::from(
+                    json!({"token": raw_token, "new_password": "newpass123"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -69,12 +74,14 @@ async fn expired_reset_token_is_rejected(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn reset_invalidates_existing_session(pool: sqlx::PgPool) {
     let password_hash = nami_engine::auth::password::hash_password("password123").unwrap();
-    sqlx::query("insert into users (email, password_hash, email_verified_at) values ($1, $2, now())")
-        .bind("reset2@example.com")
-        .bind(&password_hash)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "insert into users (email, password_hash, email_verified_at) values ($1, $2, now())",
+    )
+    .bind("reset2@example.com")
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let app = test_app(pool.clone());
     let login_res = app
@@ -84,7 +91,9 @@ async fn reset_invalidates_existing_session(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/login")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"email": "reset2@example.com", "password": "password123"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "reset2@example.com", "password": "password123"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -112,7 +121,9 @@ async fn reset_invalidates_existing_session(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/password/reset")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"token": raw_token, "new_password": "brandnewpass"}).to_string()))
+                .body(Body::from(
+                    json!({"token": raw_token, "new_password": "brandnewpass"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -179,40 +190,63 @@ async fn reset_token_cannot_be_reused(pool: sqlx::PgPool) {
             .method("POST")
             .uri("/auth/password/reset")
             .header("content-type", "application/json")
-            .body(Body::from(json!({"token": raw_token, "new_password": password}).to_string()))
+            .body(Body::from(
+                json!({"token": raw_token, "new_password": password}).to_string(),
+            ))
             .unwrap()
     };
 
-    let first = app.clone().oneshot(make_request("firstnewpass")).await.unwrap();
+    let first = app
+        .clone()
+        .oneshot(make_request("firstnewpass"))
+        .await
+        .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
 
-    let second = app.clone().oneshot(make_request("secondnewpass")).await.unwrap();
+    let second = app
+        .clone()
+        .oneshot(make_request("secondnewpass"))
+        .await
+        .unwrap();
     assert_eq!(second.status(), StatusCode::BAD_REQUEST);
 
     // The password actually set must match the FIRST reset, not the second.
-    let login_with_first = app.clone().oneshot(
-        Request::builder()
-            .method("POST")
-            .uri("/auth/login")
-            .header("content-type", "application/json")
-            .body(Body::from(json!({"email": "reuse@example.com", "password": "firstnewpass"}).to_string()))
-            .unwrap(),
-    ).await.unwrap();
+    let login_with_first = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"email": "reuse@example.com", "password": "firstnewpass"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(login_with_first.status(), StatusCode::OK);
 
-    let login_with_second = app.oneshot(
-        Request::builder()
-            .method("POST")
-            .uri("/auth/login")
-            .header("content-type", "application/json")
-            .body(Body::from(json!({"email": "reuse@example.com", "password": "secondnewpass"}).to_string()))
-            .unwrap(),
-    ).await.unwrap();
+    let login_with_second = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"email": "reuse@example.com", "password": "secondnewpass"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(login_with_second.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[sqlx::test]
-async fn forgot_password_for_existing_user_returns_generic_message_and_creates_token(pool: sqlx::PgPool) {
+async fn forgot_password_for_existing_user_returns_generic_message_and_creates_token(
+    pool: sqlx::PgPool,
+) {
     let password_hash = nami_engine::auth::password::hash_password("password123").unwrap();
     let user_id: (uuid::Uuid,) = sqlx::query_as(
         "insert into users (email, password_hash, email_verified_at) values ($1, $2, now()) returning id",
@@ -230,24 +264,30 @@ async fn forgot_password_for_existing_user_returns_generic_message_and_creates_t
                 .method("POST")
                 .uri("/auth/password/forgot")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"email": "forgot@example.com"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "forgot@example.com"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["message"], "if this email exists, a reset link was sent");
+    assert_eq!(
+        json["message"],
+        "if this email exists, a reset link was sent"
+    );
 
-    let count: (i64,) = sqlx::query_as(
-        "select count(*) from password_reset_tokens where user_id = $1",
-    )
-    .bind(user_id.0)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let count: (i64,) =
+        sqlx::query_as("select count(*) from password_reset_tokens where user_id = $1")
+            .bind(user_id.0)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(count.0, 1);
 }
 
@@ -260,16 +300,23 @@ async fn forgot_password_for_unknown_user_returns_same_generic_message(pool: sql
                 .method("POST")
                 .uri("/auth/password/forgot")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"email": "doesnotexist@example.com"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "doesnotexist@example.com"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(json["message"], "if this email exists, a reset link was sent");
+    assert_eq!(
+        json["message"],
+        "if this email exists, a reset link was sent"
+    );
 }
 
 /// Regression guard for Fix B: `current_user_id` (used by `totp_setup`/
@@ -279,12 +326,14 @@ async fn forgot_password_for_unknown_user_returns_same_generic_message(pool: sql
 #[sqlx::test]
 async fn totp_setup_rejects_stale_session_after_reset(pool: sqlx::PgPool) {
     let password_hash = nami_engine::auth::password::hash_password("password123").unwrap();
-    sqlx::query("insert into users (email, password_hash, email_verified_at) values ($1, $2, now())")
-        .bind("totpstale@example.com")
-        .bind(&password_hash)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "insert into users (email, password_hash, email_verified_at) values ($1, $2, now())",
+    )
+    .bind("totpstale@example.com")
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let app = test_app(pool.clone());
     let cookie = login(&app, "totpstale@example.com", "password123").await;
@@ -310,7 +359,9 @@ async fn totp_setup_rejects_stale_session_after_reset(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/password/reset")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"token": raw_token, "new_password": "brandnewpass2"}).to_string()))
+                .body(Body::from(
+                    json!({"token": raw_token, "new_password": "brandnewpass2"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -322,7 +373,9 @@ async fn totp_setup_rejects_stale_session_after_reset(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/totp/setup")
                 .header(header::COOKIE, cookie)
-                .body(Body::empty())
+                // Body-less actions send `{}`: the API takes no other body.
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
                 .unwrap(),
         )
         .await
@@ -338,16 +391,22 @@ async fn totp_setup_rejects_stale_session_after_reset(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn forgot_password_returns_generic_200_even_if_mail_send_fails(pool: sqlx::PgPool) {
     let password_hash = nami_engine::auth::password::hash_password("password123").unwrap();
-    sqlx::query("insert into users (email, password_hash, email_verified_at) values ($1, $2, now())")
-        .bind("mailfail@example.com")
-        .bind(&password_hash)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "insert into users (email, password_hash, email_verified_at) values ($1, $2, now())",
+    )
+    .bind("mailfail@example.com")
+    .bind(&password_hash)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // Port 1 is a reserved/unreachable TCP port, so the SMTP send will fail.
-    let state = AppState { mailer: Mailer::new("localhost", 1), ..AppState::for_test(pool) };
-    let app = nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state));
+    let state = AppState {
+        mailer: Mailer::new("localhost", 1),
+        ..AppState::for_test(pool)
+    };
+    let app =
+        nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state));
 
     let response = app
         .oneshot(
@@ -355,7 +414,9 @@ async fn forgot_password_returns_generic_200_even_if_mail_send_fails(pool: sqlx:
                 .method("POST")
                 .uri("/auth/password/forgot")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"email": "mailfail@example.com"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "mailfail@example.com"}).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -367,8 +428,12 @@ async fn forgot_password_returns_generic_200_even_if_mail_send_fails(pool: sqlx:
 /// instance of the same bug pattern.
 #[sqlx::test]
 async fn register_returns_generic_200_even_if_mail_send_fails(pool: sqlx::PgPool) {
-    let state = AppState { mailer: Mailer::new("localhost", 1), ..AppState::for_test(pool) };
-    let app = nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state));
+    let state = AppState {
+        mailer: Mailer::new("localhost", 1),
+        ..AppState::for_test(pool)
+    };
+    let app =
+        nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state));
 
     let response = app
         .oneshot(
@@ -376,7 +441,10 @@ async fn register_returns_generic_200_even_if_mail_send_fails(pool: sqlx::PgPool
                 .method("POST")
                 .uri("/auth/register")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({"email": "regmailfail@example.com", "password": "password123"}).to_string()))
+                .body(Body::from(
+                    json!({"email": "regmailfail@example.com", "password": "password123"})
+                        .to_string(),
+                ))
                 .unwrap(),
         )
         .await

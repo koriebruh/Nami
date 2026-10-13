@@ -30,23 +30,38 @@ pub fn validate_name(raw: &str) -> Result<String, String> {
     Ok(name.to_string())
 }
 
-/// Format and separator characters that change how text renders, or hide in
-/// it, without being visible themselves: the soft hyphen, the Arabic letter
-/// mark, the Mongolian vowel separator, zero-width spaces and joiners,
-/// direction marks, line and paragraph separators, bidirectional embeddings,
-/// overrides and isolates, the word joiner and invisible operators, and the
-/// byte order mark.
-fn is_invisible_or_bidi_char(c: char) -> bool {
+/// Format, separator and blank characters that change how text renders, or
+/// hide in it, without being visible themselves: the soft hyphen, the
+/// combining grapheme joiner, the Arabic letter mark, the Hangul fillers
+/// (U+115F, U+1160, U+3164, U+FFA0), the Mongolian vowel separator, the
+/// zero-width space, direction marks, line and paragraph separators,
+/// bidirectional embeddings, overrides and isolates, the word joiner and
+/// invisible operators, the deprecated format characters U+206A..=U+206F, the
+/// blank Braille pattern and the byte order mark.
+///
+/// The zero-width non-joiner and joiner (U+200C, U+200D) are not among them:
+/// Persian and Indic scripts and emoji sequences need them. Names, monitor
+/// URLs and tcp hosts are checked against this set; keywords are not, since
+/// they are matched against page text, which can hold anything.
+pub(crate) fn is_invisible_or_bidi_char(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
+            | '\u{034F}'
             | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
             | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
             | '\u{2028}'..='\u{202E}'
             | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{2800}'
+            | '\u{3164}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
     )
 }
 
@@ -56,17 +71,15 @@ mod tests {
 
     const INVISIBLE: &str = "name must not contain invisible or text-direction characters";
 
-    /// Every character `validate_name` must reject: U+00AD, U+061C, U+180E,
-    /// U+200B..=U+200F, U+2028..=U+202E, U+2060..=U+2064, U+2066..=U+2069
-    /// and U+FEFF.
+    /// Every character `validate_name` must reject: U+00AD, U+034F, U+061C,
+    /// U+115F, U+1160, U+180E, U+200B, U+200E, U+200F, U+2028..=U+202E,
+    /// U+2060..=U+2064, U+2066..=U+206F, U+2800, U+3164, U+FEFF and U+FFA0.
     fn invisible_or_bidi_chars() -> Vec<char> {
-        let mut chars = vec!['\u{00AD}', '\u{061C}', '\u{180E}', '\u{FEFF}'];
-        for range in [
-            0x200B..=0x200F,
-            0x2028..=0x202E,
-            0x2060..=0x2064,
-            0x2066..=0x2069,
-        ] {
+        let mut chars = vec![
+            '\u{00AD}', '\u{034F}', '\u{061C}', '\u{115F}', '\u{1160}', '\u{180E}', '\u{200B}',
+            '\u{200E}', '\u{200F}', '\u{2800}', '\u{3164}', '\u{FEFF}', '\u{FFA0}',
+        ];
+        for range in [0x2028..=0x202E, 0x2060..=0x2064, 0x2066..=0x206F] {
             chars.extend(range.map(|code| char::from_u32(code).unwrap()));
         }
         chars
@@ -118,7 +131,7 @@ mod tests {
     #[test]
     fn rejects_invisible_and_text_direction_characters_anywhere_in_the_input() {
         let chars = invisible_or_bidi_chars();
-        assert_eq!(chars.len(), 25, "the rejected set is 25 code points");
+        assert_eq!(chars.len(), 35, "the rejected set is 35 code points");
         for c in chars {
             // Also at the edges and alone: U+2028 / U+2029 are whitespace,
             // so a trim-first check would let them through there.
@@ -143,14 +156,40 @@ mod tests {
         // Ordinary visible or space characters right below and above the
         // rejected ones, so a range that drifts wider is caught.
         for c in [
-            '\u{00AC}', '\u{00AE}', '\u{061B}', '\u{061D}', '\u{180D}', '\u{180F}', '\u{200A}',
-            '\u{2010}', '\u{2027}', '\u{202F}', '\u{205F}', '\u{FEFE}',
+            '\u{00AC}', '\u{00AE}', '\u{034E}', '\u{0350}', '\u{061B}', '\u{061D}', '\u{115E}',
+            '\u{1161}', '\u{180D}', '\u{180F}', '\u{200A}', '\u{2010}', '\u{2027}', '\u{202F}',
+            '\u{205F}', '\u{2065}', '\u{2070}', '\u{27FF}', '\u{2801}', '\u{3163}', '\u{3165}',
+            '\u{FEFE}', '\u{FF00}', '\u{FF9F}', '\u{FFA1}',
         ] {
             assert!(
                 validate_name(&format!("a{c}b")).is_ok(),
                 "U+{:04X}",
                 c as u32
             );
+        }
+    }
+
+    /// The zero-width non-joiner and joiner shape real text: Persian and
+    /// Indic words, and emoji sequences such as a technologist.
+    #[test]
+    fn accepts_the_zero_width_non_joiner_and_joiner() {
+        for raw in [
+            "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}",
+            "\u{915}\u{94d}\u{200d}\u{937}",
+            "\u{1f469}\u{200d}\u{1f4bb} on call",
+            "a\u{200c}b\u{200d}c",
+        ] {
+            assert_eq!(validate_name(raw).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn the_same_characters_are_refused_in_urls_and_hosts() {
+        for c in invisible_or_bidi_chars() {
+            assert!(super::is_invisible_or_bidi_char(c), "U+{:04X}", c as u32);
+        }
+        for c in ['\u{200C}', '\u{200D}', 'a', '/', '\u{e9}'] {
+            assert!(!super::is_invisible_or_bidi_char(c), "U+{:04X}", c as u32);
         }
     }
 

@@ -8,11 +8,13 @@
 //! router inline; test files' `test_app()`/`build_app()` helpers do too.
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{ConnectInfo, Request},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
 };
+use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use time::Duration as TimeDuration;
@@ -59,6 +61,9 @@ fn rate_limited_with_governor(router: Router<AppState>) -> Router<AppState> {
 /// nami-ui sends in `X-Forwarded-For`, which anyone reaching this port could
 /// forge. What outside clients must reach goes on the public listener instead
 /// ([`build_public_router`]).
+///
+/// Every state-changing request must carry a JSON body (see
+/// [`require_json_body`]).
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(routes::health::router())
@@ -71,7 +76,49 @@ pub fn build_router(state: AppState) -> Router {
         .merge(routes::monitors::router())
         .merge(routes::incidents::router())
         .merge(routes::heartbeats::router())
+        .layer(middleware::from_fn(require_json_body))
         .with_state(state)
+}
+
+/// Refuses a state-changing request (POST, PUT, PATCH) whose body is not
+/// declared as JSON with `415`, before any handler, session check or rate
+/// limiter sees it. Browsers send forms across sites without asking first
+/// (`application/x-www-form-urlencoded`, `multipart/form-data`, `text/plain`),
+/// so this keeps a form on another site from ever driving the API with a
+/// visitor's session, also for actions that take no body: those send `{}`.
+/// Reads and DELETE are left alone: they carry no body, and no browser sends
+/// a cross-site DELETE without asking first.
+async fn require_json_body(request: Request, next: Next) -> Response {
+    let changes_state = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::PATCH
+    );
+    if changes_state && !declares_json(request.headers()) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(json!({ "error": "send a JSON body (Content-Type: application/json)" })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+/// Whether `Content-Type` is JSON, the way axum's `Json` extractor judges it:
+/// `application/json` or `application/<anything>+json`, parameters (such as
+/// `charset`) and case ignored.
+fn declares_json(headers: &HeaderMap) -> bool {
+    let Some(content_type) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    let Some((kind, subtype)) = essence.split_once('/') else {
+        return false;
+    };
+    let subtype = subtype.to_ascii_lowercase();
+    kind.eq_ignore_ascii_case("application") && (subtype == "json" || subtype.ends_with("+json"))
 }
 
 /// The public listener's router (`PUBLIC_PORT`): only what clients outside
