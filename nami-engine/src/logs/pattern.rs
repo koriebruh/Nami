@@ -4,7 +4,8 @@
 //! - ISO-8601 timestamps (a date and a time, `T` or a space between them,
 //!   optional fraction and offset) -> `<ts>`;
 //! - UUIDs -> `<uuid>`;
-//! - IPv6 addresses (not identifier paths such as `a::b2`) and IPv4
+//! - IPv6 addresses (not identifier paths such as `a::b2`; an address may
+//!   end in `::`, and a `/64` prefix length after it is a `<num>`) and IPv4
 //!   addresses -> `<ip>`;
 //! - `0x…` and standalone hex runs of at least 8 characters with a digit and
 //!   a letter -> `<hex>`;
@@ -161,15 +162,24 @@ fn closing_quote(chars: &[char], open: usize) -> Option<usize> {
     None
 }
 
-/// `<ip>` when the run (minus trailing `.`/`:` punctuation) is an IPv6
-/// address (see [`looks_like_ipv6`]).
+/// `<ip>` when the run is an IPv6 address (see [`looks_like_ipv6`]) once
+/// trailing punctuation is taken off. A trailing `::` belongs to the address
+/// (`2001:db8::`, the `fe80::` of `fe80::/10`) but the `:` of
+/// `2001:db8::1: refused` and the `.` of `::1.` do not, so the run is tried
+/// without its trailing dots first (an address never ends in a dot, but may
+/// end in `::`), then without any trailing dots and colons. Two tries at
+/// most, so the scan stays linear.
 fn replace_ipv6(run: &str) -> String {
-    let core = run.trim_end_matches(['.', ':']);
-    if looks_like_ipv6(core) {
-        format!("<ip>{}", &run[core.len()..])
-    } else {
-        run.to_string()
+    if !run.contains(':') {
+        return run.to_string();
     }
+    let candidates = [run.trim_end_matches('.'), run.trim_end_matches(['.', ':'])];
+    for core in candidates {
+        if looks_like_ipv6(core) {
+            return format!("<ip>{}", &run[core.len()..]);
+        }
+    }
+    run.to_string()
 }
 
 /// An IPv6 address, as opposed to an identifier path that merely parses as
@@ -372,6 +382,29 @@ mod tests {
                 message,
                 "{token} is a code path, not an address"
             );
+        }
+    }
+
+    #[test]
+    fn ipv6_addresses_ending_in_a_double_colon_and_prefixes_are_whole_ips() {
+        for (message, expected) in [
+            ("net 2001:db8::", "net <ip>"),
+            ("net 2001:db8:: is down", "net <ip> is down"),
+            ("route fe80::/10", "route <ip>/<num>"),
+            (
+                "route 2001:db8::/32 via fe80::1",
+                "route <ip>/<num> via <ip>",
+            ),
+            ("see 2001:db8::.", "see <ip>."),
+            ("peer 2001:db8::1: refused", "peer <ip>: refused"),
+            ("ping ::1.", "ping <ip>."),
+        ] {
+            assert_eq!(normalize_message(message), expected, "{message}");
+        }
+        // A trailing `::` on a scoped identifier is still not an address.
+        for token in ["a::", "dead::", "std::", "Foo::", "cafe::"] {
+            let message = format!("call {token} failed");
+            assert_eq!(normalize_message(&message), message, "{token}");
         }
     }
 

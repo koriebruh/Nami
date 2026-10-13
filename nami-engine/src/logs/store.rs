@@ -66,13 +66,20 @@ impl LogRow {
 
 /// A fresh row id that sorts in creation order under ClickHouse.
 ///
-/// ClickHouse compares `UUID` values by their second 8 bytes first. In a
-/// UUIDv7 those are random bits (the timestamp and the counter that orders
-/// ids within a millisecond sit in the first 8), so ids would break ties in
-/// `ORDER BY (project_id, dt, id)` at random. Swapping the two 64-bit halves
-/// puts the timestamp and counter where ClickHouse compares first. Row ids
-/// are opaque: nothing reads one back as a UUIDv7, they only have to be
-/// unique and ordered.
+/// ClickHouse compares `UUID` values by their second 8 bytes first. A UUIDv7
+/// keeps its 48-bit timestamp and the version in the first 8 bytes, and the
+/// 42-bit counter that orders ids within a millisecond straddles both
+/// halves: its high 12 bits end the first 8 bytes, its other 30 bits follow
+/// the variant bits in the second 8, which end in random bits (the uuid
+/// crate reseeds the counter at random every millisecond). Compared second
+/// half first, ids would sort by those low counter bits and the random bits
+/// before the timestamp, so across milliseconds in random order, and break
+/// ties in `ORDER BY (project_id, dt, id)`. Swapping the two 64-bit halves
+/// puts the timestamp, the version and the high counter bits where
+/// ClickHouse compares first and the low counter bits where it compares
+/// second, so its comparison equals the generation order. Row ids are
+/// opaque: nothing reads one back as a UUIDv7, they only have to be unique
+/// and ordered.
 pub fn new_row_id() -> Uuid {
     let (high, low) = Uuid::now_v7().as_u64_pair();
     Uuid::from_u64_pair(low, high)
@@ -88,23 +95,45 @@ pub fn build_row(event: LogEvent, source: &IngestSource) -> LogRow {
 /// days a source may have) and a `dt` inside the window around `now`
 /// ([`normalize::clamp_to_accepted_range`]).
 ///
-/// Events are plain data and later pipeline stages may rewrite them, so the
-/// size caps of [`LogEvent::new`] and the `dt` window are enforced again
-/// here: whatever path built the event, a stored row respects them.
+/// Events are plain data (public fields) and later pipeline stages may
+/// rewrite them, so everything [`LogEvent::new`] and `from_json` guarantee is
+/// enforced again here, and whatever path built the event, a stored row
+/// respects it:
+/// - the message and `fields` size caps, and the `dt` window;
+/// - `level` is one of the known levels: it goes through
+///   [`normalize::level_from_name`] (letter case and aliases are fine) and is
+///   `info` when it names none;
+/// - `trace_id` is 32 and `span_id` 16 hex characters, lowercase, or empty
+///   ([`normalize::checked_id`]): anything else is not stored as an id but
+///   put into `fields` under its own name (a field of that name already
+///   there stays), where the fields cap applies to it.
 pub fn build_row_at(event: LogEvent, source: &IngestSource, now: DateTime<Utc>) -> LogRow {
     let message = normalize::truncate_message(event.message);
-    let fields = normalize::cap_fields(event.fields);
+    let mut fields = event.fields;
+    let trace_id = normalize::checked_id(
+        event.trace_id,
+        normalize::TRACE_ID_LEN,
+        "trace_id",
+        &mut fields,
+    );
+    let span_id = normalize::checked_id(
+        event.span_id,
+        normalize::SPAN_ID_LEN,
+        "span_id",
+        &mut fields,
+    );
+    let fields = normalize::cap_fields(fields);
     let pattern = pattern::normalize_message(&message);
     LogRow {
         id: new_row_id(),
         project_id: source.project_id,
         source_id: source.id,
         dt: normalize::clamp_to_accepted_range(event.dt, now),
-        level: event.level,
+        level: normalize::level_from_name(&event.level).to_string(),
         fields: serde_json::Value::Object(fields).to_string(),
         message,
-        trace_id: event.trace_id,
-        span_id: event.span_id,
+        trace_id,
+        span_id,
         pattern,
         // Within 1..=365, so the cast cannot truncate.
         retention_days: source
@@ -244,5 +273,105 @@ mod tests {
             let row = build_row_at(event_at(now()), &source(stored), now());
             assert_eq!(row.retention_days, expected, "retention {stored}");
         }
+    }
+
+    const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+    const SPAN: &str = "00f067aa0ba902b7";
+
+    fn row_with(level: &str, trace_id: &str, span_id: &str) -> LogRow {
+        let event = LogEvent {
+            level: level.to_string(),
+            trace_id: trace_id.to_string(),
+            span_id: span_id.to_string(),
+            ..event_at(now())
+        };
+        build_row_at(event, &source(14), now())
+    }
+
+    fn fields_of(row: &LogRow) -> Value {
+        serde_json::from_str(&row.fields).unwrap()
+    }
+
+    #[test]
+    fn a_level_outside_the_known_set_is_mapped_or_becomes_info() {
+        for (level, expected) in [
+            ("info", "info"),
+            ("error", "error"),
+            ("fatal", "fatal"),
+            ("WARNING", "warn"),
+            (" Err ", "error"),
+            ("verbose", "info"),
+            ("", "info"),
+        ] {
+            assert_eq!(row_with(level, "", "").level, expected, "{level:?}");
+        }
+        for level in normalize::LEVELS {
+            assert_eq!(row_with(level, "", "").level, level, "{level}");
+        }
+        // A hand-built event cannot store a level of any length.
+        assert_eq!(row_with(&"x".repeat(100_000), "", "").level, "info");
+    }
+
+    #[test]
+    fn valid_ids_are_kept_in_lowercase_and_empty_ids_stay_empty() {
+        let row = row_with("info", TRACE, SPAN);
+        assert_eq!((row.trace_id.as_str(), row.span_id.as_str()), (TRACE, SPAN));
+        let row = row_with("info", &TRACE.to_uppercase(), &SPAN.to_uppercase());
+        assert_eq!((row.trace_id.as_str(), row.span_id.as_str()), (TRACE, SPAN));
+        let row = row_with("info", "", "");
+        assert_eq!((row.trace_id.as_str(), row.span_id.as_str()), ("", ""));
+        assert_eq!(row.fields, "{}");
+    }
+
+    #[test]
+    fn ids_that_are_not_valid_are_not_stored_as_ids_but_kept_in_fields() {
+        for (trace_id, span_id) in [
+            ("4bf92f3577b34da6a3ce929d0e0e473", "00f067aa0ba902b"),
+            ("4bf92f3577b34da6a3ce929d0e0e47361", "00f067aa0ba902b71"),
+            ("00000000000000000000000000000000", "0000000000000000"),
+            ("4bf92f3577b34da6a3ce929d0e0e473g", "00f067aa0ba902bz"),
+            (" 4bf92f3577b34da6a3ce929d0e0e4736", " 00f067aa0ba902b7"),
+            ("trace-1", "span-1"),
+        ] {
+            let row = row_with("info", trace_id, span_id);
+            assert_eq!(
+                (row.trace_id.as_str(), row.span_id.as_str()),
+                ("", ""),
+                "{trace_id} {span_id}"
+            );
+            let fields = fields_of(&row);
+            assert_eq!(fields["trace_id"], trace_id);
+            assert_eq!(fields["span_id"], span_id);
+        }
+    }
+
+    #[test]
+    fn an_id_of_any_length_neither_gets_stored_nor_pushes_fields_past_the_cap() {
+        let row = row_with("info", &"a".repeat(1024 * 1024), &"b".repeat(100));
+        assert_eq!((row.trace_id.as_str(), row.span_id.as_str()), ("", ""));
+        assert!(
+            row.fields.len() <= normalize::MAX_FIELDS_BYTES,
+            "{}",
+            row.fields.len()
+        );
+        let fields = fields_of(&row);
+        assert!(
+            fields.get("trace_id").is_none(),
+            "too big for fields: dropped"
+        );
+        assert_eq!(fields["span_id"], "b".repeat(100));
+        assert!(fields.get(normalize::FIELDS_TRUNCATED_KEY).is_some());
+    }
+
+    #[test]
+    fn an_invalid_id_does_not_replace_a_field_of_the_same_name() {
+        let mut event = event_at(now());
+        event.trace_id = "not-an-id".to_string();
+        event
+            .fields
+            .insert("trace_id".to_string(), json!("from the sender"));
+        let row = build_row_at(event, &source(14), now());
+        assert_eq!(row.trace_id, "");
+        assert_eq!(fields_of(&row)["trace_id"], "from the sender");
     }
 }

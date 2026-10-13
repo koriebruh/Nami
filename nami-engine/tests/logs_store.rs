@@ -59,9 +59,11 @@ fn build_row_carries_the_source_and_the_pattern() {
     assert_ne!(built.id, row(&source, json!({}), received).id);
 }
 
-/// ClickHouse orders UUIDs by their second 8 bytes first, which for a plain
-/// UUIDv7 (timestamp first, random bits second) would break `dt` ties at
-/// random. Row ids are UUIDv7s with the two halves swapped
+/// ClickHouse orders UUIDs by their second 8 bytes first. A plain UUIDv7
+/// keeps its timestamp in the first 8 bytes and, in the second 8, the low
+/// bits of a counter that is reseeded at random every millisecond, then
+/// random bits, so it would break `dt` ties in random order across
+/// milliseconds. Row ids are UUIDv7s with the two halves swapped
 /// (`store::new_row_id`), so rows built in sequence sort in that sequence.
 #[tokio::test]
 async fn row_ids_sort_in_build_order_when_dt_ties() {
@@ -128,10 +130,15 @@ fn wild_timestamps_are_clamped_by_build_row() {
     let newest = store::build_row(event("2200-01-01T00:00:00Z"), &source);
     let after = Utc::now();
 
+    // Both edges sit on the column's millisecond grid, rounded inward: the
+    // oldest one up, the newest one down. Each may therefore lie up to 1 ms
+    // inside the exact instant, so the slack goes on the rounding side only
+    // (for the oldest edge that is the upper bound: warm, `after` is often in
+    // the same millisecond as the insert time and the rounding is not).
     let millisecond = Duration::milliseconds(1);
     assert!(
-        oldest.dt >= before - normalize::MAX_PAST - millisecond
-            && oldest.dt <= after - normalize::MAX_PAST,
+        oldest.dt >= before - normalize::MAX_PAST
+            && oldest.dt <= after - normalize::MAX_PAST + millisecond,
         "{} is not insert time - 365 days",
         oldest.dt
     );
@@ -141,6 +148,46 @@ fn wild_timestamps_are_clamped_by_build_row() {
         "{} is not insert time + 1 day",
         newest.dt
     );
+}
+
+/// `LogEvent::new` takes the level and the ids as given, so an event built by
+/// hand could carry anything. Whatever it carries, the table only ever holds
+/// one of the known levels and ids of 32 / 16 hex characters (or empty
+/// ones); the raw values are kept in `fields`.
+#[tokio::test]
+async fn hand_built_events_cannot_store_an_arbitrary_level_or_id() {
+    let ch = ClickHouse::create_test_database().await.unwrap();
+    let source = source();
+    let event = normalize::LogEvent::new(
+        Utc::now(),
+        &"x".repeat(10_000),
+        "m".to_string(),
+        Map::new(),
+        "y".repeat(10_000),
+        "z".repeat(10_000),
+    );
+    store::insert_logs(&ch, &[store::build_row(event, &source)])
+        .await
+        .unwrap();
+
+    let stored: Vec<Value> = ch
+        .query_rows(
+            "SELECT level, trace_id, span_id, length(fields) AS fields_length
+             FROM logs WHERE project_id = {p:UUID}",
+            &[("p", source.project_id.to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0]["level"], "info");
+    assert_eq!(stored[0]["trace_id"], "");
+    assert_eq!(stored[0]["span_id"], "");
+    assert!(
+        stored[0]["fields_length"].as_u64().unwrap() > 20_000,
+        "the raw ids are kept in fields: {}",
+        stored[0]
+    );
+    ch.drop_database().await.unwrap();
 }
 
 /// The window of `dt` spans at most 367 calendar days (365 back, today,

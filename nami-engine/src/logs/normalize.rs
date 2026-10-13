@@ -1,8 +1,9 @@
 //! Field mapping and size caps for one ingested event. Every ingest path
 //! (HTTP JSON, NDJSON and MessagePack, syslog, and later OTLP logs) ends in
 //! a [`LogEvent`] built here; `store::build_row` then turns it into a row,
-//! applying the size caps and the `dt` window ([`clamp_to_accepted_range`])
-//! once more, so a row respects them whatever built or edited the event.
+//! applying the size caps, the `dt` window ([`clamp_to_accepted_range`]) and
+//! the level and id checks ([`level_from_name`], [`checked_id`]) once more,
+//! so a row respects them whatever built or edited the event.
 //!
 //! Mapping of a JSON object (`from_json`):
 //! - timestamp from the first of `dt` | `timestamp` | `time` that parses
@@ -29,6 +30,11 @@ pub const MAX_FIELDS_BYTES: usize = 256 * 1024;
 pub const FIELDS_TRUNCATED_KEY: &str = "_nami_truncated";
 /// Room kept for the [`FIELDS_TRUNCATED_KEY`] entry when dropping keys.
 const MARKER_RESERVE: usize = 128;
+
+/// A stored `trace_id` is 32 hex characters (W3C trace context), a stored
+/// `span_id` 16.
+pub const TRACE_ID_LEN: usize = 32;
+pub const SPAN_ID_LEN: usize = 16;
 
 pub const TIMESTAMP_KEYS: [&str; 3] = ["dt", "timestamp", "time"];
 pub const MESSAGE_KEYS: [&str; 3] = ["message", "msg", "log"];
@@ -72,7 +78,8 @@ impl LogEvent {
     /// millisecond precision of the `dt` column. Every way of building an
     /// event goes through here; `level`, `trace_id` and `span_id` are taken
     /// as given, so callers outside [`from_json`] normalize them first
-    /// ([`level_from_name`], [`level_from_number`], [`is_hex_id`]).
+    /// ([`level_from_name`], [`level_from_number`], [`checked_id`]), and
+    /// `store::build_row` checks them again before a row is built.
     pub fn new(
         dt: DateTime<Utc>,
         level: &str,
@@ -99,8 +106,8 @@ pub fn from_json(mut object: Map<String, Value>, received_at: DateTime<Utc>) -> 
         .map(message_text)
         .unwrap_or_default();
     let level = take_level(&mut object);
-    let trace_id = take_hex_id(&mut object, "trace_id", 32);
-    let span_id = take_hex_id(&mut object, "span_id", 16);
+    let trace_id = take_hex_id(&mut object, "trace_id", TRACE_ID_LEN);
+    let span_id = take_hex_id(&mut object, "span_id", SPAN_ID_LEN);
     LogEvent::new(dt, level, message, object, trace_id, span_id)
 }
 
@@ -284,6 +291,23 @@ fn take_hex_id(object: &mut Map<String, Value>, key: &str, len: usize) -> String
         Some(Value::String(text)) => text.to_ascii_lowercase(),
         _ => String::new(),
     }
+}
+
+/// `id` as it may be stored: lowercase when it is `len` hex characters (see
+/// [`is_hex_id`]), empty when it is empty. Anything else is no id: it moves
+/// into `fields` under `key` (unless the event already has a field of that
+/// name, which stays), so nothing the sender wrote is lost, and the caller
+/// applies the fields cap afterwards. The stored column then holds at most
+/// `len` characters whatever built the event.
+pub fn checked_id(id: String, len: usize, key: &str, fields: &mut Map<String, Value>) -> String {
+    if id.is_empty() {
+        return id;
+    }
+    if is_hex_id(&id, len) {
+        return id.to_ascii_lowercase();
+    }
+    fields.entry(key).or_insert(Value::String(id));
+    String::new()
 }
 
 /// Cuts the message to [`MAX_MESSAGE_BYTES`] (on a character boundary),
@@ -703,5 +727,50 @@ mod tests {
                 assert_eq!(clamped.timestamp_subsec_nanos() % 1_000_000, 0, "{clamped}");
             }
         }
+    }
+
+    #[test]
+    fn checked_id_keeps_valid_ids_in_lowercase_and_moves_anything_else_to_fields() {
+        let mut fields = Map::new();
+        assert_eq!(
+            checked_id(String::new(), TRACE_ID_LEN, "trace_id", &mut fields),
+            ""
+        );
+        assert!(fields.is_empty(), "an empty id is simply empty");
+        assert_eq!(
+            checked_id(
+                "4BF92F3577B34DA6A3CE929D0E0E4736".to_string(),
+                TRACE_ID_LEN,
+                "trace_id",
+                &mut fields
+            ),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert!(fields.is_empty(), "a valid id stays out of the fields");
+
+        // A span id is no trace id, and a long id is no id at all.
+        for (id, len, key) in [
+            ("00f067aa0ba902b7", TRACE_ID_LEN, "trace_id"),
+            ("4bf92f3577b34da6a3ce929d0e0e4736", SPAN_ID_LEN, "span_id"),
+            ("00000000000000000000000000000000", TRACE_ID_LEN, "trace_id"),
+            ("not an id", SPAN_ID_LEN, "span_id"),
+        ] {
+            let mut fields = Map::new();
+            assert_eq!(
+                checked_id(id.to_string(), len, key, &mut fields),
+                "",
+                "{id}"
+            );
+            assert_eq!(fields.get(key), Some(&json!(id)), "{id}: the value is kept");
+        }
+
+        // A field of the same name that is already there stays.
+        let mut fields = Map::new();
+        fields.insert("span_id".to_string(), json!("from the sender"));
+        assert_eq!(
+            checked_id("nope".to_string(), SPAN_ID_LEN, "span_id", &mut fields),
+            ""
+        );
+        assert_eq!(fields["span_id"], "from the sender");
     }
 }
