@@ -11,6 +11,7 @@ fn test_app(pool: sqlx::PgPool) -> axum::Router {
     };
     axum::Router::new()
         .merge(routes::auth::router())
+        .merge(routes::auth::rate_limited_router())
         .merge(routes::projects::router())
         .layer(tower_sessions::SessionManagerLayer::new(tower_sessions::MemoryStore::default()))
         .with_state(state)
