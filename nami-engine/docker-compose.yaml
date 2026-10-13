@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: nami
+      POSTGRES_PASSWORD: nami
+      POSTGRES_DB: nami
+    ports:
+      - "5432:5432"
+    volumes:
+      - nami_postgres_data:/var/lib/postgresql/data
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025" # SMTP
+      - "8025:8025" # Web UI + API
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    # unused until the uptime-monitoring sub-project
+
+volumes:
+  nami_postgres_data:
