@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use nami_engine::{
     config::Config,
-    db::{PoolSettings, pool_options},
+    db::{PoolSettings, pool_options, run_migrations},
 };
 
 /// A pool with `settings` over this test's database.
@@ -113,5 +113,65 @@ async fn waiting_for_a_connection_gives_up_after_the_acquire_timeout(pool: sqlx:
     assert!(
         (Duration::from_millis(400)..Duration::from_secs(3)).contains(&elapsed),
         "gave up after {elapsed:?}"
+    );
+}
+
+/// Migrations run on a connection of their own with no statement timeout: a
+/// wait for the migration table (another instance migrating) or a long
+/// migration is never cancelled half-way through startup, even when the
+/// database itself sets a timeout for every new connection. The same run on a
+/// pool with the request timeout is cancelled, which is why it is not done
+/// there.
+#[sqlx::test]
+async fn migrations_wait_out_a_lock_that_would_cancel_them_on_the_pool(pool: sqlx::PgPool) {
+    // Every new connection to this database gets a 1 s statement timeout.
+    sqlx::query(
+        "do $$ begin
+             execute format('alter database %I set statement_timeout = %L', current_database(), '1s');
+         end $$",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Another instance busy with the migration table, for 2.5 s.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("lock table _sqlx_migrations in access exclusive mode")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let bounded = pool_with(
+        &pool,
+        PoolSettings {
+            max_connections: 1,
+            acquire_timeout: Duration::from_secs(5),
+            statement_timeout: Duration::from_secs(1),
+        },
+    )
+    .await;
+    let cancelled = sqlx::migrate!("./migrations")
+        .run(&bounded)
+        .await
+        .expect_err("on the pool the wait is cancelled");
+    assert!(
+        cancelled.to_string().contains("statement timeout"),
+        "{cancelled}"
+    );
+    // The cancelled run keeps holding the migrator's advisory lock on its
+    // connection: closing the pool lets it go.
+    bounded.close().await;
+
+    let options = (*pool.connect_options()).clone();
+    let started = Instant::now();
+    let (migrated, ()) = tokio::join!(run_migrations(&options), async {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        holder.rollback().await.unwrap();
+    });
+    let waited = started.elapsed();
+
+    migrated.expect("the migration run waited the lock out");
+    assert!(
+        waited >= Duration::from_millis(2400),
+        "it waited for the lock, past the database's 1 s timeout: {waited:?}"
     );
 }

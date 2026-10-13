@@ -1,6 +1,9 @@
 use std::time::Duration;
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::{
+    Connection,
+    postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions},
+};
 
 use crate::config::Config;
 
@@ -50,4 +53,22 @@ pub async fn connect_pool(
     settings: &PoolSettings,
 ) -> Result<PgPool, sqlx::Error> {
     pool_options(settings).connect(database_url).await
+}
+
+/// Runs the migrations on a connection of their own, with no statement or lock
+/// timeout. On a pooled connection, `statement_timeout` (see [`pool_options`])
+/// would cancel a long migration half-way, or the migrator's wait while
+/// another instance holds the migration lock, and stop startup for nothing.
+/// Both are reset explicitly, so a timeout set for the role or the database
+/// does not apply either. The connection is closed afterwards.
+pub async fn run_migrations(options: &PgConnectOptions) -> Result<(), sqlx::migrate::MigrateError> {
+    let mut conn = PgConnection::connect_with(options).await?;
+    sqlx::query(
+        "select set_config('statement_timeout', '0', false), set_config('lock_timeout', '0', false)",
+    )
+    .execute(&mut conn)
+    .await?;
+    sqlx::migrate!("./migrations").run(&mut conn).await?;
+    conn.close().await?;
+    Ok(())
 }

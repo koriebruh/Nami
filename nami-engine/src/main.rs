@@ -24,8 +24,12 @@ async fn main() {
     )
     .await
     .expect("failed to connect to database");
-    sqlx::migrate!("./migrations")
-        .run(&pool)
+    // On a connection of their own, without the pool's statement timeout.
+    let connect_options: sqlx::postgres::PgConnectOptions = config
+        .database_url
+        .parse()
+        .expect("DATABASE_URL must be a Postgres URL");
+    db::run_migrations(&connect_options)
         .await
         .expect("failed to run migrations");
 
