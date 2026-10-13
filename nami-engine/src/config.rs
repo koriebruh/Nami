@@ -27,6 +27,9 @@ pub struct Config {
     /// `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`, case-insensitively; any
     /// other value stops startup (see `env_flag`).
     pub uptime_worker_enabled: bool,
+    /// AES-256 key for secrets at rest (`NAMI_ENCRYPTION_KEY`, base64). Never
+    /// logged: `Config` deliberately does not implement `Debug`.
+    pub encryption_key: [u8; crate::crypto::KEY_LEN],
 }
 
 impl Config {
@@ -47,6 +50,7 @@ impl Config {
             cookie_secure: std::env::var("COOKIE_SECURE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            encryption_key: encryption_key_from_env(),
             ..Self::from_env_defaults_only()
         }
     }
@@ -98,8 +102,18 @@ impl Config {
             ui_base_url: std::env::var("UI_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
             uptime_worker_enabled: env_flag("UPTIME_WORKER_ENABLED", true),
+            // Tests only: `from_env` always replaces it with the real key.
+            encryption_key: crate::crypto::TEST_KEY,
         }
     }
+}
+
+/// `NAMI_ENCRYPTION_KEY` is required outside tests: a missing or malformed
+/// key stops startup instead of running with secrets nobody can decrypt
+/// later (or encrypted under a key nobody kept).
+fn encryption_key_from_env() -> [u8; crate::crypto::KEY_LEN] {
+    let raw = std::env::var("NAMI_ENCRYPTION_KEY").unwrap_or_default();
+    crate::crypto::parse_key(&raw).unwrap_or_else(|message| panic!("{message}"))
 }
 
 /// Reads a boolean env flag, `default` when it is unset. A value that is not

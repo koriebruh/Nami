@@ -1,6 +1,6 @@
 use sqlx::PgPool;
 
-use crate::{clickhouse::ClickHouse, config::Config, email};
+use crate::{clickhouse::ClickHouse, config::Config, crypto::Cipher, email};
 
 /// A ClickHouse database name that is never created. `AppState::for_test`
 /// binds its client to it, so a test that touches ClickHouse without opting
@@ -13,6 +13,8 @@ pub struct AppState {
     pub db: PgPool,
     pub mailer: email::Mailer,
     pub clickhouse: ClickHouse,
+    /// Seals and opens monitor secrets; built from `config.encryption_key`.
+    pub cipher: Cipher,
     pub config: Config,
 }
 
@@ -20,8 +22,9 @@ impl AppState {
     /// Test-only constructor (same precedent as
     /// `router::with_fallback_connect_info`): every field gets the
     /// defaults tests expect — `Config::from_env_for_test()`, the Mailpit
-    /// mailer, and a ClickHouse client bound to a database that does not
-    /// exist. Tests override single fields with struct-update syntax, e.g.
+    /// mailer, a ClickHouse client bound to a database that does not
+    /// exist, and a cipher over the fixed `crypto::TEST_KEY`. Tests override
+    /// single fields with struct-update syntax, e.g.
     /// `AppState { mailer: Mailer::new("localhost", 1), ..AppState::for_test(pool) }`,
     /// so adding a field to `AppState` never touches test files again.
     pub fn for_test(pool: PgPool) -> AppState {
@@ -35,6 +38,7 @@ impl AppState {
                 &config.clickhouse_password,
                 UNCONFIGURED_TEST_CLICKHOUSE_DATABASE,
             ),
+            cipher: Cipher::new(&config.encryption_key),
             config,
         }
     }

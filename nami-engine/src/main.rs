@@ -1,4 +1,6 @@
-use nami_engine::{clickhouse::ClickHouse, config::Config, db, email, router, state::AppState};
+use nami_engine::{
+    clickhouse::ClickHouse, config::Config, crypto::Cipher, db, email, router, state::AppState,
+};
 use std::net::SocketAddr;
 use tower_sessions_sqlx_store::PostgresStore;
 
@@ -52,6 +54,7 @@ async fn main() {
         db: pool,
         mailer: email::Mailer::new(&config.smtp_host, config.smtp_port),
         clickhouse,
+        cipher: Cipher::new(&config.encryption_key),
         config,
     };
 
