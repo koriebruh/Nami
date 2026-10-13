@@ -1,9 +1,13 @@
+use std::collections::HashMap;
+
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::get,
 };
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
@@ -11,6 +15,7 @@ use crate::{
     middleware::rbac::{CurrentUser, require_project_role},
     models::monitor::{self, CreateMonitorRequest, Monitor, PatchMonitorRequest},
     state::AppState,
+    uptime::store::{self, MonitorStats, UptimeCheckRow},
 };
 
 // RBAC mirrors routes/projects.rs: viewer reads, member creates/edits,
@@ -26,16 +31,50 @@ pub fn router() -> Router<AppState> {
             "/projects/{id}/monitors/{monitor_id}",
             get(get_monitor).patch(patch_monitor).delete(delete_monitor),
         )
+        .route(
+            "/projects/{id}/monitors/{monitor_id}/checks",
+            get(list_checks),
+        )
+        .route("/projects/{id}/monitors/{monitor_id}/stats", get(get_stats))
+}
+
+/// A monitor plus its 24-hour uptime (`null` when it has no checks in the
+/// window, or when ClickHouse is unavailable).
+#[derive(Serialize)]
+struct MonitorSummary {
+    #[serde(flatten)]
+    monitor: Monitor,
+    uptime_24h: Option<f64>,
 }
 
 async fn list_monitors(
     State(state): State<AppState>,
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
-) -> Result<Json<Vec<Monitor>>, AppError> {
+) -> Result<Json<Vec<MonitorSummary>>, AppError> {
     require_project_role(&state.db, &user, project_id, "viewer").await?;
+    let monitors = monitor::list_for_project(&state.db, project_id).await?;
+    // Uptime decorates this list; current status comes from Postgres. If
+    // ClickHouse is down, still list every monitor, with uptime unknown.
+    let uptime = match store::uptime_24h_by_monitor(&state.clickhouse, project_id, Utc::now()).await
+    {
+        Ok(uptime) => uptime,
+        Err(e) => {
+            tracing::warn!(error = %e, %project_id, "24h uptime unavailable; listing monitors without it");
+            HashMap::new()
+        }
+    };
     Ok(Json(
-        monitor::list_for_project(&state.db, project_id).await?,
+        monitors
+            .into_iter()
+            .map(|monitor| {
+                let uptime_24h = uptime.get(&monitor.id).copied();
+                MonitorSummary {
+                    monitor,
+                    uptime_24h,
+                }
+            })
+            .collect(),
     ))
 }
 
@@ -95,4 +134,39 @@ async fn delete_monitor(
         return Err(AppError::NotFound);
     }
     Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+#[derive(Deserialize)]
+struct ChecksQuery {
+    limit: Option<u32>,
+}
+
+async fn list_checks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<ChecksQuery>,
+) -> Result<Json<Vec<UptimeCheckRow>>, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    monitor::find_in_project(&state.db, project_id, monitor_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    Ok(Json(
+        store::recent_checks(&state.clickhouse, project_id, monitor_id, limit).await?,
+    ))
+}
+
+async fn get_stats(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<MonitorStats>, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    monitor::find_in_project(&state.db, project_id, monitor_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(
+        store::monitor_stats(&state.clickhouse, project_id, monitor_id, Utc::now()).await?,
+    ))
 }

@@ -44,6 +44,193 @@ pub async fn insert_checks(
     ch.insert_rows("uptime_checks", rows).await
 }
 
+/// Buckets in the stats series: 48 x 30 minutes = the last 24 hours.
+pub const SERIES_BUCKETS: i64 = 48;
+/// Must match `INTERVAL 30 MINUTE` in the series query.
+pub const BUCKET_SECONDS: i64 = 30 * 60;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MonitorStats {
+    pub uptime_24h: Option<f64>,
+    pub uptime_7d: Option<f64>,
+    pub uptime_30d: Option<f64>,
+    pub avg_response_ms_24h: Option<f64>,
+    pub series: Vec<SeriesBucket>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SeriesBucket {
+    pub bucket_start: DateTime<Utc>,
+    pub avg_response_ms: Option<f64>,
+    pub up_ratio: Option<f64>,
+}
+
+fn ratio(up: u64, total: u64) -> Option<f64> {
+    (total > 0).then(|| up as f64 / total as f64)
+}
+
+/// 24-hour uptime per monitor of one project, from one grouped query.
+/// Monitors with no checks in the window are absent from the map.
+pub async fn uptime_24h_by_monitor(
+    ch: &ClickHouse,
+    project_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<std::collections::HashMap<Uuid, f64>, ClickHouseError> {
+    #[derive(Deserialize)]
+    struct Row {
+        monitor_id: Uuid,
+        up: u64,
+        total: u64,
+    }
+    let rows: Vec<Row> = ch
+        .query_rows(
+            "SELECT monitor_id, countIf(status = 'up') AS up, count() AS total
+             FROM uptime_checks
+             WHERE project_id = {project_id:UUID}
+               AND checked_at >= fromUnixTimestamp64Milli({since_ms:Int64}, 'UTC')
+               AND checked_at <= fromUnixTimestamp64Milli({now_ms:Int64}, 'UTC')
+             GROUP BY monitor_id",
+            &[
+                ("project_id", project_id.to_string()),
+                (
+                    "since_ms",
+                    (now - chrono::Duration::hours(24))
+                        .timestamp_millis()
+                        .to_string(),
+                ),
+                ("now_ms", now.timestamp_millis().to_string()),
+            ],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| ratio(row.up, row.total).map(|uptime| (row.monitor_id, uptime)))
+        .collect())
+}
+
+/// The monitor's most recent checks, newest first.
+pub async fn recent_checks(
+    ch: &ClickHouse,
+    project_id: Uuid,
+    monitor_id: Uuid,
+    limit: u32,
+) -> Result<Vec<UptimeCheckRow>, ClickHouseError> {
+    ch.query_rows(
+        "SELECT monitor_id, project_id, checked_at, status, status_code, response_time_ms, error
+         FROM uptime_checks
+         WHERE project_id = {project_id:UUID} AND monitor_id = {monitor_id:UUID}
+         ORDER BY checked_at DESC
+         LIMIT {limit:UInt32}",
+        &[
+            ("project_id", project_id.to_string()),
+            ("monitor_id", monitor_id.to_string()),
+            ("limit", limit.to_string()),
+        ],
+    )
+    .await
+}
+
+/// Uptime over 24 h / 7 d / 30 d, 24 h average response time, and a 24 h
+/// series of [`SERIES_BUCKETS`] half-hour buckets ending with the bucket
+/// that contains `now`. Buckets without checks are present with nulls, so a
+/// chart always gets a stable x-axis. `now` is a parameter so tests can pin
+/// the bucket boundaries.
+pub async fn monitor_stats(
+    ch: &ClickHouse,
+    project_id: Uuid,
+    monitor_id: Uuid,
+    now: DateTime<Utc>,
+) -> Result<MonitorStats, ClickHouseError> {
+    #[derive(Deserialize, Default)]
+    struct Totals {
+        up_24h: u64,
+        total_24h: u64,
+        up_7d: u64,
+        total_7d: u64,
+        up_30d: u64,
+        total_30d: u64,
+        avg_response_ms_24h: Option<f64>,
+    }
+    #[derive(Deserialize)]
+    struct BucketRow {
+        bucket: i64,
+        avg_response_ms: Option<f64>,
+        up: u64,
+        total: u64,
+    }
+
+    let millis = |t: DateTime<Utc>| t.timestamp_millis().to_string();
+    let totals: Vec<Totals> = ch
+        .query_rows(
+            "SELECT
+                 countIf(status = 'up' AND checked_at >= fromUnixTimestamp64Milli({since_24h:Int64}, 'UTC')) AS up_24h,
+                 countIf(checked_at >= fromUnixTimestamp64Milli({since_24h:Int64}, 'UTC')) AS total_24h,
+                 countIf(status = 'up' AND checked_at >= fromUnixTimestamp64Milli({since_7d:Int64}, 'UTC')) AS up_7d,
+                 countIf(checked_at >= fromUnixTimestamp64Milli({since_7d:Int64}, 'UTC')) AS total_7d,
+                 countIf(status = 'up') AS up_30d,
+                 count() AS total_30d,
+                 avgIf(response_time_ms, checked_at >= fromUnixTimestamp64Milli({since_24h:Int64}, 'UTC')) AS avg_response_ms_24h
+             FROM uptime_checks
+             WHERE project_id = {project_id:UUID} AND monitor_id = {monitor_id:UUID}
+               AND checked_at >= fromUnixTimestamp64Milli({since_30d:Int64}, 'UTC')
+               AND checked_at <= fromUnixTimestamp64Milli({now_ms:Int64}, 'UTC')",
+            &[
+                ("project_id", project_id.to_string()),
+                ("monitor_id", monitor_id.to_string()),
+                ("since_24h", millis(now - chrono::Duration::hours(24))),
+                ("since_7d", millis(now - chrono::Duration::days(7))),
+                ("since_30d", millis(now - chrono::Duration::days(30))),
+                ("now_ms", millis(now)),
+            ],
+        )
+        .await?;
+    let totals = totals.into_iter().next().unwrap_or_default();
+
+    let current_bucket = now.timestamp() - now.timestamp().rem_euclid(BUCKET_SECONDS);
+    let first_bucket = current_bucket - (SERIES_BUCKETS - 1) * BUCKET_SECONDS;
+    let rows: Vec<BucketRow> = ch
+        .query_rows(
+            "SELECT toUnixTimestamp(toStartOfInterval(checked_at, INTERVAL 30 MINUTE)) AS bucket,
+                    avg(response_time_ms) AS avg_response_ms,
+                    countIf(status = 'up') AS up,
+                    count() AS total
+             FROM uptime_checks
+             WHERE project_id = {project_id:UUID} AND monitor_id = {monitor_id:UUID}
+               AND checked_at >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC')
+               AND checked_at <= fromUnixTimestamp64Milli({now_ms:Int64}, 'UTC')
+             GROUP BY bucket",
+            &[
+                ("project_id", project_id.to_string()),
+                ("monitor_id", monitor_id.to_string()),
+                ("from_ms", (first_bucket * 1000).to_string()),
+                ("now_ms", millis(now)),
+            ],
+        )
+        .await?;
+    let by_bucket: std::collections::HashMap<i64, BucketRow> =
+        rows.into_iter().map(|r| (r.bucket, r)).collect();
+    let series = (0..SERIES_BUCKETS)
+        .map(|i| {
+            let start = first_bucket + i * BUCKET_SECONDS;
+            let row = by_bucket.get(&start);
+            SeriesBucket {
+                bucket_start: DateTime::from_timestamp(start, 0)
+                    .expect("bucket start is a valid timestamp"),
+                avg_response_ms: row.and_then(|r| r.avg_response_ms),
+                up_ratio: row.and_then(|r| ratio(r.up, r.total)),
+            }
+        })
+        .collect();
+
+    Ok(MonitorStats {
+        uptime_24h: ratio(totals.up_24h, totals.total_24h),
+        uptime_7d: ratio(totals.up_7d, totals.total_7d),
+        uptime_30d: ratio(totals.up_30d, totals.total_30d),
+        avg_response_ms_24h: totals.avg_response_ms_24h,
+        series,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;

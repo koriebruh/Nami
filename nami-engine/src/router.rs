@@ -57,6 +57,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(rate_limited_with_governor(routes::auth::rate_limited_router()))
         .merge(routes::projects::router())
         .merge(routes::monitors::router())
+        .merge(routes::incidents::router())
         .with_state(state)
 }
 

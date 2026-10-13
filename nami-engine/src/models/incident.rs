@@ -1,6 +1,49 @@
 use chrono::{DateTime, Utc};
-use sqlx::PgConnection;
+use serde::Serialize;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
+
+/// One row of `GET /projects/{id}/incidents`.
+#[derive(Debug, Clone, PartialEq, sqlx::FromRow, Serialize)]
+pub struct IncidentListItem {
+    pub id: Uuid,
+    pub project_id: Uuid,
+    pub monitor_id: Option<Uuid>,
+    pub heartbeat_id: Option<Uuid>,
+    /// Name of the monitor (or heartbeat) the incident belongs to.
+    pub source_name: Option<String>,
+    pub title: String,
+    pub cause: Option<String>,
+    pub status: String,
+    pub started_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+/// Newest first, capped at 200. `status` and `monitor_id` are optional
+/// filters (`None` = no filter).
+pub async fn list_for_project(
+    pool: &PgPool,
+    project_id: Uuid,
+    status: Option<&str>,
+    monitor_id: Option<Uuid>,
+) -> Result<Vec<IncidentListItem>, sqlx::Error> {
+    sqlx::query_as(
+        "select i.id, i.project_id, i.monitor_id, null::uuid as heartbeat_id,
+                m.name as source_name, i.title, i.cause, i.status, i.started_at, i.resolved_at
+         from incidents i
+         left join monitors m on m.id = i.monitor_id
+         where i.project_id = $1
+           and ($2::text is null or i.status = $2)
+           and ($3::uuid is null or i.monitor_id = $3)
+         order by i.started_at desc
+         limit 200",
+    )
+    .bind(project_id)
+    .bind(status)
+    .bind(monitor_id)
+    .fetch_all(pool)
+    .await
+}
 
 /// Opens an incident for the monitor unless one is already open (the
 /// `incidents_one_open_per_monitor` index turns a duplicate into a no-op).
