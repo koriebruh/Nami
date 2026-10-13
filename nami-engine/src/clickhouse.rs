@@ -86,11 +86,12 @@ TTL toDateTime(dt) + toIntervalDay(retention_days)",
 
 /// Settings a caller may never pass as extra settings: they are owned by
 /// this client. That is the query text, its parameters and the database;
-/// the output format, buffering and read-only guard of
+/// the output format, buffering, read-only guard, server-side time limit
+/// ([`QUERY_MAX_EXECUTION_SECS`]) and cancel-on-disconnect of
 /// [`ClickHouse::query_rows_with`]; the strict row parsing of
 /// [`ClickHouse::insert_rows_with`]; and the wire formats of
 /// [`BASE_SETTINGS`], which every request pins.
-const RESERVED_SETTINGS: [&str; 9] = [
+const RESERVED_SETTINGS: [&str; 11] = [
     "query",
     "database",
     "readonly",
@@ -100,6 +101,8 @@ const RESERVED_SETTINGS: [&str; 9] = [
     "date_time_input_format",
     "date_time_output_format",
     "output_format_json_quote_64bit_integers",
+    "max_execution_time",
+    "cancel_http_readonly_queries_on_client_close",
 ];
 
 /// Prefix of the throwaway databases created by
@@ -249,9 +252,10 @@ impl ClickHouse {
     }
 
     /// [`Self::query_rows`] plus extra ClickHouse settings, e.g.
-    /// `max_execution_time`. Settings are fixed names and values from code,
+    /// `max_result_rows`. Settings are fixed names and values from code,
     /// never user input; panics on one this client owns (see
-    /// `RESERVED_SETTINGS`), so the read-only guard cannot be lifted.
+    /// `RESERVED_SETTINGS`), so the read-only guard cannot be lifted and the
+    /// time limit of [`QUERY_MAX_EXECUTION_SECS`] cannot be changed.
     pub async fn query_rows_with<T: DeserializeOwned>(
         &self,
         sql: &str,
@@ -525,13 +529,13 @@ mod tests {
         let mut pairs = Vec::new();
         push_extra_settings(
             &mut pairs,
-            &[("async_insert", "1"), ("max_execution_time", "30")],
+            &[("async_insert", "1"), ("max_result_rows", "1000")],
         );
         assert_eq!(
             pairs,
             vec![
                 ("async_insert".to_string(), "1".to_string()),
-                ("max_execution_time".to_string(), "30".to_string())
+                ("max_result_rows".to_string(), "1000".to_string())
             ]
         );
     }

@@ -1,7 +1,7 @@
 // Requires `docker compose up -d clickhouse` (user/password nami/nami).
 use chrono::{DateTime, Duration, Utc};
 use nami_engine::{
-    clickhouse::{ClickHouse, ClickHouseError},
+    clickhouse::{ClickHouse, ClickHouseError, QUERY_MAX_EXECUTION_SECS},
     state::AppState,
 };
 use serde::{Deserialize, Serialize};
@@ -330,23 +330,33 @@ async fn query_rows_with_adds_its_settings_and_still_sends_the_ones_the_client_o
         .query_rows_with(
             "SELECT 1 AS n",
             &[],
-            &[("max_execution_time", "7"), ("max_result_rows", "1000")],
+            &[
+                ("max_result_rows", "1000"),
+                ("max_bytes_to_read", "1000000"),
+            ],
         )
         .await
         .unwrap();
     assert_eq!(rows, vec![serde_json::json!({ "n": 1 })]);
 
     let pairs = received_settings(&server).await;
-    for (name, value) in [("max_execution_time", "7"), ("max_result_rows", "1000")] {
+    for (name, value) in [
+        ("max_result_rows", "1000"),
+        ("max_bytes_to_read", "1000000"),
+    ] {
         assert_eq!(pairs[only_position(&pairs, name)].1, value, "{pairs:?}");
     }
     // The settings the client owns still arrive, with their values, and after
-    // the extra ones, so nothing a caller passes can take their place.
-    let last_extra = only_position(&pairs, "max_result_rows");
+    // the extra ones, so nothing a caller passes can take their place. That
+    // includes the time limit and the cancel-on-disconnect every read carries.
+    let last_extra = only_position(&pairs, "max_bytes_to_read");
+    let time_limit = QUERY_MAX_EXECUTION_SECS.to_string();
     for (name, value) in [
         ("default_format", "JSONEachRow"),
         ("wait_end_of_query", "1"),
         ("readonly", "2"),
+        ("max_execution_time", time_limit.as_str()),
+        ("cancel_http_readonly_queries_on_client_close", "1"),
     ] {
         let at = only_position(&pairs, name);
         assert!(
@@ -385,7 +395,7 @@ async fn every_setting_the_client_sends_on_its_own_is_refused_as_an_extra() {
         .filter(|name| !name.starts_with("param_"))
         .collect();
     assert!(
-        sent.len() >= 9,
+        sent.len() >= 11,
         "expected the client's own settings, got {sent:?}"
     );
     for name in sent {
@@ -397,8 +407,9 @@ async fn every_setting_the_client_sends_on_its_own_is_refused_as_an_extra() {
                 .await
         })
         .await;
+        let refused = outcome.as_ref().is_err_and(|error| error.is_panic());
         assert!(
-            outcome.unwrap_err().is_panic(),
+            refused,
             "{name} is set by the client itself, so it must be refused as an extra setting"
         );
     }
