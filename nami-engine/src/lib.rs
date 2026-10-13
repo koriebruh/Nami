@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod clickhouse;
 pub mod config;
 pub mod db;
 pub mod email;

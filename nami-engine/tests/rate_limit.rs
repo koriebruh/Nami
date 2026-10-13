@@ -1,10 +1,10 @@
 use axum::{body::Body, http::{Request, StatusCode}};
 use tower::ServiceExt;
-use nami_engine::{state::AppState, email::Mailer, config::Config};
+use nami_engine::state::AppState;
 use serde_json::json;
 
 fn build_app(pool: sqlx::PgPool) -> axum::Router {
-    let state = AppState { db: pool, mailer: Mailer::new("localhost", 1025), config: Config::from_env_for_test() };
+    let state = AppState::for_test(pool);
     // Same governor config/error_handler and session-layer settings as
     // main.rs, defined once in `nami_engine::router` and shared here (see
     // Fix 4 in the final hardening round). `SmartIpKeyExtractor` checks

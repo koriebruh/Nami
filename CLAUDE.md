@@ -92,6 +92,10 @@ task review — disclose this in every PR description.
   later) runs as containers via `nami-engine/docker-compose.yaml` — never
   installed natively on the host. `docker compose up -d <service>` before
   running the engine or its tests.
+- Docker Postgres listens on host port **5433** (a native Homebrew Postgres
+  on this machine owns 5432 and would silently capture `localhost:5432`
+  connections). Run engine tests with
+  `DATABASE_URL=postgres://nami:nami@localhost:5433/nami`.
 - Commit messages: Conventional Commits (`feat(engine): ...`, `fix(ui): ...`,
   `chore: ...`).
 - Rust: no ORM — SQLx with runtime-checked queries (`query`/`query_as`), no

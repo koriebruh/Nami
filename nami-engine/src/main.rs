@@ -1,4 +1,4 @@
-use nami_engine::{config::Config, db, email, router, state::AppState};
+use nami_engine::{clickhouse::ClickHouse, config::Config, db, email, router, state::AppState};
 use std::net::SocketAddr;
 use tower_sessions_sqlx_store::PostgresStore;
 
@@ -13,6 +13,17 @@ async fn main() {
         .run(&pool)
         .await
         .expect("failed to run migrations");
+
+    let clickhouse = ClickHouse::new(
+        &config.clickhouse_url,
+        &config.clickhouse_user,
+        &config.clickhouse_password,
+        &config.clickhouse_database,
+    );
+    clickhouse
+        .migrate()
+        .await
+        .expect("failed to run ClickHouse migrations");
 
     // tower-sessions-sqlx-store 0.15.0 pins sqlx ^0.8, which is incompatible
     // (different crate version = different `PgPool` type) with this crate's
@@ -40,6 +51,7 @@ async fn main() {
     let state = AppState {
         db: pool,
         mailer: email::Mailer::new(&config.smtp_host, config.smtp_port),
+        clickhouse,
         config,
     };
 

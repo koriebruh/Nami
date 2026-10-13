@@ -3,12 +3,7 @@ use tower::ServiceExt;
 
 #[sqlx::test]
 async fn health_returns_ok(pool: sqlx::PgPool) {
-    let mailer = nami_engine::email::Mailer::new("localhost", 1025);
-    let state = nami_engine::state::AppState {
-        db: pool,
-        mailer,
-        config: nami_engine::config::Config::from_env_for_test(),
-    };
+    let state = nami_engine::state::AppState::for_test(pool);
     let app = nami_engine::router::build_router(state);
 
     let response = app
