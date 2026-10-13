@@ -9,3 +9,4 @@ pub mod state;
 pub mod routes;
 pub mod models;
 pub mod router;
+pub mod uptime;
