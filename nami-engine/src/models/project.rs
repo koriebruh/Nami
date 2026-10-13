@@ -8,12 +8,41 @@ pub struct Project {
     pub slug: String,
 }
 
-pub async fn insert_project(pool: &PgPool, name: &str, slug: &str) -> Result<Project, sqlx::Error> {
-    sqlx::query_as("insert into projects (name, slug) values ($1, $2) returning id, name, slug")
-        .bind(name)
-        .bind(slug)
-        .fetch_one(pool)
-        .await
+/// Creates a project AND seeds its creator as a `project_members` row at
+/// `admin`, atomically (a single `pool.begin()` transaction, mirroring
+/// `find_or_create_oauth_user`'s multi-statement-atomicity pattern in
+/// `models/user.rs`). Without this, a freshly created project has zero
+/// members — not even its creator — and since only a global admin (not a
+/// project admin) could previously add the first member, a global admin who
+/// isn't also made a member here would be locked out of managing their own
+/// project's membership afterward.
+pub async fn insert_project(
+    pool: &PgPool,
+    name: &str,
+    slug: &str,
+    created_by: Uuid,
+) -> Result<Project, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let project: Project = sqlx::query_as(
+        "insert into projects (name, slug, created_by) values ($1, $2, $3) returning id, name, slug",
+    )
+    .bind(name)
+    .bind(slug)
+    .bind(created_by)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "insert into project_members (project_id, user_id, project_role) values ($1, $2, 'admin')",
+    )
+    .bind(project.id)
+    .bind(created_by)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(project)
 }
 
 pub async fn list_projects_for_user(pool: &PgPool, user_id: Uuid, is_global_admin: bool) -> Result<Vec<Project>, sqlx::Error> {

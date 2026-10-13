@@ -1,6 +1,6 @@
 use axum::{body::Body, http::{Request, StatusCode, header}};
 use tower::ServiceExt;
-use nami_engine::{state::AppState, email::Mailer, routes, config::Config};
+use nami_engine::{state::AppState, email::Mailer, config::Config};
 use serde_json::json;
 
 async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::HeaderValue {
@@ -22,13 +22,11 @@ async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::H
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState { db: pool, mailer: Mailer::new("localhost", 1025), config: Config::from_env_for_test() };
-    axum::Router::new()
-        .merge(routes::auth::router())
-        .merge(routes::auth::rate_limited_router())
-        .layer(tower_sessions::SessionManagerLayer::new(
+    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state))
+        .layer(nami_engine::router::configure_session_layer(
             tower_sessions::MemoryStore::default(),
+            false,
         ))
-        .with_state(state)
 }
 
 #[sqlx::test]
@@ -349,7 +347,7 @@ async fn forgot_password_returns_generic_200_even_if_mail_send_fails(pool: sqlx:
 
     // Port 1 is a reserved/unreachable TCP port, so the SMTP send will fail.
     let state = AppState { db: pool, mailer: Mailer::new("localhost", 1), config: Config::from_env_for_test() };
-    let app = axum::Router::new().merge(routes::auth::router()).with_state(state);
+    let app = nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state));
 
     let response = app
         .oneshot(
@@ -370,10 +368,7 @@ async fn forgot_password_returns_generic_200_even_if_mail_send_fails(pool: sqlx:
 #[sqlx::test]
 async fn register_returns_generic_200_even_if_mail_send_fails(pool: sqlx::PgPool) {
     let state = AppState { db: pool, mailer: Mailer::new("localhost", 1), config: Config::from_env_for_test() };
-    let app = axum::Router::new()
-        .merge(routes::auth::router())
-        .merge(routes::auth::rate_limited_router())
-        .with_state(state);
+    let app = nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state));
 
     let response = app
         .oneshot(

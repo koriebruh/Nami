@@ -25,7 +25,7 @@ async fn create_project(
     Json(payload): Json<CreateProjectRequest>,
 ) -> Result<Json<models::project::Project>, AppError> {
     require_global_role(&user, "admin")?;
-    let project = models::project::insert_project(&state.db, &payload.name, &payload.slug).await?;
+    let project = models::project::insert_project(&state.db, &payload.name, &payload.slug, user.id).await?;
     Ok(Json(project))
 }
 

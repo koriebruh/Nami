@@ -1,14 +1,11 @@
 use axum::{body::{self, Body}, http::{Request, StatusCode}};
 use tower::ServiceExt;
-use nami_engine::{state::AppState, email::Mailer, routes, config::Config};
+use nami_engine::{state::AppState, email::Mailer, config::Config};
 use serde_json::{json, Value};
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState { db: pool, mailer: Mailer::new("localhost", 1025), config: Config::from_env_for_test() };
-    axum::Router::new()
-        .merge(routes::auth::router())
-        .merge(routes::auth::rate_limited_router())
-        .with_state(state)
+    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state))
 }
 
 #[sqlx::test]
@@ -96,6 +93,72 @@ async fn registering_twice_does_not_duplicate_or_change_response(pool: sqlx::PgP
         .filter(|m| m["To"][0]["Address"] == "dup@example.com")
         .collect();
     assert_eq!(dup_messages.len(), 1);
+}
+
+/// Fix 3a (final-fix-wave): the first user ever registered on a fresh
+/// deployment becomes global admin — otherwise there's no way to ever create
+/// the first project (`POST /projects` requires global admin, and
+/// `global_role` otherwise defaults to `member`). `#[sqlx::test]` gives each
+/// test a fresh, empty database, so registering exactly one user here IS the
+/// "first user on a fresh deployment" case.
+#[sqlx::test]
+async fn first_registered_user_becomes_global_admin(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "email": "first@example.com", "password": "password123" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let role: (String,) = sqlx::query_as("select global_role from users where email = $1")
+        .bind("first@example.com")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(role.0, "admin");
+}
+
+/// Companion to the above: a SECOND registered user must still get the
+/// ordinary `member` default — the bootstrap only applies to the very first
+/// user on an empty deployment, not every registration thereafter.
+#[sqlx::test]
+async fn second_registered_user_stays_member(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+
+    let make_request = |email: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/auth/register")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "email": email, "password": "password123" }).to_string()))
+            .unwrap()
+    };
+
+    let first = app.clone().oneshot(make_request("firstuser@example.com")).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let second = app.oneshot(make_request("seconduser@example.com")).await.unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+
+    let first_role: (String,) = sqlx::query_as("select global_role from users where email = $1")
+        .bind("firstuser@example.com")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(first_role.0, "admin");
+
+    let second_role: (String,) = sqlx::query_as("select global_role from users where email = $1")
+        .bind("seconduser@example.com")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(second_role.0, "member");
 }
 
 #[sqlx::test]

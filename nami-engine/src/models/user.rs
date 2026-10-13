@@ -27,11 +27,25 @@ pub async fn insert_user(
     email: &str,
     password_hash: &str,
 ) -> Result<User, sqlx::Error> {
+    // First-registered-user-becomes-admin bootstrap: this project is
+    // explicitly single-org (no multi-tenancy), so there's otherwise no way
+    // to ever create the first project (`POST /projects` requires global
+    // `admin`, and `global_role` defaults to `member`). A count-then-insert
+    // (not a single atomic statement) is an accepted, extremely
+    // low-probability race for this one-time bootstrap event only — not
+    // worth wrapping in a transaction for this fix.
+    let is_first_user = sqlx::query_scalar::<_, i64>("select count(*) from users")
+        .fetch_one(pool)
+        .await?
+        == 0;
+    let global_role = if is_first_user { "admin" } else { "member" };
+
     sqlx::query_as::<_, User>(
-        "insert into users (email, password_hash) values ($1, $2) returning *",
+        "insert into users (email, password_hash, global_role) values ($1, $2, $3) returning *",
     )
     .bind(email)
     .bind(password_hash)
+    .bind(global_role)
     .fetch_one(pool)
     .await
 }

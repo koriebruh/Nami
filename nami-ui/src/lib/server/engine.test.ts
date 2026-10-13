@@ -35,6 +35,46 @@ describe('callEngine', () => {
 		expect(response.status).toBe(200);
 	});
 
+	it('relays secure=false when the engine Set-Cookie omits Secure (COOKIE_SECURE=false/unset)', async () => {
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { 'set-cookie': 'id=abc123; Path=/; HttpOnly' }
+			})
+		);
+		const setCookie = vi.fn();
+		const event = {
+			fetch: fetchMock,
+			request: { headers: new Headers() },
+			cookies: { set: setCookie },
+			getClientAddress: () => '203.0.113.5'
+		} as any;
+
+		await callEngine(event, '/auth/login', { method: 'POST' });
+
+		expect(setCookie).toHaveBeenCalledWith('id', 'abc123', expect.objectContaining({ secure: false }));
+	});
+
+	it('relays secure=true when the engine Set-Cookie includes Secure (COOKIE_SECURE=true)', async () => {
+		const fetchMock = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { 'set-cookie': 'id=abc123; Path=/; HttpOnly; Secure' }
+			})
+		);
+		const setCookie = vi.fn();
+		const event = {
+			fetch: fetchMock,
+			request: { headers: new Headers() },
+			cookies: { set: setCookie },
+			getClientAddress: () => '203.0.113.5'
+		} as any;
+
+		await callEngine(event, '/auth/login', { method: 'POST' });
+
+		expect(setCookie).toHaveBeenCalledWith('id', 'abc123', expect.objectContaining({ secure: true }));
+	});
+
 	it('sets x-forwarded-for from the real client address', async () => {
 		const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }));
 

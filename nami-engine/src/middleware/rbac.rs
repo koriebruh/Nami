@@ -41,7 +41,10 @@ impl FromRequestParts<AppState> for CurrentUser {
             .ok_or(AppError::Unauthorized)?;
 
         if auth_at < user.password_changed_at {
-            session.delete().await.ok();
+            // `.flush()` not `.delete()`: delete only removes the server-side
+            // row and leaves a stale cookie on the client until its Max-Age
+            // (same reasoning as `logout` in `routes::auth`). Flush does both.
+            session.flush().await.ok();
             return Err(AppError::Unauthorized);
         }
 
@@ -49,15 +52,20 @@ impl FromRequestParts<AppState> for CurrentUser {
     }
 }
 
-pub fn require_global_role(user: &CurrentUser, min: &str) -> Result<(), AppError> {
-    let rank = |role: &str| match role {
+/// Shared by `require_global_role` and `require_project_role` (previously
+/// duplicated verbatim in both). `None` on an unrecognized role string so
+/// both callers fail closed rather than ranking an unknown role above `-1`.
+fn role_rank(role: &str) -> Option<i32> {
+    match role {
         "admin" => Some(2),
         "member" => Some(1),
         "viewer" => Some(0),
         _ => None,
-    };
+    }
+}
 
-    match (rank(&user.global_role), rank(min)) {
+pub fn require_global_role(user: &CurrentUser, min: &str) -> Result<(), AppError> {
+    match (role_rank(&user.global_role), role_rank(min)) {
         (Some(user_rank), Some(min_rank)) if user_rank >= min_rank => Ok(()),
         _ => Err(AppError::Forbidden),
     }
@@ -89,15 +97,8 @@ pub async fn require_project_role(
     .fetch_optional(pool)
     .await?;
 
-    let rank = |role: &str| match role {
-        "admin" => Some(2),
-        "member" => Some(1),
-        "viewer" => Some(0),
-        _ => None,
-    };
-
     match row {
-        Some((role,)) => match (rank(&role), rank(min)) {
+        Some((role,)) => match (role_rank(&role), role_rank(min)) {
             (Some(user_rank), Some(min_rank)) if user_rank >= min_rank => Ok(()),
             _ => Err(crate::error::AppError::Forbidden),
         },

@@ -79,8 +79,9 @@ task review — disclose this in every PR description.
   running the engine or its tests.
 - Commit messages: Conventional Commits (`feat(engine): ...`, `fix(ui): ...`,
   `chore: ...`).
-- Rust: no ORM — SQLx with compile-time checked queries. Server-side
-  sessions only (tower-sessions + Postgres store), never JWT.
+- Rust: no ORM — SQLx with runtime-checked queries (`query`/`query_as`), no
+  compile-time macros. Server-side sessions only (tower-sessions + Postgres
+  store), never JWT.
 - RBAC: two levels only — `global_role` on `users` (`admin`/`member`/`viewer`)
   and `project_role` on `project_members` (`admin`/`member`/`viewer`).
   Global `admin` bypasses project membership checks. Authorization failure

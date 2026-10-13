@@ -4,6 +4,7 @@ pub struct Config {
     pub port: u16,
     pub smtp_host: String,
     pub smtp_port: u16,
+    pub cookie_secure: bool,
     pub oauth_redirect_base_url: String,
     pub google_client_id: String,
     pub google_client_secret: String,
@@ -32,6 +33,9 @@ impl Config {
                 .unwrap_or_else(|_| "1025".to_string())
                 .parse()
                 .expect("SMTP_PORT must be a number"),
+            cookie_secure: std::env::var("COOKIE_SECURE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
             ..Self::from_env_defaults_only()
         }
     }
@@ -54,6 +58,7 @@ impl Config {
             port: 8080,
             smtp_host: "localhost".to_string(),
             smtp_port: 1025,
+            cookie_secure: false,
             oauth_redirect_base_url: std::env::var("OAUTH_REDIRECT_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
             google_client_id: std::env::var("GOOGLE_CLIENT_ID").unwrap_or_default(),

@@ -35,7 +35,13 @@ export async function callEngine(
 		const pathAttr = attrs.find((a) => a.toLowerCase().startsWith('path='));
 		event.cookies.set(name, value, {
 			path: pathAttr ? pathAttr.split('=')[1] : '/',
-			httpOnly: attrs.some((a) => a.toLowerCase() === 'httponly')
+			httpOnly: attrs.some((a) => a.toLowerCase() === 'httponly'),
+			// Mirror the engine's actual `Secure` attribute rather than
+			// hardcoding one: nami-engine's `COOKIE_SECURE` env var controls
+			// whether it sends `Secure` on its own Set-Cookie, and this relayed
+			// cookie must always match, not silently default to insecure (or
+			// hardcode secure before the engine is actually served over HTTPS).
+			secure: attrs.some((a) => a.toLowerCase() === 'secure')
 		});
 	}
 
