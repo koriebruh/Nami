@@ -1,6 +1,6 @@
 use axum::{body::Body, http::{Request, StatusCode, header}};
 use tower::ServiceExt;
-use nami_engine::{state::AppState, email::Mailer, routes};
+use nami_engine::{state::AppState, email::Mailer, routes, config::Config};
 use serde_json::json;
 
 async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::HeaderValue {
@@ -21,7 +21,7 @@ async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::H
 }
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
-    let state = AppState { db: pool, mailer: Mailer::new("localhost", 1025) };
+    let state = AppState { db: pool, mailer: Mailer::new("localhost", 1025), config: Config::from_env_for_test() };
     axum::Router::new()
         .merge(routes::auth::router())
         .layer(tower_sessions::SessionManagerLayer::new(
@@ -347,7 +347,7 @@ async fn forgot_password_returns_generic_200_even_if_mail_send_fails(pool: sqlx:
         .unwrap();
 
     // Port 1 is a reserved/unreachable TCP port, so the SMTP send will fail.
-    let state = AppState { db: pool, mailer: Mailer::new("localhost", 1) };
+    let state = AppState { db: pool, mailer: Mailer::new("localhost", 1), config: Config::from_env_for_test() };
     let app = axum::Router::new().merge(routes::auth::router()).with_state(state);
 
     let response = app
@@ -368,7 +368,7 @@ async fn forgot_password_returns_generic_200_even_if_mail_send_fails(pool: sqlx:
 /// instance of the same bug pattern.
 #[sqlx::test]
 async fn register_returns_generic_200_even_if_mail_send_fails(pool: sqlx::PgPool) {
-    let state = AppState { db: pool, mailer: Mailer::new("localhost", 1) };
+    let state = AppState { db: pool, mailer: Mailer::new("localhost", 1), config: Config::from_env_for_test() };
     let app = axum::Router::new().merge(routes::auth::router()).with_state(state);
 
     let response = app

@@ -41,17 +41,21 @@ async fn main() {
         // not a real sliding expiry. Force a save on every request instead.
         .with_always_save(true);
 
-    let mailer = email::Mailer::new(&config.smtp_host, config.smtp_port);
-    let state = AppState { db: pool, mailer };
+    let port = config.port;
+    let state = AppState {
+        db: pool,
+        mailer: email::Mailer::new(&config.smtp_host, config.smtp_port),
+        config,
+    };
     let app = Router::new()
         .merge(routes::health::router())
         .merge(routes::auth::router())
         .layer(session_layer)
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port))
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .unwrap();
-    tracing::info!("listening on port {}", config.port);
+    tracing::info!("listening on port {}", port);
     axum::serve(listener, app).await.unwrap();
 }

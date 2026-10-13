@@ -15,6 +15,8 @@ pub enum AppError {
     NotFound,
     #[error("rate limited")]
     RateLimited,
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 impl IntoResponse for AppError {
@@ -29,6 +31,7 @@ impl IntoResponse for AppError {
             AppError::Validation(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "too many requests".to_string()),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }

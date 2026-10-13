@@ -1,4 +1,5 @@
-use axum::{routing::{get, post}, Router, Json, extract::{State, Query}};
+use axum::{routing::{get, post}, Router, Json, extract::{State, Query, Path}};
+use oauth2::{CsrfToken, Scope, AuthorizationCode, TokenResponse};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_sessions::Session;
@@ -16,6 +17,10 @@ pub fn router() -> Router<AppState> {
         .route("/auth/totp/verify", post(totp_verify))
         .route("/auth/password/forgot", post(forgot_password))
         .route("/auth/password/reset", post(reset_password))
+        // axum 0.8 uses `{param}` path syntax (not the brief's `:param`, which is
+        // the pre-0.8 axum/matchit syntax and panics at router-build time here).
+        .route("/auth/oauth/{provider}/start", get(oauth_start))
+        .route("/auth/oauth/{provider}/callback", get(oauth_callback))
 }
 
 #[derive(Deserialize)]
@@ -348,4 +353,149 @@ async fn reset_password(
     models::user::update_password(&state.db, user_id, &new_hash).await?;
 
     Ok(Json(json!({ "message": "password reset" })))
+}
+
+async fn oauth_start(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    session: Session,
+) -> Result<axum::response::Redirect, AppError> {
+    let provider = auth::oauth::Provider::parse(&provider)
+        .ok_or_else(|| AppError::Validation("unknown provider".into()))?;
+    let client = provider.client(&state.config);
+
+    let (auth_url, csrf_token) = client
+        .authorize_url(CsrfToken::new_random)
+        .add_scope(Scope::new("email".to_string()))
+        .url();
+
+    session
+        .insert("oauth_csrf", csrf_token.secret().clone())
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+
+    Ok(axum::response::Redirect::to(auth_url.as_str()))
+}
+
+#[derive(Deserialize)]
+struct OAuthCallbackQuery {
+    code: String,
+    state: String,
+}
+
+// Google's OIDC userinfo endpoint returns the subject identifier as `sub`
+// (there is no `id` field).
+#[derive(serde::Deserialize)]
+struct GoogleUserInfo {
+    sub: String,
+    email: String,
+}
+
+// GitHub's `GET /user` returns `id` as a JSON integer, not a string, and
+// `email` is nullable (many users don't have a public email set).
+#[derive(serde::Deserialize)]
+struct GitHubUserInfo {
+    id: u64,
+    email: Option<String>,
+}
+
+async fn oauth_callback(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Query(query): Query<OAuthCallbackQuery>,
+    session: Session,
+) -> Result<Json<Value>, AppError> {
+    let provider = auth::oauth::Provider::parse(&provider)
+        .ok_or_else(|| AppError::Validation("unknown provider".into()))?;
+
+    let expected_csrf: String = session
+        .get("oauth_csrf")
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?
+        .ok_or_else(|| AppError::Validation("missing csrf state".into()))?;
+    if expected_csrf != query.state {
+        return Err(AppError::Validation("csrf mismatch".into()));
+    }
+
+    // Remove the stored CSRF value as soon as it's validated (matched),
+    // regardless of what happens afterward in this function (token exchange
+    // or userinfo fetch failing, etc). Previously this was only removed on
+    // the full success path at the end, so a failed token exchange left the
+    // CSRF token in the session indefinitely, letting it be reused if a
+    // later `/token` call succeeded.
+    session.remove::<String>("oauth_csrf").await.ok();
+
+    let client = provider.client(&state.config);
+    // oauth2's `reqwest` feature vendors its own reqwest dependency (0.12.x), a
+    // different major version from this crate's own `reqwest` (0.13.x, used below
+    // for the userinfo call) — the two `Client` types are distinct, so the token
+    // exchange specifically needs `oauth2::reqwest::Client`, which is the only
+    // type implementing oauth2's `AsyncHttpClient` trait.
+    let oauth_http_client = oauth2::reqwest::Client::new();
+    let token = client
+        .exchange_code(AuthorizationCode::new(query.code))
+        .request_async(&oauth_http_client)
+        .await
+        .map_err(|_| AppError::Validation("token exchange failed".into()))?;
+
+    let userinfo_response = reqwest::Client::new()
+        .get(provider.userinfo_url(&state.config))
+        .bearer_auth(token.access_token().secret())
+        .send()
+        .await
+        .map_err(|_| AppError::Validation("userinfo request failed".into()))?;
+
+    // Each provider's userinfo endpoint returns a different shape; parse
+    // with the matching struct and normalize to a (provider_user_id, email)
+    // pair before calling `find_or_create_oauth_user`.
+    let (provider_user_id, email) = match provider {
+        auth::oauth::Provider::Google => {
+            let info: GoogleUserInfo = userinfo_response
+                .json()
+                .await
+                .map_err(|_| AppError::Validation("invalid userinfo response".into()))?;
+            (info.sub, info.email)
+        }
+        auth::oauth::Provider::Github => {
+            let info: GitHubUserInfo = userinfo_response
+                .json()
+                .await
+                .map_err(|_| AppError::Validation("invalid userinfo response".into()))?;
+            let email = info.email.ok_or_else(|| {
+                AppError::Validation(
+                    "GitHub account has no public email; please make an email public on GitHub or register with email/password instead"
+                        .into(),
+                )
+            })?;
+            (info.id.to_string(), email)
+        }
+    };
+
+    let user = models::user::find_or_create_oauth_user(
+        &state.db,
+        provider.as_str(),
+        &provider_user_id,
+        &email,
+    )
+    .await?;
+
+    // Rotate the session ID before promoting to a fully authenticated session,
+    // mirroring `login`'s and `totp_verify`'s success paths. Without this, a
+    // session ID that existed before the OAuth round-trip (e.g. attacker-fixed)
+    // could be reused as the post-auth session.
+    session
+        .cycle_id()
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+
+    session
+        .insert("user_id", user.id)
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+    session
+        .insert("auth_at", chrono::Utc::now())
+        .await
+        .map_err(|_| AppError::Validation("session error".into()))?;
+
+    Ok(Json(json!({ "authenticated": true })))
 }
