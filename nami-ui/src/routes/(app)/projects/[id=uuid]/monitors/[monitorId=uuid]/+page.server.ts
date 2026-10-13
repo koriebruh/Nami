@@ -1,0 +1,66 @@
+import { error, redirect } from '@sveltejs/kit';
+import {
+	callEngine,
+	engineErrorMessage,
+	engineFailure,
+	enginePath,
+	redirectToLoginIfUnauthorized
+} from '#lib/server/engine';
+import { formText } from '#lib/server/monitor-form';
+import type { Incident, Monitor, MonitorStats, UptimeCheck } from '#lib/uptime';
+import type { Actions, PageServerLoad, RequestEvent } from './$types';
+
+export const load: PageServerLoad = async (event) => {
+	const { id, monitorId } = event.params;
+	const [monitorRes, statsRes, checksRes, incidentsRes] = await Promise.all([
+		callEngine(event, enginePath`/projects/${id}/monitors/${monitorId}`),
+		callEngine(event, enginePath`/projects/${id}/monitors/${monitorId}/stats`),
+		callEngine(event, enginePath`/projects/${id}/monitors/${monitorId}/checks?limit=20`),
+		callEngine(event, enginePath`/projects/${id}/incidents?monitor_id=${monitorId}`)
+	]);
+	redirectToLoginIfUnauthorized(monitorRes);
+	if (monitorRes.status === 404) throw error(404, 'Monitor not found.');
+	if (!monitorRes.ok) {
+		throw error(
+			monitorRes.status === 403 ? 403 : 500,
+			await engineErrorMessage(monitorRes, 'Could not load monitor.')
+		);
+	}
+	const monitor: Monitor = await monitorRes.json();
+	// History lives in ClickHouse: if it is unavailable, still render the
+	// monitor (its status comes from Postgres) with the history sections empty.
+	const stats: MonitorStats | null = statsRes.ok ? await statsRes.json() : null;
+	const checks: UptimeCheck[] = checksRes.ok ? await checksRes.json() : [];
+	const incidents: Incident[] = incidentsRes.ok ? await incidentsRes.json() : [];
+	return { monitor, stats, checks, incidents };
+};
+
+async function setPaused(event: RequestEvent, paused: boolean) {
+	const response = await callEngine(
+		event,
+		enginePath`/projects/${event.params.id}/monitors/${event.params.monitorId}`,
+		{ method: 'PATCH', body: JSON.stringify({ paused }) }
+	);
+	if (!response.ok) return engineFailure(response, 'Could not update monitor.');
+	return { success: true };
+}
+
+export const actions: Actions = {
+	pause: (event) => setPaused(event, true),
+	resume: (event) => setPaused(event, false),
+	delete: async (event) => {
+		// The Delete button asks with confirm() and then sends `confirm=yes`.
+		// Without JavaScript there is no dialog, and a bare POST must not delete
+		// a monitor and its incidents: send the page back to ask first.
+		const form = await event.request.formData();
+		if (formText(form, 'confirm') !== 'yes') return { confirmDelete: true as const };
+
+		const response = await callEngine(
+			event,
+			enginePath`/projects/${event.params.id}/monitors/${event.params.monitorId}`,
+			{ method: 'DELETE' }
+		);
+		if (!response.ok) return engineFailure(response, 'Could not delete monitor.');
+		throw redirect(303, enginePath`/projects/${event.params.id}/monitors`);
+	}
+};

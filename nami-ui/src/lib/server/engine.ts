@@ -1,4 +1,4 @@
-import type { RequestEvent } from '@sveltejs/kit';
+import { fail, redirect, type RequestEvent } from '@sveltejs/kit';
 
 // NOTE: this SvelteKit version (3.x, in this repo) replaced the old
 // "$env/dynamic/private" arbitrary-runtime-var object with a declared/typed
@@ -72,4 +72,62 @@ export async function getCurrentUser(event: RequestEvent): Promise<CurrentUser |
 	const response = await callEngine(event, '/auth/me');
 	if (!response.ok) return null;
 	return (await response.json()) as CurrentUser;
+}
+
+/**
+ * The engine's `{ "error": "..." }` message, or `fallback` when the body is
+ * not that shape (axum's own extractor rejections are plain text).
+ */
+export async function engineErrorMessage(response: Response, fallback: string): Promise<string> {
+	try {
+		const body = await response.json();
+		if (body && typeof body.error === 'string') return body.error;
+	} catch {
+		// not JSON
+	}
+	return fallback;
+}
+
+/**
+ * Builds a path from a template literal, percent-encoding every interpolated
+ * value so that it stays one path segment (or one query value). Use it for
+ * every engine path and every redirect target that has a route param or a
+ * form field in it: SvelteKit hands those over decoded, so a value like
+ * `../auth/me?` would otherwise turn `/projects/${id}/monitors` into a request
+ * for `/auth/me` (URL parsing resolves the dots) or cut the path short at the
+ * `?`.
+ *
+ * A value that is exactly `.` or `..` is refused: URL parsing removes dot
+ * segments even when they are percent-encoded (`%2E%2E`), so encoding cannot
+ * make them safe.
+ */
+export function enginePath(strings: TemplateStringsArray, ...values: unknown[]): string {
+	let path = strings[0];
+	values.forEach((value, i) => {
+		const text = String(value);
+		if (text === '.' || text === '..') {
+			throw new Error(`enginePath: "${text}" would be removed from the path as a dot segment`);
+		}
+		path += encodeURIComponent(text) + strings[i + 1];
+	});
+	return path;
+}
+
+/**
+ * The engine answers 401 when the session is gone (expired, or ended by a
+ * password change). A visitor in that state goes to the login page, where a
+ * form or a page error would only say "unauthorized". Throws the redirect.
+ */
+export function redirectToLoginIfUnauthorized(response: Response): void {
+	if (response.status === 401) throw redirect(303, '/login');
+}
+
+/**
+ * The `fail()` for a form action whose engine call did not succeed: the
+ * engine's own message, or `fallback`, with the engine's status. A 401 goes to
+ * the login page instead (see `redirectToLoginIfUnauthorized`).
+ */
+export async function engineFailure(response: Response, fallback: string) {
+	redirectToLoginIfUnauthorized(response);
+	return fail(response.status, { message: await engineErrorMessage(response, fallback) });
 }
