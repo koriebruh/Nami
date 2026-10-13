@@ -51,14 +51,55 @@ impl FromRequestParts<AppState> for CurrentUser {
 
 pub fn require_global_role(user: &CurrentUser, min: &str) -> Result<(), AppError> {
     let rank = |role: &str| match role {
-        "admin" => 2,
-        "member" => 1,
-        "viewer" => 0,
-        _ => -1,
+        "admin" => Some(2),
+        "member" => Some(1),
+        "viewer" => Some(0),
+        _ => None,
     };
-    if rank(&user.global_role) >= rank(min) {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden)
+
+    match (rank(&user.global_role), rank(min)) {
+        (Some(user_rank), Some(min_rank)) if user_rank >= min_rank => Ok(()),
+        _ => Err(AppError::Forbidden),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user_with_role(role: &str) -> CurrentUser {
+        CurrentUser {
+            id: uuid::Uuid::nil(),
+            email: "test@example.com".to_string(),
+            global_role: role.to_string(),
+        }
+    }
+
+    #[test]
+    fn unrecognized_global_role_fails_closed_even_against_low_bar() {
+        let user = user_with_role("superadmin");
+        let result = require_global_role(&user, "viewer");
+        assert!(matches!(result, Err(AppError::Forbidden)));
+    }
+
+    #[test]
+    fn unrecognized_min_argument_fails_closed() {
+        let user = user_with_role("admin");
+        let result = require_global_role(&user, "Admin");
+        assert!(matches!(result, Err(AppError::Forbidden)));
+    }
+
+    #[test]
+    fn known_roles_still_rank_correctly() {
+        let admin = user_with_role("admin");
+        let member = user_with_role("member");
+        let viewer = user_with_role("viewer");
+
+        assert!(require_global_role(&admin, "admin").is_ok());
+        assert!(require_global_role(&admin, "viewer").is_ok());
+        assert!(require_global_role(&member, "admin").is_err());
+        assert!(require_global_role(&member, "member").is_ok());
+        assert!(require_global_role(&viewer, "member").is_err());
+        assert!(require_global_role(&viewer, "viewer").is_ok());
     }
 }
