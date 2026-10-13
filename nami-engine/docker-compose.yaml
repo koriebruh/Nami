@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: nami
       POSTGRES_DB: nami
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - nami_postgres_data:/var/lib/postgresql/data
 
@@ -17,11 +17,25 @@ services:
       - "8025:8025" # Web UI + API
 
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    # Pinned: the HTTP query-parameter escaping and DateTime handling in
+    # src/clickhouse.rs were verified against 26.9.
+    image: clickhouse/clickhouse-server:26.9
+    environment:
+      # ClickHouse 26.x rejects the passwordless `default` user over the
+      # network, so nami-engine authenticates as this user.
+      CLICKHOUSE_USER: nami
+      CLICKHOUSE_PASSWORD: nami
+      CLICKHOUSE_DB: nami
     ports:
-      - "8123:8123"
-      - "9000:9000"
-    # unused until the uptime-monitoring sub-project
+      - "8123:8123" # HTTP interface (nami-engine)
+      - "9000:9000" # native protocol (clickhouse-client)
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - nami_clickhouse_data:/var/lib/clickhouse
 
 volumes:
   nami_postgres_data:
+  nami_clickhouse_data:

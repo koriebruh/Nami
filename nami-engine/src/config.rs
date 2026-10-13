@@ -16,6 +16,15 @@ pub struct Config {
     pub github_auth_url: String,
     pub github_token_url: String,
     pub github_userinfo_url: String,
+    pub clickhouse_url: String,
+    pub clickhouse_user: String,
+    pub clickhouse_password: String,
+    pub clickhouse_database: String,
+    /// Base URL of nami-ui, used to build links in alert emails.
+    pub ui_base_url: String,
+    /// `UPTIME_WORKER_ENABLED=false` serves the API without the background
+    /// uptime checker (e.g. a second, API-only replica).
+    pub uptime_worker_enabled: bool,
 }
 
 impl Config {
@@ -77,6 +86,18 @@ impl Config {
                 .unwrap_or_else(|_| "https://github.com/login/oauth/access_token".to_string()),
             github_userinfo_url: std::env::var("GITHUB_USERINFO_URL")
                 .unwrap_or_else(|_| "https://api.github.com/user".to_string()),
+            clickhouse_url: std::env::var("CLICKHOUSE_URL")
+                .unwrap_or_else(|_| "http://localhost:8123".to_string()),
+            clickhouse_user: std::env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "nami".to_string()),
+            clickhouse_password: std::env::var("CLICKHOUSE_PASSWORD")
+                .unwrap_or_else(|_| "nami".to_string()),
+            clickhouse_database: std::env::var("CLICKHOUSE_DATABASE")
+                .unwrap_or_else(|_| "nami".to_string()),
+            ui_base_url: std::env::var("UI_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:5173".to_string()),
+            uptime_worker_enabled: std::env::var("UPTIME_WORKER_ENABLED")
+                .map(|v| !(v == "false" || v == "0"))
+                .unwrap_or(true),
         }
     }
 }
