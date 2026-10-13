@@ -14,6 +14,7 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "projects",
         "project_members",
         "sources",
+        "source_usage_daily",
         "email_verification_tokens",
         "password_reset_tokens",
         "monitors",

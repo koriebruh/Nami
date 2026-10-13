@@ -26,6 +26,8 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+pub mod logs;
+
 pub const PASSWORD: &str = "password123";
 
 /// argon2 is deliberately slow: hash the shared fixture password once per

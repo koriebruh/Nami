@@ -24,7 +24,7 @@ use tower_governor::{
 };
 use tower_sessions::{Expiry, SessionManagerLayer, SessionStore, cookie::SameSite};
 
-use crate::{error::AppError, routes, state::AppState};
+use crate::{error::AppError, routes, routes::logs_ingest::IngestLimits, state::AppState};
 
 /// Wraps `rate_limited_router()` with the real governor config: per-IP
 /// (`SmartIpKeyExtractor`, not `GlobalKeyExtractor` — see the historical
@@ -122,24 +122,44 @@ fn declares_json(headers: &HeaderMap) -> bool {
 }
 
 /// The public listener's router (`PUBLIC_PORT`): only what clients outside
-/// reach without a session, namely the heartbeat ping endpoint (later the log,
-/// OTLP and Sentry ingest endpoints) and a `/health` that does not touch the
-/// database. None of the API is served here, so the public port can be exposed
-/// to cron jobs and other machines without exposing the API with it. Pings
-/// share [`routes::heartbeats::MAX_PINGS_IN_FLIGHT`] places.
+/// reach without a session, namely the heartbeat ping endpoint, the log ingest
+/// endpoint (later the OTLP and Sentry ones) and a `/health` that does not
+/// touch the database. None of the API is served here, so the public port can
+/// be exposed to cron jobs, log shippers and other machines without exposing
+/// the API with it. Pings share [`routes::heartbeats::MAX_PINGS_IN_FLIGHT`]
+/// places, ingest requests [`routes::logs_ingest::MAX_INGEST_IN_FLIGHT`]. The
+/// JSON-only guard of the API (`require_json_body`) does not apply here:
+/// ingest takes NDJSON and MessagePack, gzipped, and the token in the
+/// `Authorization` header (never a cookie) is its credential.
 pub fn build_public_router(state: AppState) -> Router {
-    build_public_router_with_ping_slots(
-        state,
-        Arc::new(Semaphore::new(routes::heartbeats::MAX_PINGS_IN_FLIGHT)),
-    )
+    build_public_router_with_limits(state, default_ping_slots(), IngestLimits::default())
 }
 
 /// [`build_public_router`] whose pings hold places of `ping_slots` (tests hold
 /// its places to fill the endpoint up).
 pub fn build_public_router_with_ping_slots(state: AppState, ping_slots: Arc<Semaphore>) -> Router {
+    build_public_router_with_limits(state, ping_slots, IngestLimits::default())
+}
+
+/// [`build_public_router`] with the given limits on the ingest endpoint
+/// (tests fill its places up, or shorten how long it waits for a body).
+pub fn build_public_router_with_ingest_limits(state: AppState, limits: IngestLimits) -> Router {
+    build_public_router_with_limits(state, default_ping_slots(), limits)
+}
+
+fn default_ping_slots() -> Arc<Semaphore> {
+    Arc::new(Semaphore::new(routes::heartbeats::MAX_PINGS_IN_FLIGHT))
+}
+
+fn build_public_router_with_limits(
+    state: AppState,
+    ping_slots: Arc<Semaphore>,
+    ingest_limits: IngestLimits,
+) -> Router {
     Router::new()
         .merge(routes::health::public_router())
         .merge(routes::heartbeats::public_router(ping_slots))
+        .merge(routes::logs_ingest::public_router(ingest_limits))
         .with_state(state)
 }
 

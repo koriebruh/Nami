@@ -51,6 +51,13 @@ phases merge.
   with a `…[truncated]` marker, `fields` capped at 256 KiB per event.
 - Per-source rate limit (in-memory token bucket, keyed by source id):
   50 requests/s, burst 100 → 429 with the service's JSON error shape.
+- Served by the public listener (`PUBLIC_PORT`) only, never by the private
+  API port, so exposing the one public port to shippers exposes none of the
+  API. At most 32 ingest requests run at once per engine instance; one that
+  finds every place taken → `503` with `Retry-After: 1`, answered before any
+  database work, so an ingest flood cannot starve the Postgres pool that
+  the API and the uptime worker share. A bearer token that is not exactly 43
+  base64url characters → 401 without a database query.
 - Response `202 {"accepted": N}`. Inserts use ClickHouse
   `async_insert=1, wait_for_async_insert=1` so the server batches small
   inserts and 202 still means durable.

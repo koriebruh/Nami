@@ -2,10 +2,12 @@ use nami_engine::{
     clickhouse::ClickHouse,
     config::Config,
     crypto::{Cipher, TEST_KEY},
-    db, email, router,
+    db, email,
+    logs::LogsState,
+    router,
     state::AppState,
 };
-use std::{future::IntoFuture, net::SocketAddr};
+use std::{future::IntoFuture, net::SocketAddr, sync::Arc};
 use tower_sessions_sqlx_store::PostgresStore;
 
 #[tokio::main]
@@ -73,8 +75,12 @@ async fn main() {
             .unwrap_or_else(|message| panic!("{message}")),
         clickhouse,
         cipher: Cipher::new(&config.encryption_key),
+        logs: Arc::new(LogsState::default()),
         config,
     };
+
+    // Every instance that ingests logs adds its usage counters to Postgres.
+    tokio::spawn(nami_engine::logs::usage::run_forever(state.clone()));
 
     if state.config.uptime_worker_enabled {
         tokio::spawn(nami_engine::uptime::worker::run_forever(state.clone()));

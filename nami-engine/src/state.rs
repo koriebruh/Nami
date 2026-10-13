@@ -1,6 +1,8 @@
+use std::sync::Arc;
+
 use sqlx::PgPool;
 
-use crate::{clickhouse::ClickHouse, config::Config, crypto::Cipher, email};
+use crate::{clickhouse::ClickHouse, config::Config, crypto::Cipher, email, logs::LogsState};
 
 /// A ClickHouse database name that is never created. `AppState::for_test`
 /// binds its client to it, so a test that touches ClickHouse without opting
@@ -15,6 +17,8 @@ pub struct AppState {
     pub clickhouse: ClickHouse,
     /// Seals and opens monitor secrets; built from `config.encryption_key`.
     pub cipher: Cipher,
+    /// Log ingest rate limits and usage counters (in memory, per instance).
+    pub logs: Arc<LogsState>,
     pub config: Config,
 }
 
@@ -23,7 +27,8 @@ impl AppState {
     /// `router::with_fallback_connect_info`): every field gets the
     /// defaults tests expect — `Config::from_env_for_test()`, the Mailpit
     /// mailer, a ClickHouse client bound to a database that does not
-    /// exist, and a cipher over the fixed `crypto::TEST_KEY`. Tests override
+    /// exist, a cipher over the fixed `crypto::TEST_KEY`, and fresh log
+    /// ingest state (default rate limits, no usage). Tests override
     /// single fields with struct-update syntax, e.g.
     /// `AppState { mailer: Mailer::new("localhost", 1), ..AppState::for_test(pool) }`,
     /// so adding a field to `AppState` never touches test files again.
@@ -39,6 +44,7 @@ impl AppState {
                 UNCONFIGURED_TEST_CLICKHOUSE_DATABASE,
             ),
             cipher: Cipher::new(&config.encryption_key),
+            logs: Arc::new(LogsState::default()),
             config,
         }
     }
