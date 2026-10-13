@@ -51,7 +51,9 @@ describe('heartbeat detail page: ping URL', () => {
 		const { body } = renderPage(heartbeat());
 		expect(body).toContain(`<code class="block flex-1`);
 		expect(body.split(PING).length - 1).toBe(2); // the URL itself, and inside the crontab line
-		expect(body).toContain(`0 3 * * * /usr/local/bin/backup.sh &amp;&amp; curl -fsS -m 10 --retry 3 ${PING}`);
+		// The command quotes the URL; the URL block above it is the plain URL.
+		expect(body).toContain(`0 3 * * * /usr/local/bin/backup.sh &amp;&amp; curl -fsS -m 10 --retry 3 '${PING}'`);
+		expect(body).toContain(`select-all">${PING}</code>`);
 		expect(body).toContain('>Rotate token<');
 		expect(body).not.toContain('visible to project members');
 	});

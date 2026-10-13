@@ -4,6 +4,8 @@ import { actions, load } from './+page.server';
 
 const heartbeatsPath = `/projects/${PROJECT_ID}/heartbeats`;
 
+type Scenario = [name: string, engine: Parameters<typeof fakeEvent>[0], rejection: { status: number } | null];
+
 describe('heartbeat list load', () => {
 	const originalPublicUrl = process.env.PUBLIC_ENGINE_URL;
 	beforeEach(() => {
@@ -56,6 +58,34 @@ describe('heartbeat list load', () => {
 		const { event, calls } = fakeEvent({ params: { id: '../auth/me?' }, body: '[]' });
 		await load(event);
 		expect(calls().map((call) => call.path + call.search)).toEqual(['/projects/..%2Fauth%2Fme%3F/heartbeats']);
+	});
+
+	// The page carries the ping token, in its markup and in the data sent with
+	// it: no browser or proxy may keep either. The header is set before anything
+	// can fail, so every response of the load has it, and only once (SvelteKit
+	// throws when a header is set twice).
+	const scenarios: Scenario[] = [
+		['a member', { body: JSON.stringify([{ id: HEARTBEAT_ID, name: 'Backup', token: 'a'.repeat(64) }]) }, null],
+		['a viewer, who gets no token', { body: JSON.stringify([{ id: HEARTBEAT_ID, name: 'Backup', token: null }]) }, null],
+		['an empty list', { body: '[]' }, null],
+		['a caller the engine refuses', { status: 403, body: '{"error":"forbidden"}' }, { status: 403 }],
+		['an engine failure', { status: 500, body: '{"error":"internal error"}' }, { status: 500 }],
+		['an engine error that is not JSON', { status: 502, body: '<html>bad gateway</html>' }, { status: 500 }],
+		['a session that is gone', { status: 401, body: '{"error":"unauthorized"}' }, { status: 303 }]
+	];
+	it.each(scenarios)('forbids caching for %s', async (_name, engine, rejection) => {
+		const { event, setHeaders } = fakeEvent(engine);
+		if (rejection) await expect(load(event)).rejects.toMatchObject(rejection);
+		else await load(event);
+		expect(setHeaders).toHaveBeenCalledTimes(1);
+		expect(setHeaders).toHaveBeenCalledWith({ 'cache-control': 'private, no-store' });
+	});
+
+	it('fails with the configuration error when PUBLIC_ENGINE_URL is not an http(s) URL', async () => {
+		process.env.PUBLIC_ENGINE_URL = 'engine.example.com';
+		const { event, setHeaders } = fakeEvent({ body: '[]' });
+		await expect(load(event)).rejects.toThrow(/PUBLIC_ENGINE_URL/);
+		expect(setHeaders).toHaveBeenCalledTimes(1);
 	});
 });
 

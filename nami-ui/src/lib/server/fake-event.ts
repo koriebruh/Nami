@@ -37,6 +37,10 @@ export function fakeEvent(options: Options = {}) {
 		request = new Request('http://ui.test/', { method: 'POST', body });
 	}
 
+	// What a load sets on its response. SvelteKit throws when a header is set
+	// twice, so a test that cares reads the call count too.
+	const setHeaders = vi.fn();
+
 	const event = {
 		params: { id: PROJECT_ID, monitorId: MONITOR_ID, heartbeatId: HEARTBEAT_ID, ...options.params },
 		url: new URL(options.url ?? 'http://ui.test/'),
@@ -44,12 +48,14 @@ export function fakeEvent(options: Options = {}) {
 		request,
 		parent: async () => ({}),
 		cookies: { set: vi.fn() },
+		setHeaders,
 		getClientAddress: () => '203.0.113.5'
 	};
 
 	return {
 		// Cast: only the parts of RequestEvent that the code under test reads exist.
 		event: event as any,
+		setHeaders,
 		/** The engine requests made so far, as method, path, query string and body. */
 		calls: () =>
 			fetch.mock.calls.map(([input, init]) => {

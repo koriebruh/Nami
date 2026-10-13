@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import {
 	formatClockUtc,
@@ -8,7 +9,9 @@ import {
 	formatUtc,
 	monitorTarget,
 	niceTicks,
+	pingCommand,
 	pingUrl,
+	shellQuote,
 	statusSince,
 	timeAgo,
 	type Incident
@@ -185,5 +188,71 @@ describe('formatSeconds', () => {
 		expect(formatSeconds(-5)).toBe('0s');
 		expect(formatSeconds(90.9)).toBe('1m 30s');
 		expect(formatSeconds(Number.NaN)).toBe('0s');
+	});
+});
+
+// The shell tests ask /bin/sh, so they need a POSIX system (this repo's machines
+// and containers are).
+const posix = process.platform !== 'win32';
+
+describe('shellQuote', () => {
+	it('wraps the value in single quotes', () => {
+		expect(shellQuote('https://engine.example.com/api/v1/heartbeat/abc')).toBe(
+			"'https://engine.example.com/api/v1/heartbeat/abc'"
+		);
+		expect(shellQuote('')).toBe("''");
+	});
+
+	it('closes, escapes and reopens the quote around a single quote', () => {
+		expect(shellQuote("it's")).toBe("'it'\\''s'");
+		expect(shellQuote("'")).toBe("''\\'''");
+	});
+
+	// The only way to know a quoting function is right is to ask a shell: every
+	// value, whatever it holds, comes back as one word, unchanged, and nothing
+	// in it runs.
+	it.skipIf(!posix)('is read back unchanged, as one word, by a real shell', () => {
+		const values = [
+			'plain',
+			'https://engine.example.com/a b/api/v1/heartbeat/abc',
+			"it's",
+			"a'b'c",
+			"''",
+			'x\'; echo pwned; \'',
+			'$(echo pwned)',
+			'`echo pwned`',
+			'${HOME}',
+			'a;b&c|d>e<f',
+			'*?[a-z]~',
+			'"double"',
+			'back\\slash',
+			'100%',
+			'#not-a-comment',
+			'multi\nline',
+			'tab\there',
+			'ünï€ode'
+		];
+		for (const value of values) {
+			const out = execFileSync('/bin/sh', ['-c', `printf %s ${shellQuote(value)}`], { encoding: 'utf8' });
+			expect(out, JSON.stringify(value)).toBe(value);
+			// Two words, not one: the quoting must not have merged or split anything.
+			const count = execFileSync('/bin/sh', ['-c', `set -- ${shellQuote(value)} ${shellQuote(value)}; printf %s $#`], { encoding: 'utf8' });
+			expect(count, JSON.stringify(value)).toBe('2');
+		}
+	});
+});
+
+describe('pingCommand', () => {
+	it('is the curl command of the crontab example, with the URL quoted', () => {
+		expect(pingCommand('http://localhost:8080/api/v1/heartbeat/abc')).toBe(
+			"curl -fsS -m 10 --retry 3 'http://localhost:8080/api/v1/heartbeat/abc'"
+		);
+	});
+
+	it.skipIf(!posix)('keeps a URL with shell characters in it as one argument', () => {
+		const url = "https://example.com/it's;$(echo pwned)&x=1/api/v1/heartbeat/abc";
+		const echoed = execFileSync('/bin/sh', ['-c', pingCommand(url).replace(/^curl /, 'printf "%s\\n" ')], { encoding: 'utf8' });
+		// curl's options are separate words, the URL is the last one, intact.
+		expect(echoed.trimEnd().split('\n')).toEqual(['-fsS', '-m', '10', '--retry', '3', url]);
 	});
 });

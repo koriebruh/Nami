@@ -12,6 +12,12 @@ import type { Heartbeat } from '#lib/uptime';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {
+	// The page carries the ping tokens, in its markup and in the data that goes
+	// with it: no browser or proxy may keep either. Set first, so that every
+	// response of this load has it (a viewer's, an error page, a redirect), and
+	// only here: SvelteKit throws when a header is set twice.
+	event.setHeaders({ 'cache-control': 'private, no-store' });
+
 	const response = await callEngine(event, enginePath`/projects/${event.params.id}/heartbeats`);
 	redirectToLoginIfUnauthorized(response);
 	if (!response.ok) {

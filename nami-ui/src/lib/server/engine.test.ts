@@ -220,32 +220,100 @@ describe('publicEngineUrl', () => {
 		else process.env.PUBLIC_ENGINE_URL = original;
 	});
 
+	function configure(value: string): string {
+		process.env.PUBLIC_ENGINE_URL = value;
+		return publicEngineUrl();
+	}
+
 	it('defaults to the local engine', () => {
 		delete process.env.PUBLIC_ENGINE_URL;
 		expect(publicEngineUrl()).toBe('http://localhost:8080');
 	});
 
-	it('uses PUBLIC_ENGINE_URL without a trailing slash', () => {
-		process.env.PUBLIC_ENGINE_URL = 'https://status-engine.example.com/';
-		expect(publicEngineUrl()).toBe('https://status-engine.example.com');
-	});
-
-	it('trims every trailing slash and keeps a path prefix', () => {
-		process.env.PUBLIC_ENGINE_URL = 'https://example.com/engine///';
-		expect(publicEngineUrl()).toBe('https://example.com/engine');
-	});
-
 	// `PUBLIC_ENGINE_URL=` in an env file is an empty string, not an unset
 	// variable: it must not turn every ping URL into a relative path.
 	it('treats an empty or blank value as unset', () => {
-		for (const blank of ['', '   ', '/', ' / ']) {
-			process.env.PUBLIC_ENGINE_URL = blank;
-			expect(publicEngineUrl(), JSON.stringify(blank)).toBe('http://localhost:8080');
+		for (const blank of ['', ' ', '   ', '\t\n']) {
+			expect(configure(blank), JSON.stringify(blank)).toBe('http://localhost:8080');
 		}
 	});
 
+	it('uses PUBLIC_ENGINE_URL without a trailing slash', () => {
+		expect(configure('https://status-engine.example.com/')).toBe('https://status-engine.example.com');
+		expect(configure('http://localhost:9000/')).toBe('http://localhost:9000');
+		expect(configure('https://status-engine.example.com')).toBe('https://status-engine.example.com');
+	});
+
+	it('trims every trailing slash and keeps a path prefix', () => {
+		expect(configure('https://example.com/engine///')).toBe('https://example.com/engine');
+		expect(configure('https://example.com/a/b/')).toBe('https://example.com/a/b');
+		expect(configure('https://example.com////')).toBe('https://example.com');
+	});
+
 	it('ignores whitespace around the value', () => {
-		process.env.PUBLIC_ENGINE_URL = '  https://status-engine.example.com/  ';
-		expect(publicEngineUrl()).toBe('https://status-engine.example.com');
+		expect(configure('  https://status-engine.example.com/  ')).toBe('https://status-engine.example.com');
+	});
+
+	// Going through URL parsing also gives one spelling: lower-case scheme and
+	// host, no default port.
+	it('writes the URL the way the URL parser does', () => {
+		expect(configure('HTTPS://Engine.Example.COM:443/Engine/')).toBe('https://engine.example.com/Engine');
+		expect(configure('http://[::1]:8080/')).toBe('http://[::1]:8080');
+		expect(configure('http://127.0.0.1:8080')).toBe('http://127.0.0.1:8080');
+	});
+
+	// A value that is not an absolute http(s) URL would put a broken or foreign
+	// URL in front of every member, to be pasted into crontabs: refuse it loudly.
+	describe('refuses a value that is not an absolute http(s) URL', () => {
+		const message = /PUBLIC_ENGINE_URL must be an absolute http:\/\/ or https:\/\/ URL/;
+
+		it.each([
+			['a host without a scheme', 'engine.example.com'],
+			['a host and port without a scheme', 'engine.example.com:8080'],
+			['localhost with a port (parsed as a scheme)', 'localhost:8080'],
+			['a scheme-relative URL', '//engine.example.com'],
+			['a path', '/'],
+			['a relative path', 'engine/api'],
+			['ftp', 'ftp://engine.example.com'],
+			['file', 'file:///etc/passwd'],
+			['javascript', 'javascript:alert(1)'],
+			['data', 'data:text/plain,hello'],
+			['a scheme with no host', 'http://'],
+			['garbage', 'not a url'],
+			['garbage with a scheme', 'https://exa mple.com'],
+			['punctuation', '://']
+		])('%s', (_name, value) => {
+			expect(() => configure(value)).toThrow(message);
+		});
+	});
+
+	// It is the base that /api/v1/heartbeat/<token> is appended to, and it is
+	// shown to every member, so it carries no secret and no query.
+	describe('refuses a base that cannot take a path appended', () => {
+		const message = /PUBLIC_ENGINE_URL must not contain credentials, a query string or a fragment/;
+
+		it.each([
+			['credentials', 'https://user:secret@engine.example.com'],
+			['a user name', 'https://user@engine.example.com/'],
+			['a query string', 'https://engine.example.com/?key=1'],
+			['a fragment', 'https://engine.example.com/#top']
+		])('%s', (_name, value) => {
+			expect(() => configure(value)).toThrow(message);
+		});
+
+		// The error goes to the server log, and the value may be a secret.
+		it('does not repeat the value in the error', () => {
+			for (const value of ['https://user:hunter2@engine.example.com', 'hunter2:secret@engine.example.com']) {
+				process.env.PUBLIC_ENGINE_URL = value;
+				let message = '';
+				try {
+					publicEngineUrl();
+				} catch (error) {
+					message = (error as Error).message;
+				}
+				expect(message, value).toContain('PUBLIC_ENGINE_URL');
+				expect(message, value).not.toContain('hunter2');
+			}
+		});
 	});
 });

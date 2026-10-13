@@ -90,6 +90,24 @@ export function pingUrl(engineUrl: string, token: string): string {
 	return `${engineUrl.replace(/\/+$/, '')}/api/v1/heartbeat/${encodeURIComponent(token)}`;
 }
 
+/**
+ * `value` as one shell word: in single quotes, so that nothing in it (a space,
+ * `&`, `;`, `$(...)`, a backtick) is read by the shell. A single quote inside
+ * is closed, escaped and reopened: it's -> 'it'\''s'.
+ */
+export function shellQuote(value: string): string {
+	return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The command a cron job runs to ping: quiet unless it fails, 10 s to answer,
+ * 3 retries. The URL is quoted, because it is built from configuration
+ * (PUBLIC_ENGINE_URL) and the command is pasted into a shell.
+ */
+export function pingCommand(url: string): string {
+	return `curl -fsS -m 10 --retry 3 ${shellQuote(url)}`;
+}
+
 /** Compact period: 86400 -> "1d", 5400 -> "1h 30m", 90 -> "1m 30s". */
 export function formatSeconds(total: number): string {
 	const parts: string[] = [];

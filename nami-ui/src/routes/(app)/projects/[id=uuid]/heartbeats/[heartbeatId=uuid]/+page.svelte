@@ -3,7 +3,7 @@
 	import { refreshAll } from '$app/navigation';
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
-	import { formatSeconds, formatUtc, pingUrl, timeAgo } from '#lib/uptime';
+	import { formatSeconds, formatUtc, pingCommand, pingUrl, timeAgo } from '#lib/uptime';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();
@@ -21,8 +21,7 @@
 	const base = $derived(`/projects/${data.project.id}/heartbeats/${data.heartbeat.id}`);
 	// The engine sends no token to a viewer: no ping URL and no command then.
 	const url = $derived(data.heartbeat.token ? pingUrl(data.engineUrl, data.heartbeat.token) : null);
-	const curl = $derived(url ? `curl -fsS -m 10 --retry 3 ${url}` : null);
-	const cron = $derived(curl ? `0 3 * * * /usr/local/bin/backup.sh && ${curl}` : null);
+	const cron = $derived(url ? `0 3 * * * /usr/local/bin/backup.sh && ${pingCommand(url)}` : null);
 
 	// The settings inputs read these three instead of `data`. Every 30 s refresh
 	// hands over a new `data` object, but a derived tells its readers only when

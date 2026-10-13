@@ -7,6 +7,8 @@ const listPath = `/projects/${PROJECT_ID}/heartbeats`;
 const hostile = '../auth/me?';
 const hostileSegment = '..%2Fauth%2Fme%3F';
 
+type Scenario = [name: string, engine: Parameters<typeof fakeEvent>[0], rejection: { status: number } | null];
+
 describe('heartbeat detail load', () => {
 	const originalPublicUrl = process.env.PUBLIC_ENGINE_URL;
 	beforeEach(() => {
@@ -67,6 +69,34 @@ describe('heartbeat detail load', () => {
 		const heartbeat = fakeEvent({ params: { heartbeatId: hostile }, body: '{}' });
 		await load(heartbeat.event);
 		expect(heartbeat.calls().map((call) => call.path)).toEqual([`${listPath}/${hostileSegment}`]);
+	});
+
+	// The page carries the ping token, in its markup and in the data sent with
+	// it: no browser or proxy may keep either. The header is set before anything
+	// can fail, so every response of the load has it, and only once (SvelteKit
+	// throws when a header is set twice).
+	const scenarios: Scenario[] = [
+		['a member', { body: JSON.stringify({ id: HEARTBEAT_ID, name: 'Backup', token: 'b'.repeat(64) }) }, null],
+		['a viewer, who gets no token', { body: JSON.stringify({ id: HEARTBEAT_ID, name: 'Backup', token: null }) }, null],
+		['a heartbeat that is not there', { status: 404, body: '{"error":"not found"}' }, { status: 404 }],
+		['a caller the engine refuses', { status: 403, body: '{"error":"forbidden"}' }, { status: 403 }],
+		['an engine failure', { status: 500, body: '{"error":"internal error"}' }, { status: 500 }],
+		['an engine error that is not JSON', { status: 400, body: 'Invalid URL: invalid character' }, { status: 500 }],
+		['a session that is gone', { status: 401, body: '{"error":"unauthorized"}' }, { status: 303 }]
+	];
+	it.each(scenarios)('forbids caching for %s', async (_name, engine, rejection) => {
+		const { event, setHeaders } = fakeEvent(engine);
+		if (rejection) await expect(load(event)).rejects.toMatchObject(rejection);
+		else await load(event);
+		expect(setHeaders).toHaveBeenCalledTimes(1);
+		expect(setHeaders).toHaveBeenCalledWith({ 'cache-control': 'private, no-store' });
+	});
+
+	it('fails with the configuration error when PUBLIC_ENGINE_URL is not an http(s) URL', async () => {
+		process.env.PUBLIC_ENGINE_URL = 'ftp://engine.example.com';
+		const { event, setHeaders } = fakeEvent({ body: JSON.stringify({ id: HEARTBEAT_ID, name: 'Backup', token: 'b'.repeat(64) }) });
+		await expect(load(event)).rejects.toThrow(/PUBLIC_ENGINE_URL/);
+		expect(setHeaders).toHaveBeenCalledTimes(1);
 	});
 });
 
