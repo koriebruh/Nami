@@ -1,9 +1,10 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
 	callEngine,
 	engineErrorMessage,
 	engineFailure,
 	enginePath,
+	publicEngineUrl,
 	redirectToLoginIfUnauthorized
 } from './engine';
 
@@ -209,5 +210,42 @@ describe('engineFailure', () => {
 	it('redirects to the login page instead when the session is gone', async () => {
 		const response = new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401 });
 		await expect(engineFailure(response, 'fallback')).rejects.toMatchObject({ status: 303, location: '/login' });
+	});
+});
+
+describe('publicEngineUrl', () => {
+	const original = process.env.PUBLIC_ENGINE_URL;
+	afterEach(() => {
+		if (original === undefined) delete process.env.PUBLIC_ENGINE_URL;
+		else process.env.PUBLIC_ENGINE_URL = original;
+	});
+
+	it('defaults to the local engine', () => {
+		delete process.env.PUBLIC_ENGINE_URL;
+		expect(publicEngineUrl()).toBe('http://localhost:8080');
+	});
+
+	it('uses PUBLIC_ENGINE_URL without a trailing slash', () => {
+		process.env.PUBLIC_ENGINE_URL = 'https://status-engine.example.com/';
+		expect(publicEngineUrl()).toBe('https://status-engine.example.com');
+	});
+
+	it('trims every trailing slash and keeps a path prefix', () => {
+		process.env.PUBLIC_ENGINE_URL = 'https://example.com/engine///';
+		expect(publicEngineUrl()).toBe('https://example.com/engine');
+	});
+
+	// `PUBLIC_ENGINE_URL=` in an env file is an empty string, not an unset
+	// variable: it must not turn every ping URL into a relative path.
+	it('treats an empty or blank value as unset', () => {
+		for (const blank of ['', '   ', '/', ' / ']) {
+			process.env.PUBLIC_ENGINE_URL = blank;
+			expect(publicEngineUrl(), JSON.stringify(blank)).toBe('http://localhost:8080');
+		}
+	});
+
+	it('ignores whitespace around the value', () => {
+		process.env.PUBLIC_ENGINE_URL = '  https://status-engine.example.com/  ';
+		expect(publicEngineUrl()).toBe('https://status-engine.example.com');
 	});
 });

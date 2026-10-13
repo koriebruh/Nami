@@ -3,10 +3,12 @@ import {
 	formatClockUtc,
 	formatDuration,
 	formatMs,
+	formatSeconds,
 	formatUptime,
 	formatUtc,
 	monitorTarget,
 	niceTicks,
+	pingUrl,
 	statusSince,
 	timeAgo,
 	type Incident
@@ -139,5 +141,49 @@ describe('statusSince', () => {
 	it('falls back to creation', () => {
 		expect(statusSince({ current_status: 'up', created_at: created }, [])).toBe(created);
 		expect(statusSince({ current_status: 'pending', created_at: created }, history)).toBe(created);
+	});
+});
+
+describe('pingUrl', () => {
+	it('joins the engine URL and token without a double slash', () => {
+		expect(pingUrl('https://engine.example.com/', 'abc')).toBe('https://engine.example.com/api/v1/heartbeat/abc');
+		expect(pingUrl('http://localhost:8080', 'abc')).toBe('http://localhost:8080/api/v1/heartbeat/abc');
+	});
+
+	it('keeps a path prefix of the engine URL', () => {
+		expect(pingUrl('https://example.com/engine//', 'abc')).toBe('https://example.com/engine/api/v1/heartbeat/abc');
+	});
+
+	// Tokens are hex, but the URL is built from engine data: whatever it holds
+	// stays inside its own path segment.
+	it('keeps a token inside its own path segment', () => {
+		expect(pingUrl('http://localhost:8080', 'a/../b?c#d')).toBe(
+			'http://localhost:8080/api/v1/heartbeat/a%2F..%2Fb%3Fc%23d'
+		);
+	});
+});
+
+describe('formatSeconds', () => {
+	it('shows at most two units', () => {
+		expect(formatSeconds(86_400)).toBe('1d');
+		expect(formatSeconds(5_400)).toBe('1h 30m');
+		expect(formatSeconds(90)).toBe('1m 30s');
+		expect(formatSeconds(90_061)).toBe('1d 1h');
+		expect(formatSeconds(0)).toBe('0s');
+	});
+
+	it('covers the whole range a heartbeat can have (30 s to 31 days)', () => {
+		expect(formatSeconds(30)).toBe('30s');
+		expect(formatSeconds(59)).toBe('59s');
+		expect(formatSeconds(61)).toBe('1m 1s');
+		expect(formatSeconds(3_599)).toBe('59m 59s');
+		expect(formatSeconds(3_661)).toBe('1h 1m');
+		expect(formatSeconds(2_678_400)).toBe('31d');
+	});
+
+	it('never shows a negative, fractional or unknown amount', () => {
+		expect(formatSeconds(-5)).toBe('0s');
+		expect(formatSeconds(90.9)).toBe('1m 30s');
+		expect(formatSeconds(Number.NaN)).toBe('0s');
 	});
 });

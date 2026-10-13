@@ -68,6 +68,45 @@ export type Incident = {
 	resolved_at: string | null;
 };
 
+export type Heartbeat = {
+	id: string;
+	project_id: string;
+	name: string;
+	/**
+	 * The ping secret. `null` for a viewer: the engine only gives it to members
+	 * of the project (and global admins), because whoever holds it can ping.
+	 */
+	token: string | null;
+	period_seconds: number;
+	grace_seconds: number;
+	paused: boolean;
+	current_status: Status;
+	last_ping_at: string | null;
+	created_at: string;
+};
+
+/** The URL a cron job pings: straight to nami-engine, not through this BFF. */
+export function pingUrl(engineUrl: string, token: string): string {
+	return `${engineUrl.replace(/\/+$/, '')}/api/v1/heartbeat/${encodeURIComponent(token)}`;
+}
+
+/** Compact period: 86400 -> "1d", 5400 -> "1h 30m", 90 -> "1m 30s". */
+export function formatSeconds(total: number): string {
+	const parts: string[] = [];
+	let rest = Math.max(0, Math.floor(total));
+	for (const [unit, size] of [
+		['d', 86_400],
+		['h', 3_600],
+		['m', 60],
+		['s', 1]
+	] as const) {
+		const amount = Math.floor(rest / size);
+		rest -= amount * size;
+		if (amount > 0) parts.push(`${amount}${unit}`);
+	}
+	return parts.length > 0 ? parts.slice(0, 2).join(' ') : '0s';
+}
+
 /**
  * Uptime ratio (0..1) as a percentage with two decimals, truncated rather
  * than rounded so downtime never disappears: 0.99999 shows "99.99%", never

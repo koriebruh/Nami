@@ -5,10 +5,13 @@ import { vi } from 'vitest';
 
 export const PROJECT_ID = 'c13bc10a-d17f-443b-8976-c6d9b54e2798';
 export const MONITOR_ID = 'f41ffdb1-c497-4b17-8d3f-70477470ef6e';
+export const HEARTBEAT_ID = '0b9d1f6c-5a3e-4c2f-9d47-6e8a1c3b7f25';
 
 type Options = {
-	/** Route params; by default the two ids above. */
+	/** Route params; by default the ids above. */
 	params?: Record<string, string>;
+	/** The request URL, for a load that reads the query string. */
+	url?: string;
 	/** What every engine call answers, unless `respond` is given. */
 	status?: number;
 	body?: string;
@@ -35,7 +38,8 @@ export function fakeEvent(options: Options = {}) {
 	}
 
 	const event = {
-		params: { id: PROJECT_ID, monitorId: MONITOR_ID, ...options.params },
+		params: { id: PROJECT_ID, monitorId: MONITOR_ID, heartbeatId: HEARTBEAT_ID, ...options.params },
+		url: new URL(options.url ?? 'http://ui.test/'),
 		fetch,
 		request,
 		parent: async () => ({}),

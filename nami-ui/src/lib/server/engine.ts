@@ -131,3 +131,14 @@ export async function engineFailure(response: Response, fallback: string) {
 	redirectToLoginIfUnauthorized(response);
 	return fail(response.status, { message: await engineErrorMessage(response, fallback) });
 }
+
+/**
+ * nami-engine's URL as your cron jobs reach it, for heartbeat ping URLs.
+ * Pings go straight to the engine (cron jobs are not browser sessions), so
+ * this can differ from the internal ENGINE_URL this BFF calls. An empty or
+ * blank value (`PUBLIC_ENGINE_URL=` in an env file) counts as unset.
+ */
+export function publicEngineUrl(): string {
+	const configured = (process.env.PUBLIC_ENGINE_URL ?? '').trim().replace(/\/+$/, '');
+	return configured || 'http://localhost:8080';
+}
