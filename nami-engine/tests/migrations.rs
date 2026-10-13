@@ -15,6 +15,7 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "project_members",
         "email_verification_tokens",
         "password_reset_tokens",
+        "monitors",
     ] {
         assert!(names.contains(&expected.to_string()), "missing table {expected}");
     }
