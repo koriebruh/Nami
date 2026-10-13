@@ -709,6 +709,9 @@ mod tests {
             last_checked_at: None,
             next_check_at: Utc::now(),
             created_at: Utc::now(),
+            follow_redirects: true,
+            verify_ssl: true,
+            ..Monitor::default()
         }
     }
 

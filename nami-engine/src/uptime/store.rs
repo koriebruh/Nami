@@ -288,6 +288,9 @@ mod tests {
             last_checked_at: None,
             next_check_at: DateTime::from_timestamp(1_792_000_000, 0).unwrap(),
             created_at: DateTime::from_timestamp(1_792_000_000, 0).unwrap(),
+            follow_redirects: true,
+            verify_ssl: true,
+            ..Monitor::default()
         }
     }
 

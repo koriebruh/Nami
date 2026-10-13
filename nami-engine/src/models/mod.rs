@@ -1,10 +1,25 @@
 pub mod heartbeat;
 pub mod incident;
 pub mod monitor;
+pub mod monitor_request;
 pub mod project;
 pub mod source;
 pub mod token;
 pub mod user;
+
+use serde::{Deserialize, Deserializer};
+
+/// Deserializer for a PATCH field that can be cleared. With
+/// `#[serde(default, deserialize_with = "nullable")]` on an
+/// `Option<Option<T>>`: absent = `None` (keep), `null` = `Some(None)`
+/// (clear), a value = `Some(Some(v))` (set).
+pub fn nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
 
 /// Name rule shared by monitors and heartbeats: trimmed, 1-200 characters,
 /// no control characters (names end up in alert email subjects) and none of

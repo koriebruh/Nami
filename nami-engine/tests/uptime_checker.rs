@@ -27,23 +27,19 @@ fn monitor(check_type: &str) -> Monitor {
         project_id: Uuid::new_v4(),
         name: "test".to_string(),
         check_type: check_type.to_string(),
-        url: None,
-        host: None,
-        port: None,
         http_method: "GET".to_string(),
-        keyword: None,
         keyword_mode: "contains".to_string(),
         expected_status_min: 200,
         expected_status_max: 399,
         interval_seconds: 60,
         timeout_seconds: 5,
         confirmation_threshold: 2,
-        paused: false,
         current_status: "pending".to_string(),
-        consecutive_failures: 0,
-        last_checked_at: None,
+        follow_redirects: true,
+        verify_ssl: true,
         next_check_at: Utc::now(),
         created_at: Utc::now(),
+        ..Monitor::default()
     }
 }
 

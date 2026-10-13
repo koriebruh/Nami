@@ -33,7 +33,10 @@ use aes_gcm::{
 use base64::Engine;
 use hkdf::Hkdf;
 use rand::{RngCore, rngs::OsRng};
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, Unexpected, Visitor},
+};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -212,7 +215,11 @@ pub fn parse_key(raw: &str) -> Result<[u8; KEY_LEN], String> {
 
 /// A write-only secret from a request body (a header value, a password).
 /// `Debug` never shows it and it cannot be serialized, so it cannot leak
-/// through a log line or an API response by accident.
+/// through a log line or an API response by accident. Deserializing accepts a
+/// string only, and a value of another type is refused without quoting it:
+/// serde_json's own message would repeat it ("invalid type: integer 123456,
+/// expected a string") into the error response and the log, which a password
+/// written as a number would turn into a leak.
 ///
 /// Serializing one is a compile error:
 ///
@@ -228,8 +235,7 @@ pub fn parse_key(raw: &str) -> Result<[u8; KEY_LEN], String> {
 /// fn assert_serialize<T: serde::Serialize>() {}
 /// assert_serialize::<String>();
 /// ```
-#[derive(Clone, PartialEq, Eq, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SecretString(String);
 
 impl SecretString {
@@ -246,4 +252,69 @@ impl fmt::Debug for SecretString {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SecretString(<redacted>)")
     }
+}
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<SecretString, D::Error> {
+        // `deserialize_any`, not `deserialize_string`: serde_json builds the
+        // error for a non-string itself in the latter, quoted value included,
+        // while here every type reaches the visitor below.
+        deserializer.deserialize_any(SecretStringVisitor)
+    }
+}
+
+/// Takes a string; names any other type without its value.
+struct SecretStringVisitor;
+
+impl SecretStringVisitor {
+    fn wrong_type<E: de::Error>(&self, what: &'static str) -> E {
+        E::invalid_type(Unexpected::Other(what), self)
+    }
+}
+
+impl Visitor<'_> for SecretStringVisitor {
+    type Value = SecretString;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a string")
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<SecretString, E> {
+        Ok(SecretString::new(value))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<SecretString, E> {
+        Ok(SecretString(value))
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<SecretString, E> {
+        Err(self.wrong_type("boolean"))
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<SecretString, E> {
+        Err(self.wrong_type("number"))
+    }
+
+    fn visit_i128<E: de::Error>(self, _: i128) -> Result<SecretString, E> {
+        Err(self.wrong_type("number"))
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<SecretString, E> {
+        Err(self.wrong_type("number"))
+    }
+
+    fn visit_u128<E: de::Error>(self, _: u128) -> Result<SecretString, E> {
+        Err(self.wrong_type("number"))
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<SecretString, E> {
+        Err(self.wrong_type("number"))
+    }
+
+    fn visit_bytes<E: de::Error>(self, _: &[u8]) -> Result<SecretString, E> {
+        Err(self.wrong_type("byte array"))
+    }
+
+    // `visit_char` forwards to `visit_str`, the rest (`null`, a list, an
+    // object) never carry a value into the default message.
 }

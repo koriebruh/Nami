@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     middleware::rbac::{CurrentUser, require_project_reader, require_project_role},
-    models::monitor::{self, CreateMonitorRequest, Monitor, PatchMonitorRequest},
+    models::monitor::{self, CreateMonitorRequest, MonitorView, PatchMonitorRequest},
     state::AppState,
     uptime::store::{self, MonitorStats, UptimeCheckRow},
 };
@@ -32,7 +32,9 @@ const MAX_CHECKS_LIMIT: u32 = 500;
 
 // RBAC mirrors routes/projects.rs: viewer reads, member creates/edits,
 // admin deletes. Viewers read monitors with the secrets of their URL masked
-// (`Monitor::for_reader`). `require_project_role` runs before any database or
+// and their request body and username hidden (`Monitor::for_reader`); nobody
+// ever reads a header value or the password: every monitor leaves here as a
+// `MonitorView`. `require_project_role` runs before any database or
 // ClickHouse lookup, so a caller without access gets 403 whether or not the
 // monitor exists. Extractors run before the handler body, so a malformed path
 // or query string (`?limit=abc`) is a 400 even for such a caller; that
@@ -59,7 +61,7 @@ pub fn router() -> Router<AppState> {
 #[derive(Serialize)]
 struct MonitorSummary {
     #[serde(flatten)]
-    monitor: Monitor,
+    monitor: MonitorView,
     uptime_24h: Option<f64>,
 }
 
@@ -90,7 +92,7 @@ async fn list_monitors(
             .map(|monitor| {
                 let uptime_24h = uptime.get(&monitor.id).copied();
                 MonitorSummary {
-                    monitor: monitor.for_reader(reader),
+                    monitor: MonitorView::from(monitor.for_reader(reader)),
                     uptime_24h,
                 }
             })
@@ -110,10 +112,10 @@ async fn create_monitor(
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
     Json(payload): Json<CreateMonitorRequest>,
-) -> Result<(StatusCode, Json<Monitor>), AppError> {
+) -> Result<(StatusCode, Json<MonitorView>), AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
     let config = monitor::validate(payload.into_config()).map_err(AppError::Validation)?;
-    let created = monitor::insert_monitor(&state.db, project_id, &config)
+    let created = monitor::insert_monitor(&state.db, &state.cipher, project_id, &config)
         .await
         .map_err(|e| match &e {
             // A global admin bypasses membership, so the project itself may
@@ -123,19 +125,19 @@ async fn create_monitor(
             }
             _ => AppError::Database(e),
         })?;
-    Ok((StatusCode::CREATED, Json(created)))
+    Ok((StatusCode::CREATED, Json(MonitorView::from(created))))
 }
 
 async fn get_monitor(
     State(state): State<AppState>,
     user: CurrentUser,
     Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<Monitor>, AppError> {
+) -> Result<Json<MonitorView>, AppError> {
     let reader = require_project_reader(&state.db, &user, project_id).await?;
     let found = monitor::find_in_project(&state.db, project_id, monitor_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(found.for_reader(reader)))
+    Ok(Json(MonitorView::from(found.for_reader(reader))))
 }
 
 async fn patch_monitor(
@@ -143,12 +145,13 @@ async fn patch_monitor(
     user: CurrentUser,
     Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PatchMonitorRequest>,
-) -> Result<Json<Monitor>, AppError> {
+) -> Result<Json<MonitorView>, AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
-    let updated = monitor::update_in_project(&state.db, project_id, monitor_id, payload)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    Ok(Json(updated))
+    let updated =
+        monitor::update_in_project(&state.db, &state.cipher, project_id, monitor_id, payload)
+            .await?
+            .ok_or(AppError::NotFound)?;
+    Ok(Json(MonitorView::from(updated)))
 }
 
 async fn delete_monitor(
