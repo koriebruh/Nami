@@ -33,9 +33,22 @@ export async function callEngine(
 		const [pair, ...attrs] = setCookie.split(';').map((s) => s.trim());
 		const [name, value] = pair.split('=');
 		const pathAttr = attrs.find((a) => a.toLowerCase().startsWith('path='));
+		const sameSiteAttr = attrs.find((a) => a.toLowerCase().startsWith('samesite='));
+		// Mirror the engine's actual SameSite attribute rather than letting it
+		// silently fall through to SvelteKit's own default (Lax). The engine
+		// deliberately sets Lax itself (see nami-engine's router.rs) so the
+		// OAuth login flow's CSRF-state cookie survives the top-level redirect
+		// back from Google/GitHub -- relaying it explicitly here means a
+		// future engine-side change to this attribute can't be silently
+		// overridden by this proxy again.
+		const sameSite = (sameSiteAttr?.split('=')[1]?.toLowerCase() ?? 'lax') as
+			| 'lax'
+			| 'strict'
+			| 'none';
 		event.cookies.set(name, value, {
 			path: pathAttr ? pathAttr.split('=')[1] : '/',
 			httpOnly: attrs.some((a) => a.toLowerCase() === 'httponly'),
+			sameSite,
 			// Mirror the engine's actual `Secure` attribute rather than
 			// hardcoding one: nami-engine's `COOKIE_SECURE` env var controls
 			// whether it sends `Secure` on its own Set-Cookie, and this relayed
@@ -46,4 +59,17 @@ export async function callEngine(
 	}
 
 	return response;
+}
+
+export type CurrentUser = {
+	id: string;
+	email: string;
+	global_role: string;
+};
+
+/** Returns the authenticated user via /auth/me, or null if not logged in. */
+export async function getCurrentUser(event: RequestEvent): Promise<CurrentUser | null> {
+	const response = await callEngine(event, '/auth/me');
+	if (!response.ok) return null;
+	return (await response.json()) as CurrentUser;
 }

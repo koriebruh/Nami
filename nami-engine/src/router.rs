@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use time::Duration as TimeDuration;
 use tower_governor::{governor::GovernorConfigBuilder, key_extractor::SmartIpKeyExtractor, GovernorLayer};
-use tower_sessions::{Expiry, SessionManagerLayer, SessionStore};
+use tower_sessions::{cookie::SameSite, Expiry, SessionManagerLayer, SessionStore};
 
 use crate::{error::AppError, routes, state::AppState};
 
@@ -65,8 +65,20 @@ pub fn build_router(state: AppState) -> Router {
 /// `always_save = false`, which would make a read-only request like
 /// `/auth/me` never re-persist the session, silently turning the "inactivity"
 /// expiry into a fixed window from the last write instead of a real sliding
-/// expiry), and `with_secure(cookie_secure)` (`Config::cookie_secure`,
-/// `COOKIE_SECURE` env var — true only once served over HTTPS).
+/// expiry), `with_secure(cookie_secure)` (`Config::cookie_secure`,
+/// `COOKIE_SECURE` env var — true only once served over HTTPS), and
+/// `with_same_site(SameSite::Lax)`.
+///
+/// Lax (not tower-sessions' own default of Strict) is a deliberate choice,
+/// not an oversight: the OAuth login flow (`routes/auth.rs`'s
+/// `oauth_callback`) requires the session holding `oauth_csrf` to survive a
+/// cross-site-originated top-level GET redirect from Google/GitHub back to
+/// this app — Strict blocks cookies on exactly that kind of navigation, Lax
+/// does not. Declaring it explicitly here (instead of relying on nami-ui's
+/// BFF proxy to coincidentally default to Lax when it relays the cookie,
+/// which it did until this was made explicit) means a future change to
+/// nami-ui's cookie-relay logic can't silently reopen this gap or silently
+/// change the app's CSRF posture without anyone deciding to.
 pub fn configure_session_layer<S>(store: S, cookie_secure: bool) -> SessionManagerLayer<S>
 where
     S: SessionStore + Clone + Send + Sync + 'static,
@@ -75,6 +87,7 @@ where
         .with_secure(cookie_secure)
         .with_expiry(Expiry::OnInactivity(TimeDuration::hours(24)))
         .with_always_save(true)
+        .with_same_site(SameSite::Lax)
 }
 
 async fn inject_fallback_connect_info(mut req: Request, next: Next) -> Response {
