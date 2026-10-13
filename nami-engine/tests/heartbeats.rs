@@ -2292,6 +2292,12 @@ async fn the_public_listener_serves_none_of_the_api(pool: sqlx::PgPool) {
         ("GET", format!("/projects/{project}/monitors"), None),
         ("GET", format!("/projects/{project}/heartbeats"), None),
         ("GET", format!("/projects/{project}/incidents"), None),
+        ("GET", format!("/projects/{project}/sources"), None),
+        (
+            "POST",
+            format!("/projects/{project}/sources"),
+            Some(json!({ "name": "x" })),
+        ),
     ] {
         let (status, _) = call(&public, method, &uri, None, body).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");

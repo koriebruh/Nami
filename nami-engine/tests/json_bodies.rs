@@ -148,6 +148,19 @@ async fn every_state_changing_route_refuses_bodies_that_are_not_json(pool: sqlx:
         "/projects/{project}/monitors/{}",
         monitor["id"].as_str().unwrap()
     );
+    let (source_status, source) = call(
+        &app,
+        "POST",
+        &format!("/projects/{project}/sources"),
+        Some(&admin),
+        Some(json!({ "name": "web" })),
+    )
+    .await;
+    assert_eq!(source_status, StatusCode::CREATED, "{source}");
+    let source_uri = format!(
+        "/projects/{project}/sources/{}",
+        source["id"].as_str().unwrap()
+    );
 
     for (method, uri) in [
         ("POST", "/auth/logout".to_string()),
@@ -162,6 +175,9 @@ async fn every_state_changing_route_refuses_bodies_that_are_not_json(pool: sqlx:
         ("PATCH", monitor_uri.clone()),
         ("POST", format!("/projects/{project}/heartbeats")),
         ("PUT", monitor_uri.clone()),
+        ("POST", format!("/projects/{project}/sources")),
+        ("PATCH", source_uri.clone()),
+        ("POST", format!("{source_uri}/rotate")),
     ] {
         for cookie in [Some(&admin), None] {
             for (content_type, body) in NOT_JSON {
