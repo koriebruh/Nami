@@ -758,6 +758,108 @@ async fn a_patch_is_validated_against_what_is_stored(pool: sqlx::PgPool) {
     .await;
 }
 
+/// Credentials in the url become an `Authorization` header, and basic auth
+/// adds another: the two exclude each other, on create and on PATCH, whichever
+/// of them is stored.
+#[sqlx::test]
+async fn basic_auth_and_credentials_in_the_url_exclude_each_other(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let collection = format!("/projects/{project}/monitors");
+    let conflict = "use either basic auth or credentials in the url, not both";
+    let monitor = |url: &str, extra: Value| {
+        let mut body = json!({ "name": "x", "check_type": "http", "url": url });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    let basic = json!({ "auth_username": "monitor", "auth_password": PASSWORD_SECRET });
+
+    // Both at once: refused, nothing stored, and no secret in the message.
+    for url in [
+        "https://user:url-secret-9d4e@example.com/",
+        "https://url-secret-9d4e@example.com/",
+    ] {
+        let (status, json) = call(
+            &app,
+            "POST",
+            &collection,
+            Some(&member),
+            Some(monitor(url, basic.clone())),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {json}");
+        let message = json["error"].as_str().unwrap_or_default();
+        assert_eq!(message, conflict, "{url}");
+    }
+    let count: i64 = sqlx::query_scalar("select count(*) from monitors")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    // Either one alone is fine.
+    let (status, with_url) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(monitor(
+            "https://user:url-secret-9d4e@example.com/",
+            json!({}),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{with_url}");
+    let with_url = format!("{collection}/{}", with_url["id"].as_str().unwrap());
+    let (status, with_basic) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(monitor("https://example.com/", basic.clone())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{with_basic}");
+    let with_basic = format!("{collection}/{}", with_basic["id"].as_str().unwrap());
+
+    // PATCH is judged on what is stored: neither can be added to the other.
+    let (status, json) = call(&app, "PATCH", &with_url, Some(&member), Some(basic.clone())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["error"], conflict);
+    let (status, json) = call(
+        &app,
+        "PATCH",
+        &with_basic,
+        Some(&member),
+        Some(json!({ "url": "https://user:url-secret-9d4e@example.com/" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert_eq!(json["error"], conflict);
+    // ...and the refused edits left both monitors as they were.
+    let (_, unchanged) = call(&app, "GET", &with_basic, Some(&member), None).await;
+    assert_eq!(unchanged["url"], "https://example.com/");
+    assert_eq!(unchanged["auth_username"], "monitor");
+    let (_, unchanged) = call(&app, "GET", &with_url, Some(&member), None).await;
+    assert_eq!(unchanged["auth_username"], Value::Null);
+
+    // One request can swap one for the other.
+    let (status, swapped) = call(
+        &app,
+        "PATCH",
+        &with_basic,
+        Some(&member),
+        Some(json!({ "url": "https://user:url-secret-9d4e@example.com/", "auth_username": null })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{swapped}");
+    assert_eq!(swapped["auth_username"], Value::Null);
+    assert_eq!(swapped["has_auth_password"], false);
+}
+
 /// Editing how a monitor is requested makes it due now; keeping everything as
 /// it is does not. A secret cannot be compared with its ciphertext, so
 /// replacing one always counts.
@@ -863,7 +965,8 @@ async fn switching_to_a_non_http_type_drops_the_request_config(pool: sqlx::PgPoo
 /// Viewers read monitors with the URL masked (Phase 1) and, now, without the
 /// request body and the username either: both carry credentials as often as a
 /// URL does. Nobody, member or admin, ever reads a header value or the
-/// password.
+/// password. (Credentials in the URL and basic auth exclude each other, so the
+/// two are read on two monitors.)
 #[sqlx::test]
 async fn viewers_get_masked_urls_and_no_secrets_and_members_still_no_secret_values(
     pool: sqlx::PgPool,
@@ -879,6 +982,7 @@ async fn viewers_get_masked_urls_and_no_secrets_and_members_still_no_secret_valu
     let collection = format!("/projects/{project}/monitors");
     let url = "https://alerts:s3cret-pw@status.example.com:8443/health?token=abc123&region=eu#frag-secret";
     let redacted = "https://alerts:***@status.example.com:8443/health?token=***&region=***#***";
+    let basic_url = "https://status.example.com/basic";
     let body = format!("{{\"api_key\":\"{BODY_SECRET}\"}}");
 
     let (status, created) = call(
@@ -890,22 +994,44 @@ async fn viewers_get_masked_urls_and_no_secrets_and_members_still_no_secret_valu
             "name": "API", "check_type": "http", "url": url, "http_method": "POST",
             "request_body": body,
             "request_headers": [{ "name": "X-Api-Key", "value": HEADER_SECRET }],
-            "auth_username": "service-account", "auth_password": PASSWORD_SECRET,
         })),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["url"], url, "the member who saved it sees it whole");
     let item = format!("{collection}/{}", created["id"].as_str().unwrap());
+    let (status, created_basic) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(json!({
+            "name": "Basic", "check_type": "http", "url": basic_url,
+            "auth_username": "service-account", "auth_password": PASSWORD_SECRET,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created_basic}");
+    let basic_item = format!("{collection}/{}", created_basic["id"].as_str().unwrap());
 
     let (status, detail) = call(&app, "GET", &item, Some(&viewer), None).await;
     assert_eq!(status, StatusCode::OK);
+    let (status, basic_detail) = call(&app, "GET", &basic_item, Some(&viewer), None).await;
+    assert_eq!(status, StatusCode::OK);
     let (_, list) = call(&app, "GET", &collection, Some(&viewer), None).await;
-    for shown in [&detail, &list[0]] {
+    let in_list = |name: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|monitor| monitor["name"] == name)
+            .unwrap_or_else(|| panic!("{name} is not in {list}"))
+            .clone()
+    };
+    for shown in [&detail, &in_list("API")] {
         assert_eq!(shown["url"], redacted, "the masked URL composes");
         assert_eq!(shown["request_body"], "***", "set, but not readable");
-        assert_eq!(shown["auth_username"], "***");
-        assert_eq!(shown["has_auth_password"], true);
+        assert_eq!(shown["auth_username"], Value::Null, "none was set");
+        assert_eq!(shown["has_auth_password"], false);
         assert_eq!(
             shown["request_headers"],
             json!([{ "name": "X-Api-Key", "value_set": true }])
@@ -913,7 +1039,14 @@ async fn viewers_get_masked_urls_and_no_secrets_and_members_still_no_secret_valu
         assert_eq!(shown["http_method"], "POST");
         assert_eq!(shown["name"], "API", "everything else is as saved");
     }
-    for body in [&detail, &list] {
+    for shown in [&basic_detail, &in_list("Basic")] {
+        assert_eq!(shown["url"], basic_url, "nothing in it to mask");
+        assert_eq!(shown["auth_username"], "***");
+        assert_eq!(shown["has_auth_password"], true);
+        assert_eq!(shown["request_body"], Value::Null, "none was set");
+        assert_eq!(shown["name"], "Basic", "everything else is as saved");
+    }
+    for body in [&detail, &basic_detail, &list] {
         assert_redacted(body);
         let text = body.to_string();
         for secret in [
@@ -934,13 +1067,25 @@ async fn viewers_get_masked_urls_and_no_secrets_and_members_still_no_secret_valu
         ("global admin", &root),
     ] {
         let (_, detail) = call(&app, "GET", &item, Some(cookie), None).await;
+        let (_, basic_detail) = call(&app, "GET", &basic_item, Some(cookie), None).await;
         let (_, list) = call(&app, "GET", &collection, Some(cookie), None).await;
-        for shown in [&detail, &list[0]] {
+        let in_list = |name: &str| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|monitor| monitor["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        for shown in [&detail, &in_list("API")] {
             assert_eq!(shown["url"], url, "{who}");
             assert_eq!(shown["request_body"], body, "{who}");
+        }
+        for shown in [&basic_detail, &in_list("Basic")] {
             assert_eq!(shown["auth_username"], "service-account", "{who}");
         }
         assert_redacted(&detail);
+        assert_redacted(&basic_detail);
         assert_redacted(&list);
     }
 }

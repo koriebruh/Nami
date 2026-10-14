@@ -230,6 +230,15 @@ pub fn redact_url(url: &str) -> String {
     parsed.to_string()
 }
 
+/// Whether `url` carries credentials of its own (`https://user:pass@host/`,
+/// `https://token@host/`). reqwest sends them as an `Authorization: Basic`
+/// header, so they count as basic auth wherever that matters: a monitor cannot
+/// have both (see `validate_request_config`), and a check carrying them never
+/// follows a redirect to another origin.
+pub fn url_has_credentials(url: &reqwest::Url) -> bool {
+    !url.username().is_empty() || url.password().is_some()
+}
+
 /// The user-editable fields of a monitor. Create and PATCH both build one,
 /// run it through [`validate`], and only then write it.
 #[derive(Debug, Clone, PartialEq)]
@@ -563,6 +572,7 @@ fn validate_http(c: &mut MonitorConfig) -> Result<(), String> {
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         return Err("url must be a valid http(s) URL".into());
     }
+    let credentials_in_url = url_has_credentials(&parsed);
     c.url = Some(url);
     c.host = None;
     c.port = None;
@@ -587,12 +597,13 @@ fn validate_http(c: &mut MonitorConfig) -> Result<(), String> {
     } else {
         c.keyword = None;
     }
-    validate_request_config(c)
+    validate_request_config(c, credentials_in_url)
 }
 
 /// Body, headers and basic auth of an http or keyword monitor (the method is
-/// checked by [`validate`]). Error messages never repeat a secret.
-fn validate_request_config(c: &mut MonitorConfig) -> Result<(), String> {
+/// checked by [`validate`]); `credentials_in_url` says whether its URL carries
+/// credentials of its own. Error messages never repeat a secret.
+fn validate_request_config(c: &mut MonitorConfig, credentials_in_url: bool) -> Result<(), String> {
     c.request_body = c.request_body.take().filter(|body| !body.is_empty());
     if let Some(body) = &c.request_body {
         if !BODY_METHODS.contains(&c.http_method.as_str()) {
@@ -642,6 +653,11 @@ fn validate_request_config(c: &mut MonitorConfig) -> Result<(), String> {
         .any(|name| name.eq_ignore_ascii_case("authorization"));
     if c.auth_username.is_some() && has_authorization_header {
         return Err("use either basic auth or an Authorization header, not both".into());
+    }
+    // Credentials in the URL become an `Authorization` header too, and basic
+    // auth would add a second one next to it.
+    if c.auth_username.is_some() && credentials_in_url {
+        return Err("use either basic auth or credentials in the url, not both".into());
     }
     Ok(())
 }
@@ -1209,6 +1225,55 @@ mod tests {
         let swap = patch(json!({ "auth_username": "u", "request_headers": [] }))
             .apply_to(MonitorConfig::from(&with_header));
         assert!(validate(swap).is_ok());
+    }
+
+    /// reqwest turns credentials in the URL into an `Authorization` header and
+    /// adds basic auth next to it: two of them.
+    #[test]
+    fn basic_auth_and_credentials_in_the_url_exclude_each_other() {
+        let conflict = "use either basic auth or credentials in the url, not both";
+        // Basic auth is stored: credentials in the new url are refused, however
+        // they are spelled.
+        for url in [
+            "https://user:secret@example.com/orders",
+            "https://user@example.com/",
+            "https://:secret@example.com/",
+            "http://token@example.com:8080/x?y=1",
+        ] {
+            let error = validate(merged(json!({ "url": url }))).unwrap_err();
+            assert_eq!(error, conflict, "{url}");
+            assert!(!error.contains("secret") && !error.contains("token"));
+        }
+        // An empty userinfo is no credentials.
+        assert!(validate(merged(json!({ "url": "https://@example.com/" }))).is_ok());
+        // Without basic auth, credentials in the url are fine.
+        let no_auth = Monitor {
+            auth_username: None,
+            auth_password_enc: None,
+            ..stored_monitor()
+        };
+        let with =
+            |body: serde_json::Value| validate(patch(body).apply_to(MonitorConfig::from(&no_auth)));
+        assert!(with(json!({ "url": "https://user:secret@example.com/" })).is_ok());
+        // The stored url counts too: basic auth cannot be added next to it...
+        let with_credentials = Monitor {
+            url: Some("https://user:secret@example.com/".to_string()),
+            auth_username: None,
+            auth_password_enc: None,
+            ..stored_monitor()
+        };
+        let add_auth = patch(json!({ "auth_username": "u", "auth_password": "p" }))
+            .apply_to(MonitorConfig::from(&with_credentials));
+        assert_eq!(validate(add_auth).unwrap_err(), conflict);
+        // ...unless the same request takes the credentials out of the url, or
+        // does without the basic auth.
+        let swap = patch(json!({ "auth_username": "u", "url": "https://example.com/" }))
+            .apply_to(MonitorConfig::from(&with_credentials));
+        assert!(validate(swap).is_ok());
+        let url_to_creds =
+            patch(json!({ "url": "https://user:p@example.com/", "auth_username": null }))
+                .apply_to(MonitorConfig::from(&stored_monitor()));
+        assert!(validate(url_to_creds).is_ok());
     }
 
     #[test]

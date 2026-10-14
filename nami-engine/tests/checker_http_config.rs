@@ -393,8 +393,10 @@ async fn at_most_ten_redirects_are_followed() {
     }
 }
 
-/// Security: reqwest drops Authorization and Cookie on a cross-origin redirect
-/// but would forward a custom header such as an API key; monitors with custom
+/// Security: reqwest would forward a custom header such as an API key to
+/// wherever a redirect points, and drops `Authorization` and `Cookie` only on
+/// the hop that crosses to another host (see
+/// `credentials_in_the_url_never_reach_another_origin`); monitors with custom
 /// headers or basic auth only follow redirects that stay on the monitored
 /// origin (scheme, host and port).
 #[tokio::test]
@@ -413,12 +415,12 @@ async fn secrets_never_follow_a_redirect_to_another_origin() {
         // Same machine, different host name: 127.0.0.1 -> localhost.
         (
             format!("http://localhost:{port}/landing"),
-            "redirect to another host (localhost) was not followed".to_string(),
+            "so the redirect to another host (localhost) was not followed".to_string(),
         ),
         // Same host name, different port.
         (
             format!("http://127.0.0.1:{port}/landing"),
-            format!("redirect to another origin (http://127.0.0.1:{port}) was not followed"),
+            format!("so the redirect to another origin (http://127.0.0.1:{port}) was not followed"),
         ),
     ];
     for (location, expected) in destinations {
@@ -448,6 +450,10 @@ async fn secrets_never_follow_a_redirect_to_another_origin() {
             let error = outcome.error.unwrap();
             assert!(error.contains(&expected), "{label}: {error}");
             assert!(
+                error.starts_with("headers and credentials are only sent to the monitored origin"),
+                "the reason comes first: {error}"
+            );
+            assert!(
                 !error.contains(API_KEY) && !error.contains(PASSWORD),
                 "{error}"
             );
@@ -462,6 +468,89 @@ async fn secrets_never_follow_a_redirect_to_another_origin() {
         );
         target.reset().await;
     }
+}
+
+/// reqwest drops `Authorization`, `Cookie` and the like only on the hop that
+/// crosses to another host, from that hop's own copy of the request headers;
+/// the next hop starts again from the original ones. Credentials in the
+/// monitored URL (`http://user:pass@host/`, which reqwest turns into an
+/// `Authorization` header) therefore came back one hop later: host A to host
+/// B/1 to host B/2 sent them to B. A monitor with credentials in its URL never
+/// leaves its origin either.
+#[tokio::test]
+async fn credentials_in_the_url_never_reach_another_origin() {
+    let target = MockServer::start().await;
+    let elsewhere = MockServer::start().await;
+    let port = elsewhere.address().port();
+    // Two hops on the other host: the second one is where the header came back.
+    redirect(&elsewhere, "/1", format!("http://localhost:{port}/2")).await;
+    Mock::given(path("/2"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&elsewhere)
+        .await;
+    redirect(&target, "/start", format!("http://localhost:{port}/1")).await;
+
+    for userinfo in ["user:pass-9a8b7c", "user", ":pass-9a8b7c"] {
+        let url = format!(
+            "{}/start",
+            target
+                .uri()
+                .replacen("http://", &format!("http://{userinfo}@"), 1)
+        );
+
+        let outcome = perform_check(&check_context(), &http_monitor(url)).await;
+
+        for request in elsewhere.received_requests().await.unwrap() {
+            assert_eq!(
+                received_header(&request, "authorization"),
+                None,
+                "{userinfo}: {} got the credentials",
+                request.url
+            );
+        }
+        assert_eq!(
+            outcome.status,
+            CheckStatus::Down,
+            "{userinfo}: {:?}",
+            outcome.error
+        );
+        let error = outcome.error.unwrap();
+        assert!(
+            error.contains("another host (localhost)"),
+            "{userinfo}: {error}"
+        );
+        assert!(!error.contains("pass-9a8b7c"), "{error}");
+    }
+    assert!(
+        elsewhere.received_requests().await.unwrap().is_empty(),
+        "no request reached the other host"
+    );
+}
+
+/// Credentials in the URL still work where they belong: every hop that stays
+/// on the monitored origin carries them.
+#[tokio::test]
+async fn credentials_in_the_url_ride_along_on_redirects_that_stay_on_the_origin() {
+    let server = MockServer::start().await;
+    redirect(&server, "/start", format!("{}/landing", server.uri())).await;
+    Mock::given(method("GET"))
+        .and(path("/landing"))
+        .and(header("authorization", "Basic dXNlcjpwYXNzLTlhOGI3Yw=="))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let url = format!(
+        "{}/start",
+        server
+            .uri()
+            .replacen("http://", "http://user:pass-9a8b7c@", 1)
+    );
+
+    let outcome = perform_check(&check_context(), &http_monitor(url)).await;
+
+    assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
+    assert_eq!(outcome.status_code, Some(200));
 }
 
 /// The same redirects are followed by every monitor without secrets, and
@@ -750,6 +839,15 @@ async fn sealed_headers_that_are_not_valid_http_fail_the_check_without_echoing_t
         ("bad name", API_KEY),
         ("X-Api-Key", "line\nbreak-secret"),
         ("X-Api-Key", "\u{7f}del-secret"),
+        // The client owns these (validation refuses them): a sealed blob that
+        // has them anyway is not sent.
+        ("Host", "evil.test"),
+        ("host", "evil.test"),
+        ("Content-Length", "0"),
+        ("CONTENT-LENGTH", "0"),
+        ("Transfer-Encoding", "chunked"),
+        ("Connection", "upgrade"),
+        ("cOnNeCtIoN", "close"),
     ] {
         let base = http_monitor(format!("{}/", server.uri()));
         let (enc, names) = sealed_headers_for(&test_cipher(), base.id, &[(name, value)]);
@@ -768,6 +866,38 @@ async fn sealed_headers_that_are_not_valid_http_fail_the_check_without_echoing_t
         );
     }
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// Names that only look like the reserved ones are ordinary headers.
+#[tokio::test]
+async fn headers_that_merely_resemble_the_reserved_ones_are_sent() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let names = [
+        "Hosts",
+        "X-Host",
+        "Content-Type",
+        "Content-Lengths",
+        "Connection-Id",
+        "Keep-Alive",
+    ];
+    let headers: Vec<(&str, &str)> = names.iter().map(|name| (*name, "v")).collect();
+    let monitor = with_headers(http_monitor(format!("{}/", server.uri())), &headers);
+
+    let outcome = perform_check(&check_context(), &monitor).await;
+
+    assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
+    let requests = server.received_requests().await.unwrap();
+    for name in names {
+        assert_eq!(
+            received_header(&requests[0], name),
+            Some(b"v".to_vec()),
+            "{name}"
+        );
+    }
 }
 
 #[tokio::test]
