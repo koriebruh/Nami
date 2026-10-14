@@ -68,6 +68,12 @@ pub struct Monitor {
     pub auth_password_enc: Option<Vec<u8>>,
     pub follow_redirects: bool,
     pub verify_ssl: bool,
+    /// Consecutive successful checks a `down` monitor needs before it
+    /// recovers (1-10).
+    pub recovery_threshold: i32,
+    /// The successes counted toward that so far. Only the worker moves it
+    /// (see `uptime::worker::apply_outcome`); no API request can.
+    pub consecutive_successes: i32,
 }
 
 /// What `Debug` prints in place of a sealed column that holds a value.
@@ -105,6 +111,8 @@ impl fmt::Debug for Monitor {
             auth_password_enc,
             follow_redirects,
             verify_ssl,
+            recovery_threshold,
+            consecutive_successes,
         } = self;
         f.debug_struct("Monitor")
             .field("id", id)
@@ -141,6 +149,8 @@ impl fmt::Debug for Monitor {
             )
             .field("follow_redirects", follow_redirects)
             .field("verify_ssl", verify_ssl)
+            .field("recovery_threshold", recovery_threshold)
+            .field("consecutive_successes", consecutive_successes)
             .finish()
     }
 }
@@ -263,6 +273,7 @@ pub struct MonitorConfig {
     pub auth_password: PasswordChange,
     pub follow_redirects: bool,
     pub verify_ssl: bool,
+    pub recovery_threshold: i32,
 }
 
 impl From<&Monitor> for MonitorConfig {
@@ -292,15 +303,16 @@ impl From<&Monitor> for MonitorConfig {
             },
             follow_redirects: m.follow_redirects,
             verify_ssl: m.verify_ssl,
+            recovery_threshold: m.recovery_threshold,
         }
     }
 }
 
 impl MonitorConfig {
     /// True when a field that changes how or when the monitor is checked
-    /// differs from `current`. Renaming, pausing and the confirmation
-    /// threshold do not count; replacing or clearing a secret does (a
-    /// secret cannot be compared with its ciphertext).
+    /// differs from `current`. Renaming, pausing and the confirmation and
+    /// recovery thresholds do not count; replacing or clearing a secret does
+    /// (a secret cannot be compared with its ciphertext).
     pub fn changes_check_of(&self, current: &Monitor) -> bool {
         self.check_type != current.check_type
             || self.url != current.url
@@ -357,6 +369,8 @@ pub struct CreateMonitorRequest {
     pub follow_redirects: bool,
     #[serde(default = "default_true")]
     pub verify_ssl: bool,
+    #[serde(default = "default_recovery_threshold")]
+    pub recovery_threshold: i32,
 }
 
 fn default_http_method() -> String {
@@ -382,6 +396,9 @@ fn default_confirmation_threshold() -> i32 {
 }
 fn default_true() -> bool {
     true
+}
+fn default_recovery_threshold() -> i32 {
+    1
 }
 
 impl CreateMonitorRequest {
@@ -413,6 +430,7 @@ impl CreateMonitorRequest {
             },
             follow_redirects: self.follow_redirects,
             verify_ssl: self.verify_ssl,
+            recovery_threshold: self.recovery_threshold,
         }
     }
 }
@@ -448,6 +466,7 @@ pub struct PatchMonitorRequest {
     pub auth_password: Option<Option<SecretString>>,
     pub follow_redirects: Option<bool>,
     pub verify_ssl: Option<bool>,
+    pub recovery_threshold: Option<i32>,
 }
 
 /// A nullable PATCH field applied to its current value.
@@ -491,6 +510,7 @@ impl PatchMonitorRequest {
             },
             follow_redirects: self.follow_redirects.unwrap_or(base.follow_redirects),
             verify_ssl: self.verify_ssl.unwrap_or(base.verify_ssl),
+            recovery_threshold: self.recovery_threshold.unwrap_or(base.recovery_threshold),
         }
     }
 }
@@ -540,6 +560,9 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
     }
     if !(1..=10).contains(&c.confirmation_threshold) {
         return Err("confirmation_threshold must be between 1 and 10".into());
+    }
+    if !(1..=10).contains(&c.recovery_threshold) {
+        return Err("recovery_threshold must be between 1 and 10".into());
     }
     Ok(c)
 }
@@ -787,7 +810,8 @@ async fn write_config(
              request_body = $17, auth_username = $18, follow_redirects = $19, verify_ssl = $20,
              request_header_names = case when $21 then request_header_names else $22 end,
              request_headers_enc = case when $21 then request_headers_enc else $23 end,
-             auth_password_enc = case when $24 then auth_password_enc else $25 end
+             auth_password_enc = case when $24 then auth_password_enc else $25 end,
+             recovery_threshold = $26
          where id = $1
          returning *",
     )
@@ -816,6 +840,7 @@ async fn write_config(
     .bind(sealed_headers)
     .bind(keep_password)
     .bind(sealed_password)
+    .bind(c.recovery_threshold)
     .fetch_one(&mut *conn)
     .await
 }
@@ -971,6 +996,7 @@ mod tests {
             auth_password_enc: Some(vec![4, 5, 6]),
             follow_redirects: true,
             verify_ssl: true,
+            recovery_threshold: 1,
             ..Monitor::default()
         }
     }
@@ -1309,6 +1335,7 @@ mod tests {
             json!({ "name": "renamed" }),
             json!({ "paused": true }),
             json!({ "confirmation_threshold": 5 }),
+            json!({ "recovery_threshold": 5 }),
             json!({ "http_method": "POST", "follow_redirects": true, "verify_ssl": true }),
             json!({ "request_body": "{}" }),
             json!({ "auth_username": "monitor" }),
@@ -1329,6 +1356,41 @@ mod tests {
             json!({ "verify_ssl": false }),
         ] {
             assert!(reschedules(body.clone()), "{body}");
+        }
+    }
+
+    #[test]
+    fn the_recovery_threshold_defaults_to_one_follows_a_patch_and_stays_within_one_to_ten() {
+        let create: CreateMonitorRequest = serde_json::from_value(json!({
+            "name": "n", "check_type": "http", "url": "https://example.com",
+        }))
+        .unwrap();
+        assert_eq!(create.into_config().recovery_threshold, 1);
+
+        let stored = Monitor {
+            recovery_threshold: 4,
+            ..stored_monitor()
+        };
+        let patched = |body: serde_json::Value| {
+            patch(body)
+                .apply_to(MonitorConfig::from(&stored))
+                .recovery_threshold
+        };
+        assert_eq!(patched(json!({})), 4, "absent keeps what is stored");
+        assert_eq!(patched(json!({ "recovery_threshold": 7 })), 7);
+
+        for threshold in [1, 10] {
+            assert!(
+                validate(merged(json!({ "recovery_threshold": threshold }))).is_ok(),
+                "{threshold}"
+            );
+        }
+        for threshold in [i32::MIN, -1, 0, 11, i32::MAX] {
+            assert_eq!(
+                validate(merged(json!({ "recovery_threshold": threshold }))).unwrap_err(),
+                "recovery_threshold must be between 1 and 10",
+                "{threshold}"
+            );
         }
     }
 
@@ -1397,6 +1459,10 @@ mod tests {
             assert!(printed.contains("<sealed>"), "{printed}");
             assert!(!printed.contains("[1, 2, 3]") && !printed.contains("[4, 5, 6]"));
             assert!(printed.contains("Orders") && printed.contains("X-Api-Key"));
+            assert!(
+                printed.contains("recovery_threshold") && printed.contains("consecutive_successes"),
+                "{printed}"
+            );
         }
         let unsealed = format!(
             "{:?}",
