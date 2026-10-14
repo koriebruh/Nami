@@ -5,9 +5,12 @@
 //! [`RETENTION_DAYS`] days.
 //!
 //! The quota check reads the day's flushed bytes (cached for at most
-//! [`FLUSHED_CACHE_TTL`]) plus this instance's unflushed delta. A request
-//! that crosses the quota is accepted whole, so the overshoot is bounded by
-//! one request plus about one flush interval of traffic per instance.
+//! [`FLUSHED_CACHE_TTL`]) plus this instance's unflushed delta. Bytes count
+//! when a request has been stored, so a request that is still in flight is
+//! not in the total yet, and a request that crosses the quota is accepted
+//! whole. The overshoot of a source is bounded by the requests it has in
+//! flight (at most `rate_limit::MAX_IN_FLIGHT_PER_SOURCE`, each of up to about
+//! 100 MB stored) plus about one flush interval of traffic per instance.
 
 use std::{
     collections::HashMap,
@@ -160,7 +163,9 @@ impl UsageTracker {
     /// Adds every pending delta to `source_usage_daily` in one statement and
     /// returns how many (source, day) rows it touched. Counters of deleted
     /// sources are dropped; on a database error every delta is kept for the
-    /// next flush.
+    /// next flush. The rows are written in key order, so that two instances
+    /// flushing the same sources at once take their row locks in the same
+    /// order and cannot deadlock.
     pub async fn flush(&self, pool: &PgPool) -> Result<usize, sqlx::Error> {
         let batch = std::mem::take(&mut *self.pending.lock().expect("usage lock poisoned"));
         if batch.is_empty() {
@@ -202,6 +207,7 @@ impl UsageTracker {
                   as d(source_id, day, events, bytes, events_dropped, events_sampled_out,
                        requests_rate_limited, requests_over_quota)
              where exists (select 1 from sources s where s.id = d.source_id)
+             order by d.source_id, d.day
              on conflict (source_id, day) do update set
                  events = u.events + excluded.events,
                  bytes = u.bytes + excluded.bytes,

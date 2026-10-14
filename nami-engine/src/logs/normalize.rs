@@ -356,10 +356,29 @@ pub fn cap_fields(mut fields: Map<String, Value>) -> Map<String, Value> {
     fields
 }
 
+/// The length of `value` as JSON text, counted while it is written and
+/// thrown away: measuring a field must not build a copy of it (a field the
+/// size of the whole event cap, 50 MiB of decoded values, would make one as
+/// large as its text).
 fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
-    serde_json::to_vec(value)
-        .map(|bytes| bytes.len())
-        .unwrap_or(0)
+    struct Count(usize);
+
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut count = Count(0);
+    match serde_json::to_writer(&mut count, value) {
+        Ok(()) => count.0,
+        Err(_) => 0,
+    }
 }
 
 #[cfg(test)]

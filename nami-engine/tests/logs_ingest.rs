@@ -2,25 +2,32 @@
 // Requires `docker compose up -d postgres clickhouse`.
 mod common;
 
-use std::{io::Write, sync::Arc, time::Duration};
+use std::{
+    io::Write,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::http::StatusCode;
 use common::{
     LogCapture,
     logs::{
-        messages, post_json, post_logs, seed_source, seed_source_with, source_config, stored_rows,
-        test_cipher, unreachable_pool,
+        eventually, first_response, ingest_head, ingest_request, messages, post_json, post_logs,
+        post_to, seed_source, seed_source_with, serve, source_config, stored_rows, test_cipher,
+        unreachable_pool,
     },
     public_app, seed_project, state_with_clickhouse, test_public_app,
 };
 use nami_engine::{
+    clickhouse::ClickHouse,
     logs::{
         LogsState,
+        ingest::BodyPace,
         normalize::{FIELDS_TRUNCATED_KEY, MAX_MESSAGE_BYTES, TRUNCATION_MARKER},
-        rate_limit::TokenBuckets,
+        rate_limit::{InFlight, TokenBuckets},
     },
     models::source::{self, SourceConfig},
-    router::build_public_router_with_ingest_limits,
+    router::{build_public_router, build_public_router_with_ingest_limits},
     routes::logs_ingest::IngestLimits,
     state::AppState,
 };
@@ -751,68 +758,468 @@ async fn an_ingest_request_holds_its_place_while_it_waits_for_the_database(pool:
     ch.drop_database().await.unwrap();
 }
 
+const WAIT: Duration = Duration::from_secs(10);
+
 /// A request holds its place while its body arrives, so a client that stalls
 /// (a dead connection that never closes, a sender that goes quiet) must not
-/// keep it for ever: at the deadline the request ends with 408 and the place
-/// is free again. Over a real socket, which is where a client can stall.
+/// keep it for long: a small body gets the grace period, not the cap, and is
+/// answered 408, logged with its source (never its token), and its place is
+/// free again. Over a real socket, which is where a client can stall.
 #[sqlx::test]
-async fn a_stalled_body_gives_up_its_place_at_the_deadline(pool: sqlx::PgPool) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+async fn a_stalled_body_gives_up_its_place_after_the_grace_period_and_is_logged(
+    pool: sqlx::PgPool,
+) {
+    use tokio::io::AsyncWriteExt;
 
+    let capture = LogCapture::default();
+    let _guard = capture.install();
     let (state, ch) = state_with_clickhouse(&pool).await;
     let limits = IngestLimits {
         places: Arc::new(Semaphore::new(1)),
-        body_read_timeout: Duration::from_millis(800),
+        body_pace: BodyPace {
+            grace: Duration::from_millis(500),
+            min_bytes_per_second: 1_000_000,
+            cap: Duration::from_secs(30),
+        },
+        ..IngestLimits::default()
     };
-    let public = build_public_router_with_ingest_limits(state, limits);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move { axum::serve(listener, public).await.unwrap() });
+    let served = serve(build_public_router_with_ingest_limits(state, limits)).await;
     let project = seed_project(&pool).await;
-    let (_, token) = seed_source(&pool, project, "api").await;
-    let http = reqwest::Client::builder().no_proxy().build().unwrap();
-    let post = || {
-        http.post(format!("http://{addr}/api/v1/logs"))
-            .bearer_auth(&token)
-            .json(&json!({ "message": "m" }))
-            .send()
-    };
+    let (source_id, token) = seed_source(&pool, project, "api").await;
+    let message = json!({ "message": "m" });
 
     // A client announces 1000 bytes, sends one and goes quiet.
-    let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut stalled = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    let started = Instant::now();
     stalled
-        .write_all(
-            format!(
-                "POST /api/v1/logs HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\n\
-                 Content-Type: application/json\r\nContent-Length: 1000\r\n\r\n{{"
-            )
-            .as_bytes(),
-        )
+        .write_all(format!("{}{{", ingest_head(&token, 1000)).as_bytes())
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (status, _, _) = post_to(served.addr, &token, &message, WAIT).await.unwrap();
     assert_eq!(
-        post().await.unwrap().status(),
+        status,
         StatusCode::SERVICE_UNAVAILABLE,
         "the only place is held by the stalled request"
     );
 
-    let mut reply = [0u8; 512];
-    let read = tokio::time::timeout(Duration::from_secs(10), stalled.read(&mut reply))
+    let reply = first_response(&mut stalled, WAIT)
         .await
-        .expect("the stalled request is answered at the deadline")
-        .unwrap();
-    let reply = String::from_utf8_lossy(&reply[..read]);
+        .expect("the stalled request is answered");
     assert!(reply.starts_with("HTTP/1.1 408"), "{reply}");
     assert!(reply.contains(r#""code":"request_timeout""#), "{reply}");
-
-    assert_eq!(
-        post().await.unwrap().status(),
-        StatusCode::ACCEPTED,
-        "the place was given back"
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "after the grace period of 0.5 s, not the cap of 30 s: {:?}",
+        started.elapsed()
     );
+
+    let (status, _, _) = post_to(served.addr, &token, &message, WAIT).await.unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED, "the place was given back");
     assert_eq!(stored_rows(&ch, project).await.len(), 1);
-    server.abort();
+
+    let output = capture.lines().join("\n");
+    assert!(
+        output.contains("ingest request body did not arrive in time"),
+        "{output}"
+    );
+    assert!(output.contains(&source_id.to_string()), "{output}");
+    assert!(!output.contains(&token), "a token leaked into the logs");
+    ch.drop_database().await.unwrap();
+}
+
+/// What a body must keep up with grows with what it has delivered, so a client
+/// that sends a trickle (a flat deadline would give it the cap) is cut off as
+/// soon as it falls behind: here 200 bytes every 150 ms is 1.3 KB/s against a
+/// minimum of 2 KB/s, for a body that would take 75 s to arrive.
+#[sqlx::test]
+async fn a_body_that_crawls_in_slower_than_the_minimum_pace_is_cut_off_early(pool: sqlx::PgPool) {
+    use tokio::io::AsyncWriteExt;
+
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let limits = IngestLimits {
+        body_pace: BodyPace {
+            grace: Duration::from_millis(300),
+            min_bytes_per_second: 2_000,
+            cap: Duration::from_secs(30),
+        },
+        ..IngestLimits::default()
+    };
+    let served = serve(build_public_router_with_ingest_limits(state, limits)).await;
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+
+    let (mut read, mut write) = tokio::net::TcpStream::connect(served.addr)
+        .await
+        .unwrap()
+        .into_split();
+    write
+        .write_all(ingest_head(&token, 100_000).as_bytes())
+        .await
+        .unwrap();
+    let started = Instant::now();
+    let trickle = tokio::spawn(async move {
+        while write.write_all(&[b' '; 200]).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    });
+    let reply = first_response(&mut read, WAIT)
+        .await
+        .expect("the crawling request is answered");
+    trickle.abort();
+    assert!(reply.starts_with("HTTP/1.1 408"), "{reply}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}: it fell behind after about a second",
+        started.elapsed()
+    );
+    ch.drop_database().await.unwrap();
+}
+
+/// The same pace, kept: a body that arrives in pieces fast enough is stored.
+#[sqlx::test]
+async fn a_body_that_keeps_to_the_minimum_pace_is_stored(pool: sqlx::PgPool) {
+    use tokio::io::AsyncWriteExt;
+
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let limits = IngestLimits {
+        body_pace: BodyPace {
+            grace: Duration::from_millis(300),
+            min_bytes_per_second: 4_000,
+            cap: Duration::from_secs(30),
+        },
+        ..IngestLimits::default()
+    };
+    let served = serve(build_public_router_with_ingest_limits(state, limits)).await;
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+
+    let body = serde_json::to_string(&vec![json!({ "message": "x".repeat(900) }); 5]).unwrap();
+    let mut client = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    client
+        .write_all(ingest_head(&token, body.len()).as_bytes())
+        .await
+        .unwrap();
+    for piece in body.as_bytes().chunks(body.len() / 5 + 1) {
+        client.write_all(piece).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let reply = first_response(&mut client, WAIT).await.expect("answered");
+    assert!(reply.starts_with("HTTP/1.1 202"), "{reply}");
+    assert!(reply.contains(r#"{"accepted":5}"#), "{reply}");
+    assert_eq!(stored_rows(&ch, project).await.len(), 5);
+    ch.drop_database().await.unwrap();
+}
+
+/// A client that hangs up (hyper drops the handler the moment it sees the
+/// connection end) must not free the place of work that is still running, and
+/// must not let its events be stored without being counted. A ClickHouse that
+/// takes 1.2 s to answer holds the request in the insert.
+#[sqlx::test]
+async fn a_client_that_hangs_up_during_the_insert_still_has_its_events_stored_and_counted(
+    pool: sqlx::PgPool,
+) {
+    use tokio::io::AsyncWriteExt;
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(1200)))
+        .mount(&slow)
+        .await;
+    let state = AppState {
+        clickhouse: ClickHouse::new(&slow.uri(), "nami", "nami", "nami_unused"),
+        ..AppState::for_test(pool.clone())
+    };
+    let logs = state.logs.clone();
+    let limits = IngestLimits {
+        places: Arc::new(Semaphore::new(1)),
+        ..IngestLimits::default()
+    };
+    let served = serve(build_public_router_with_ingest_limits(state, limits)).await;
+    let project = seed_project(&pool).await;
+    let (source_id, token) = seed_source(&pool, project, "api").await;
+    let today = chrono::Utc::now().date_naive();
+
+    // A complete request. Once its insert is under way, the connection ends.
+    let mut leaving = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    leaving
+        .write_all(ingest_request(&token, r#"{"message":"left behind"}"#).as_bytes())
+        .await
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while slow.received_requests().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the insert never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    leaving.shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let message = json!({ "message": "next" });
+    let (status, _, _) = post_to(served.addr, &token, &message, WAIT).await.unwrap();
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the place is held by the insert that is under way, not by the connection"
+    );
+    assert_eq!(
+        logs.in_flight.count(source_id),
+        1,
+        "and so is the source's count of requests in flight"
+    );
+
+    eventually("the events are counted", WAIT, || {
+        logs.usage.pending(source_id, today).events == 1
+    })
+    .await;
+    assert!(logs.usage.pending(source_id, today).bytes > 0);
+    let inserts = slow.received_requests().await.unwrap();
+    assert_eq!(inserts.len(), 1, "the 503 never reached ClickHouse");
+    assert_eq!(
+        String::from_utf8_lossy(&inserts[0].body).lines().count(),
+        1,
+        "one event was inserted"
+    );
+
+    let (status, _, _) = post_to(served.addr, &token, &message, WAIT).await.unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED, "the place was given back");
+}
+
+/// The same hang-up while the batch is still waiting for a place to be
+/// decoded: the place of the endpoint stays taken until the work ends, and the
+/// work still happens.
+#[sqlx::test]
+async fn a_client_that_hangs_up_while_its_batch_waits_to_be_decoded_keeps_its_place(
+    pool: sqlx::PgPool,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let logs = state.logs.clone();
+    let limits = IngestLimits {
+        places: Arc::new(Semaphore::new(1)),
+        decodes: Arc::new(Semaphore::new(1)),
+        ..IngestLimits::default()
+    };
+    // Decoding cannot start while the test holds the only place for it.
+    let gate = limits.decodes.clone().acquire_owned().await.unwrap();
+    let served = serve(build_public_router_with_ingest_limits(state, limits)).await;
+    let project = seed_project(&pool).await;
+    let (source_id, token) = seed_source(&pool, project, "api").await;
+    let today = chrono::Utc::now().date_naive();
+
+    let mut leaving = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+    leaving
+        .write_all(ingest_request(&token, r#"{"message":"left behind"}"#).as_bytes())
+        .await
+        .unwrap();
+    // Long enough for the request to be read and its work to wait for the gate.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    leaving.shutdown().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let message = json!({ "message": "next" });
+    let (status, _, _) = post_to(served.addr, &token, &message, WAIT).await.unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(logs.usage.pending(source_id, today).events, 0);
+    assert_eq!(
+        logs.in_flight.count(source_id),
+        1,
+        "the source's count stays too"
+    );
+
+    drop(gate);
+    eventually("the events are counted", WAIT, || {
+        logs.usage.pending(source_id, today).events == 1
+    })
+    .await;
+    assert_eq!(stored_rows(&ch, project).await.len(), 1);
+    eventually("the place is given back", WAIT, || {
+        logs.in_flight.count(source_id) == 0
+    })
+    .await;
+    let (status, _, _) = post_to(served.addr, &token, &message, WAIT).await.unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED);
+    ch.drop_database().await.unwrap();
+}
+
+/// One token cannot take every place: a source has a few requests in flight at
+/// most and is told 429 beyond them, while the other sources are served. The
+/// requests a source has in flight are counted until their work ends, so
+/// hanging up does not free them early either.
+#[sqlx::test]
+async fn one_source_cannot_hold_more_than_its_share_of_the_places(pool: sqlx::PgPool) {
+    use tokio::io::AsyncWriteExt;
+
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let logs = Arc::new(LogsState {
+        in_flight: InFlight::new(2),
+        ..LogsState::default()
+    });
+    let state = AppState {
+        logs: logs.clone(),
+        ..state
+    };
+    let served = serve(build_public_router(state)).await;
+    let project = seed_project(&pool).await;
+    let (a, token_a) = seed_source(&pool, project, "a").await;
+    let (_, token_b) = seed_source(&pool, project, "b").await;
+    let message = json!({ "message": "m" });
+
+    // Two requests of `a` stall in the middle of their bodies.
+    let mut stalled = Vec::new();
+    for _ in 0..2 {
+        let mut client = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+        client
+            .write_all(format!("{}{{", ingest_head(&token_a, 1000)).as_bytes())
+            .await
+            .unwrap();
+        stalled.push(client);
+    }
+    eventually("both are counted", WAIT, || logs.in_flight.count(a) == 2).await;
+
+    let (status, headers, json) = post_to(served.addr, &token_a, &message, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{json}");
+    assert_eq!(json["code"], "too_many_in_flight");
+    assert!(
+        json["error"].as_str().unwrap().contains("at most 2"),
+        "{json}"
+    );
+    assert_eq!(headers["retry-after"], "1");
+    let (status, _, _) = post_to(served.addr, &token_b, &message, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED, "another source is served");
+
+    logs.usage.flush(&pool).await.unwrap();
+    let rejected: i64 = sqlx::query_scalar(
+        "select requests_rate_limited from source_usage_daily where source_id = $1",
+    )
+    .bind(a)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rejected, 1, "the rejection counts as rate limited");
+
+    // The clients hang up with their bodies unread: the handlers are dropped
+    // and the counts go back to zero.
+    drop(stalled);
+    eventually("the source's count is back to zero", WAIT, || {
+        logs.in_flight.count(a) == 0
+    })
+    .await;
+    let (status, _, _) = post_to(served.addr, &token_a, &message, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED);
+    ch.drop_database().await.unwrap();
+}
+
+/// The token lookup and the quota check wait for one of a few places before
+/// they ask Postgres, so that ingest never has more statements running than
+/// the pool can spare. Waiting for one holds no connection.
+#[sqlx::test]
+async fn ingest_waits_for_one_of_a_few_places_before_it_asks_postgres(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let limits = IngestLimits {
+        queries: Arc::new(Semaphore::new(1)),
+        ..IngestLimits::default()
+    };
+    let public = build_public_router_with_ingest_limits(state, limits.clone());
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+
+    let held = limits.queries.clone().acquire_owned().await.unwrap();
+    let waiting = tokio::time::timeout(
+        Duration::from_millis(300),
+        post_json(&public, &token, json!({ "message": "m" })),
+    )
+    .await;
+    assert!(waiting.is_err(), "with no place free the request waits");
+    drop(held);
+    assert_eq!(
+        post_json(&public, &token, json!({ "message": "m" }))
+            .await
+            .0,
+        StatusCode::ACCEPTED
+    );
+    ch.drop_database().await.unwrap();
+}
+
+/// 50 MiB of zeros inside one array is 50 KB gzipped and, decoded, gigabytes of
+/// values: the decoders stop at their budget and the request is a 413, in a
+/// fraction of the time (and of the memory) that decoding it all would take.
+#[sqlx::test]
+async fn a_gzip_body_that_decodes_to_gigabytes_is_refused_at_once(pool: sqlx::PgPool) {
+    const MIB: usize = 1024 * 1024;
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let public = public_app(state);
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+
+    // Exactly the 50 MiB gzip allows: a head, then zeros (or `0,`s) to fill
+    // it, as one member and 49 of 1 MiB.
+    let zeros = gzip(&vec![0u8; MIB]);
+    let mut msgpack_bomb = vec![0x81, 0xa1, b'a', 0xdd];
+    msgpack_bomb.extend(52_428_792u32.to_be_bytes());
+    msgpack_bomb.resize(MIB, 0);
+    let mut msgpack_gz = gzip(&msgpack_bomb);
+    msgpack_gz.extend(zeros.repeat(49));
+
+    let mut json_bomb = b"{\"a\":[".to_vec();
+    json_bomb.extend("0,".repeat((MIB - 6) / 2).bytes());
+    let mut json_gz = gzip(&json_bomb);
+    json_gz.extend(gzip("0,".repeat(MIB / 2).as_bytes()).repeat(49));
+
+    for (what, headers, body) in [
+        ("MessagePack", [MSGPACK, GZIP], msgpack_gz),
+        ("JSON", [JSON, GZIP], json_gz),
+    ] {
+        assert!(
+            body.len() < 100 * 1024,
+            "{what}: {} bytes on the wire",
+            body.len()
+        );
+        let started = Instant::now();
+        let (status, _, json) = post_logs(&public, Some(&token), &headers, body).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{what}: {json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("expands to more than"),
+            "{what}: {json}"
+        );
+        assert!(started.elapsed() < WAIT, "{what}: {:?}", started.elapsed());
+    }
+    assert!(stored_rows(&ch, project).await.is_empty());
+    ch.drop_database().await.unwrap();
+}
+
+/// A second `Content-Encoding` line is a stack of codings, or something a
+/// proxy added: refused, not read as its first line alone.
+#[sqlx::test]
+async fn more_than_one_content_encoding_is_415(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let public = public_app(state);
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let body = gzip(b"{\"message\":\"gz\"}");
+
+    for extra in ["identity", "gzip", "br"] {
+        let headers = [JSON, GZIP, ("content-encoding", extra)];
+        let (status, _, json) = post_logs(&public, Some(&token), &headers, body.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{extra}: {json}"
+        );
+    }
+    let (status, _, json) = post_logs(&public, Some(&token), &[JSON, GZIP], body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{json}");
+    assert_eq!(stored_rows(&ch, project).await.len(), 1);
     ch.drop_database().await.unwrap();
 }
 

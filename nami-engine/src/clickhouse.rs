@@ -205,6 +205,40 @@ impl ClickHouse {
         rows: &[T],
         settings: &[(&'static str, &'static str)],
     ) -> Result<(), ClickHouseError> {
+        let pairs = self.insert_pairs(table, settings)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.post(pairs, encode_rows(rows)?).await.map(|_| ())
+    }
+
+    /// [`Self::insert_rows_with`] for a body that [`encode_rows`] has already
+    /// built: encoding a big batch takes real CPU time and as much memory as
+    /// the batch, so a caller with one does that on a blocking thread, then
+    /// only sends it from the async side. Everything else is as for
+    /// `insert_rows_with`, which this is the second half of; an empty body is
+    /// a no-op (`table` is still validated first).
+    pub async fn insert_encoded_with(
+        &self,
+        table: &str,
+        body: String,
+        settings: &[(&'static str, &'static str)],
+    ) -> Result<(), ClickHouseError> {
+        let pairs = self.insert_pairs(table, settings)?;
+        if body.is_empty() {
+            return Ok(());
+        }
+        self.post(pairs, body).await.map(|_| ())
+    }
+
+    /// The URL parameters of an `INSERT INTO <database>.<table> FORMAT
+    /// JSONEachRow`; validates `table` (and the database) before anything is
+    /// sent.
+    fn insert_pairs(
+        &self,
+        table: &str,
+        settings: &[(&'static str, &'static str)],
+    ) -> Result<Vec<(String, String)>, ClickHouseError> {
         let mut pairs = self.settings_with_database()?;
         push_extra_settings(&mut pairs, settings);
         pairs.push((
@@ -217,15 +251,7 @@ impl ClickHouse {
         ));
         pairs.push(identifier_param("db", &self.database)?);
         pairs.push(identifier_param("table", table)?);
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut body = String::new();
-        for row in rows {
-            body.push_str(&serde_json::to_string(row).map_err(ClickHouseError::Encode)?);
-            body.push('\n');
-        }
-        self.post(pairs, body).await.map(|_| ())
+        Ok(pairs)
     }
 
     /// Runs a `SELECT` and deserializes each `JSONEachRow` line into `T`.
@@ -407,6 +433,19 @@ impl ClickHouse {
     }
 }
 
+/// The `JSONEachRow` body of `rows`: one serde-encoded JSON object per line,
+/// each ended by a newline. The CPU-bound half of
+/// [`ClickHouse::insert_rows_with`], for callers that run it somewhere other
+/// than an async worker (see [`ClickHouse::insert_encoded_with`]).
+pub fn encode_rows<T: Serialize>(rows: &[T]) -> Result<String, ClickHouseError> {
+    let mut body = String::new();
+    for row in rows {
+        body.push_str(&serde_json::to_string(row).map_err(ClickHouseError::Encode)?);
+        body.push('\n');
+    }
+    Ok(body)
+}
+
 /// Makes a typed query-parameter value (`String`, `UUID`, `Int64`, ...) arrive
 /// byte-for-byte. ClickHouse parses those values in its "escaped" (TSV) text
 /// format: a raw tab or newline is a parse error, and backslash sequences are
@@ -477,8 +516,8 @@ fn validate_identifier(name: &str) -> Result<&str, ClickHouseError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_SETTINGS, ClickHouse, ClickHouseError, RESERVED_SETTINGS, escape_param_value,
-        push_extra_settings, validate_identifier,
+        BASE_SETTINGS, ClickHouse, ClickHouseError, RESERVED_SETTINGS, encode_rows,
+        escape_param_value, push_extra_settings, validate_identifier,
     };
 
     /// Every SELECT is bounded on the server and stops there when the client
@@ -522,6 +561,69 @@ mod tests {
             !statement.contains_key("max_execution_time"),
             "{statement:?}"
         );
+    }
+
+    /// `insert_encoded_with` sends exactly what `insert_rows_with` does for
+    /// the same rows: the same settings, the same query, the same body.
+    #[tokio::test]
+    async fn an_encoded_body_is_sent_as_insert_rows_would_send_it() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_probe");
+        let rows = [
+            serde_json::json!({ "a": 1, "b": "x\ny" }),
+            serde_json::json!({ "a": 2 }),
+        ];
+        let settings = [("async_insert", "1"), ("wait_for_async_insert", "1")];
+
+        ch.insert_rows_with("logs", &rows, &settings).await.unwrap();
+        let body = encode_rows(&rows).unwrap();
+        ch.insert_encoded_with("logs", body.clone(), &settings)
+            .await
+            .unwrap();
+        assert_eq!(body, "{\"a\":1,\"b\":\"x\\ny\"}\n{\"a\":2}\n");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let query = |index: usize| -> Vec<(String, String)> {
+            let mut pairs: Vec<_> = requests[index].url.query_pairs().into_owned().collect();
+            pairs.sort();
+            pairs
+        };
+        assert_eq!(query(0), query(1), "the same settings and query");
+        assert_eq!(requests[0].body, requests[1].body, "the same body");
+        assert_eq!(requests[1].body, body.as_bytes());
+    }
+
+    /// An empty batch sends nothing, but a table name that is not an
+    /// identifier is refused all the same.
+    #[tokio::test]
+    async fn an_empty_encoded_body_sends_nothing_and_a_bad_table_is_refused_first() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_probe");
+
+        ch.insert_encoded_with("logs", String::new(), &[])
+            .await
+            .unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        for body in [String::new(), "{}\n".to_string()] {
+            assert!(matches!(
+                ch.insert_encoded_with("logs; drop", body, &[]).await,
+                Err(ClickHouseError::InvalidIdentifier(_))
+            ));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

@@ -53,11 +53,27 @@ phases merge.
   50 requests/s, burst 100 → 429 with the service's JSON error shape.
 - Served by the public listener (`PUBLIC_PORT`) only, never by the private
   API port, so exposing the one public port to shippers exposes none of the
-  API. At most 32 ingest requests run at once per engine instance; one that
-  finds every place taken → `503` with `Retry-After: 1`, answered before any
-  database work, so an ingest flood cannot starve the Postgres pool that
-  the API and the uptime worker share. A bearer token that is not exactly 43
-  base64url characters → 401 without a database query.
+  API. A bearer token that is not exactly 43 base64url characters → 401
+  without a database query.
+- Load limits, so that no sender can exhaust the engine or the pool the API
+  and the uptime worker share:
+  - at most 32 ingest requests run at once per engine instance; one that
+    finds every place taken → `503` with `Retry-After: 1`, answered before
+    any database work. A source may have at most 4 requests in flight → `429`
+    `too_many_in_flight` (counted with the rate-limited requests), so one
+    token cannot take every place;
+  - at most 8 Postgres statements at once (never more than half the pool),
+    so the API and the worker always find connections free;
+  - the body must arrive at a pace: 5 s to start, then 64 KiB/s, 60 s at the
+    most → `408`, logged with the source (never the token). A request holds
+    its place until its work ends, also when the client has hung up, and its
+    events are stored and counted either way;
+  - what a body decodes to is capped, not only its bytes: the decoders stop at
+    192 MiB of estimated decoded size (a MessagePack `0` is one byte and a
+    32-byte value) → `413`, and at most 4 bodies are decoded at once, so
+    50 MiB of zeros in one array costs a few hundred ms and under 200 MiB, not
+    gigabytes;
+  - at most one `Content-Encoding` line, a single `gzip` (or none) → else `415`.
 - Response `202 {"accepted": N}`. Inserts use ClickHouse
   `async_insert=1, wait_for_async_insert=1` so the server batches small
   inserts and 202 still means durable.

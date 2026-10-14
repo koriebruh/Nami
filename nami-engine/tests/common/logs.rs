@@ -1,5 +1,7 @@
 //! Helpers for the log management tests.
 
+use std::{net::SocketAddr, time::Duration};
+
 use axum::{
     Router,
     body::Body,
@@ -123,4 +125,97 @@ pub fn messages(rows: &[Value]) -> Vec<String> {
         .collect();
     messages.sort();
     messages
+}
+
+/// A router served on a loopback port, over real sockets, the way `main.rs`
+/// serves the public listener. That is where a client can stall, trickle a
+/// body or hang up, which a router called in process never sees. Stops when
+/// dropped.
+pub struct Served {
+    pub addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub async fn serve(router: Router) -> Served {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    Served { addr, task }
+}
+
+/// The head of an ingest request that announces `content_length` bytes of
+/// JSON.
+pub fn ingest_head(token: &str, content_length: usize) -> String {
+    format!(
+        "POST /api/v1/logs HTTP/1.1\r\nHost: ingest\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {content_length}\r\n\r\n"
+    )
+}
+
+/// A complete ingest request with `body`.
+pub fn ingest_request(token: &str, body: &str) -> String {
+    format!("{}{body}", ingest_head(token, body.len()))
+}
+
+/// What the server writes first, if it does within `wait`: the status line and
+/// whatever came with it. `None` when nothing came, or the connection closed
+/// without a word.
+pub async fn first_response(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    wait: Duration,
+) -> Option<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buffer = [0u8; 1024];
+    match tokio::time::timeout(wait, stream.read(&mut buffer)).await {
+        Ok(Ok(read)) if read > 0 => Some(String::from_utf8_lossy(&buffer[..read]).into_owned()),
+        _ => None,
+    }
+}
+
+/// `POST /api/v1/logs` to `addr` over a real connection, with a JSON body:
+/// the status, the headers and the JSON answer. Gives up after `wait`.
+pub async fn post_to(
+    addr: SocketAddr,
+    token: &str,
+    body: &Value,
+    wait: Duration,
+) -> Result<(StatusCode, HeaderMap, Value), reqwest::Error> {
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .post(format!("http://{addr}/api/v1/logs"))
+        .bearer_auth(token)
+        .json(body)
+        .timeout(wait)
+        .send()
+        .await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let text = response.text().await?;
+    Ok((
+        status,
+        headers,
+        serde_json::from_str(&text).unwrap_or(Value::Null),
+    ))
+}
+
+/// Polls `condition` until it holds, up to `wait`; panics with `what` after
+/// that.
+pub async fn eventually(what: &str, wait: Duration, mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + wait;
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never happened: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

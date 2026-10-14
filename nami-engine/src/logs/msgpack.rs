@@ -8,11 +8,17 @@
 //!   applies to JSON bodies);
 //! - map keys must be strings; strings must be UTF-8;
 //! - `bin` values become base64 strings, timestamp extensions (type -1)
-//!   RFC 3339 strings, other extensions `null`; NaN/infinite floats `null`.
+//!   RFC 3339 strings, other extensions `null`; NaN/infinite floats `null`;
+//! - everything decoded is charged to a [`Budget`] before it is built, so a
+//!   body that decodes to far more than it weighs (a MessagePack `0` is one
+//!   byte and a 32-byte `Value`) stops at the budget, with
+//!   [`MsgpackError::TooLarge`], instead of taking gigabytes.
 
 use base64::Engine;
 use chrono::{DateTime, SecondsFormat};
 use serde_json::{Map, Number, Value};
+
+use super::budget::{ARRAY_BYTES, Budget, MAP_BYTES, STRING_BYTES, TooLarge, VALUE_BYTES};
 
 /// Arrays/maps may nest this deep, counting the outermost one (serde_json's
 /// recursion limit for JSON bodies is the same).
@@ -36,22 +42,50 @@ pub enum MsgpackError {
     NotAnObject,
     #[error("too many events")]
     TooManyEvents,
+    #[error("the body decodes to more data than the limit allows")]
+    TooLarge,
+}
+
+impl From<TooLarge> for MsgpackError {
+    fn from(_: TooLarge) -> Self {
+        MsgpackError::TooLarge
+    }
 }
 
 type Result<T> = std::result::Result<T, MsgpackError>;
 
-/// Decodes exactly one value (no trailing bytes).
+/// Decodes exactly one value (no trailing bytes), within the
+/// [`Budget::for_request`] budget.
 pub fn decode_value(input: &[u8]) -> Result<Value> {
-    let mut decoder = Decoder { input, pos: 0 };
+    let mut budget = Budget::for_request();
+    let mut decoder = Decoder {
+        input,
+        pos: 0,
+        budget: &mut budget,
+    };
     let value = decoder.value(0)?;
     decoder.finish()?;
     Ok(value)
 }
 
 /// The events of an ingest body: one map, or an array of at most
-/// `max_events` maps.
+/// `max_events` maps, within the [`Budget::for_request`] budget.
 pub fn decode_events(input: &[u8], max_events: usize) -> Result<Vec<Map<String, Value>>> {
-    let mut decoder = Decoder { input, pos: 0 };
+    decode_events_within(input, max_events, &mut Budget::for_request())
+}
+
+/// [`decode_events`] charging `budget`, which the caller keeps: it shows what
+/// the decoding cost, also when it stopped.
+pub fn decode_events_within(
+    input: &[u8],
+    max_events: usize,
+    budget: &mut Budget,
+) -> Result<Vec<Map<String, Value>>> {
+    let mut decoder = Decoder {
+        input,
+        pos: 0,
+        budget,
+    };
     let events = match decoder.peek()? {
         marker if is_map(marker) => vec![decoder.object(0)?],
         marker if is_array(marker) => {
@@ -81,16 +115,13 @@ fn is_array(marker: u8) -> bool {
     matches!(marker, 0x90..=0x9f | 0xdc | 0xdd)
 }
 
-fn is_str(marker: u8) -> bool {
-    matches!(marker, 0xa0..=0xbf | 0xd9..=0xdb)
-}
-
-struct Decoder<'a> {
+struct Decoder<'a, 'b> {
     input: &'a [u8],
     pos: usize,
+    budget: &'b mut Budget,
 }
 
-impl<'a> Decoder<'a> {
+impl<'a> Decoder<'a, '_> {
     fn remaining(&self) -> usize {
         self.input.len() - self.pos
     }
@@ -170,12 +201,16 @@ impl<'a> Decoder<'a> {
         if !is_map(marker) {
             return Err(MsgpackError::NotAnObject);
         }
+        self.budget.charge(VALUE_BYTES)?;
         let len = self.map_len(marker)?;
         self.map_entries(len, depth)
     }
 
     fn value(&mut self, depth: usize) -> Result<Value> {
         let marker = self.byte()?;
+        // Every value takes a slot; what a string, array or map holds on top
+        // of that is charged where it is built.
+        self.budget.charge(VALUE_BYTES)?;
         Ok(match marker {
             0x00..=0x7f => Value::from(marker),
             0x80..=0x8f | 0xde | 0xdf => {
@@ -251,6 +286,7 @@ impl<'a> Decoder<'a> {
             return Err(MsgpackError::TooDeep);
         }
         self.check_items(len, 1)?;
+        self.budget.charge(ARRAY_BYTES)?;
         let mut items = Vec::new();
         for _ in 0..len {
             items.push(self.value(depth + 1)?);
@@ -263,30 +299,45 @@ impl<'a> Decoder<'a> {
             return Err(MsgpackError::TooDeep);
         }
         self.check_items(len, 2)?;
+        self.budget.charge(MAP_BYTES)?;
         let mut map = Map::new();
         for _ in 0..len {
-            // Reject a non-string key before decoding it (it may be a deep map).
-            let marker = self.peek()?;
-            if !is_str(marker) {
-                return Err(MsgpackError::NonStringKey);
-            }
-            let Value::String(key) = self.value(depth + 1)? else {
-                return Err(MsgpackError::NonStringKey);
-            };
+            let key = self.key()?;
             let value = self.value(depth + 1)?;
             map.insert(key, value);
         }
         Ok(map)
     }
 
+    /// A map key: it must be a string, and is rejected before anything else
+    /// of the entry is read (the value may be a deep map).
+    fn key(&mut self) -> Result<String> {
+        let marker = self.byte()?;
+        let len = match marker {
+            0xa0..=0xbf => (marker & 0x1f) as usize,
+            0xd9 => self.byte()? as usize,
+            0xda => self.u16()?,
+            0xdb => self.u32()?,
+            _ => return Err(MsgpackError::NonStringKey),
+        };
+        let bytes = self.take(len)?;
+        self.budget.key(len)?;
+        let text = std::str::from_utf8(bytes).map_err(|_| MsgpackError::InvalidUtf8)?;
+        Ok(text.to_string())
+    }
+
     fn str(&mut self, len: usize) -> Result<Value> {
         let bytes = self.take(len)?;
+        self.budget.charge(STRING_BYTES.saturating_add(len))?;
         let text = std::str::from_utf8(bytes).map_err(|_| MsgpackError::InvalidUtf8)?;
         Ok(Value::String(text.to_string()))
     }
 
     fn bin(&mut self, len: usize) -> Result<Value> {
         let bytes = self.take(len)?;
+        // Base64 takes 4 characters for every 3 bytes, the last group padded.
+        self.budget
+            .charge(STRING_BYTES.saturating_add(len.div_ceil(3).saturating_mul(4)))?;
         Ok(Value::String(
             base64::engine::general_purpose::STANDARD.encode(bytes),
         ))
@@ -298,6 +349,8 @@ impl<'a> Decoder<'a> {
         if ext_type != -1 {
             return Ok(Value::Null);
         }
+        // An RFC 3339 timestamp is at most 35 characters.
+        self.budget.charge(STRING_BYTES + 40)?;
         Ok(timestamp(data).map(Value::String).unwrap_or(Value::Null))
     }
 }

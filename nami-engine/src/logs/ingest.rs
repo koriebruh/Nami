@@ -1,15 +1,21 @@
 //! HTTP ingest bodies: authentication header, content negotiation, size
 //! limits, gzip, and parsing into events. The handler is
 //! `routes::logs_ingest`; everything here except [`read_body`] is
-//! synchronous, and [`rows_from_body`] runs it on a blocking thread.
+//! synchronous, and [`prepare`] runs it on a blocking thread.
 //!
 //! Formats: JSON — one object, an array of objects, or several of those
 //! separated by whitespace, which covers NDJSON (`application/x-ndjson`)
 //! and shippers that send NDJSON as `application/json` — and MessagePack
 //! (`application/msgpack`, `application/x-msgpack`): one map or an array of
 //! maps. Either may be gzip-compressed (`Content-Encoding: gzip`).
+//!
+//! What a body may cost is limited at every step, on the wire and in memory:
+//! 10 MiB as sent ([`read_body`], which also expects it to arrive at a decent
+//! [`BodyPace`]), 50 MiB after gzip ([`gunzip`], which stops inflating at the
+//! limit), 10,000 events, and [`budget::MAX_DECODED_BYTES`] of what the
+//! decoders build from it ([`budget`]).
 
-use std::{fmt, io::Read, time::Duration};
+use std::{fmt, io::Read, sync::Arc, time::Duration};
 
 use axum::{
     Json,
@@ -24,10 +30,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
+use http_body_util::BodyExt;
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Number, Value, json};
+use tokio::{sync::Semaphore, time::Instant};
 
 use super::{
+    budget::{self, Budget, TooLarge, VALUE_BYTES},
     msgpack::{self, MsgpackError},
     normalize,
     rate_limit::REQUESTS_PER_SECOND,
@@ -40,16 +49,47 @@ pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// Largest accepted body after gzip decompression (gzip-bomb guard).
 pub const MAX_DECOMPRESSED_BYTES: usize = 50 * 1024 * 1024;
 pub const MAX_EVENTS: usize = 10_000;
-/// The longest a request may take to deliver its body. A request holds one of
-/// the few ingest places while it does (see
-/// `routes::logs_ingest::MAX_INGEST_IN_FLIGHT`), and a client that stalls
-/// (a dead connection that never closes, or one that sends a byte a minute)
-/// must not keep it for ever: the full 10 MiB still fits at about 1.4 Mbit/s.
-pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// A parse error that quotes the body (serde_json does for a value of the
 /// wrong type) is cut to this many bytes: a body that is one huge string
 /// must not come back as one huge error message.
 const MAX_ERROR_DETAIL_BYTES: usize = 200;
+
+/// How fast a request body has to arrive. A request holds one of the few
+/// ingest places while its body is on the way, so a client that stalls (a dead
+/// connection that never closes) or sends a byte now and then must not keep it
+/// for long: the body gets `grace` to get going, then has to keep up
+/// `min_bytes_per_second` (the time it may take grows with what it has
+/// delivered), and all of it has to be in within `cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyPace {
+    pub grace: Duration,
+    pub min_bytes_per_second: u64,
+    pub cap: Duration,
+}
+
+impl BodyPace {
+    /// 5 s to start, then 64 KiB/s, at most 60 s in all: a small body that
+    /// stalls is cut off after about 5 s, and the full 10 MiB still fits at
+    /// about 1.4 Mbit/s.
+    pub const DEFAULT: BodyPace = BodyPace {
+        grace: Duration::from_secs(5),
+        min_bytes_per_second: 64 * 1024,
+        cap: Duration::from_secs(60),
+    };
+
+    /// How long after the start a body that has delivered `received` bytes may
+    /// take to deliver its next piece.
+    pub fn allowed(&self, received: usize) -> Duration {
+        let earned = received as f64 / self.min_bytes_per_second.max(1) as f64;
+        (self.grace + Duration::from_secs_f64(earned)).min(self.cap)
+    }
+}
+
+impl Default for BodyPace {
+    fn default() -> Self {
+        BodyPace::DEFAULT
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
@@ -61,7 +101,11 @@ pub enum IngestError {
     Busy,
     #[error("rate limit exceeded")]
     RateLimited,
-    /// The body did not arrive within [`BODY_READ_TIMEOUT`].
+    /// The source already has `limit` requests in flight (see
+    /// `rate_limit::MAX_IN_FLIGHT_PER_SOURCE`).
+    #[error("too many requests in flight for this source")]
+    TooManyInFlight { limit: usize },
+    /// The body did not arrive at the pace of [`BodyPace`].
     #[error("timed out waiting for the request body")]
     RequestTimeout,
     #[error("daily byte quota exceeded")]
@@ -125,6 +169,16 @@ impl IntoResponse for IngestError {
                         "rate limit exceeded: at most {REQUESTS_PER_SECOND} requests per second per source"
                     ),
                     "code": "rate_limited"
+                }),
+                Some(1),
+            ),
+            IngestError::TooManyInFlight { limit } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({
+                    "error": format!(
+                        "too many requests in flight for this source: at most {limit} at once"
+                    ),
+                    "code": "too_many_in_flight"
                 }),
                 Some(1),
             ),
@@ -192,15 +246,32 @@ fn header(headers: &HeaderMap, name: axum::http::HeaderName) -> Option<String> {
         .map(|v| v.trim().to_ascii_lowercase())
 }
 
+fn unsupported_content_encoding() -> IngestError {
+    IngestError::UnsupportedMediaType(
+        "unsupported Content-Encoding: send one gzip coding, or an uncompressed body".to_string(),
+    )
+}
+
 pub fn body_encoding(headers: &HeaderMap) -> Result<BodyEncoding, IngestError> {
-    let gzip = match header(headers, CONTENT_ENCODING).as_deref() {
+    // One coding in one header. A second `Content-Encoding` line (or a list,
+    // `gzip, br`) is a stack of codings, or a line a proxy added: reading only
+    // the first would decode the body as something it is not.
+    let mut codings = headers.get_all(CONTENT_ENCODING).iter();
+    let coding = match (codings.next(), codings.next()) {
+        (_, Some(_)) => return Err(unsupported_content_encoding()),
+        (None, None) => None,
+        (Some(value), None) => Some(
+            value
+                .to_str()
+                .map_err(|_| unsupported_content_encoding())?
+                .trim()
+                .to_ascii_lowercase(),
+        ),
+    };
+    let gzip = match coding.as_deref() {
         None | Some("") | Some("identity") => false,
         Some("gzip") | Some("x-gzip") => true,
-        Some(_) => {
-            return Err(IngestError::UnsupportedMediaType(
-                "unsupported Content-Encoding: send gzip or an uncompressed body".to_string(),
-            ));
-        }
+        Some(_) => return Err(unsupported_content_encoding()),
     };
     let media_type = header(headers, CONTENT_TYPE)
         .map(|value| value.split(';').next().unwrap_or("").trim().to_string());
@@ -236,13 +307,13 @@ fn body_too_large() -> IngestError {
     ))
 }
 
-/// Reads at most [`MAX_BODY_BYTES`], all of it within `timeout` (408
-/// otherwise, see [`BODY_READ_TIMEOUT`]); a larger declared `Content-Length`
-/// is refused before reading anything.
+/// Reads at most [`MAX_BODY_BYTES`], at the pace of `pace` (408 when the
+/// body stalls or crawls); a larger declared `Content-Length` is refused
+/// before reading anything.
 pub async fn read_body(
-    body: Body,
+    mut body: Body,
     headers: &HeaderMap,
-    timeout: Duration,
+    pace: &BodyPace,
 ) -> Result<Bytes, IngestError> {
     let declared = headers
         .get(CONTENT_LENGTH)
@@ -251,50 +322,99 @@ pub async fn read_body(
     if declared.is_some_and(|len| len > MAX_BODY_BYTES as u64) {
         return Err(body_too_large());
     }
-    tokio::time::timeout(timeout, axum::body::to_bytes(body, MAX_BODY_BYTES))
-        .await
-        .map_err(|_elapsed| IngestError::RequestTimeout)?
-        .map_err(|error| {
-            if is_length_limit(&error) {
-                body_too_large()
-            } else {
-                IngestError::BadRequest("could not read the request body".to_string())
+    let started = Instant::now();
+    let mut pieces: Vec<Bytes> = Vec::new();
+    let mut received = 0usize;
+    loop {
+        let wait = pace.allowed(received).saturating_sub(started.elapsed());
+        let frame = match tokio::time::timeout(wait, body.frame()).await {
+            Err(_elapsed) => return Err(IngestError::RequestTimeout),
+            Ok(None) => break,
+            Ok(Some(Err(_))) => {
+                return Err(IngestError::BadRequest(
+                    "could not read the request body".to_string(),
+                ));
             }
-        })
-}
-
-fn is_length_limit(error: &axum::Error) -> bool {
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(e) = current {
-        if e.is::<http_body_util::LengthLimitError>() {
-            return true;
+            Ok(Some(Ok(frame))) => frame,
+        };
+        // Trailers, the other kind of frame, say nothing we need.
+        if let Ok(data) = frame.into_data() {
+            received += data.len();
+            if received > MAX_BODY_BYTES {
+                return Err(body_too_large());
+            }
+            pieces.push(data);
         }
-        current = e.source();
     }
-    false
+    if pieces.len() <= 1 {
+        return Ok(pieces.pop().unwrap_or_default());
+    }
+    let mut whole = Vec::with_capacity(received);
+    for piece in pieces {
+        whole.extend_from_slice(&piece);
+    }
+    Ok(Bytes::from(whole))
 }
 
-/// Turns a body into the rows to store for `source`: decompress, parse,
-/// normalize ([`build_rows`]), on a blocking thread. That work is CPU-bound,
-/// about 50 ms for a typical batch of 10,000 events and up to a second for
-/// one of large messages, and on an async worker it would stall every other
-/// request that worker serves.
-pub async fn rows_from_body(
+/// A batch of events as the ingest path sends it on: the rows as the body of
+/// the ClickHouse insert, and what they count for.
+#[derive(Debug)]
+pub struct Prepared {
+    /// The `JSONEachRow` body of the rows ([`store::encode_logs`]).
+    pub body: String,
+    pub events: usize,
+    /// What the rows count against usage and quotas ([`LogRow::stored_bytes`]).
+    pub bytes: u64,
+}
+
+/// Turns a body into what to send to ClickHouse for `source`: decompress,
+/// parse, normalize ([`build_rows`]) and encode the insert body
+/// ([`store::encode_logs`]), on a blocking thread, with a place of `decodes`
+/// held for as long as that runs. The work is CPU-bound (about 50 ms for a
+/// typical batch of 10,000 events, up to a second for one of large messages)
+/// and takes memory in proportion (see [`budget`]): on an async worker it
+/// would stall every other request that worker serves, and left to the places
+/// of the endpoint alone, 32 hostile bodies could be decoded at once.
+///
+/// The place is moved into the blocking task and released when it ends: a
+/// blocking task cannot be cancelled, so it must keep the place even if
+/// whoever awaits it is gone. The rows are dropped there too, so only the
+/// encoded body stays in memory while ClickHouse is waited for.
+pub async fn prepare(
     body: Bytes,
     encoding: BodyEncoding,
     source: &IngestSource,
     received_at: DateTime<Utc>,
-) -> Result<Vec<LogRow>, IngestError> {
-    let source = source.clone();
-    tokio::task::spawn_blocking(move || build_rows(body, encoding, &source, received_at))
+    decodes: &Arc<Semaphore>,
+) -> Result<Prepared, IngestError> {
+    let place = decodes
+        .clone()
+        .acquire_owned()
         .await
-        .map_err(|error| {
-            tracing::error!(%error, "log ingest worker failed");
+        .map_err(|_| IngestError::Internal)?;
+    let source = source.clone();
+    tokio::task::spawn_blocking(move || {
+        let _place = place;
+        let rows = build_rows(body, encoding, &source, received_at)?;
+        let bytes = rows.iter().map(LogRow::stored_bytes).sum();
+        let body = store::encode_logs(&rows).map_err(|error| {
+            tracing::error!(%error, "could not encode a log batch");
             IngestError::Internal
-        })?
+        })?;
+        Ok(Prepared {
+            body,
+            events: rows.len(),
+            bytes,
+        })
+    })
+    .await
+    .map_err(|error| {
+        tracing::error!(%error, "log ingest worker failed");
+        IngestError::Internal
+    })?
 }
 
-/// The synchronous part of [`rows_from_body`].
+/// The synchronous part of [`prepare`]: the rows of a body.
 pub fn build_rows(
     body: Bytes,
     encoding: BodyEncoding,
@@ -313,7 +433,10 @@ pub fn decode_events(
     encoding: BodyEncoding,
 ) -> Result<Vec<Map<String, Value>>, IngestError> {
     let raw = if encoding.gzip {
-        Bytes::from(gunzip(&body)?)
+        let inflated = gunzip(&body)?;
+        // The compressed body is not needed any more.
+        drop(body);
+        Bytes::from(inflated)
     } else {
         body
     };
@@ -325,6 +448,7 @@ pub fn decode_events(
         BodyFormat::MessagePack => {
             msgpack::decode_events(&raw, MAX_EVENTS).map_err(|error| match error {
                 MsgpackError::TooManyEvents => too_many_events(),
+                MsgpackError::TooLarge => decoded_too_large(),
                 other => IngestError::BadRequest(format!("invalid MessagePack body: {other}")),
             })
         }
@@ -335,7 +459,16 @@ fn too_many_events() -> IngestError {
     IngestError::PayloadTooLarge(format!("too many events: at most {MAX_EVENTS} per request"))
 }
 
-/// gzip (multi-member) with the output capped at [`MAX_DECOMPRESSED_BYTES`].
+fn decoded_too_large() -> IngestError {
+    IngestError::PayloadTooLarge(format!(
+        "request body expands to more than {} MiB once decoded: send fewer or smaller events",
+        budget::MAX_DECODED_BYTES / (1024 * 1024)
+    ))
+}
+
+/// gzip (multi-member) with the output capped at [`MAX_DECOMPRESSED_BYTES`]:
+/// inflating stops at the cap, so a few MiB that would inflate to gigabytes
+/// cost about 50 MiB of work and memory, no more.
 pub fn gunzip(compressed: &[u8]) -> Result<Vec<u8>, IngestError> {
     let mut out = Vec::new();
     flate2::read::MultiGzDecoder::new(compressed)
@@ -352,23 +485,36 @@ pub fn gunzip(compressed: &[u8]) -> Result<Vec<u8>, IngestError> {
 }
 
 /// A whitespace-separated sequence of JSON objects or arrays of objects,
-/// failing fast on the event after the [`MAX_EVENTS`]th.
+/// failing fast on the event after the [`MAX_EVENTS`]th and on a body that
+/// decodes to more than the [`Budget::for_request`] budget.
 pub fn parse_json_events(raw: &[u8]) -> Result<Vec<Map<String, Value>>, IngestError> {
+    parse_json_events_within(raw, &mut Budget::for_request())
+}
+
+/// [`parse_json_events`] charging `budget`, which the caller keeps: it shows
+/// what the parsing cost, also when it stopped.
+pub fn parse_json_events_within(
+    raw: &[u8],
+    budget: &mut Budget,
+) -> Result<Vec<Map<String, Value>>, IngestError> {
     let mut events = Vec::new();
-    let mut overflow = false;
+    let mut refusal = None;
     let mut deserializer = serde_json::Deserializer::from_slice(raw);
     // `end` succeeds once only whitespace is left; otherwise it has skipped
     // the whitespace before the next value.
     while deserializer.end().is_err() {
         let seed = TopLevel {
             events: &mut events,
-            overflow: &mut overflow,
+            spend: Spend {
+                budget: &mut *budget,
+                refusal: &mut refusal,
+            },
         };
         if let Err(error) = seed.deserialize(&mut deserializer) {
-            return Err(if overflow {
-                too_many_events()
-            } else {
-                invalid_json(&error)
+            return Err(match refusal {
+                Some(Refusal::TooManyEvents) => too_many_events(),
+                Some(Refusal::TooLarge) => decoded_too_large(),
+                None => invalid_json(&error),
             });
         }
     }
@@ -397,21 +543,155 @@ fn invalid_json(error: &serde_json::Error) -> IngestError {
     IngestError::BadRequest(format!("invalid JSON body: {detail}"))
 }
 
+/// Why a parse stopped although the body is well-formed JSON. serde errors
+/// carry a message only, and a 413 must not be taken for a 400.
+#[derive(Debug, Clone, Copy)]
+enum Refusal {
+    TooManyEvents,
+    TooLarge,
+}
+
+/// The budget a parse charges, and where it notes that it refused to go on.
+struct Spend<'a> {
+    budget: &'a mut Budget,
+    refusal: &'a mut Option<Refusal>,
+}
+
+impl Spend<'_> {
+    fn reborrow(&mut self) -> Spend<'_> {
+        Spend {
+            budget: &mut *self.budget,
+            refusal: &mut *self.refusal,
+        }
+    }
+
+    fn charge<E: de::Error>(
+        &mut self,
+        cost: impl FnOnce(&mut Budget) -> Result<(), TooLarge>,
+    ) -> Result<(), E> {
+        cost(&mut *self.budget).map_err(|TooLarge| {
+            *self.refusal = Some(Refusal::TooLarge);
+            E::custom("decoded size over the limit")
+        })
+    }
+
+    fn value<E: de::Error>(&mut self) -> Result<(), E> {
+        self.charge(|budget| budget.charge(VALUE_BYTES))
+    }
+}
+
+/// Builds a `serde_json::Value` as `Value::deserialize` does, charging the
+/// budget for each piece before it allocates it: a body of 50 MiB of `0,`
+/// stops after a few million values instead of building them all.
+struct Counted<'a>(Spend<'a>);
+
+impl<'de> DeserializeSeed<'de> for Counted<'_> {
+    type Value = Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Counted<'_> {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any valid JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(mut self, value: bool) -> Result<Value, E> {
+        self.0.value::<E>()?;
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E: de::Error>(mut self, value: i64) -> Result<Value, E> {
+        self.0.value::<E>()?;
+        Ok(Value::from(value))
+    }
+
+    fn visit_u64<E: de::Error>(mut self, value: u64) -> Result<Value, E> {
+        self.0.value::<E>()?;
+        Ok(Value::from(value))
+    }
+
+    fn visit_f64<E: de::Error>(mut self, value: f64) -> Result<Value, E> {
+        self.0.value::<E>()?;
+        Ok(Number::from_f64(value).map_or(Value::Null, Value::Number))
+    }
+
+    fn visit_str<E: de::Error>(mut self, value: &str) -> Result<Value, E> {
+        self.0.charge::<E>(|budget| budget.string(value.len()))?;
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(mut self, value: String) -> Result<Value, E> {
+        self.0.charge::<E>(|budget| budget.string(value.len()))?;
+        Ok(Value::String(value))
+    }
+
+    fn visit_none<E: de::Error>(mut self) -> Result<Value, E> {
+        self.0.value::<E>()?;
+        Ok(Value::Null)
+    }
+
+    fn visit_unit<E: de::Error>(mut self) -> Result<Value, E> {
+        self.0.value::<E>()?;
+        Ok(Value::Null)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<Value, A::Error> {
+        self.0.charge::<A::Error>(|budget| budget.array())?;
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element_seed(Counted(self.0.reborrow()))? {
+            items.push(item);
+        }
+        Ok(Value::Array(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(mut self, map: A) -> Result<Value, A::Error> {
+        read_object(map, &mut self.0).map(Value::Object)
+    }
+}
+
+/// The entries of an object, each key and value charged before it is built.
+fn read_object<'de, A: MapAccess<'de>>(
+    mut map: A,
+    spend: &mut Spend<'_>,
+) -> Result<Map<String, Value>, A::Error> {
+    spend.charge::<A::Error>(|budget| budget.object())?;
+    let mut object = Map::new();
+    while let Some(key) = map.next_key::<String>()? {
+        spend.charge::<A::Error>(|budget| budget.key(key.len()))?;
+        let value = map.next_value_seed(Counted(spend.reborrow()))?;
+        object.insert(key, value);
+    }
+    Ok(object)
+}
+
+/// One event, an object, added to `events`; refused when there are
+/// [`MAX_EVENTS`] already, before any of it is read.
+fn read_event<'de, A: MapAccess<'de>>(
+    map: A,
+    events: &mut Vec<Map<String, Value>>,
+    spend: &mut Spend<'_>,
+) -> Result<(), A::Error> {
+    if events.len() >= MAX_EVENTS {
+        *spend.refusal = Some(Refusal::TooManyEvents);
+        return Err(<A::Error as de::Error>::custom("too many events"));
+    }
+    events.push(read_object(map, spend)?);
+    Ok(())
+}
+
 /// One top-level JSON value: an object (one event) or an array of objects.
 struct TopLevel<'a> {
     events: &'a mut Vec<Map<String, Value>>,
-    overflow: &'a mut bool,
-}
-
-impl TopLevel<'_> {
-    fn push<E: de::Error>(&mut self, event: Map<String, Value>) -> Result<(), E> {
-        if self.events.len() >= MAX_EVENTS {
-            *self.overflow = true;
-            return Err(E::custom("too many events"));
-        }
-        self.events.push(event);
-        Ok(())
-    }
+    spend: Spend<'a>,
 }
 
 impl<'de> DeserializeSeed<'de> for TopLevel<'_> {
@@ -430,15 +710,44 @@ impl<'de> Visitor<'de> for TopLevel<'_> {
     }
 
     fn visit_map<A: MapAccess<'de>>(mut self, map: A) -> Result<(), A::Error> {
-        let event = serde::Deserialize::deserialize(de::value::MapAccessDeserializer::new(map))?;
-        self.push(event)
+        read_event(map, self.events, &mut self.spend)
     }
 
     fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<(), A::Error> {
-        while let Some(event) = seq.next_element::<Map<String, Value>>()? {
-            self.push(event)?;
-        }
+        while seq
+            .next_element_seed(Event {
+                events: &mut *self.events,
+                spend: self.spend.reborrow(),
+            })?
+            .is_some()
+        {}
         Ok(())
+    }
+}
+
+/// An element of a top-level array: it must be an object.
+struct Event<'a> {
+    events: &'a mut Vec<Map<String, Value>>,
+    spend: Spend<'a>,
+}
+
+impl<'de> DeserializeSeed<'de> for Event<'_> {
+    type Value = ();
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Event<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a JSON object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(mut self, map: A) -> Result<(), A::Error> {
+        read_event(map, self.events, &mut self.spend)
     }
 }
 
@@ -457,6 +766,7 @@ pub fn seconds_until_utc_midnight(now: DateTime<Utc>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logs::budget::{ARRAY_BYTES, KEY_BYTES, MAP_BYTES, MAX_DECODED_BYTES, STRING_BYTES};
     use std::io::Write;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -472,6 +782,20 @@ mod tests {
         encoder.write_all(data).unwrap();
         encoder.finish().unwrap()
     }
+
+    fn source() -> IngestSource {
+        IngestSource {
+            id: uuid::Uuid::new_v4(),
+            project_id: uuid::Uuid::new_v4(),
+            retention_days: 30,
+            daily_byte_quota: None,
+        }
+    }
+
+    const JSON: BodyEncoding = BodyEncoding {
+        format: BodyFormat::Json,
+        gzip: false,
+    };
 
     #[test]
     fn bearer_tokens_are_read_case_insensitively() {
@@ -495,10 +819,6 @@ mod tests {
 
     #[test]
     fn content_types_and_encodings_select_the_parser() {
-        let json = BodyEncoding {
-            format: BodyFormat::Json,
-            gzip: false,
-        };
         for content_type in [
             None,
             Some("application/json; charset=utf-8"),
@@ -508,7 +828,7 @@ mod tests {
             let h = content_type
                 .map(|ct| headers(&[("content-type", ct)]))
                 .unwrap_or_default();
-            assert_eq!(body_encoding(&h).unwrap(), json, "{content_type:?}");
+            assert_eq!(body_encoding(&h).unwrap(), JSON, "{content_type:?}");
         }
         for content_type in ["application/msgpack", "Application/X-MsgPack"] {
             let h = headers(&[("content-type", content_type), ("content-encoding", "gzip")]);
@@ -528,6 +848,38 @@ mod tests {
                 body_encoding(&headers(&[(name, value)])),
                 Err(IngestError::UnsupportedMediaType(_))
             ));
+        }
+    }
+
+    /// One coding, in one header line: a second line, a list, or a header that
+    /// is not text is a stack of codings we do not unwrap, or something a proxy
+    /// added, and is not read as its first line alone.
+    #[test]
+    fn only_a_single_content_encoding_is_accepted() {
+        let with = |values: &[&[u8]]| {
+            let mut map = HeaderMap::new();
+            for value in values {
+                map.append(CONTENT_ENCODING, HeaderValue::from_bytes(value).unwrap());
+            }
+            body_encoding(&map)
+        };
+        assert!(with(&[b"gzip"]).unwrap().gzip);
+        assert!(with(&[b"x-gzip"]).unwrap().gzip);
+        assert!(!with(&[b"identity"]).unwrap().gzip);
+        assert!(!with(&[]).unwrap().gzip);
+        for values in [
+            &[&b"gzip"[..], b"gzip"][..],
+            &[b"gzip", b"br"],
+            &[b"identity", b"gzip"],
+            &[b"gzip", b"identity"],
+            &[b"gzip, gzip"],
+            &[b"gzip, identity"],
+            &[b"gzip\xff"],
+        ] {
+            assert!(
+                matches!(with(values), Err(IngestError::UnsupportedMediaType(_))),
+                "{values:?}"
+            );
         }
     }
 
@@ -618,6 +970,212 @@ mod tests {
         ));
     }
 
+    /// What a document costs, by the model of [`budget`], worked out apart
+    /// from either decoder: the object of an event, then for each entry its
+    /// key and its value; an array and each of its items; a string and its
+    /// characters; every other value a slot.
+    fn expected_cost(event: &Value) -> usize {
+        fn value(v: &Value) -> usize {
+            match v {
+                Value::String(s) => VALUE_BYTES + STRING_BYTES + s.len(),
+                Value::Array(items) => {
+                    VALUE_BYTES + ARRAY_BYTES + items.iter().map(value).sum::<usize>()
+                }
+                Value::Object(entries) => {
+                    VALUE_BYTES
+                        + MAP_BYTES
+                        + entries
+                            .iter()
+                            .map(|(k, v)| KEY_BYTES + STRING_BYTES + k.len() + value(v))
+                            .sum::<usize>()
+                }
+                _ => VALUE_BYTES,
+            }
+        }
+        value(event)
+    }
+
+    /// Both decoders charge the same for the same document, and what the model
+    /// says: a body costs the same budget as JSON and as MessagePack.
+    #[test]
+    fn both_decoders_charge_what_the_model_says() {
+        for event in [
+            json!({}),
+            json!({ "message": "hello", "n": 1, "f": 1.5, "t": true, "z": null }),
+            json!({ "a": [1, "xy", null, { "b": [[], {}] }], "": "" }),
+            json!({ "long": "é".repeat(5000), "k".repeat(300): vec![0; 100] }),
+        ] {
+            let expected = expected_cost(&event);
+
+            let mut budget = Budget::new(usize::MAX);
+            let events = parse_json_events_within(event.to_string().as_bytes(), &mut budget);
+            assert_eq!(events.unwrap().len(), 1);
+            assert_eq!(budget.spent(), expected, "JSON {event}");
+
+            let mut budget = Budget::new(usize::MAX);
+            let packed = rmp_serde::to_vec(&event).unwrap();
+            msgpack::decode_events_within(&packed, MAX_EVENTS, &mut budget).unwrap();
+            assert_eq!(budget.spent(), expected, "MessagePack {event}");
+        }
+    }
+
+    /// 50 MB of `0,` is a 25-million-element array: 1.6 GB of values without a
+    /// budget. With one, the parse stops after as many values as the budget
+    /// pays for, and says 413.
+    #[test]
+    fn a_json_body_that_decodes_to_more_than_the_budget_is_refused_where_it_runs_out() {
+        let limit = 4 * 1024 * 1024;
+        let body = format!("{{\"a\":[{}0]}}", "0,".repeat(3_000_000));
+        let mut budget = Budget::new(limit);
+        let refused = parse_json_events_within(body.as_bytes(), &mut budget);
+        assert!(
+            matches!(&refused, Err(IngestError::PayloadTooLarge(m)) if m.contains("expands to more than")),
+            "{refused:?}"
+        );
+        assert!(
+            budget.spent() <= limit && budget.spent() > limit - VALUE_BYTES,
+            "{} of {limit}: stopped as soon as the budget ran out",
+            budget.spent()
+        );
+
+        // Tiny objects are the dearest per byte: 8 bytes of JSON, a B-tree node.
+        let body = format!("{{\"a\":[{}{{\"b\":1}}]}}", "{\"b\":1},".repeat(100_000));
+        let mut budget = Budget::new(limit);
+        assert!(matches!(
+            parse_json_events_within(body.as_bytes(), &mut budget),
+            Err(IngestError::PayloadTooLarge(_))
+        ));
+        assert!(budget.spent() <= limit);
+
+        // Keys and strings are charged by their length too.
+        let body = format!("{{\"a\":\"{}\"}}", "x".repeat(limit));
+        assert!(matches!(
+            parse_json_events_within(body.as_bytes(), &mut Budget::new(limit)),
+            Err(IngestError::PayloadTooLarge(_))
+        ));
+        let body = format!("{{\"{}\":1}}", "k".repeat(limit));
+        assert!(matches!(
+            parse_json_events_within(body.as_bytes(), &mut Budget::new(limit)),
+            Err(IngestError::PayloadTooLarge(_))
+        ));
+    }
+
+    /// The same bomb in MessagePack: a one-byte value is the same 64 charged
+    /// bytes, so 52 million of them stop at the budget, however the 50 MiB were
+    /// delivered.
+    #[test]
+    fn a_messagepack_body_that_decodes_to_more_than_the_budget_is_refused_too() {
+        let limit = 4 * 1024 * 1024;
+        // { "a": [0 x 5,000,000] }
+        let mut body = vec![0x81, 0xa1, b'a', 0xdd];
+        body.extend(5_000_000u32.to_be_bytes());
+        body.resize(body.len() + 5_000_000, 0);
+        let mut budget = Budget::new(limit);
+        assert_eq!(
+            msgpack::decode_events_within(&body, MAX_EVENTS, &mut budget),
+            Err(MsgpackError::TooLarge)
+        );
+        assert!(budget.spent() <= limit && budget.spent() > limit - VALUE_BYTES);
+        // And through the body decoder: a 413, not a 400.
+        let refused = decode_events(
+            Bytes::from(body),
+            BodyEncoding {
+                format: BodyFormat::MessagePack,
+                gzip: false,
+            },
+        );
+        assert!(
+            matches!(refused, Err(IngestError::PayloadTooLarge(_))),
+            "{refused:?}"
+        );
+    }
+
+    /// The budget is one for the whole body, not one per event: events that are
+    /// each far under it add up to a refusal.
+    #[test]
+    fn the_budget_is_shared_by_all_the_events_of_a_body() {
+        let limit = 2 * 1024 * 1024;
+        let event = format!("{{\"message\":\"{}\"}}", "x".repeat(100_000));
+        let mut budget = Budget::new(limit);
+        let one = parse_json_events_within(event.as_bytes(), &mut budget);
+        assert_eq!(one.unwrap().len(), 1);
+        assert!(
+            budget.spent() < limit / 10,
+            "one event is a small part of it"
+        );
+
+        // NDJSON, an array and MessagePack alike.
+        let ndjson = vec![event.as_str(); 30].join("\n");
+        assert!(matches!(
+            parse_json_events_within(ndjson.as_bytes(), &mut Budget::new(limit)),
+            Err(IngestError::PayloadTooLarge(_))
+        ));
+        let array = format!("[{}]", vec![event.as_str(); 30].join(","));
+        assert!(matches!(
+            parse_json_events_within(array.as_bytes(), &mut Budget::new(limit)),
+            Err(IngestError::PayloadTooLarge(_))
+        ));
+        let one: Value = serde_json::from_str(&event).unwrap();
+        let packed = rmp_serde::to_vec(&vec![one; 30]).unwrap();
+        assert_eq!(
+            msgpack::decode_events_within(&packed, MAX_EVENTS, &mut Budget::new(limit)),
+            Err(MsgpackError::TooLarge)
+        );
+    }
+
+    /// A batch that is big but sensible fits the budget with room to spare:
+    /// 10,000 events of 40 fields with strings of 40 characters.
+    #[test]
+    fn a_large_legitimate_batch_fits_the_budget() {
+        let event = |n: usize| {
+            let mut fields = Map::new();
+            for i in 0..40 {
+                fields.insert(
+                    format!("field_{i:02}"),
+                    json!(format!("value {n} {i} {}", "x".repeat(24))),
+                );
+            }
+            Value::Object(fields)
+        };
+        let events: Vec<Value> = (0..MAX_EVENTS).map(event).collect();
+        let body = serde_json::to_vec(&events).unwrap();
+        let mut budget = Budget::for_request();
+        let parsed = parse_json_events_within(&body, &mut budget).unwrap();
+        assert_eq!(parsed.len(), MAX_EVENTS);
+        assert!(
+            budget.spent() < MAX_DECODED_BYTES * 3 / 4,
+            "{} MiB of {} MiB for a {} MiB body",
+            budget.spent() >> 20,
+            MAX_DECODED_BYTES >> 20,
+            body.len() >> 20
+        );
+    }
+
+    /// Inflating stops at the cap: a few MiB on the wire that would inflate to
+    /// gigabytes are refused after about 50 MiB of work. A check made after
+    /// inflating everything would need that many gigabytes of memory (and
+    /// minutes) here, which the time limit would show.
+    #[test]
+    fn a_gzip_body_that_inflates_to_gigabytes_is_stopped_at_the_cap() {
+        // 3,000 members of 1 MiB of zeros: ~3 MiB on the wire, ~3 GiB inflated.
+        let bomb = gzip(&vec![0u8; 1024 * 1024]).repeat(3_000);
+        assert!(
+            bomb.len() < 4 * 1024 * 1024,
+            "{} bytes on the wire",
+            bomb.len()
+        );
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            gunzip(&bomb),
+            Err(IngestError::PayloadTooLarge(_))
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}: it was not stopped at the cap",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn gzip_is_capped_after_decompression() {
         assert_eq!(gunzip(&gzip(b"hello")).unwrap(), b"hello");
@@ -669,6 +1227,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_body_may_take_longer_the_more_it_has_delivered_up_to_the_cap() {
+        let pace = BodyPace::DEFAULT;
+        assert_eq!(pace.allowed(0), Duration::from_secs(5));
+        // 64 KiB/s: another second for every 64 KiB.
+        assert_eq!(pace.allowed(64 * 1024), Duration::from_secs(6));
+        assert_eq!(pace.allowed(640 * 1024), Duration::from_secs(15));
+        // The cap holds however much was delivered, and a rate of zero
+        // cannot divide by zero.
+        assert_eq!(pace.allowed(MAX_BODY_BYTES), Duration::from_secs(60));
+        assert_eq!(pace.allowed(usize::MAX), Duration::from_secs(60));
+        let stalled = BodyPace {
+            min_bytes_per_second: 0,
+            ..pace
+        };
+        assert_eq!(
+            stalled.allowed(1),
+            Duration::from_secs(6),
+            "a rate of 0 counts as 1"
+        );
+        assert_eq!(stalled.allowed(1000), Duration::from_secs(60));
+    }
+
     #[tokio::test]
     async fn every_rejection_has_its_status_and_headers() {
         let cases = [
@@ -676,6 +1257,12 @@ mod tests {
             (IngestError::Busy, 503, Some("1"), None),
             (IngestError::RequestTimeout, 408, None, None),
             (IngestError::RateLimited, 429, Some("1"), None),
+            (
+                IngestError::TooManyInFlight { limit: 4 },
+                429,
+                Some("1"),
+                None,
+            ),
             (
                 IngestError::QuotaExceeded {
                     retry_after_seconds: 777,
@@ -709,49 +1296,58 @@ mod tests {
         }
     }
 
-    /// Normalization is CPU-bound; on an async worker it would stall every
-    /// other request the worker serves. With a ticker task sharing the
-    /// (single-threaded) runtime, the longest wait between two ticks must be
-    /// well below what the same work costs when run inline.
-    #[tokio::test]
-    async fn rows_are_built_on_a_blocking_thread_not_on_the_runtime() {
-        use std::{
-            sync::{
-                Arc,
-                atomic::{AtomicBool, Ordering},
-            },
-            time::{Duration, Instant},
-        };
-
-        let source = IngestSource {
-            id: uuid::Uuid::new_v4(),
-            project_id: uuid::Uuid::new_v4(),
-            retention_days: 30,
-            daily_byte_quota: None,
-        };
-        let events: Vec<Value> = (0..5_000)
+    /// Events dense in what the pattern step replaces (numbers, addresses,
+    /// UUIDs), which costs the most CPU per byte.
+    fn workload(events: usize) -> Bytes {
+        let events: Vec<Value> = (0..events)
             .map(|n| {
                 json!({
-                    "message": format!("request {n} from 10.0.{}.{} took {n}.5 ms {}", n % 200, n % 250, "x".repeat(1000)),
+                    "message": format!(
+                        "request {n} from 10.0.{}.{} for 550e8400-e29b-41d4-a716-{n:012} took {n}.5 ms {}",
+                        n % 200,
+                        n % 250,
+                        "retry 12 of 3 at 192.168.1.1; ".repeat(16)
+                    ),
                     "level": "warn",
                     "user": { "id": n, "tags": ["a", "b"] }
                 })
             })
             .collect();
-        let body = Bytes::from(serde_json::to_vec(&events).unwrap());
-        let encoding = BodyEncoding {
-            format: BodyFormat::Json,
-            gzip: false,
+        Bytes::from(serde_json::to_vec(&events).unwrap())
+    }
+
+    /// Normalization is CPU-bound; on an async worker it would stall every
+    /// other request the worker serves. With a ticker task sharing the
+    /// (single-threaded) runtime, the longest wait between two ticks must be
+    /// well below what the same work costs when run inline. The batch grows
+    /// until the work takes long enough to tell (a debug build needs a few
+    /// thousand events, an optimized one more).
+    #[tokio::test]
+    async fn rows_are_built_on_a_blocking_thread_not_on_the_runtime() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Instant,
         };
 
-        let started = Instant::now();
-        let inline = build_rows(body.clone(), encoding, &source, Utc::now()).unwrap();
-        let inline_time = started.elapsed();
-        assert_eq!(inline.len(), events.len());
-        assert!(
-            inline_time > Duration::from_millis(100),
-            "the batch is too small to tell anything: {inline_time:?}"
-        );
+        let source = source();
+        let mut events = 250;
+        let (body, inline_time) = loop {
+            let body = workload(events);
+            let started = Instant::now();
+            let rows = build_rows(body.clone(), JSON, &source, Utc::now()).unwrap();
+            assert_eq!(rows.len(), events);
+            let took = started.elapsed();
+            if took >= Duration::from_millis(150) || events >= MAX_EVENTS {
+                break (body, took);
+            }
+            events = (events * 2).min(MAX_EVENTS);
+        };
+        if inline_time < Duration::from_millis(50) {
+            eprintln!(
+                "skipped: even {events} events take only {inline_time:?} here, too little to tell a blocked runtime"
+            );
+            return;
+        }
 
         let done = Arc::new(AtomicBool::new(false));
         let ticker = tokio::spawn({
@@ -768,16 +1364,90 @@ mod tests {
             }
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let rows = rows_from_body(body, encoding, &source, Utc::now())
-            .await
-            .unwrap();
+        let prepared = prepare(
+            body,
+            JSON,
+            &source,
+            Utc::now(),
+            &Arc::new(Semaphore::new(1)),
+        )
+        .await
+        .unwrap();
         done.store(true, Ordering::Relaxed);
         let longest_wait = ticker.await.unwrap();
 
-        assert_eq!(rows.len(), events.len());
+        assert_eq!(prepared.events, events);
         assert!(
             longest_wait < inline_time / 2,
             "the runtime stood still for {longest_wait:?}; the work takes {inline_time:?}"
         );
+    }
+
+    /// The batch that goes on to ClickHouse: one line per event, the same
+    /// rows `store::insert_logs` would send, and what they count for.
+    #[tokio::test]
+    async fn a_prepared_batch_is_the_insert_body_and_what_it_counts_for() {
+        let source = source();
+        let decodes = Arc::new(Semaphore::new(1));
+        let body = Bytes::from_static(br#"[{"message":"one","a":1},{"message":"two"}]"#);
+        let prepared = prepare(body.clone(), JSON, &source, Utc::now(), &decodes)
+            .await
+            .unwrap();
+        assert_eq!(prepared.events, 2);
+        assert_eq!(prepared.body.lines().count(), 2);
+        assert!(prepared.body.ends_with('\n'));
+        let rows = build_rows(body, JSON, &source, Utc::now()).unwrap();
+        assert_eq!(
+            prepared.bytes,
+            rows.iter().map(LogRow::stored_bytes).sum::<u64>()
+        );
+        let first: Value = serde_json::from_str(prepared.body.lines().next().unwrap()).unwrap();
+        assert_eq!(first["message"], "one");
+        assert_eq!(first["source_id"], source.id.to_string());
+
+        // No events, nothing to send.
+        let empty = prepare(
+            Bytes::from_static(b"[]"),
+            JSON,
+            &source,
+            Utc::now(),
+            &decodes,
+        )
+        .await
+        .unwrap();
+        assert_eq!((empty.events, empty.bytes, empty.body.as_str()), (0, 0, ""));
+    }
+
+    /// A decode takes a place of `decodes` and gives it back when it ends,
+    /// whether it worked or not; with none free it waits.
+    #[tokio::test]
+    async fn decoding_waits_for_a_place_and_gives_it_back() {
+        let source = source();
+        let decodes = Arc::new(Semaphore::new(1));
+        let good = Bytes::from_static(br#"{"message":"m"}"#);
+
+        let held = decodes.clone().acquire_owned().await.unwrap();
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(150),
+            prepare(good.clone(), JSON, &source, Utc::now(), &decodes),
+        )
+        .await;
+        assert!(waiting.is_err(), "no place is free: it waits");
+        drop(held);
+
+        prepare(good, JSON, &source, Utc::now(), &decodes)
+            .await
+            .unwrap();
+        assert_eq!(decodes.available_permits(), 1, "given back after a success");
+        let bad = prepare(
+            Bytes::from_static(b"{"),
+            JSON,
+            &source,
+            Utc::now(),
+            &decodes,
+        )
+        .await;
+        assert!(matches!(bad, Err(IngestError::BadRequest(_))));
+        assert_eq!(decodes.available_permits(), 1, "and after a failure");
     }
 }

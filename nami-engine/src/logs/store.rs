@@ -147,6 +147,21 @@ pub async fn insert_logs(ch: &ClickHouse, rows: &[LogRow]) -> Result<(), ClickHo
         .await
 }
 
+/// The `JSONEachRow` body of `rows`, the CPU-bound half of [`insert_logs`]: a
+/// batch of 10,000 events is megabytes of text, so the HTTP ingest path builds
+/// it on a blocking thread (`ingest::prepare`) and only sends it from the
+/// async side with [`insert_encoded_logs`].
+pub fn encode_logs(rows: &[LogRow]) -> Result<String, ClickHouseError> {
+    crate::clickhouse::encode_rows(rows)
+}
+
+/// [`insert_logs`] for a body made by [`encode_logs`]: the same table, the
+/// same [`INSERT_SETTINGS`]. An empty body is a no-op.
+pub async fn insert_encoded_logs(ch: &ClickHouse, body: String) -> Result<(), ClickHouseError> {
+    ch.insert_encoded_with(LOGS_TABLE, body, &INSERT_SETTINGS)
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};

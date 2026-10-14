@@ -431,6 +431,38 @@ async fn the_quota_check_uses_the_flushed_total_and_the_unflushed_delta(pool: sq
     );
 }
 
+/// Engine instances flush the same sources at the same moment. A flush is one
+/// statement that locks the rows it upserts as it goes: if each wrote them in
+/// an order of its own (a HashMap's, different for every tracker), two of them
+/// could each wait for a row the other holds and Postgres would kill one with
+/// a deadlock. So every flush writes in key order. Rows of a statement land in
+/// the heap in the order it produced them, which `ctid` shows.
+#[sqlx::test]
+async fn a_flush_writes_its_rows_in_key_order(pool: sqlx::PgPool) {
+    let project = seed_project(&pool).await;
+    let mut sources = Vec::new();
+    for n in 0..60 {
+        sources.push(seed_source(&pool, project, &format!("s{n}")).await.0);
+    }
+    let today = Utc::now().date_naive();
+    let tracker = usage::UsageTracker::default();
+    for (n, source) in sources.iter().enumerate() {
+        tracker.record_accepted(*source, today, 1, n as u64);
+        tracker.record_accepted(*source, today - chrono::Duration::days(1), 1, n as u64);
+    }
+    assert_eq!(tracker.flush(&pool).await.unwrap(), 120);
+
+    let written: Vec<(Uuid, chrono::NaiveDate)> =
+        sqlx::query_as("select source_id, day from source_usage_daily order by ctid")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let mut by_key = written.clone();
+    by_key.sort();
+    assert_eq!(written.len(), 120);
+    assert_eq!(written, by_key, "rows are written by source, then day");
+}
+
 #[sqlx::test]
 async fn usage_older_than_400_days_is_pruned(pool: sqlx::PgPool) {
     let project = seed_project(&pool).await;

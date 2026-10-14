@@ -132,7 +132,8 @@ fn declares_json(headers: &HeaderMap) -> bool {
 /// ingest takes NDJSON and MessagePack, gzipped, and the token in the
 /// `Authorization` header (never a cookie) is its credential.
 pub fn build_public_router(state: AppState) -> Router {
-    build_public_router_with_limits(state, default_ping_slots(), IngestLimits::default())
+    let ingest_limits = IngestLimits::for_pool(state.config.database_max_connections);
+    build_public_router_with_limits(state, default_ping_slots(), ingest_limits)
 }
 
 /// [`build_public_router`] whose pings hold places of `ping_slots` (tests hold

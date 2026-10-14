@@ -49,7 +49,8 @@ pub fn test_app(pool: sqlx::PgPool) -> Router {
 }
 
 /// The public listener's router (`PUBLIC_PORT`) over `state`, exactly as
-/// `main.rs` serves it: the heartbeat ping endpoint and `/health`, no session.
+/// `main.rs` serves it: the heartbeat ping endpoint, log ingest
+/// (`POST /api/v1/logs`) and `/health`, no session.
 pub fn public_app(state: AppState) -> Router {
     nami_engine::router::build_public_router(state)
 }
