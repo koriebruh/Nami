@@ -100,6 +100,8 @@ struct LockedMonitor {
     current_status: String,
     consecutive_failures: i32,
     confirmation_threshold: i32,
+    consecutive_successes: i32,
+    recovery_threshold: i32,
     paused: bool,
     last_checked_at: Option<DateTime<Utc>>,
 }
@@ -109,11 +111,14 @@ struct LockedMonitor {
 /// rather than from `monitor` (a snapshot taken at claim time), so
 /// concurrent results for one monitor are applied one after the other.
 ///
-/// - success: failures reset; `down` -> `up` resolves the open incident and
-///   returns a `Recovered` transition; `pending` -> `up` is silent.
-/// - failure: failures + 1; reaching the confirmation threshold while not
-///   already `down` (including from `pending`) sets `down`, opens an
-///   incident and returns a `Down` transition.
+/// - success: failures reset. While `down`, successes count up, and reaching
+///   the monitor's `recovery_threshold` sets `up`, resolves the open incident
+///   and returns a `Recovered` transition; until then the monitor stays
+///   `down` and nothing is sent. From `pending` or `up`, a success sets `up`
+///   silently and counts nothing.
+/// - failure: successes reset; failures + 1; reaching the confirmation
+///   threshold while not already `down` (including from `pending`) sets
+///   `down`, opens an incident and returns a `Down` transition.
 ///
 /// A monitor deleted or paused while its check was in flight is left alone,
 /// and so is a stale result: one whose check started no later than the last
@@ -132,49 +137,60 @@ pub async fn apply_outcome(
 ) -> Result<Option<Transition>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let row: Option<LockedMonitor> = sqlx::query_as(
-        "select project_id, name, current_status, consecutive_failures, confirmation_threshold, paused,
-                last_checked_at
+        "select project_id, name, current_status, consecutive_failures, confirmation_threshold,
+                consecutive_successes, recovery_threshold, paused, last_checked_at
          from monitors where id = $1 for update",
     )
     .bind(monitor.id)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(LockedMonitor {
-        project_id,
-        name,
-        current_status: status,
-        consecutive_failures: failures,
-        confirmation_threshold: threshold,
-        paused,
-        last_checked_at,
-    }) = row
-    else {
+    let Some(state) = row else {
         return Ok(None);
     };
-    if paused {
+    if state.paused {
         return Ok(None);
     }
-    if last_checked_at.is_some_and(|last| last >= outcome.checked_at) {
+    if state
+        .last_checked_at
+        .is_some_and(|last| last >= outcome.checked_at)
+    {
         return Ok(None);
     }
 
     let transition = match outcome.status {
         CheckStatus::Up => {
+            let was_down = state.current_status == "down";
+            let successes = state.consecutive_successes.saturating_add(1);
+            // Only a down monitor counts successes, and only the one that
+            // reaches the threshold brings it back.
+            let recovers = was_down && successes >= state.recovery_threshold;
+            let still_down = was_down && !recovers;
+            let (status, counted) = if still_down {
+                ("down", successes)
+            } else {
+                ("up", 0)
+            };
             sqlx::query(
-                "update monitors set current_status = 'up', consecutive_failures = 0, last_checked_at = $2
+                "update monitors
+                 set current_status = $2,
+                     consecutive_failures = 0,
+                     consecutive_successes = $3,
+                     last_checked_at = $4
                  where id = $1",
             )
             .bind(monitor.id)
+            .bind(status)
+            .bind(counted)
             .bind(outcome.checked_at)
             .execute(&mut *tx)
             .await?;
-            if status == "down" {
+            if recovers {
                 incident::resolve_for_monitor(&mut tx, monitor.id, outcome.checked_at).await?;
                 Some(Transition {
                     kind: TransitionKind::Recovered,
                     subject: Subject::Monitor(monitor.id),
-                    project_id,
-                    name,
+                    project_id: state.project_id,
+                    name: state.name,
                     cause: None,
                     at: outcome.checked_at,
                 })
@@ -183,11 +199,13 @@ pub async fn apply_outcome(
             }
         }
         CheckStatus::Down => {
-            let failures = failures.saturating_add(1);
-            let goes_down = failures >= threshold && status != "down";
+            let failures = state.consecutive_failures.saturating_add(1);
+            let goes_down =
+                failures >= state.confirmation_threshold && state.current_status != "down";
             sqlx::query(
                 "update monitors
                  set consecutive_failures = $2,
+                     consecutive_successes = 0,
                      current_status = case when $3 then 'down' else current_status end,
                      last_checked_at = $4
                  where id = $1",
@@ -202,9 +220,9 @@ pub async fn apply_outcome(
                 let cause = outcome.error.as_deref().map(alerts::sanitize_cause);
                 let opened = incident::open_for_monitor(
                     &mut tx,
-                    project_id,
+                    state.project_id,
                     monitor.id,
-                    &format!("{name} is down"),
+                    &format!("{} is down", state.name),
                     cause.as_deref(),
                     outcome.checked_at,
                 )
@@ -214,8 +232,8 @@ pub async fn apply_outcome(
                 opened.map(|_| Transition {
                     kind: TransitionKind::Down,
                     subject: Subject::Monitor(monitor.id),
-                    project_id,
-                    name,
+                    project_id: state.project_id,
+                    name: state.name,
                     cause,
                     at: outcome.checked_at,
                 })
