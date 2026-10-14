@@ -3,6 +3,8 @@
 //! it, hence the blanket `dead_code` allowance.
 #![allow(dead_code)]
 
+pub mod tls;
+
 use std::sync::OnceLock;
 
 use axum::{
@@ -10,7 +12,16 @@ use axum::{
     body::Body,
     http::{HeaderValue, Request, StatusCode, header},
 };
-use nami_engine::state::AppState;
+use chrono::Utc;
+use nami_engine::{
+    crypto::{Cipher, SecretString, TEST_KEY},
+    models::{
+        monitor::Monitor,
+        monitor_request::{RequestHeader, seal_headers, seal_password},
+    },
+    state::AppState,
+    uptime::checker::CheckContext,
+};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -266,6 +277,69 @@ pub async fn make_due(pool: &sqlx::PgPool, monitor_id: Uuid) {
         .execute(pool)
         .await
         .unwrap();
+}
+
+/// An in-memory monitor for checker tests (never saved). Every field a check
+/// reads has a working default; override fields with struct update syntax.
+pub fn unsaved_monitor(check_type: &str) -> Monitor {
+    Monitor {
+        id: Uuid::new_v4(),
+        project_id: Uuid::new_v4(),
+        name: "test".to_string(),
+        check_type: check_type.to_string(),
+        http_method: "GET".to_string(),
+        keyword_mode: "contains".to_string(),
+        expected_status_min: 200,
+        expected_status_max: 399,
+        interval_seconds: 60,
+        timeout_seconds: 5,
+        confirmation_threshold: 2,
+        current_status: "pending".to_string(),
+        follow_redirects: true,
+        verify_ssl: true,
+        next_check_at: Utc::now(),
+        created_at: Utc::now(),
+        ..Monitor::default()
+    }
+}
+
+/// The checker context tests use: real HTTP clients and the test cipher.
+pub fn check_context() -> CheckContext {
+    CheckContext::new(test_cipher())
+}
+
+pub fn test_cipher() -> Cipher {
+    Cipher::new(&TEST_KEY)
+}
+
+/// `monitor` with these custom headers, sealed with the test cipher for its
+/// own id (what the API stores), and their names beside them.
+pub fn with_headers(monitor: Monitor, headers: &[(&str, &str)]) -> Monitor {
+    let headers: Vec<RequestHeader> = headers
+        .iter()
+        .map(|(name, value)| RequestHeader {
+            name: name.to_string(),
+            value: SecretString::new(*value),
+        })
+        .collect();
+    Monitor {
+        request_headers_enc: Some(seal_headers(&test_cipher(), monitor.id, &headers)),
+        request_header_names: headers.into_iter().map(|header| header.name).collect(),
+        ..monitor
+    }
+}
+
+/// `monitor` with basic auth, the password sealed for the monitor's own id.
+pub fn with_basic_auth(monitor: Monitor, username: &str, password: &str) -> Monitor {
+    Monitor {
+        auth_username: Some(username.to_string()),
+        auth_password_enc: Some(seal_password(
+            &test_cipher(),
+            monitor.id,
+            &SecretString::new(password),
+        )),
+        ..monitor
+    }
 }
 
 /// A message as Mailpit stored it.

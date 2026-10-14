@@ -1,21 +1,48 @@
 //! Performs one check of one monitor. Never fails: every problem (timeout,
 //! refused connection, wrong status, missing keyword, a destination no check
-//! may contact) becomes a `Down` outcome with a short human-readable `error`.
+//! may contact, secrets that cannot be decrypted) becomes a `Down` outcome
+//! with a short human-readable `error`.
 
 use std::{
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-use crate::models::monitor::Monitor;
+use crate::{
+    crypto::{Cipher, SecretString},
+    models::{
+        monitor::{Monitor, url_has_credentials},
+        monitor_request::{
+            BODY_METHODS, HTTP_METHODS, RESERVED_HEADERS, open_headers, open_password,
+        },
+    },
+    state::AppState,
+};
 
 /// Keyword checks read at most this much of the body; a keyword that only
 /// appears after the first MiB counts as not found.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// Redirect hops a check follows before giving up (`follow_redirects`).
+pub const MAX_REDIRECTS: usize = 10;
+
+/// The down reason when a monitor's stored secrets cannot be decrypted. It
+/// ends up in check history, incidents and alert emails, so it is deliberately
+/// generic: it says what happened, never what the secrets were.
+pub const CONFIG_DECRYPT_ERROR: &str =
+    "request configuration could not be decrypted (was NAMI_ENCRYPTION_KEY changed?)";
+
+/// The down reason when decrypted headers are not valid HTTP, or are ones the
+/// client owns (see `RESERVED_HEADERS`). Validation keeps such headers from
+/// being stored, so this is a safety net; like the one above it never repeats a
+/// header name or value.
+const INVALID_HEADERS_ERROR: &str = "invalid request header configuration";
 
 /// An outcome's `error` keeps at most this many chars, followed by an ellipsis
 /// when it was cut. Part of the text can come from the target (a TLS error
@@ -186,61 +213,268 @@ pub struct CheckOutcome {
     pub checked_at: DateTime<Utc>,
 }
 
-/// The client used for checks. Redirects are followed (reqwest's default
-/// policy, up to 10 hops). Idle connections are never kept, so every check
-/// opens a fresh connection: a pooled keep-alive socket would hide a server
-/// that stopped accepting new connections, and would leave connection setup
-/// out of the measured response time.
+/// What every check of one worker pass shares: the HTTP clients and the cipher
+/// that opens the monitors' secrets. Cloning is cheap: every clone shares the
+/// same clients (including the ones built later, see [`HttpClients`]) and key
+/// material.
 ///
-/// Proxy settings from the environment (`HTTP_PROXY`, `HTTPS_PROXY`,
-/// `ALL_PROXY`) or the operating system are ignored: a check must reach the
-/// monitored address itself, not whatever a proxy in the engine's environment
-/// makes of it, and tcp checks never use a proxy.
+/// Meant to be built once per pass and dropped with it, not kept for the life
+/// of the worker: clients that live across passes resume the TLS sessions of
+/// earlier checks, which skips verifying the certificate the server presents
+/// now and leaves most of the handshake out of the measured response time.
+/// Building a context is cheap (no client exists until a check needs it), and
+/// one built per pass never outlives the runtime that drives its connections.
+#[derive(Clone)]
+pub struct CheckContext {
+    pub http: HttpClients,
+    pub cipher: Cipher,
+}
+
+impl CheckContext {
+    pub fn new(cipher: Cipher) -> CheckContext {
+        CheckContext {
+            http: HttpClients::new(),
+            cipher,
+        }
+    }
+
+    pub fn for_state(state: &AppState) -> CheckContext {
+        CheckContext::new(state.cipher.clone())
+    }
+}
+
+/// How a client treats a redirect.
+#[derive(Clone, Copy)]
+enum RedirectMode {
+    /// No redirect is followed: the 3xx response is the result.
+    None,
+    /// Up to [`MAX_REDIRECTS`], anywhere.
+    Follow,
+    /// Up to [`MAX_REDIRECTS`], within the monitored origin (scheme, host and
+    /// port) only: for requests that carry credentials of any kind.
+    SameOrigin,
+}
+
+/// The clients [`HttpClients`] keeps: every [`RedirectMode`] with and without
+/// certificate verification.
+const CLIENT_COUNT: usize = 3 * 2;
+
+/// One reqwest client per combination of the per-monitor transport settings:
+/// how redirects are handled (see [`RedirectMode`]) and whether certificates
+/// are verified. All of them come out of [`build_client`], so every one is
+/// built the same way, and hardened the same way:
 ///
-/// No connection goes to an address [`is_forbidden_destination`] refuses:
-/// names resolve through [`GuardedResolver`], and a redirect to an IP literal
-/// is refused by the redirect policy (the monitor's own URL is checked in
-/// [`perform_check`]).
-pub fn build_http_client() -> reqwest::Client {
+/// - Idle connections are never kept, so every check opens a fresh connection:
+///   a pooled keep-alive socket would hide a server that stopped accepting new
+///   connections, and would leave connection setup out of the measured
+///   response time.
+/// - Proxy settings from the environment (`HTTP_PROXY`, `HTTPS_PROXY`,
+///   `ALL_PROXY`) or the operating system are ignored: a check must reach the
+///   monitored address itself, not whatever a proxy in the engine's
+///   environment makes of it, and tcp checks never use a proxy.
+/// - No connection goes to an address [`is_forbidden_destination`] refuses:
+///   names resolve through [`GuardedResolver`], and a redirect to an IP
+///   literal is refused by the redirect policy (the monitor's own URL is
+///   checked in [`probe_http`]).
+/// - No `Referer` is sent when a redirect is followed: the monitored URL can
+///   carry a token in its query, and the redirect may lead to another origin.
+///
+/// A client is built when a check first needs it, not up front: building one
+/// can mean parsing the system's root certificates, and a pass rarely uses more
+/// than one or two of the six. Clones share what has been built.
+#[derive(Clone)]
+pub struct HttpClients {
+    /// Indexed by `mode * 2 + (verify_ssl ? 0 : 1)`, `mode` being the
+    /// [`RedirectMode`]'s position in its declaration.
+    clients: Arc<[OnceLock<reqwest::Client>; CLIENT_COUNT]>,
+}
+
+impl Default for HttpClients {
+    fn default() -> Self {
+        HttpClients::new()
+    }
+}
+
+impl HttpClients {
+    pub fn new() -> HttpClients {
+        HttpClients {
+            clients: Arc::new(std::array::from_fn(|_| OnceLock::new())),
+        }
+    }
+
+    /// The client for one request, built if no check has needed it yet.
+    ///
+    /// A request that carries credentials of any kind (custom headers, basic
+    /// auth, credentials in the URL) only follows redirects that stay on the
+    /// monitored origin. reqwest drops `Authorization`, `Cookie`,
+    /// `Proxy-Authorization` and `WWW-Authenticate` only on the hop that
+    /// crosses to another host, from that hop's copy of the request headers;
+    /// the next hop starts again from the original ones, so a chain that moves
+    /// to another host and carries on there gets them back. Every other header
+    /// (an API key, say) is forwarded to wherever the target points.
+    ///
+    /// # Panics
+    ///
+    /// If the client cannot be built (no TLS roots on the system, say).
+    pub fn select(
+        &self,
+        follow_redirects: bool,
+        verify_ssl: bool,
+        carries_secrets: bool,
+    ) -> &reqwest::Client {
+        let mode = match (follow_redirects, carries_secrets) {
+            (false, _) => RedirectMode::None,
+            (true, false) => RedirectMode::Follow,
+            (true, true) => RedirectMode::SameOrigin,
+        };
+        self.clients[mode as usize * 2 + usize::from(!verify_ssl)]
+            .get_or_init(|| build_client(mode, verify_ssl))
+    }
+
+    /// How many clients exist so far.
+    #[cfg(test)]
+    fn built(&self) -> usize {
+        self.clients
+            .iter()
+            .filter(|slot| slot.get().is_some())
+            .count()
+    }
+}
+
+/// The one place a check's HTTP client is built (see [`HttpClients`]).
+fn build_client(redirects: RedirectMode, verify_ssl: bool) -> reqwest::Client {
+    let policy = match redirects {
+        RedirectMode::None => reqwest::redirect::Policy::none(),
+        RedirectMode::Follow => follow_policy(false),
+        RedirectMode::SameOrigin => follow_policy(true),
+    };
     reqwest::Client::builder()
         .no_proxy()
         .dns_resolver(GuardedResolver)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if names_forbidden_address(attempt.url()) {
-                attempt.error(DestinationNotAllowed)
-            } else {
-                reqwest::redirect::Policy::default().redirect(attempt)
-            }
-        }))
+        .redirect(policy)
+        .referer(false)
+        .danger_accept_invalid_certs(!verify_ssl)
         .pool_max_idle_per_host(0)
         .user_agent(concat!("Nami-Uptime/", env!("CARGO_PKG_VERSION")))
         .build()
-        .expect("failed to build the uptime HTTP client")
+        .expect("failed to build an uptime HTTP client")
+}
+
+/// Follows up to [`MAX_REDIRECTS`] redirects, refusing every hop to an address
+/// no check may contact (see [`is_forbidden_destination`]), and, with
+/// `same_origin_only`, every hop that leaves the monitored origin.
+fn follow_policy(same_origin_only: bool) -> reqwest::redirect::Policy {
+    let limit = reqwest::redirect::Policy::limited(MAX_REDIRECTS);
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if names_forbidden_address(attempt.url()) {
+            return attempt.error(DestinationNotAllowed);
+        }
+        let leaves = same_origin_only
+            .then(|| leaves_origin(attempt.previous(), attempt.url()))
+            .flatten();
+        match leaves {
+            Some(refused) => attempt.error(refused),
+            None => limit.redirect(attempt),
+        }
+    })
+}
+
+/// Why a redirect was refused: it leaves the monitored origin, and the request
+/// carries credentials (see [`HttpClients::select`]). Names where it points, as
+/// an origin or just a host, never a path, query or userinfo. The reason comes
+/// first and the host is shortened (see [`named_host`]), so that the whole text
+/// fits `MAX_ERROR_CHARS` and its explanation is never what gets cut.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CrossOriginRedirect {
+    target: String,
+}
+
+impl fmt::Display for CrossOriginRedirect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "headers and credentials are only sent to the monitored origin, so the redirect to {} was not followed",
+            self.target
+        )
+    }
+}
+
+impl std::error::Error for CrossOriginRedirect {}
+
+/// The most chars of a host name a refusal quotes; the rest is replaced by an
+/// ellipsis. A host name can be 253 chars long.
+const NAMED_HOST_CHARS: usize = 100;
+
+fn named_host(host: &str) -> String {
+    match host.char_indices().nth(NAMED_HOST_CHARS) {
+        Some((cut, _)) => format!("{}…", &host[..cut]),
+        None => host.to_string(),
+    }
+}
+
+/// `scheme://host`, with `:port` unless it is the scheme's default: the origin
+/// as `url::Origin::ascii_serialization` writes it, with the host shortened.
+fn named_origin(url: &reqwest::Url) -> String {
+    let host = named_host(url.host_str().unwrap_or("unknown"));
+    match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    }
+}
+
+/// Whether the redirect to `next` leaves the origin of the monitored URL, the
+/// first of the URLs `previous` requested so far. Origins are compared as
+/// browsers do: scheme, host and port, where a port left out is the scheme's
+/// default one. When there is no monitored URL to compare with, nothing is
+/// known to stay, so the redirect is refused.
+fn leaves_origin(previous: &[reqwest::Url], next: &reqwest::Url) -> Option<CrossOriginRedirect> {
+    let original = previous.first();
+    if original.is_some_and(|original| original.origin() == next.origin()) {
+        return None;
+    }
+    let same_host = original.is_some_and(|original| original.host_str() == next.host_str());
+    let target = if same_host {
+        format!("another origin ({})", named_origin(next))
+    } else {
+        format!(
+            "another host ({})",
+            named_host(next.host_str().unwrap_or("unknown"))
+        )
+    };
+    Some(CrossOriginRedirect { target })
 }
 
 /// Runs the monitor's check within its timeout. Response time is measured
 /// to the response headers for `http` checks, to the end of the (capped)
-/// body for `keyword` checks, and to connection setup for `tcp` checks.
+/// body for `keyword` checks, and to connection setup for `tcp` checks. For
+/// `http` and `keyword` checks it starts when the request is ready to be sent:
+/// building the HTTP client the first time a pass needs it, and opening the
+/// monitor's secrets, are not part of it.
 ///
-/// Keyword checks always send GET, whatever `http_method` says, because a HEAD
-/// response has no body. Matching is case-sensitive, on the body decoded as
-/// UTF-8 with invalid bytes replaced, whatever charset the response declares:
-/// a keyword with non-ASCII characters never matches a page served in another
-/// encoding such as Latin-1.
+/// `http` and `keyword` checks send the monitor's request configuration: its
+/// method, body (for POST, PUT and PATCH), custom headers and basic auth, on
+/// the client matching its redirect and TLS settings (see [`HttpClients`]). The
+/// secrets are opened here, for this one check; if they cannot be, the check is
+/// down with [`CONFIG_DECRYPT_ERROR`] and nothing is sent. A keyword check
+/// needs the body, and a HEAD response has none, so a stored HEAD goes out as
+/// GET. Matching is case-sensitive, on the body decoded as UTF-8 with invalid
+/// bytes replaced, whatever charset the response declares: a keyword with
+/// non-ASCII characters never matches a page served in another encoding such
+/// as Latin-1.
 ///
 /// A destination no check may contact (see [`is_forbidden_destination`]) is
 /// refused before any connection, with the generic [`DESTINATION_NOT_ALLOWED`].
 ///
 /// The outcome's `error` is capped at `MAX_ERROR_CHARS` chars and is one line
 /// of text (see [`clean_error`]).
-pub async fn perform_check(http: &reqwest::Client, monitor: &Monitor) -> CheckOutcome {
+pub async fn perform_check(ctx: &CheckContext, monitor: &Monitor) -> CheckOutcome {
     let checked_at = Utc::now();
     let timeout_secs = u64::try_from(monitor.timeout_seconds.clamp(1, 60)).unwrap_or(10);
     let timeout = Duration::from_secs(timeout_secs);
     let started = Instant::now();
     let probe = async {
         match monitor.check_type.as_str() {
-            "http" | "keyword" => probe_http(http, monitor, started).await,
+            "http" | "keyword" => probe_http(ctx, monitor).await,
             "tcp" => probe_tcp(monitor, started).await,
             other => Observation::down(None, None, format!("unsupported check type {other:?}")),
         }
@@ -296,7 +530,7 @@ fn elapsed_ms(started: Instant) -> u32 {
     u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
-async fn probe_http(http: &reqwest::Client, monitor: &Monitor, started: Instant) -> Observation {
+async fn probe_http(ctx: &CheckContext, monitor: &Monitor) -> Observation {
     let Some(url) = monitor.url.as_deref() else {
         return Observation::down(None, None, "monitor has no url".to_string());
     };
@@ -312,18 +546,21 @@ async fn probe_http(http: &reqwest::Client, monitor: &Monitor, started: Instant)
     } else {
         None
     };
-    // A keyword check needs the body, and a HEAD response has none.
-    let method = if keyword.is_none() && monitor.http_method == "HEAD" {
-        reqwest::Method::HEAD
-    } else {
-        reqwest::Method::GET
-    };
     // The URL's own host, if it is an IP literal: a name is judged when it
     // resolves (see `GuardedResolver`), a redirect by the redirect policy.
     if reqwest::Url::parse(url).is_ok_and(|parsed| names_forbidden_address(&parsed)) {
         return Observation::down(None, None, DESTINATION_NOT_ALLOWED.to_string());
     }
-    let mut response = match http.request(method, url).send().await {
+    // Last before sending: the secrets are opened only for a request that
+    // will be sent.
+    let request = match build_request(ctx, monitor, url, keyword.is_some()) {
+        Ok(request) => request,
+        Err(message) => return Observation::down(None, None, message),
+    };
+    // The response time starts here: the request may just have built its
+    // client (see `HttpClients`), which has nothing to do with the target.
+    let started = Instant::now();
+    let mut response = match request.send().await {
         Ok(response) => response,
         Err(e) => return Observation::down(None, None, describe_request_error(&e)),
     };
@@ -362,6 +599,94 @@ async fn probe_http(http: &reqwest::Client, monitor: &Monitor, started: Instant)
             format!("keyword \"{keyword}\" not found"),
         ),
     }
+}
+
+/// The request one check sends: the monitor's method, custom headers, basic
+/// auth and body, on the client matching its redirect and TLS settings.
+///
+/// The secrets are opened here, for this check alone, and never logged or
+/// echoed: every failure becomes one of two fixed messages. The request has no
+/// timeout of its own, the deadline in [`perform_check`] covers it.
+///
+/// `needs_body` is set for keyword checks, which read the response body: a
+/// stored HEAD is sent as GET for them, because a HEAD response has none. The
+/// request body only goes out with a method that may carry one, whatever is
+/// stored.
+fn build_request(
+    ctx: &CheckContext,
+    monitor: &Monitor,
+    url: &str,
+    needs_body: bool,
+) -> Result<reqwest::RequestBuilder, String> {
+    let method = request_method(&monitor.http_method, needs_body)?;
+    let headers = match &monitor.request_headers_enc {
+        Some(sealed) => open_headers(&ctx.cipher, monitor.id, sealed)
+            .map_err(|_| CONFIG_DECRYPT_ERROR.to_string())?,
+        None => Vec::new(),
+    };
+    let password = match &monitor.auth_password_enc {
+        Some(sealed) => Some(
+            open_password(&ctx.cipher, monitor.id, sealed)
+                .map_err(|_| CONFIG_DECRYPT_ERROR.to_string())?,
+        ),
+        None => None,
+    };
+    let mut header_map = HeaderMap::with_capacity(headers.len());
+    for header in &headers {
+        // Values go out as the bytes they are: validation accepts any text
+        // without control characters, and `HeaderValue::from_str` would refuse
+        // every non-ASCII one.
+        let (Ok(name), Ok(mut value)) = (
+            HeaderName::from_bytes(header.name.as_bytes()),
+            HeaderValue::from_bytes(header.value.expose().as_bytes()),
+        ) else {
+            return Err(INVALID_HEADERS_ERROR.to_string());
+        };
+        // Framing headers belong to the client. Validation refuses them, so
+        // they are only here if a sealed list was not written through the API.
+        if RESERVED_HEADERS.contains(&name.as_str()) {
+            return Err(INVALID_HEADERS_ERROR.to_string());
+        }
+        // Keeps the value out of `Debug` output and HTTP/2 header compression.
+        value.set_sensitive(true);
+        header_map.append(name, value);
+    }
+    // Credentials of any kind keep the request on its origin (see
+    // `HttpClients::select`): custom headers, basic auth, and the ones in the
+    // URL itself, which reqwest sends as an `Authorization` header.
+    let carries_secrets = !headers.is_empty()
+        || monitor.auth_username.is_some()
+        || reqwest::Url::parse(url).is_ok_and(|parsed| url_has_credentials(&parsed));
+    let client = ctx.http.select(
+        monitor.follow_redirects,
+        monitor.verify_ssl,
+        carries_secrets,
+    );
+    let sends_body = BODY_METHODS.contains(&method.as_str());
+    let mut request = client.request(method, url).headers(header_map);
+    if let Some(username) = &monitor.auth_username {
+        request = request.basic_auth(username, password.as_ref().map(SecretString::expose));
+    }
+    match &monitor.request_body {
+        Some(body) if sends_body => request = request.body(body.clone()),
+        _ => {}
+    }
+    Ok(request)
+}
+
+/// The method a check sends: the stored one, as long as it is one a monitor
+/// may have (see `HTTP_METHODS`), and with `needs_body`, GET in place of HEAD.
+fn request_method(stored: &str, needs_body: bool) -> Result<reqwest::Method, String> {
+    let method = if needs_body && stored == "HEAD" {
+        "GET"
+    } else {
+        stored
+    };
+    HTTP_METHODS
+        .contains(&method)
+        .then(|| reqwest::Method::from_bytes(method.as_bytes()).ok())
+        .flatten()
+        .ok_or_else(|| format!("unsupported http method {method:?}"))
 }
 
 async fn read_capped(
@@ -407,7 +732,8 @@ fn describe_request_error(error: &reqwest::Error) -> String {
         return DESTINATION_NOT_ALLOWED.to_string();
     }
     if error.is_redirect() {
-        return "too many redirects".to_string();
+        // "too many redirects", or the reason a redirect was refused.
+        return root_cause(error);
     }
     if let Some(message) = io_error_kind(error).and_then(io_kind_message) {
         return message.to_string();
@@ -691,6 +1017,271 @@ mod tests {
             let parsed = reqwest::Url::parse(url).unwrap();
             assert!(!names_forbidden_address(&parsed), "{url}");
         }
+    }
+
+    fn url(text: &str) -> reqwest::Url {
+        reqwest::Url::parse(text).unwrap()
+    }
+
+    /// The redirect check as the client's policy asks it: the monitored URL
+    /// first, then wherever the redirect points.
+    fn leaves(monitored: &str, next: &str) -> Option<String> {
+        leaves_origin(&[url(monitored)], &url(next)).map(|refused| refused.target)
+    }
+
+    #[test]
+    fn a_redirect_that_keeps_the_origin_is_followed() {
+        for (monitored, next) in [
+            ("http://a.test/x", "http://a.test/y?z=1#f"),
+            ("http://a.test/x", "http://a.test:80/y"),
+            ("https://a.test/", "https://a.test:443/y"),
+            ("https://a.test:8443/", "https://a.test:8443/other"),
+            ("HTTP://A.TEST/x", "http://a.test/y"),
+            ("http://user:secret@a.test/x", "http://a.test/y"),
+            ("http://127.0.0.1:9000/", "http://127.0.0.1:9000/login"),
+            ("http://[::1]:9000/", "http://[::1]:9000/login"),
+        ] {
+            assert_eq!(leaves(monitored, next), None, "{monitored} -> {next}");
+        }
+    }
+
+    #[test]
+    fn a_redirect_to_another_origin_is_refused_and_names_only_that_origin() {
+        for (monitored, next, target) in [
+            ("http://a.test/", "http://b.test/", "another host (b.test)"),
+            (
+                "http://a.test/",
+                "http://www.a.test/",
+                "another host (www.a.test)",
+            ),
+            (
+                "http://a.test/",
+                "http://a.test./",
+                "another host (a.test.)",
+            ),
+            (
+                "http://127.0.0.1:9000/",
+                "http://[::1]:9000/",
+                "another host ([::1])",
+            ),
+            (
+                "http://a.test/",
+                "https://a.test/",
+                "another origin (https://a.test)",
+            ),
+            (
+                "https://a.test/",
+                "http://a.test/",
+                "another origin (http://a.test)",
+            ),
+            (
+                "http://a.test/",
+                "http://a.test:8080/",
+                "another origin (http://a.test:8080)",
+            ),
+            (
+                "https://a.test/",
+                "https://a.test:8443/",
+                "another origin (https://a.test:8443)",
+            ),
+            // Nothing but the origin is ever named.
+            (
+                "http://a.test/",
+                "http://u:p@b.test:81/path?token=secret#fragment",
+                "another host (b.test)",
+            ),
+        ] {
+            assert_eq!(
+                leaves(monitored, next).as_deref(),
+                Some(target),
+                "{monitored} -> {next}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_origin_is_the_monitored_url_not_the_hop_before() {
+        // Every hop is judged against where the monitor started, so a chain
+        // cannot walk away one same-origin step at a time.
+        let chain = [url("http://a.test/"), url("http://a.test/one")];
+        assert!(leaves_origin(&chain, &url("http://a.test/two")).is_none());
+        assert!(leaves_origin(&chain, &url("http://b.test/")).is_some());
+    }
+
+    #[test]
+    fn with_nothing_to_compare_to_a_redirect_is_refused() {
+        let refused = leaves_origin(&[], &url("http://a.test/")).unwrap();
+        assert_eq!(refused.target, "another host (a.test)");
+    }
+
+    #[test]
+    fn the_refusal_reads_as_a_down_reason() {
+        let refused = leaves_origin(&[url("http://a.test/")], &url("http://b.test/")).unwrap();
+        assert_eq!(
+            refused.to_string(),
+            "headers and credentials are only sent to the monitored origin, so the redirect to another host (b.test) was not followed"
+        );
+    }
+
+    /// The error text is cut at `MAX_ERROR_CHARS`, and a host name can be 253
+    /// chars: the reason comes first and the host is shortened, so that the
+    /// whole sentence always fits.
+    #[test]
+    fn the_refusal_gives_its_reason_first_and_always_fits_the_error_cap() {
+        let long = format!(
+            "{}.{}.{}.{}.io",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(57)
+        );
+        assert_eq!(long.len(), 252);
+        for (monitored, next) in [
+            ("http://a.test/".to_string(), format!("http://{long}/")),
+            (format!("http://{long}/"), format!("https://{long}:8443/")),
+            (format!("http://{long}/"), format!("http://{long}:65535/")),
+            (
+                "http://a.test/".to_string(),
+                "https://[::1]:65535/".to_string(),
+            ),
+        ] {
+            let refused = leaves(&monitored, &next).unwrap();
+            let message = CrossOriginRedirect { target: refused }.to_string();
+            assert!(
+                message
+                    .starts_with("headers and credentials are only sent to the monitored origin"),
+                "{message}"
+            );
+            assert!(
+                message.chars().count() <= MAX_ERROR_CHARS,
+                "{} chars",
+                message.chars().count()
+            );
+            assert_eq!(clean_error(message.clone()), message, "not cut");
+            assert!(message.ends_with(" was not followed"), "{message}");
+        }
+        // A host that fits is named whole, at any length up to the shortening.
+        let fits = "h".repeat(100);
+        assert_eq!(
+            leaves("http://a.test/", &format!("http://{fits}/")).unwrap(),
+            format!("another host ({fits})")
+        );
+        assert_eq!(
+            leaves("http://a.test/", &format!("http://{fits}h/")).unwrap(),
+            format!("another host ({fits}…)")
+        );
+    }
+
+    #[test]
+    fn every_method_a_monitor_may_have_is_sent_as_stored() {
+        for stored in HTTP_METHODS {
+            assert_eq!(request_method(stored, false).unwrap().as_str(), stored);
+        }
+    }
+
+    #[test]
+    fn a_keyword_check_sends_get_for_a_stored_head_and_the_stored_method_otherwise() {
+        assert_eq!(request_method("HEAD", true).unwrap(), reqwest::Method::GET);
+        assert_eq!(
+            request_method("HEAD", false).unwrap(),
+            reqwest::Method::HEAD
+        );
+        for stored in HTTP_METHODS.into_iter().filter(|stored| *stored != "HEAD") {
+            assert_eq!(request_method(stored, true).unwrap().as_str(), stored);
+        }
+    }
+
+    #[test]
+    fn a_method_that_is_not_one_of_the_seven_is_refused() {
+        for stored in [
+            "", "get", "Get", "TRACE", "CONNECT", "BREW", "GET ", "G\u{c9}T",
+        ] {
+            for needs_body in [false, true] {
+                assert_eq!(
+                    request_method(stored, needs_body),
+                    Err(format!("unsupported http method {stored:?}"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn there_is_a_slot_for_every_mode_with_and_without_verification() {
+        assert_eq!(RedirectMode::None as usize, 0);
+        assert_eq!(RedirectMode::Follow as usize, 1);
+        assert_eq!(RedirectMode::SameOrigin as usize * 2 + 1, CLIENT_COUNT - 1);
+    }
+
+    /// `(follow_redirects, verify_ssl, carries_secrets)`, one per client.
+    const ALL_CLIENTS: [(bool, bool, bool); 6] = [
+        (false, true, false),
+        (false, false, false),
+        (true, true, false),
+        (true, false, false),
+        (true, true, true),
+        (true, false, true),
+    ];
+
+    /// Building a client can parse the system's root certificates: only the
+    /// ones a pass uses are built, when its first check needs them.
+    #[test]
+    fn a_client_is_built_when_a_check_first_needs_it() {
+        let clients = HttpClients::new();
+        assert_eq!(clients.built(), 0);
+        clients.select(true, true, false);
+        assert_eq!(clients.built(), 1);
+        clients.select(true, true, false);
+        assert_eq!(clients.built(), 1, "a second check reuses it");
+        clients.select(false, false, true);
+        assert_eq!(clients.built(), 2);
+        for (follow, verify, secrets) in ALL_CLIENTS {
+            clients.select(follow, verify, secrets);
+        }
+        assert_eq!(clients.built(), 6);
+    }
+
+    #[test]
+    fn every_combination_of_settings_gets_its_own_client_and_keeps_it() {
+        let clients = HttpClients::new();
+        let chosen: Vec<&reqwest::Client> = ALL_CLIENTS
+            .iter()
+            .map(|&(follow, verify, secrets)| clients.select(follow, verify, secrets))
+            .collect();
+        for (position, one) in chosen.iter().enumerate() {
+            for other in &chosen[position + 1..] {
+                assert!(!std::ptr::eq(*one, *other));
+            }
+        }
+        for (&(follow, verify, secrets), first) in ALL_CLIENTS.iter().zip(&chosen) {
+            assert!(std::ptr::eq(
+                clients.select(follow, verify, secrets),
+                *first
+            ));
+        }
+    }
+
+    #[test]
+    fn nothing_is_followed_so_secrets_need_no_client_of_their_own_then() {
+        let clients = HttpClients::new();
+        for verify in [true, false] {
+            assert!(std::ptr::eq(
+                clients.select(false, verify, true),
+                clients.select(false, verify, false)
+            ));
+        }
+        assert_eq!(clients.built(), 2);
+    }
+
+    #[test]
+    fn clones_share_the_clients_that_were_built() {
+        let clients = HttpClients::new();
+        let clone = clients.clone();
+        let built_by_the_clone = clone.select(true, false, false);
+        assert_eq!(clients.built(), 1);
+        assert!(std::ptr::eq(
+            clients.select(true, false, false),
+            built_by_the_clone
+        ));
     }
 
     #[test]

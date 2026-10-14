@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     future::Future,
     sync::{
@@ -7,41 +9,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Utc;
+use common::{check_context, unsaved_monitor as monitor};
 use nami_engine::{
     models::monitor::Monitor,
-    uptime::checker::{
-        CheckStatus, MAX_BODY_BYTES, MAX_ERROR_CHARS, build_http_client, perform_check,
-    },
+    uptime::checker::{CheckStatus, MAX_BODY_BYTES, MAX_ERROR_CHARS, perform_check},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
 };
-
-fn monitor(check_type: &str) -> Monitor {
-    Monitor {
-        id: Uuid::new_v4(),
-        project_id: Uuid::new_v4(),
-        name: "test".to_string(),
-        check_type: check_type.to_string(),
-        http_method: "GET".to_string(),
-        keyword_mode: "contains".to_string(),
-        expected_status_min: 200,
-        expected_status_max: 399,
-        interval_seconds: 60,
-        timeout_seconds: 5,
-        confirmation_threshold: 2,
-        current_status: "pending".to_string(),
-        follow_redirects: true,
-        verify_ssl: true,
-        next_check_at: Utc::now(),
-        created_at: Utc::now(),
-        ..Monitor::default()
-    }
-}
 
 fn http_monitor(url: String) -> Monitor {
     Monitor {
@@ -113,7 +90,7 @@ fn reset_on_close(stream: &tokio::net::TcpStream) {
 async fn status_inside_the_expected_range_is_up() {
     let server = server_returning(ResponseTemplate::new(204)).await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &http_monitor(format!("{}/", server.uri())),
     )
     .await;
@@ -127,7 +104,7 @@ async fn status_inside_the_expected_range_is_up() {
 async fn status_outside_the_expected_range_is_down_with_the_reason() {
     let server = server_returning(ResponseTemplate::new(503)).await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &http_monitor(format!("{}/", server.uri())),
     )
     .await;
@@ -147,7 +124,7 @@ async fn a_custom_expected_range_is_honoured() {
         expected_status_max: 200,
         ..http_monitor(format!("{}/", server.uri()))
     };
-    let outcome = perform_check(&build_http_client(), &only_200).await;
+    let outcome = perform_check(&check_context(), &only_200).await;
     assert_eq!(outcome.status, CheckStatus::Down);
     assert_eq!(
         outcome.error.as_deref(),
@@ -171,7 +148,7 @@ async fn redirects_are_followed_to_the_final_status() {
         .mount(&server)
         .await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &http_monitor(format!("{}/old", server.uri())),
     )
     .await;
@@ -192,7 +169,7 @@ async fn head_monitors_send_head_requests() {
         http_method: "HEAD".to_string(),
         ..http_monitor(format!("{}/", server.uri()))
     };
-    let outcome = perform_check(&build_http_client(), &head).await;
+    let outcome = perform_check(&check_context(), &head).await;
     assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
 }
 
@@ -204,14 +181,14 @@ async fn keyword_present_is_up_and_absent_is_down() {
     let url = format!("{}/", server.uri());
 
     let present = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(url.clone(), "systems go", "contains"),
     )
     .await;
     assert_eq!(present.status, CheckStatus::Up, "{:?}", present.error);
 
     let absent = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(url, "maintenance", "contains"),
     )
     .await;
@@ -227,7 +204,7 @@ async fn keyword_present_is_up_and_absent_is_down() {
 async fn keyword_matching_is_case_sensitive() {
     let server = server_returning(ResponseTemplate::new(200).set_body_string("Status: OK")).await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(format!("{}/", server.uri()), "ok", "contains"),
     )
     .await;
@@ -242,7 +219,7 @@ async fn not_contains_mode_inverts_the_keyword_check() {
     let url = format!("{}/", server.uri());
 
     let found = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(url.clone(), "error", "not_contains"),
     )
     .await;
@@ -250,7 +227,7 @@ async fn not_contains_mode_inverts_the_keyword_check() {
     assert_eq!(found.error.as_deref(), Some("keyword \"error\" found"));
 
     let missing = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(url, "panic", "not_contains"),
     )
     .await;
@@ -262,7 +239,7 @@ async fn a_keyword_beyond_the_body_cap_is_not_found() {
     let body = format!("{}NEEDLE", "a".repeat(MAX_BODY_BYTES));
     let server = server_returning(ResponseTemplate::new(200).set_body_string(body)).await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(format!("{}/", server.uri()), "NEEDLE", "contains"),
     )
     .await;
@@ -282,7 +259,7 @@ async fn a_keyword_ending_exactly_at_the_body_cap_is_found() {
     assert_eq!(body.len(), MAX_BODY_BYTES);
     let server = server_returning(ResponseTemplate::new(200).set_body_string(body)).await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(format!("{}/", server.uri()), "NEEDLE", "contains"),
     )
     .await;
@@ -297,7 +274,7 @@ async fn a_keyword_ending_one_byte_past_the_body_cap_is_not_found() {
     assert_eq!(body.len(), MAX_BODY_BYTES + 1);
     let server = server_returning(ResponseTemplate::new(200).set_body_string(body)).await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(format!("{}/", server.uri()), "NEEDLE", "contains"),
     )
     .await;
@@ -329,7 +306,7 @@ async fn an_endless_body_is_cut_at_the_cap_instead_of_being_read_forever() {
         ..keyword_monitor(format!("http://127.0.0.1:{port}/"), "needle", "contains")
     };
     let started = Instant::now();
-    let outcome = perform_check(&build_http_client(), &endless).await;
+    let outcome = perform_check(&check_context(), &endless).await;
     // Reading stops at the cap: the check ends in milliseconds, long before
     // the 5 s deadline, and with "not found" rather than a timeout.
     assert!(
@@ -346,7 +323,7 @@ async fn an_endless_body_is_cut_at_the_cap_instead_of_being_read_forever() {
 }
 
 #[tokio::test]
-async fn keyword_monitors_always_use_get_even_when_head_is_configured() {
+async fn keyword_monitors_send_get_when_head_is_configured() {
     // Only GET is mocked: a HEAD would get wiremock's default 404, and a
     // HEAD response has no body to search anyway.
     let server =
@@ -357,7 +334,7 @@ async fn keyword_monitors_always_use_get_even_when_head_is_configured() {
         http_method: "HEAD".to_string(),
         ..keyword_monitor(url.clone(), "database", "contains")
     };
-    let outcome = perform_check(&build_http_client(), &present).await;
+    let outcome = perform_check(&check_context(), &present).await;
     assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
 
     // Without a body, not_contains would pass every page: it must see the body.
@@ -365,7 +342,7 @@ async fn keyword_monitors_always_use_get_even_when_head_is_configured() {
         http_method: "HEAD".to_string(),
         ..keyword_monitor(url, "error", "not_contains")
     };
-    let outcome = perform_check(&build_http_client(), &forbidden).await;
+    let outcome = perform_check(&check_context(), &forbidden).await;
     assert_eq!(outcome.status, CheckStatus::Down);
     assert_eq!(outcome.error.as_deref(), Some("keyword \"error\" found"));
 }
@@ -375,7 +352,7 @@ async fn error_text_is_capped_however_it_is_produced() {
     let server = server_returning(ResponseTemplate::new(200).set_body_string("ok")).await;
     let long_keyword = "k".repeat(10_000);
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(format!("{}/", server.uri()), &long_keyword, "contains"),
     )
     .await;
@@ -391,7 +368,7 @@ async fn a_keyword_match_still_needs_an_expected_status() {
     let server =
         server_returning(ResponseTemplate::new(500).set_body_string("all systems go")).await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(format!("{}/", server.uri()), "systems go", "contains"),
     )
     .await;
@@ -411,7 +388,7 @@ async fn a_slow_response_times_out_within_the_monitor_timeout() {
         ..http_monitor(format!("{}/", server.uri()))
     };
     let started = Instant::now();
-    let outcome = perform_check(&build_http_client(), &slow).await;
+    let outcome = perform_check(&check_context(), &slow).await;
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "took {:?}",
@@ -425,7 +402,7 @@ async fn a_slow_response_times_out_within_the_monitor_timeout() {
 #[tokio::test]
 async fn http_connection_refused_is_down() {
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &http_monitor(format!("http://127.0.0.1:{}/", closed_port())),
     )
     .await;
@@ -443,7 +420,7 @@ async fn tcp_open_port_is_up() {
         port: Some(i32::from(port)),
         ..monitor("tcp")
     };
-    let outcome = perform_check(&build_http_client(), &tcp).await;
+    let outcome = perform_check(&check_context(), &tcp).await;
     assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
     assert!(outcome.response_time_ms.is_some());
     drop(listener);
@@ -456,7 +433,7 @@ async fn tcp_closed_port_is_down_with_connection_refused() {
         port: Some(i32::from(closed_port())),
         ..monitor("tcp")
     };
-    let outcome = perform_check(&build_http_client(), &tcp).await;
+    let outcome = perform_check(&check_context(), &tcp).await;
     assert_eq!(outcome.status, CheckStatus::Down);
     assert_eq!(outcome.error.as_deref(), Some("connection refused"));
 }
@@ -472,7 +449,7 @@ async fn a_redirect_loop_is_down_with_too_many_redirects() {
         .mount(&server)
         .await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &http_monitor(format!("{}/", server.uri())),
     )
     .await;
@@ -489,7 +466,7 @@ async fn a_reset_connection_is_down() {
     })
     .await;
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &http_monitor(format!("http://127.0.0.1:{port}/")),
     )
     .await;
@@ -504,7 +481,7 @@ async fn a_failed_tls_handshake_is_down_with_the_cause() {
     // handshake does not.
     let server = MockServer::start().await;
     let target = http_monitor(format!("https://127.0.0.1:{}/", server.address().port()));
-    let outcome = perform_check(&build_http_client(), &target).await;
+    let outcome = perform_check(&check_context(), &target).await;
     assert_eq!(outcome.status, CheckStatus::Down);
     let error = outcome.error.expect("a failed check carries an error");
     assert!(error.starts_with("connection failed: "), "{error}");
@@ -526,7 +503,7 @@ async fn a_body_that_never_finishes_times_out_within_the_monitor_timeout() {
         ..keyword_monitor(format!("http://127.0.0.1:{port}/"), "needle", "contains")
     };
     let started = Instant::now();
-    let outcome = perform_check(&build_http_client(), &stalled).await;
+    let outcome = perform_check(&check_context(), &stalled).await;
     assert!(
         started.elapsed() < Duration::from_secs(3),
         "took {:?}",
@@ -557,10 +534,10 @@ async fn every_check_opens_a_fresh_connection() {
         }
     })
     .await;
-    let client = build_http_client();
+    let ctx = check_context();
     let target = http_monitor(format!("http://127.0.0.1:{port}/"));
     for _ in 0..2 {
-        let outcome = perform_check(&client, &target).await;
+        let outcome = perform_check(&ctx, &target).await;
         assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
     }
     assert_eq!(
@@ -626,9 +603,9 @@ async fn a_monitor_that_cannot_be_checked_is_down_instead_of_panicking() {
         ),
         (monitor("ping"), "unsupported check type \"ping\""),
     ];
-    let client = build_http_client();
+    let ctx = check_context();
     for (case, expected) in cases {
-        let outcome = perform_check(&client, &case).await;
+        let outcome = perform_check(&ctx, &case).await;
         assert_eq!(outcome.status, CheckStatus::Down, "{expected}");
         assert_eq!(outcome.error.as_deref(), Some(expected));
         assert_eq!(outcome.status_code, None, "{expected}");
@@ -667,7 +644,7 @@ async fn error_text_carries_no_line_breaks_or_direction_controls() {
     let server = server_returning(ResponseTemplate::new(200).set_body_string("ok")).await;
     let keyword = "a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200F}f\u{061C}g";
     let outcome = perform_check(
-        &build_http_client(),
+        &check_context(),
         &keyword_monitor(format!("{}/", server.uri()), keyword, "contains"),
     )
     .await;
@@ -708,7 +685,7 @@ async fn literal_metadata_and_link_local_addresses_are_refused() {
         "http://[::]/",
     ] {
         let started = Instant::now();
-        let outcome = perform_check(&build_http_client(), &http_monitor(url.to_string())).await;
+        let outcome = perform_check(&check_context(), &http_monitor(url.to_string())).await;
         assert_refused(&outcome, url);
         assert!(started.elapsed() < Duration::from_secs(1), "{url}");
     }
@@ -725,7 +702,7 @@ async fn this_network_is_refused_even_where_a_server_would_answer() {
         format!("http://0.0.0.0:{port}/"),
         format!("http://[::ffff:0.0.0.0]:{port}/"),
     ] {
-        let outcome = perform_check(&build_http_client(), &http_monitor(url.clone())).await;
+        let outcome = perform_check(&check_context(), &http_monitor(url.clone())).await;
         assert_refused(&outcome, &url);
     }
     assert!(server.received_requests().await.unwrap().is_empty());
@@ -749,7 +726,7 @@ async fn a_redirect_to_a_refused_address_is_not_followed() {
             .mount(&server)
             .await;
         let outcome = perform_check(
-            &build_http_client(),
+            &check_context(),
             &http_monitor(format!("{}/", server.uri())),
         )
         .await;
@@ -778,7 +755,7 @@ async fn tcp_checks_refuse_the_same_addresses() {
             ..monitor("tcp")
         };
         let started = Instant::now();
-        let outcome = perform_check(&build_http_client(), &tcp).await;
+        let outcome = perform_check(&check_context(), &tcp).await;
         assert_refused(&outcome, host);
         assert!(started.elapsed() < Duration::from_secs(1), "{host}");
     }
@@ -795,7 +772,7 @@ async fn loopback_by_name_or_address_is_still_checked() {
         format!("http://127.0.0.1:{port}/"),
         format!("http://localhost:{port}/"),
     ] {
-        let outcome = perform_check(&build_http_client(), &http_monitor(url.clone())).await;
+        let outcome = perform_check(&check_context(), &http_monitor(url.clone())).await;
         assert_eq!(
             outcome.status,
             CheckStatus::Up,
@@ -809,6 +786,6 @@ async fn loopback_by_name_or_address_is_still_checked() {
         port: Some(i32::from(listener.local_addr().unwrap().port())),
         ..monitor("tcp")
     };
-    let outcome = perform_check(&build_http_client(), &tcp).await;
+    let outcome = perform_check(&check_context(), &tcp).await;
     assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
 }
