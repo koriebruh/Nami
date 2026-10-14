@@ -21,5 +21,8 @@ pub struct LogsState {
     /// How many requests each source has in flight (capped, see
     /// [`rate_limit::MAX_IN_FLIGHT_PER_SOURCE`]).
     pub in_flight: rate_limit::InFlight,
+    /// How many bodies of each source are decoded at once (see
+    /// [`rate_limit::MAX_DECODES_PER_SOURCE`]).
+    pub decode_shares: rate_limit::DecodeShares,
     pub usage: usage::UsageTracker,
 }

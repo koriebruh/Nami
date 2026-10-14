@@ -68,11 +68,15 @@ phases merge.
     most → `408`, logged with the source (never the token). A request holds
     its place until its work ends, also when the client has hung up, and its
     events are stored and counted either way;
-  - what a body decodes to is capped, not only its bytes: the decoders stop at
-    192 MiB of estimated decoded size (a MessagePack `0` is one byte and a
-    32-byte value) → `413`, and at most 4 bodies are decoded at once, so
-    50 MiB of zeros in one array costs a few hundred ms and under 200 MiB, not
-    gigabytes;
+  - what a body decodes to and stores is capped, not only its bytes: the
+    decoders stop at 192 MiB of estimated decoded size (a MessagePack `0` is
+    one byte and a 32-byte value) → `413`, and so do the rows once they store
+    more than 100 MiB, and the insert body once it would encode to more (a
+    control character is one byte in a message and six in the JSON sent to
+    ClickHouse). At most 4 bodies are decoded at once, 2 of one source; an
+    insert body above 8 MiB keeps its decode place until ClickHouse has taken
+    it, so only a few large ones are in memory at the same time. 50 MiB of zeros
+    in one array costs a few hundred ms and under 200 MiB, not gigabytes;
   - at most one `Content-Encoding` line, a single `gzip` (or none) → else `415`.
 - Response `202 {"accepted": N}`. Inserts use ClickHouse
   `async_insert=1, wait_for_async_insert=1` so the server batches small

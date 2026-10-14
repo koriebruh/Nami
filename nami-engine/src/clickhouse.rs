@@ -120,6 +120,10 @@ pub enum ClickHouseError {
     Server { status: u16, body: String },
     #[error("could not encode a row for clickhouse: {0}")]
     Encode(serde_json::Error),
+    /// The rows would encode to more than `limit` bytes ([`encode_rows_within`]).
+    /// Nothing was built or sent.
+    #[error("the rows encode to more than {limit} bytes")]
+    TooLarge { limit: usize },
     #[error("could not decode clickhouse row {line:?}: {source}")]
     Decode {
         line: String,
@@ -446,6 +450,58 @@ pub fn encode_rows<T: Serialize>(rows: &[T]) -> Result<String, ClickHouseError> 
     Ok(body)
 }
 
+/// [`encode_rows`] for rows that cannot be trusted to be small, which gives
+/// up with [`ClickHouseError::TooLarge`] on a batch that would encode to more
+/// than `max_bytes`. JSON escaping can multiply a row (a control character is
+/// one byte in the row and six in the body, and the `fields` text is escaped a
+/// second time inside it), so what a batch weighs is only known once it is
+/// encoded.
+///
+/// It measures first, writing every row to a counter that keeps nothing, and
+/// stops at the row that passes the limit: a batch that is too large costs no
+/// memory, and one that fits is then written into a buffer of exactly its size
+/// (a `String` that grows by doubling can end up holding twice what it
+/// needs). The price is serializing the rows twice.
+pub fn encode_rows_within<T: Serialize>(
+    rows: &[T],
+    max_bytes: usize,
+) -> Result<String, ClickHouseError> {
+    struct Count(usize);
+
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut size = 0usize;
+    for row in rows {
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, row).map_err(ClickHouseError::Encode)?;
+        // The row and its newline.
+        size = size.saturating_add(count.0 + 1);
+        if size > max_bytes {
+            return Err(ClickHouseError::TooLarge { limit: max_bytes });
+        }
+    }
+    let mut body = Vec::with_capacity(size);
+    for row in rows {
+        serde_json::to_writer(&mut body, row).map_err(ClickHouseError::Encode)?;
+        body.push(b'\n');
+    }
+    // serde_json writes UTF-8 and nothing else.
+    String::from_utf8(body).map_err(|_| {
+        ClickHouseError::Encode(<serde_json::Error as serde::ser::Error>::custom(
+            "serde_json wrote bytes that are not UTF-8",
+        ))
+    })
+}
+
 /// Makes a typed query-parameter value (`String`, `UUID`, `Int64`, ...) arrive
 /// byte-for-byte. ClickHouse parses those values in its "escaped" (TSV) text
 /// format: a raw tab or newline is a parse error, and backslash sequences are
@@ -517,7 +573,7 @@ fn validate_identifier(name: &str) -> Result<&str, ClickHouseError> {
 mod tests {
     use super::{
         BASE_SETTINGS, ClickHouse, ClickHouseError, RESERVED_SETTINGS, encode_rows,
-        escape_param_value, push_extra_settings, validate_identifier,
+        encode_rows_within, escape_param_value, push_extra_settings, validate_identifier,
     };
 
     /// Every SELECT is bounded on the server and stops there when the client
@@ -624,6 +680,29 @@ mod tests {
             ));
         }
         assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// `encode_rows_within` writes what `encode_rows` writes, into a buffer of
+    /// exactly that size, and refuses (building nothing) a batch over the limit,
+    /// at the row that passes it.
+    #[test]
+    fn rows_are_encoded_to_the_size_they_are_and_refused_over_the_limit() {
+        let rows: Vec<serde_json::Value> = (0..50)
+            .map(|n| serde_json::json!({ "n": n, "text": "x\u{1}y".repeat(n) }))
+            .collect();
+        let plain = encode_rows(&rows).unwrap();
+        let sized = encode_rows_within(&rows, plain.len()).unwrap();
+        assert_eq!(sized, plain);
+        assert_eq!(sized.capacity(), sized.len(), "no room wasted");
+        assert!(matches!(
+            encode_rows_within(&rows, plain.len() - 1),
+            Err(ClickHouseError::TooLarge { limit }) if limit == plain.len() - 1
+        ));
+        assert!(matches!(
+            encode_rows_within(&rows, 10),
+            Err(ClickHouseError::TooLarge { .. })
+        ));
+        assert_eq!(encode_rows_within::<serde_json::Value>(&[], 0).unwrap(), "");
     }
 
     #[test]

@@ -12,11 +12,11 @@ use axum::http::StatusCode;
 use common::{
     LogCapture,
     logs::{
-        eventually, first_response, ingest_head, ingest_request, messages, post_json, post_logs,
-        post_to, seed_source, seed_source_with, serve, source_config, stored_rows, test_cipher,
-        unreachable_pool,
+        closed_by_server, eventually, first_response, ingest_head, ingest_request, messages,
+        post_bytes_to, post_json, post_logs, post_to, seed_source, seed_source_with, serve,
+        source_config, stored_rows, unreachable_pool,
     },
-    public_app, seed_project, state_with_clickhouse, test_public_app,
+    public_app, seed_project, state_with_clickhouse, test_cipher, test_public_app,
 };
 use nami_engine::{
     clickhouse::ClickHouse,
@@ -24,7 +24,7 @@ use nami_engine::{
         LogsState,
         ingest::BodyPace,
         normalize::{FIELDS_TRUNCATED_KEY, MAX_MESSAGE_BYTES, TRUNCATION_MARKER},
-        rate_limit::{InFlight, TokenBuckets},
+        rate_limit::{DecodeShares, InFlight, TokenBuckets},
     },
     models::source::{self, SourceConfig},
     router::{build_public_router, build_public_router_with_ingest_limits},
@@ -953,7 +953,12 @@ async fn a_client_that_hangs_up_during_the_insert_still_has_its_events_stored_an
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     leaving.shutdown().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The server drops the request it was serving and closes the connection:
+    // from here on it is only the insert that holds the place.
+    assert!(
+        closed_by_server(&mut leaving, WAIT).await,
+        "the server never closed the connection"
+    );
 
     let message = json!({ "message": "next" });
     let (status, _, _) = post_to(served.addr, &token, &message, WAIT).await.unwrap();
@@ -1013,10 +1018,17 @@ async fn a_client_that_hangs_up_while_its_batch_waits_to_be_decoded_keeps_its_pl
         .write_all(ingest_request(&token, r#"{"message":"left behind"}"#).as_bytes())
         .await
         .unwrap();
-    // Long enough for the request to be read and its work to wait for the gate.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // The work counts as a user of its source's decode gate from its first
+    // step: once it does, it is running, and waiting for the decode place.
+    eventually("the work is waiting to decode", WAIT, || {
+        logs.decode_shares.count(source_id) == 1
+    })
+    .await;
     leaving.shutdown().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        closed_by_server(&mut leaving, WAIT).await,
+        "the server never closed the connection"
+    );
 
     let message = json!({ "message": "next" });
     let (status, _, _) = post_to(served.addr, &token, &message, WAIT).await.unwrap();
@@ -1223,6 +1235,239 @@ async fn more_than_one_content_encoding_is_415(pool: sqlx::PgPool) {
     ch.drop_database().await.unwrap();
 }
 
+/// One token cannot fill the engine's few decode places either: a source has
+/// a few of its own, and its other bodies wait at a gate of their own, so the
+/// other sources are served at once. Here the source has one place and it is
+/// taken.
+#[sqlx::test]
+async fn one_source_cannot_monopolize_the_decode_places(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let logs = Arc::new(LogsState {
+        decode_shares: DecodeShares::new(1),
+        ..LogsState::default()
+    });
+    let state = AppState {
+        logs: logs.clone(),
+        ..state
+    };
+    let served = serve(build_public_router(state)).await;
+    let project = seed_project(&pool).await;
+    let (a, token_a) = seed_source(&pool, project, "a").await;
+    let (_, token_b) = seed_source(&pool, project, "b").await;
+    let today = chrono::Utc::now().date_naive();
+
+    let share = logs.decode_shares.acquire(a).await;
+    let waiting = post_to(
+        served.addr,
+        &token_a,
+        &json!({ "message": "a" }),
+        Duration::from_millis(500),
+    )
+    .await;
+    assert!(waiting.is_err(), "a has no decode place free: it waits");
+    let (status, _, _) = post_to(served.addr, &token_b, &json!({ "message": "b" }), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::ACCEPTED, "b is not held back by a");
+
+    // The request of a that gave up waiting is still being served.
+    drop(share);
+    eventually("a's request is stored after all", WAIT, || {
+        logs.usage.pending(a, today).events == 1
+    })
+    .await;
+    assert_eq!(stored_rows(&ch, project).await.len(), 2);
+    ch.drop_database().await.unwrap();
+}
+
+/// An insert body is held in memory until ClickHouse has taken it, which can
+/// be 25 s: the places of the endpoint bound the small ones, but a large one
+/// (above 8 MiB) keeps its decode place meanwhile, so that no more than a few
+/// exist at once. Here the only decode place is held by the large body's
+/// insert, and the next request waits for it.
+#[sqlx::test]
+async fn a_large_batch_keeps_its_decode_place_until_clickhouse_has_taken_it(pool: sqlx::PgPool) {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(1500)))
+        .mount(&slow)
+        .await;
+    let state = AppState {
+        clickhouse: ClickHouse::new(&slow.uri(), "nami", "nami", "nami_unused"),
+        ..AppState::for_test(pool.clone())
+    };
+    let logs = state.logs.clone();
+    let limits = IngestLimits {
+        decodes: Arc::new(Semaphore::new(1)),
+        ..IngestLimits::default()
+    };
+    let decodes = limits.decodes.clone();
+    let served = serve(build_public_router_with_ingest_limits(state, limits)).await;
+    let project = seed_project(&pool).await;
+    let (source_id, token) = seed_source(&pool, project, "api").await;
+    let today = chrono::Utc::now().date_naive();
+
+    // 180 events of 64 KB of text: a 10 MB insert body, 12 KB gzipped.
+    let large: Vec<Value> = (0..180)
+        .map(|n| json!({ "message": format!("{n} {}", "x".repeat(60_000)) }))
+        .collect();
+    let large = gzip(&serde_json::to_vec(&large).unwrap());
+    let sending = tokio::spawn({
+        let (addr, token) = (served.addr, token.clone());
+        async move {
+            post_bytes_to(addr, &token, &[JSON, GZIP], large, WAIT)
+                .await
+                .unwrap()
+                .0
+        }
+    });
+    let deadline = Instant::now() + WAIT;
+    while slow.received_requests().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the insert never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        decodes.available_permits(),
+        0,
+        "the large body holds its place while it is inserted"
+    );
+
+    // A small request needs a decode place and has to wait for it; it is
+    // still served once the large one is done.
+    let small = json!({ "message": "small" });
+    let waiting = post_to(served.addr, &token, &small, Duration::from_millis(500)).await;
+    assert!(
+        waiting.is_err(),
+        "the decode place is held by the large body"
+    );
+    assert_eq!(slow.received_requests().await.unwrap().len(), 1);
+
+    assert_eq!(sending.await.unwrap(), StatusCode::ACCEPTED);
+    eventually("the small request is stored too", WAIT, || {
+        logs.usage.pending(source_id, today).events == 181
+    })
+    .await;
+    assert_eq!(decodes.available_permits(), 1, "and every place is back");
+}
+
+/// A small insert body does not: its place goes back as soon as it is made, so
+/// the requests behind it are decoded while it waits for ClickHouse.
+#[sqlx::test]
+async fn a_small_batch_gives_its_decode_place_back_before_its_insert(pool: sqlx::PgPool) {
+    use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(1500)))
+        .mount(&slow)
+        .await;
+    let state = AppState {
+        clickhouse: ClickHouse::new(&slow.uri(), "nami", "nami", "nami_unused"),
+        ..AppState::for_test(pool.clone())
+    };
+    let limits = IngestLimits {
+        decodes: Arc::new(Semaphore::new(1)),
+        ..IngestLimits::default()
+    };
+    let decodes = limits.decodes.clone();
+    let served = serve(build_public_router_with_ingest_limits(state, limits)).await;
+    let project = seed_project(&pool).await;
+    let (_, token_a) = seed_source(&pool, project, "a").await;
+    let (_, token_b) = seed_source(&pool, project, "b").await;
+
+    let first = tokio::spawn({
+        let (addr, token) = (served.addr, token_a.clone());
+        async move {
+            post_to(addr, &token, &json!({ "message": "first" }), WAIT)
+                .await
+                .unwrap()
+                .0
+        }
+    });
+    let deadline = Instant::now() + WAIT;
+    while slow.received_requests().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the insert never started");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(decodes.available_permits(), 1, "its place is already back");
+
+    let second = tokio::spawn({
+        let (addr, token) = (served.addr, token_b.clone());
+        async move {
+            post_to(addr, &token, &json!({ "message": "second" }), WAIT)
+                .await
+                .unwrap()
+                .0
+        }
+    });
+    // The second insert reaches ClickHouse while the first is still waiting.
+    let deadline = Instant::now() + Duration::from_millis(900);
+    while slow.received_requests().await.unwrap().len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the second request was held up behind the first one's insert"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(first.await.unwrap(), StatusCode::ACCEPTED);
+    assert_eq!(second.await.unwrap(), StatusCode::ACCEPTED);
+}
+
+/// A body that decodes to little can store as a great deal: 479 events of two
+/// strings of control characters are 52 MB inflated and 60 KB gzipped, and
+/// would have been 150 MiB of rows and a 322 MiB insert body (a control
+/// character is six bytes of JSON). It is refused, as one that stays under
+/// the cap of rows but not the cap of the insert body is.
+#[sqlx::test]
+async fn a_body_that_stores_far_more_than_it_decodes_to_is_refused(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let public = public_app(state);
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+
+    let events = |count: usize, field: bool| {
+        let mut out = vec![0xdc];
+        out.extend((count as u16).to_be_bytes());
+        for _ in 0..count {
+            out.push(if field { 0x82 } else { 0x81 });
+            out.extend([0xa7]);
+            out.extend(b"message");
+            out.push(0xdb);
+            out.extend(65_536u32.to_be_bytes());
+            out.extend(vec![1u8; 65_536]);
+            if field {
+                out.extend([0xa1, b'a', 0xda]);
+                out.extend(43_689u16.to_be_bytes());
+                out.extend(vec![1u8; 43_689]);
+            }
+        }
+        out
+    };
+    for (what, body) in [
+        ("rows over the cap", events(479, true)),
+        ("an insert body over the cap", events(790, false)),
+    ] {
+        let wire = gzip(&body);
+        assert!(
+            wire.len() < 100 * 1024,
+            "{what}: {} bytes on the wire",
+            wire.len()
+        );
+        let started = Instant::now();
+        let (status, _, json) = post_logs(&public, Some(&token), &[MSGPACK, GZIP], wire).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{what}: {json}");
+        assert!(
+            json["error"].as_str().unwrap().contains("once stored"),
+            "{what}: {json}"
+        );
+        assert!(started.elapsed() < WAIT, "{what}: {:?}", started.elapsed());
+    }
+    assert!(stored_rows(&ch, project).await.is_empty());
+    ch.drop_database().await.unwrap();
+}
+
 async fn wait_for_a_lock_wait(pool: &sqlx::PgPool, statement: &str) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -1283,7 +1528,7 @@ async fn tokens_never_appear_in_log_output(pool: sqlx::PgPool) {
 
     let (state, ch) = state_with_clickhouse(&pool).await;
     let project = seed_project(&pool).await;
-    let (_, token) = seed_source(&pool, project, "api").await;
+    let (source_id, token) = seed_source(&pool, project, "api").await;
     let working = public_app(state);
     assert_eq!(
         post_json(&working, &token, json!({ "message": "fine" }))
@@ -1322,6 +1567,15 @@ async fn tokens_never_appear_in_log_output(pool: sqlx::PgPool) {
     assert!(
         output.contains("clickhouse error"),
         "the capture works: {output}"
+    );
+    // The failed insert is logged where it happened, with its source and no token.
+    let failed = output
+        .lines()
+        .find(|line| line.contains("clickhouse error"))
+        .unwrap();
+    assert!(
+        failed.contains(&source_id.to_string()),
+        "the line names the source: {failed}"
     );
     for secret in [&token, &wrong, &unknown] {
         assert!(

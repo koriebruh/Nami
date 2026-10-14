@@ -11,6 +11,13 @@
 //! work and the memory it cost are bounded by [`MAX_DECODED_BYTES`] however
 //! small the body is.
 //!
+//! Everything is charged before it is built (a string, an object key, a
+//! container), with one exception outside the decoders' hands: `serde_json`
+//! reads a JSON string that has escapes into a scratch buffer of its own,
+//! which grows to the longest such string before the string is charged. That
+//! buffer is bounded by the body, so by the 50 MiB it may inflate to, and is
+//! not a way around the budget.
+//!
 //! The costs are estimates of the heap a value takes in `serde_json`, rounded
 //! up where a container grows by doubling (a `Vec` is up to twice its length
 //! in capacity), so a budget is a bound on memory and not an exact count. The

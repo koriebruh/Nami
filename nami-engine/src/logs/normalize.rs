@@ -204,12 +204,63 @@ fn ceil_to_millis(dt: DateTime<Utc>) -> DateTime<Utc> {
     }
 }
 
-/// Strings as they are; `null` as empty; anything else as its JSON text.
+/// Strings as they are; `null` as empty; anything else as its JSON text, made
+/// only as far as the message cap needs ([`json_text_prefix`]): a message that
+/// is an array of a million strings is cut where it passes the cap, not after
+/// the whole of its text (several times the size of the value) has been made.
 fn message_text(value: Value) -> String {
     match value {
         Value::String(text) => text,
         Value::Null => String::new(),
-        other => other.to_string(),
+        // Up to a whole character past the cap, so that [`truncate_message`]
+        // sees exactly what it would have seen of the whole text.
+        other => json_text_prefix(&other, MAX_MESSAGE_BYTES + 4),
+    }
+}
+
+/// The first `max_bytes` bytes of `value` as JSON text (fewer if the text is
+/// shorter, or if the cut falls inside a character: the partial character is
+/// dropped). Serialization stops as soon as the limit is reached.
+fn json_text_prefix<T: serde::Serialize + ?Sized>(value: &T, max_bytes: usize) -> String {
+    struct Prefix {
+        bytes: Vec<u8>,
+        max: usize,
+    }
+
+    impl std::io::Write for Prefix {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let room = self.max - self.bytes.len();
+            if buf.len() > room {
+                self.bytes.extend_from_slice(&buf[..room]);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "enough of the text has been written",
+                ));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut prefix = Prefix {
+        bytes: Vec::new(),
+        max: max_bytes,
+    };
+    // The only way writing a `Value` fails is the limit being reached (and the
+    // error is what stops the serialization there).
+    let _ = serde_json::to_writer(&mut prefix, value);
+    match String::from_utf8(prefix.bytes) {
+        Ok(text) => text,
+        Err(error) => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).unwrap_or_default()
+        }
     }
 }
 
@@ -312,13 +363,17 @@ pub fn checked_id(id: String, len: usize, key: &str, fields: &mut Map<String, Va
 
 /// Cuts the message to [`MAX_MESSAGE_BYTES`] (on a character boundary),
 /// ending in [`TRUNCATION_MARKER`].
+///
+/// The kept prefix is copied into a string of its own size: `String::truncate`
+/// keeps the allocation, and a message of 50 MiB would go on holding all of it
+/// behind its 64 KiB.
 pub fn truncate_message(message: String) -> String {
     if message.len() <= MAX_MESSAGE_BYTES {
         return message;
     }
     let cut = message.floor_char_boundary(MAX_MESSAGE_BYTES - TRUNCATION_MARKER.len());
-    let mut truncated = message;
-    truncated.truncate(cut);
+    let mut truncated = String::with_capacity(cut + TRUNCATION_MARKER.len());
+    truncated.push_str(&message[..cut]);
     truncated.push_str(TRUNCATION_MARKER);
     truncated
 }
@@ -580,6 +635,94 @@ mod tests {
                 .chars()
                 .all(|c| c == 'é')
         );
+    }
+
+    /// A message that is not a string is its JSON text, cut like any other
+    /// message. The text is only made as far as the cap, but what comes out is
+    /// exactly what cutting the whole text would give, wherever the cap falls
+    /// (in the middle of a multi-byte character included).
+    #[test]
+    fn a_message_that_is_not_a_string_is_cut_as_the_whole_of_its_text_would_be() {
+        let cases = [
+            json!([1, 2, 3]),
+            json!({ "a": "é".repeat(MAX_MESSAGE_BYTES) }),
+            json!(vec!["é"; MAX_MESSAGE_BYTES]),
+            json!(vec![1234567; MAX_MESSAGE_BYTES / 4]),
+            json!(vec!["\u{1}"; 40_000]),
+            json!(vec!["€uro"; 30_000]),
+            json!([vec!["😀"; 20_000]]),
+        ];
+        for value in cases {
+            let whole = value.to_string();
+            assert_eq!(
+                event(json!({ "message": value })).message,
+                truncate_message(whole.clone()),
+                "{} bytes of text",
+                whole.len()
+            );
+        }
+        // Every length around the cap, with a character of each width straddling it.
+        for width_char in ["a", "é", "€", "😀"] {
+            for extra in 0..8 {
+                let text = format!(
+                    "{}{}",
+                    width_char.repeat(MAX_MESSAGE_BYTES / 4),
+                    "z".repeat(extra)
+                );
+                for pad in 0..6 {
+                    let value = json!([format!("{}{text}", "p".repeat(pad))]);
+                    assert!(message_text(value.clone()).len() <= MAX_MESSAGE_BYTES + 4);
+                    assert_eq!(
+                        truncate_message(message_text(value.clone())),
+                        truncate_message(value.to_string()),
+                        "{width_char:?} + {extra} + pad {pad}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_text_of_a_value_is_made_only_as_far_as_the_cap() {
+        // A value whose text never ends: serialization has to stop at the cap,
+        // or this does not return.
+        struct Endless;
+
+        impl serde::Serialize for Endless {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(None)?;
+                for n in 0u64.. {
+                    seq.serialize_element(&n)?;
+                }
+                seq.end()
+            }
+        }
+
+        let text = json_text_prefix(&Endless, 100);
+        assert_eq!(text.len(), 100);
+        assert!(text.starts_with("[0,1,2,3,4,5,6,7,8,9,10,"), "{text}");
+        assert_eq!(json_text_prefix(&json!([1, 2]), 100), "[1,2]");
+        assert_eq!(
+            json_text_prefix(&json!(["é"]), 3),
+            "[\"",
+            "a cut inside a character drops it"
+        );
+    }
+
+    /// `String::truncate` keeps the allocation, so a message of megabytes
+    /// would go on holding all of it behind its 64 KiB.
+    #[test]
+    fn a_truncated_message_holds_only_what_it_keeps() {
+        let truncated = truncate_message("x".repeat(8 * 1024 * 1024));
+        assert_eq!(truncated.len(), MAX_MESSAGE_BYTES);
+        assert!(
+            truncated.capacity() <= MAX_MESSAGE_BYTES + 16,
+            "{}",
+            truncated.capacity()
+        );
+        let kept = truncate_message("short".to_string());
+        assert_eq!(kept, "short");
     }
 
     #[test]

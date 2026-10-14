@@ -9,8 +9,9 @@
 //! when a request has been stored, so a request that is still in flight is
 //! not in the total yet, and a request that crosses the quota is accepted
 //! whole. The overshoot of a source is bounded by the requests it has in
-//! flight (at most `rate_limit::MAX_IN_FLIGHT_PER_SOURCE`, each of up to about
-//! 100 MB stored) plus about one flush interval of traffic per instance.
+//! flight (at most `rate_limit::MAX_IN_FLIGHT_PER_SOURCE`, each storing at most
+//! `ingest::MAX_ENCODED_BYTES`, 100 MiB, of message and fields) plus about one
+//! flush interval of traffic per instance.
 
 use std::{
     collections::HashMap,

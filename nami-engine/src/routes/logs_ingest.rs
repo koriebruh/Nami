@@ -15,7 +15,7 @@ use crate::{
     clickhouse::ClickHouse,
     logs::{
         LogsState,
-        ingest::{self, BodyEncoding, BodyPace, IngestError},
+        ingest::{self, BodyEncoding, BodyPace, IngestError, Prepared},
         rate_limit::InFlightGuard,
         store,
     },
@@ -33,12 +33,22 @@ use crate::{
 ///
 /// The places bound the requests, and so the bodies *as received* (each up to
 /// [`ingest::MAX_BODY_BYTES`]); they do not bound what a body takes once it is
-/// decoded. That is bounded separately: at most [`MAX_DECODES_IN_FLIGHT`]
-/// bodies are inflated, decoded and turned into rows at a time, each decode is
-/// capped by [`crate::logs::budget::MAX_DECODED_BYTES`], and after it a
-/// request keeps only the encoded insert body until ClickHouse has taken it.
-/// Ordinary batches take a few MiB; the worst case per decode is a few hundred
-/// MiB (the budget, the inflated body of up to 50 MiB, and the rows).
+/// decoded and stored. That is bounded separately:
+/// - at most [`MAX_DECODES_IN_FLIGHT`] bodies are inflated, decoded and turned
+///   into rows at a time, and at most
+///   [`crate::logs::rate_limit::MAX_DECODES_PER_SOURCE`] of one source;
+/// - a decode may build up to [`crate::logs::budget::MAX_DECODED_BYTES`] of
+///   values and [`ingest::MAX_ENCODED_BYTES`] of rows and of insert body, over
+///   which the request is a 413; the worst case for one decode is about 300 MiB
+///   (ordinary batches take a few MiB);
+/// - after the decode only the encoded insert body is kept, until ClickHouse
+///   has taken it. A body above [`ingest::LARGE_BODY_BYTES`] keeps its decode
+///   place meanwhile, so no more than [`MAX_DECODES_IN_FLIGHT`] of those exist
+///   at once, and the smaller ones are bounded by the places of the endpoint.
+///
+/// All of it together stays under 2 GiB however the requests are made up (the
+/// bodies as received, 32 x 10 MiB; four decodes or large bodies, 4 x 300
+/// MiB; the small bodies waiting for ClickHouse, 28 x 8 MiB).
 ///
 /// Every phase has a deadline, so a stalled client or backend gives its place
 /// back in the end: the body arrives at the pace of [`BodyPace`], Postgres has
@@ -60,7 +70,9 @@ pub const MAX_INGEST_QUERIES_IN_FLIGHT: usize = 8;
 
 /// How many bodies may be inflated, decoded and turned into rows at once:
 /// that work takes memory in proportion to what a body decodes to, and the
-/// places of the endpoint alone would let 32 hostile bodies do it together.
+/// places of the endpoint alone would let 32 hostile bodies do it together. A
+/// body that turns out large keeps its place until it has been sent (see
+/// [`ingest::LARGE_BODY_BYTES`]).
 pub const MAX_DECODES_IN_FLIGHT: usize = 4;
 
 /// What limits the ingest endpoint besides the sizes of bodies.
@@ -229,32 +241,39 @@ impl Work {
     /// recorded right after the insert, with nothing that can be cancelled
     /// in between. Returns how many events were stored.
     async fn store(self, body: Bytes, encoding: BodyEncoding) -> Result<usize, IngestError> {
-        let prepared = ingest::prepare(
+        let Prepared {
+            body: encoded,
+            events,
+            bytes,
+            // A large body keeps its place for decoding until the end.
+            place: _held,
+        } = ingest::prepare(
             body,
             encoding,
             &self.source,
             self.received_at,
             &self.decodes,
+            &self.logs.decode_shares,
         )
         .await?;
-        if prepared.events > 0 {
-            store::insert_encoded_logs(&self.clickhouse, prepared.body)
+        if events > 0 {
+            store::insert_encoded_logs(&self.clickhouse, encoded)
                 .await
                 .map_err(|error| {
                     // Logged here: with the client gone there is no response to
                     // carry it. ClickHouse's text can include SQL and schema
                     // details, so the client only ever sees "internal error".
-                    tracing::error!(%error, "clickhouse error");
+                    tracing::error!(%error, source_id = %self.source.id, "clickhouse error");
                     IngestError::Internal
                 })?;
             self.logs.usage.record_accepted(
                 self.source.id,
                 self.received_at.date_naive(),
-                prepared.events as u64,
-                prepared.bytes,
+                events as u64,
+                bytes,
             );
         }
-        Ok(prepared.events)
+        Ok(events)
     }
 }
 

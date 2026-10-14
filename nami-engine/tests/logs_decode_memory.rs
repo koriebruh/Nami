@@ -2,8 +2,14 @@
 // bytes of a body, not what it decodes to: 50 MiB of MessagePack zeros inside
 // one array decoded to 1.8 GB. A counting allocator measures the heap that is
 // live at once (the figure an unbounded decode would blow up, and one that
-// does not depend on the machine the way RSS does). This binary holds a single
-// test, so nothing else allocates while it measures.
+// does not depend on the machine the way RSS does). It measures the decoders
+// (`what_a_hostile_body_decodes_to_is_bounded...`) and then the whole of what
+// a body costs on its way to ClickHouse: decoded, normalized into rows, and
+// encoded as the insert body (`what_a_body_costs_once_it_is_stored...`),
+// because a body that decodes to little can store as a great deal (a control
+// character is one byte in a message and six in the JSON that is sent). This
+// binary runs one test, which calls them in turn, so nothing else allocates
+// while it measures.
 use std::{
     alloc::{GlobalAlloc, Layout, System},
     sync::atomic::{AtomicUsize, Ordering::Relaxed},
@@ -11,13 +17,18 @@ use std::{
 };
 
 use axum::body::Bytes;
-use nami_engine::logs::{
-    budget::MAX_DECODED_BYTES,
-    ingest::{
-        self, BodyEncoding, BodyFormat, IngestError, MAX_DECOMPRESSED_BYTES, MAX_EVENTS, gunzip,
+use nami_engine::{
+    logs::{
+        budget::MAX_DECODED_BYTES,
+        ingest::{
+            self, BodyEncoding, BodyFormat, IngestError, LARGE_BODY_BYTES, MAX_DECOMPRESSED_BYTES,
+            MAX_ENCODED_BYTES, MAX_EVENTS, gunzip,
+        },
     },
+    models::source::IngestSource,
 };
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 struct Counting;
 
@@ -130,6 +141,11 @@ fn assert_refused_within_the_ceiling(
 }
 
 #[test]
+fn what_a_body_costs_in_memory_is_bounded_from_decoding_to_the_insert_body() {
+    what_a_hostile_body_decodes_to_is_bounded_whatever_its_size();
+    what_a_body_costs_once_it_is_stored_is_bounded_too();
+}
+
 fn what_a_hostile_body_decodes_to_is_bounded_whatever_its_size() {
     // 50 MiB of MessagePack zeros in one array: 51 KB gzipped, 1.8 GB decoded
     // without a budget.
@@ -242,4 +258,176 @@ fn what_a_hostile_body_decodes_to_is_bounded_whatever_its_size() {
         peak / MIB
     );
     assert!(peak <= DECODE_CEILING);
+}
+
+fn source() -> IngestSource {
+    IngestSource {
+        id: Uuid::new_v4(),
+        project_id: Uuid::new_v4(),
+        retention_days: 30,
+        daily_byte_quota: None,
+    }
+}
+
+/// The most one body may hold, beyond itself, from its values to its insert
+/// body ([`ingest::build_batch`]): the values at their most (the decode
+/// ceiling) and the rows made from them (capped at [`MAX_ENCODED_BYTES`]) are
+/// alive together; the insert body is built only after the values are gone.
+const BATCH_CEILING: usize = DECODE_CEILING + MAX_ENCODED_BYTES;
+
+/// A MessagePack string.
+fn msgpack_str(out: &mut Vec<u8>, bytes: &[u8]) {
+    match bytes.len() {
+        n if n < 32 => out.push(0xa0 | n as u8),
+        n if n < 256 => out.extend([0xd9, n as u8]),
+        n if n < 65_536 => {
+            out.push(0xda);
+            out.extend((n as u16).to_be_bytes());
+        }
+        n => {
+            out.push(0xdb);
+            out.extend((n as u32).to_be_bytes());
+        }
+    }
+    out.extend(bytes);
+}
+
+/// `events` maps of two strings of control characters, as MessagePack: the
+/// message is 64 KiB and the other field 43,689 bytes, which as JSON text is
+/// just under the 256 KiB cap of `fields`.
+fn control_character_events(events: usize, message_len: usize, field_len: usize) -> Vec<u8> {
+    let (message, field) = (vec![1u8; message_len], vec![1u8; field_len]);
+    let mut out = vec![0xdc];
+    out.extend((events as u16).to_be_bytes());
+    for _ in 0..events {
+        out.push(if field_len > 0 { 0x82 } else { 0x81 });
+        msgpack_str(&mut out, b"message");
+        msgpack_str(&mut out, &message);
+        if field_len > 0 {
+            msgpack_str(&mut out, b"a");
+            msgpack_str(&mut out, &field);
+        }
+    }
+    out
+}
+
+/// Runs the work of `prepare` on `body` and says how much memory it took at
+/// most, beyond the body itself.
+fn batch(
+    what: &str,
+    body: Vec<u8>,
+    encoding: BodyEncoding,
+) -> (Result<ingest::Batch, IngestError>, usize) {
+    let body = Bytes::from(body);
+    let started = Instant::now();
+    let (outcome, peak) =
+        peak_extra(|| ingest::build_batch(body, encoding, &source(), chrono::Utc::now()));
+    eprintln!(
+        "{what}: {} after {:?}, peak {} MiB (ceiling {} MiB)",
+        match &outcome {
+            Ok(batch) => format!(
+                "{} events, {} MiB encoded",
+                batch.events,
+                batch.body.len() / MIB
+            ),
+            Err(IngestError::PayloadTooLarge(message)) => format!("refused ({message})"),
+            Err(other) => format!("{other:?}"),
+        },
+        started.elapsed(),
+        peak / MIB,
+        BATCH_CEILING / MIB
+    );
+    assert!(
+        peak <= BATCH_CEILING,
+        "{what}: {} MiB live at once, over the {} MiB ceiling",
+        peak / MIB,
+        BATCH_CEILING / MIB
+    );
+    (outcome, peak)
+}
+
+fn assert_refused_as_too_large_once_stored(
+    what: &str,
+    outcome: Result<ingest::Batch, IngestError>,
+) {
+    match outcome {
+        Err(IngestError::PayloadTooLarge(message)) => {
+            assert!(message.contains("once stored"), "{what}: {message}")
+        }
+        other => panic!("{what}: {:?}", other.map(|batch| batch.events)),
+    }
+}
+
+/// A body that decodes to little can store as a great deal. Each 0x01 in a
+/// string is one byte in MessagePack and one in the row, but six in the JSON
+/// of the insert (`\u0001`), and the `fields` text, which is JSON already, has
+/// its backslashes escaped a second time inside its row. A 60 KB gzipped
+/// MessagePack body of 479 such events (52 MB inflated, 50 MiB charged to the
+/// decode budget) made rows of 150 MiB and an insert body of 322 MiB, which
+/// `String`'s doubling grew to a buffer of 512 MiB and kept while ClickHouse
+/// was waited for. Now it is refused as the rows pass their cap, and what
+/// slips under it is encoded to the byte, or refused before anything is built.
+fn what_a_body_costs_once_it_is_stored_is_bounded_too() {
+    // The case: message and field both full of control characters.
+    let (outcome, _) = batch(
+        "479 events of control characters",
+        control_character_events(479, 65_536, 43_689),
+        MSGPACK,
+    );
+    assert_refused_as_too_large_once_stored("rows over the cap", outcome);
+
+    // Rows well under the cap (51 MB stored) that encode to 311 MB: refused by
+    // the measuring pass of the encoder, which builds nothing.
+    let (outcome, peak) = batch(
+        "790 events of a 64 KiB message of control characters",
+        control_character_events(790, 65_536, 0),
+        MSGPACK,
+    );
+    assert_refused_as_too_large_once_stored("an insert body over the cap", outcome);
+    assert!(
+        peak < DECODE_CEILING,
+        "nothing like the {} MiB body was built: {} MiB",
+        311,
+        peak / MIB
+    );
+
+    // A message that is not a string is its JSON text, which used to be made
+    // whole: here 100,000 strings of 500 control characters, 300 MB of text
+    // (more with the doubling of the buffer) for a 64 KiB message.
+    let mut spread = vec![0x81];
+    msgpack_str(&mut spread, b"message");
+    spread.extend([0xdd]);
+    spread.extend(100_000u32.to_be_bytes());
+    let chunk = vec![1u8; 500];
+    for _ in 0..100_000 {
+        msgpack_str(&mut spread, &chunk);
+    }
+    let (outcome, _) = batch(
+        "a message that is an array of 100,000 strings",
+        spread,
+        MSGPACK,
+    );
+    let one = outcome.expect("one event, a message of 64 KiB");
+    assert_eq!(one.events, 1);
+    assert!(one.bytes < 70 * 1024, "{}", one.bytes);
+
+    // A large batch that is entirely legitimate goes through, to the byte:
+    // 150 events of a 64 KiB message is 9.9 MB, over the size at which an
+    // insert body keeps its decode place.
+    let events: Vec<Value> = (0..150)
+        .map(|n| json!({ "message": format!("{n} {}", "x".repeat(65_000)), "n": n }))
+        .collect();
+    let (outcome, _) = batch(
+        "150 events of 64 KiB of text",
+        serde_json::to_vec(&events).unwrap(),
+        JSON,
+    );
+    let large = outcome.unwrap();
+    assert_eq!(large.events, 150);
+    assert!(large.body.len() > LARGE_BODY_BYTES, "{}", large.body.len());
+    assert_eq!(
+        large.body.capacity(),
+        large.body.len(),
+        "the insert body is built to its size, with no doubling left over"
+    );
 }

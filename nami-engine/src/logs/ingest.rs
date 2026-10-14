@@ -12,8 +12,10 @@
 //! What a body may cost is limited at every step, on the wire and in memory:
 //! 10 MiB as sent ([`read_body`], which also expects it to arrive at a decent
 //! [`BodyPace`]), 50 MiB after gzip ([`gunzip`], which stops inflating at the
-//! limit), 10,000 events, and [`budget::MAX_DECODED_BYTES`] of what the
-//! decoders build from it ([`budget`]).
+//! limit), 10,000 events, [`budget::MAX_DECODED_BYTES`] of what the decoders
+//! build from it ([`budget`]), and [`MAX_ENCODED_BYTES`] of what is stored and
+//! sent to ClickHouse (a body can grow again after it is decoded: JSON
+//! escaping turns one control character into six bytes).
 
 use std::{fmt, io::Read, sync::Arc, time::Duration};
 
@@ -33,22 +35,39 @@ use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value, json};
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore},
+    time::Instant,
+};
 
 use super::{
     budget::{self, Budget, TooLarge, VALUE_BYTES},
     msgpack::{self, MsgpackError},
     normalize,
-    rate_limit::REQUESTS_PER_SECOND,
+    rate_limit::{DecodeShare, DecodeShares, REQUESTS_PER_SECOND},
     store::{self, LogRow},
 };
-use crate::{error::AppError, models::source::IngestSource};
+use crate::{clickhouse::ClickHouseError, error::AppError, models::source::IngestSource};
 
 /// Largest accepted request body, as sent (compressed or not).
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
 /// Largest accepted body after gzip decompression (gzip-bomb guard).
 pub const MAX_DECOMPRESSED_BYTES: usize = 50 * 1024 * 1024;
 pub const MAX_EVENTS: usize = 10_000;
+/// The most a request may store, and the most its insert body (the rows as
+/// JSON, [`store::encode_logs`]) may weigh: twice the inflated body. A body
+/// can grow after it is decoded (a control character is one byte in a message
+/// and six in the JSON body, and `fields` is escaped once as JSON and again as
+/// the string it is in its row), so what a request stores is checked while the
+/// rows are built and again when they are encoded, and a request over it is a
+/// 413. Together with [`LARGE_BODY_BYTES`] this bounds what the bodies waiting
+/// for ClickHouse take, at the same time.
+pub const MAX_ENCODED_BYTES: usize = 2 * MAX_DECOMPRESSED_BYTES;
+/// An insert body above this keeps its place for decoding until ClickHouse has
+/// taken it ([`Prepared::place`]), so only as many of them exist at once as
+/// there are such places; smaller ones give the place back as soon as they
+/// are built (their number is bounded by the places of the endpoint).
+pub const LARGE_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// A parse error that quotes the body (serde_json does for a value of the
 /// wrong type) is cut to this many bytes: a body that is one huge string
 /// must not come back as one huge error message.
@@ -356,6 +375,15 @@ pub async fn read_body(
     Ok(Bytes::from(whole))
 }
 
+/// A place for decoding a body: one of the engine's few
+/// (`routes::logs_ingest::IngestLimits::decodes`) and one of its source's
+/// ([`DecodeShares`]). Given back when dropped.
+#[derive(Debug)]
+pub struct DecodePlace {
+    _engine: OwnedSemaphorePermit,
+    _source: DecodeShare,
+}
+
 /// A batch of events as the ingest path sends it on: the rows as the body of
 /// the ClickHouse insert, and what they count for.
 #[derive(Debug)]
@@ -365,46 +393,59 @@ pub struct Prepared {
     pub events: usize,
     /// What the rows count against usage and quotas ([`LogRow::stored_bytes`]).
     pub bytes: u64,
+    /// The place the body was made in, still held when the body is larger than
+    /// [`LARGE_BODY_BYTES`]: keep it until the body has been sent, so that no
+    /// more than a few large bodies exist at the same time. `None` for a small
+    /// body, whose place went back when it was made.
+    pub place: Option<DecodePlace>,
 }
 
 /// Turns a body into what to send to ClickHouse for `source`: decompress,
 /// parse, normalize ([`build_rows`]) and encode the insert body
 /// ([`store::encode_logs`]), on a blocking thread, with a place of `decodes`
-/// held for as long as that runs. The work is CPU-bound (about 50 ms for a
-/// typical batch of 10,000 events, up to a second for one of large messages)
-/// and takes memory in proportion (see [`budget`]): on an async worker it
-/// would stall every other request that worker serves, and left to the places
-/// of the endpoint alone, 32 hostile bodies could be decoded at once.
+/// (and one of the source's `shares`) held for as long as that runs. The work
+/// is CPU-bound (about 50 ms for a typical batch of 10,000 events, up to a
+/// second for one of large messages) and takes memory in proportion (see
+/// [`budget`]): on an async worker it would stall every other request that
+/// worker serves, and left to the places of the endpoint alone, 32 hostile
+/// bodies could be decoded at once.
 ///
-/// The place is moved into the blocking task and released when it ends: a
-/// blocking task cannot be cancelled, so it must keep the place even if
-/// whoever awaits it is gone. The rows are dropped there too, so only the
-/// encoded body stays in memory while ClickHouse is waited for.
+/// The place is moved into the blocking task: a blocking task cannot be
+/// cancelled, so it must keep the place even if whoever awaits it is gone. The
+/// rows are dropped there too, so only the encoded body stays in memory while
+/// ClickHouse is waited for, and a body that is large ([`LARGE_BODY_BYTES`])
+/// takes the place with it ([`Prepared::place`]).
 pub async fn prepare(
     body: Bytes,
     encoding: BodyEncoding,
     source: &IngestSource,
     received_at: DateTime<Utc>,
     decodes: &Arc<Semaphore>,
+    shares: &DecodeShares,
 ) -> Result<Prepared, IngestError> {
-    let place = decodes
+    // The source's own gate first, so that what it has beyond its share waits
+    // there and not in the queue for the engine's places.
+    let share = shares.acquire(source.id).await;
+    let engine = decodes
         .clone()
         .acquire_owned()
         .await
         .map_err(|_| IngestError::Internal)?;
+    let place = DecodePlace {
+        _engine: engine,
+        _source: share,
+    };
     let source = source.clone();
     tokio::task::spawn_blocking(move || {
-        let _place = place;
-        let rows = build_rows(body, encoding, &source, received_at)?;
-        let bytes = rows.iter().map(LogRow::stored_bytes).sum();
-        let body = store::encode_logs(&rows).map_err(|error| {
-            tracing::error!(%error, "could not encode a log batch");
-            IngestError::Internal
-        })?;
+        let batch = build_batch(body, encoding, &source, received_at)?;
+        // Only the body is kept (the rows are gone); a large one keeps the
+        // place too.
+        let place = (batch.body.len() > LARGE_BODY_BYTES).then_some(place);
         Ok(Prepared {
-            body,
-            events: rows.len(),
-            bytes,
+            body: batch.body,
+            events: batch.events,
+            bytes: batch.bytes,
+            place,
         })
     })
     .await
@@ -414,17 +455,78 @@ pub async fn prepare(
     })?
 }
 
-/// The synchronous part of [`prepare`]: the rows of a body.
+/// What [`prepare`] makes of a body, before any place is attached.
+#[derive(Debug)]
+pub struct Batch {
+    /// The `JSONEachRow` body of the rows ([`store::encode_logs`]), in a
+    /// buffer of exactly its size.
+    pub body: String,
+    pub events: usize,
+    /// What the rows count against usage and quotas ([`LogRow::stored_bytes`]).
+    pub bytes: u64,
+}
+
+/// The work of [`prepare`] without its thread and its places: decompress,
+/// parse, build the rows ([`build_rows`], refused over [`MAX_ENCODED_BYTES`]
+/// stored) and encode the insert body (refused over [`MAX_ENCODED_BYTES`]
+/// encoded, before anything is built). The rows are gone when it returns.
+pub fn build_batch(
+    body: Bytes,
+    encoding: BodyEncoding,
+    source: &IngestSource,
+    received_at: DateTime<Utc>,
+) -> Result<Batch, IngestError> {
+    let rows = build_rows(body, encoding, source, received_at)?;
+    let bytes = rows.iter().map(LogRow::stored_bytes).sum();
+    let encoded = match store::encode_logs(&rows, MAX_ENCODED_BYTES) {
+        Ok(encoded) => encoded,
+        Err(ClickHouseError::TooLarge { .. }) => return Err(stored_too_large()),
+        Err(error) => {
+            tracing::error!(%error, "could not encode a log batch");
+            return Err(IngestError::Internal);
+        }
+    };
+    Ok(Batch {
+        body: encoded,
+        events: rows.len(),
+        bytes,
+    })
+}
+
+/// The synchronous part of [`prepare`]: the rows of a body. Gives up with a
+/// 413 as soon as what they store passes [`MAX_ENCODED_BYTES`] (the insert body
+/// cannot be smaller than what it stores), rather than building the rest.
 pub fn build_rows(
     body: Bytes,
     encoding: BodyEncoding,
     source: &IngestSource,
     received_at: DateTime<Utc>,
 ) -> Result<Vec<LogRow>, IngestError> {
-    Ok(decode_events(body, encoding)?
-        .into_iter()
-        .map(|object| store::build_row(normalize::from_json(object, received_at), source))
-        .collect())
+    build_rows_within(body, encoding, source, received_at, MAX_ENCODED_BYTES)
+}
+
+/// [`build_rows`] with the cap of the rows' stored bytes as a parameter.
+pub fn build_rows_within(
+    body: Bytes,
+    encoding: BodyEncoding,
+    source: &IngestSource,
+    received_at: DateTime<Utc>,
+    max_stored_bytes: usize,
+) -> Result<Vec<LogRow>, IngestError> {
+    let events = decode_events(body, encoding)?;
+    let mut rows = Vec::with_capacity(events.len());
+    let mut stored = 0u64;
+    // Each event is dropped as its row is made: the values it held go as the
+    // rows grow.
+    for object in events {
+        let row = store::build_row(normalize::from_json(object, received_at), source);
+        stored += row.stored_bytes();
+        if stored > max_stored_bytes as u64 {
+            return Err(stored_too_large());
+        }
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// Decompresses (when gzip) and parses a body into event objects.
@@ -457,6 +559,13 @@ pub fn decode_events(
 
 fn too_many_events() -> IngestError {
     IngestError::PayloadTooLarge(format!("too many events: at most {MAX_EVENTS} per request"))
+}
+
+fn stored_too_large() -> IngestError {
+    IngestError::PayloadTooLarge(format!(
+        "request body takes more than {} MiB once stored: send fewer or smaller events",
+        MAX_ENCODED_BYTES / (1024 * 1024)
+    ))
 }
 
 fn decoded_too_large() -> IngestError {
@@ -581,8 +690,9 @@ impl Spend<'_> {
 }
 
 /// Builds a `serde_json::Value` as `Value::deserialize` does, charging the
-/// budget for each piece before it allocates it: a body of 50 MiB of `0,`
-/// stops after a few million values instead of building them all.
+/// budget for each piece before it allocates it (what `serde_json` itself
+/// buffers to unescape a string aside, see [`budget`]): a body of 50 MiB of
+/// `0,` stops after a few million values instead of building them all.
 struct Counted<'a>(Spend<'a>);
 
 impl<'de> DeserializeSeed<'de> for Counted<'_> {
@@ -665,12 +775,37 @@ fn read_object<'de, A: MapAccess<'de>>(
 ) -> Result<Map<String, Value>, A::Error> {
     spend.charge::<A::Error>(|budget| budget.object())?;
     let mut object = Map::new();
-    while let Some(key) = map.next_key::<String>()? {
-        spend.charge::<A::Error>(|budget| budget.key(key.len()))?;
+    while let Some(key) = map.next_key_seed(Key(&mut *spend))? {
         let value = map.next_value_seed(Counted(spend.reborrow()))?;
         object.insert(key, value);
     }
     Ok(object)
+}
+
+/// An object's key, charged before it is copied out of the input (a key with
+/// escapes has already been unescaped into `serde_json`'s buffer, which is
+/// bounded by the body).
+struct Key<'a, 'b>(&'a mut Spend<'b>);
+
+impl<'de> DeserializeSeed<'de> for Key<'_, '_> {
+    type Value = String;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<String, D::Error> {
+        deserializer.deserialize_str(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Key<'_, '_> {
+    type Value = String;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("a string")
+    }
+
+    fn visit_str<E: de::Error>(self, key: &str) -> Result<String, E> {
+        self.0.charge::<E>(|budget| budget.key(key.len()))?;
+        Ok(key.to_owned())
+    }
 }
 
 /// One event, an object, added to `events`; refused when there are
@@ -1370,6 +1505,7 @@ mod tests {
             &source,
             Utc::now(),
             &Arc::new(Semaphore::new(1)),
+            &DecodeShares::default(),
         )
         .await
         .unwrap();
@@ -1389,13 +1525,18 @@ mod tests {
     async fn a_prepared_batch_is_the_insert_body_and_what_it_counts_for() {
         let source = source();
         let decodes = Arc::new(Semaphore::new(1));
+        let shares = DecodeShares::default();
         let body = Bytes::from_static(br#"[{"message":"one","a":1},{"message":"two"}]"#);
-        let prepared = prepare(body.clone(), JSON, &source, Utc::now(), &decodes)
+        let prepared = prepare(body.clone(), JSON, &source, Utc::now(), &decodes, &shares)
             .await
             .unwrap();
         assert_eq!(prepared.events, 2);
         assert_eq!(prepared.body.lines().count(), 2);
         assert!(prepared.body.ends_with('\n'));
+        assert!(
+            prepared.place.is_none(),
+            "a small body gives its place back"
+        );
         let rows = build_rows(body, JSON, &source, Utc::now()).unwrap();
         assert_eq!(
             prepared.bytes,
@@ -1412,42 +1553,134 @@ mod tests {
             &source,
             Utc::now(),
             &decodes,
+            &shares,
         )
         .await
         .unwrap();
         assert_eq!((empty.events, empty.bytes, empty.body.as_str()), (0, 0, ""));
     }
 
-    /// A decode takes a place of `decodes` and gives it back when it ends,
-    /// whether it worked or not; with none free it waits.
+    /// A decode takes a place of `decodes` (and one of its source's) and gives
+    /// it back when it ends, whether it worked or not; with none free it waits.
     #[tokio::test]
     async fn decoding_waits_for_a_place_and_gives_it_back() {
         let source = source();
         let decodes = Arc::new(Semaphore::new(1));
+        let shares = DecodeShares::default();
         let good = Bytes::from_static(br#"{"message":"m"}"#);
 
         let held = decodes.clone().acquire_owned().await.unwrap();
         let waiting = tokio::time::timeout(
             Duration::from_millis(150),
-            prepare(good.clone(), JSON, &source, Utc::now(), &decodes),
+            prepare(good.clone(), JSON, &source, Utc::now(), &decodes, &shares),
         )
         .await;
         assert!(waiting.is_err(), "no place is free: it waits");
+        assert_eq!(shares.count(source.id), 0, "and its share goes with it");
         drop(held);
 
-        prepare(good, JSON, &source, Utc::now(), &decodes)
+        prepare(good, JSON, &source, Utc::now(), &decodes, &shares)
             .await
             .unwrap();
         assert_eq!(decodes.available_permits(), 1, "given back after a success");
+        assert_eq!(shares.count(source.id), 0);
         let bad = prepare(
             Bytes::from_static(b"{"),
             JSON,
             &source,
             Utc::now(),
             &decodes,
+            &shares,
         )
         .await;
         assert!(matches!(bad, Err(IngestError::BadRequest(_))));
         assert_eq!(decodes.available_permits(), 1, "and after a failure");
+        assert_eq!(shares.count(source.id), 0);
+    }
+
+    /// The source's own gate: a source that already has its places decoding
+    /// waits, however many places the engine has free, and another source does
+    /// not.
+    #[tokio::test]
+    async fn a_source_cannot_decode_more_bodies_at_once_than_its_share() {
+        let (busy, other) = (source(), source());
+        let decodes = Arc::new(Semaphore::new(4));
+        let shares = DecodeShares::new(1);
+        let good = Bytes::from_static(br#"{"message":"m"}"#);
+
+        let share = shares.acquire(busy.id).await;
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(150),
+            prepare(good.clone(), JSON, &busy, Utc::now(), &decodes, &shares),
+        )
+        .await;
+        assert!(waiting.is_err(), "the source's only place is taken");
+        assert_eq!(
+            decodes.available_permits(),
+            4,
+            "no engine place was held meanwhile"
+        );
+
+        prepare(good.clone(), JSON, &other, Utc::now(), &decodes, &shares)
+            .await
+            .unwrap();
+        drop(share);
+        prepare(good, JSON, &busy, Utc::now(), &decodes, &shares)
+            .await
+            .unwrap();
+    }
+
+    /// A body that is large when encoded keeps its place until it has been
+    /// sent, so no more of them than there are places exist at once; a small
+    /// one gives it back as soon as it is made.
+    #[tokio::test]
+    async fn a_large_body_keeps_its_place_until_it_is_dropped() {
+        let source = source();
+        let decodes = Arc::new(Semaphore::new(2));
+        let shares = DecodeShares::default();
+        let events = |count: usize| {
+            let events: Vec<Value> = (0..count)
+                .map(|n| json!({ "message": format!("{n} {}", "x".repeat(60_000)) }))
+                .collect();
+            Bytes::from(serde_json::to_vec(&events).unwrap())
+        };
+
+        let small = prepare(events(20), JSON, &source, Utc::now(), &decodes, &shares)
+            .await
+            .unwrap();
+        assert!(small.body.len() < LARGE_BODY_BYTES);
+        assert!(small.place.is_none());
+        assert_eq!(decodes.available_permits(), 2);
+        assert_eq!(shares.count(source.id), 0);
+
+        let large = prepare(events(180), JSON, &source, Utc::now(), &decodes, &shares)
+            .await
+            .unwrap();
+        assert!(large.body.len() > LARGE_BODY_BYTES, "{}", large.body.len());
+        assert!(large.place.is_some());
+        assert_eq!(decodes.available_permits(), 1, "the engine's place is kept");
+        assert_eq!(shares.count(source.id), 1, "and the source's");
+        drop(large);
+        assert_eq!(decodes.available_permits(), 2);
+        assert_eq!(shares.count(source.id), 0);
+    }
+
+    /// What a request stores is capped as the rows are built, and the rows
+    /// are built no further than the cap.
+    #[test]
+    fn rows_stop_being_built_at_the_cap() {
+        let source = source();
+        let events: Vec<Value> = (0..200)
+            .map(|n| json!({ "message": format!("{n} {}", "x".repeat(60_000)) }))
+            .collect();
+        let body = Bytes::from(serde_json::to_vec(&events).unwrap());
+        assert!(build_rows(body.clone(), JSON, &source, Utc::now()).is_ok());
+        let refused = build_rows_within(body, JSON, &source, Utc::now(), 5 * 1024 * 1024);
+        match refused {
+            Err(IngestError::PayloadTooLarge(message)) => {
+                assert!(message.contains("once stored"), "{message}")
+            }
+            other => panic!("{:?}", other.map(|rows| rows.len())),
+        }
     }
 }

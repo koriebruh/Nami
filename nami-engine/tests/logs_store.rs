@@ -453,7 +453,7 @@ async fn an_encoded_batch_is_inserted_like_insert_logs_inserts_it() {
         })
         .collect();
     store::insert_logs(&probe, &rows).await.unwrap();
-    let body = store::encode_logs(&rows).unwrap();
+    let body = store::encode_logs(&rows, 1 << 20).unwrap();
     store::insert_encoded_logs(&probe, body.clone())
         .await
         .unwrap();
@@ -474,7 +474,7 @@ async fn an_encoded_batch_is_inserted_like_insert_logs_inserts_it() {
     assert_eq!(requests[0].body, requests[1].body, "the same body");
 
     // Nothing to send, nothing sent.
-    assert_eq!(store::encode_logs(&[]).unwrap(), "");
+    assert_eq!(store::encode_logs(&[], 0).unwrap(), "");
     store::insert_encoded_logs(&probe, String::new())
         .await
         .unwrap();
@@ -499,4 +499,26 @@ async fn an_encoded_batch_is_inserted_like_insert_logs_inserts_it() {
         ]
     );
     ch.drop_database().await.unwrap();
+}
+
+/// A batch over the cap is refused before anything is built; one at exactly
+/// the cap is not.
+#[test]
+fn an_encoded_batch_over_the_cap_is_refused() {
+    let source = source();
+    let rows: Vec<LogRow> = (0..10)
+        .map(|n| {
+            row(
+                &source,
+                json!({ "message": format!("m {n}") }),
+                now_millis(),
+            )
+        })
+        .collect();
+    let exact = store::encode_logs(&rows, usize::MAX).unwrap().len();
+    assert_eq!(store::encode_logs(&rows, exact).unwrap().len(), exact);
+    assert!(matches!(
+        store::encode_logs(&rows, exact - 1),
+        Err(ClickHouseError::TooLarge { limit }) if limit == exact - 1
+    ));
 }

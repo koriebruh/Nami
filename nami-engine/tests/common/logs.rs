@@ -9,18 +9,13 @@ use axum::{
 };
 use nami_engine::{
     clickhouse::ClickHouse,
-    crypto::{Cipher, TEST_KEY},
     models::source::{self, SourceConfig},
 };
 use serde_json::Value;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// The cipher `AppState::for_test` builds, so a test can open what the app
-/// sealed (and seal what the app must refuse).
-pub fn test_cipher() -> Cipher {
-    Cipher::new(&TEST_KEY)
-}
+use super::test_cipher;
 
 /// A Postgres pool whose database cannot be reached: any query through it
 /// fails once the connection attempt is refused (the API answers 500). A
@@ -187,16 +182,35 @@ pub async fn post_to(
     body: &Value,
     wait: Duration,
 ) -> Result<(StatusCode, HeaderMap, Value), reqwest::Error> {
-    let response = reqwest::Client::builder()
+    post_bytes_to(
+        addr,
+        token,
+        &[("content-type", "application/json")],
+        body.to_string().into_bytes(),
+        wait,
+    )
+    .await
+}
+
+/// [`post_to`] with a body and headers as they are (a gzip body, MessagePack).
+pub async fn post_bytes_to(
+    addr: SocketAddr,
+    token: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+    wait: Duration,
+) -> Result<(StatusCode, HeaderMap, Value), reqwest::Error> {
+    let mut request = reqwest::Client::builder()
         .no_proxy()
         .build()
         .unwrap()
         .post(format!("http://{addr}/api/v1/logs"))
         .bearer_auth(token)
-        .json(body)
-        .timeout(wait)
-        .send()
-        .await?;
+        .timeout(wait);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = request.body(body).send().await?;
     let status = response.status();
     let headers = response.headers().clone();
     let text = response.text().await?;
@@ -205,6 +219,22 @@ pub async fn post_to(
         headers,
         serde_json::from_str(&text).unwrap_or(Value::Null),
     ))
+}
+
+/// Whether the server ends the connection within `wait`: a read that returns
+/// nothing, or an error, before anything was sent back. A server that has seen
+/// the other end go away drops the request it was serving and closes.
+pub async fn closed_by_server(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+    wait: Duration,
+) -> bool {
+    use tokio::io::AsyncReadExt;
+
+    let mut buffer = [0u8; 256];
+    matches!(
+        tokio::time::timeout(wait, stream.read(&mut buffer)).await,
+        Ok(Ok(0)) | Ok(Err(_))
+    )
 }
 
 /// Polls `condition` until it holds, up to `wait`; panics with `what` after

@@ -1,8 +1,9 @@
 //! Per-source limits for HTTP ingestion, in memory and local to each engine
-//! instance: a token bucket per source id (50 requests/s, burst 100) and a
-//! cap on how many requests of one source may be in flight (4). Only
-//! authenticated sources get an entry, so the maps are bounded by the number
-//! of sources.
+//! instance: a token bucket per source id (50 requests/s, burst 100), a cap on
+//! how many requests of one source may be in flight (4), and a cap on how many
+//! of its bodies are decoded at once (2). Only authenticated sources get an
+//! entry, and an entry is dropped when its source has nothing in flight, so
+//! the maps do not grow with the sources seen.
 
 use std::{
     collections::HashMap,
@@ -10,6 +11,7 @@ use std::{
     time::Instant,
 };
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 pub const REQUESTS_PER_SECOND: f64 = 50.0;
@@ -21,6 +23,12 @@ pub const BURST: f64 = 100.0;
 /// of an async insert (10 to 250 ms) four requests at a time are about the 50
 /// requests per second the rate limit allows.
 pub const MAX_IN_FLIGHT_PER_SOURCE: usize = 4;
+/// How many bodies of one source may be decoded at once. The engine decodes
+/// only a few bodies at a time (`routes::logs_ingest::MAX_DECODES_IN_FLIGHT`),
+/// which is what bounds the memory they take; without this, the four requests
+/// one source may have in flight could hold every one of those places, and
+/// leave the other sources waiting behind them.
+pub const MAX_DECODES_PER_SOURCE: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -142,9 +150,112 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Places for decoding bodies, a few per source: a source whose bodies are
+/// being decoded waits at a gate of its own, so it cannot fill the engine's
+/// decode places (and the queue for them) with its own requests.
+#[derive(Debug)]
+pub struct DecodeShares {
+    max: usize,
+    gates: Arc<Mutex<HashMap<Uuid, Gate>>>,
+}
+
+/// One source's gate, and how many requests use it (hold a place or wait for
+/// one): it is removed when the last of them is done.
+#[derive(Debug)]
+struct Gate {
+    places: Arc<Semaphore>,
+    users: usize,
+}
+
+impl Default for DecodeShares {
+    fn default() -> Self {
+        DecodeShares::new(MAX_DECODES_PER_SOURCE)
+    }
+}
+
+impl DecodeShares {
+    pub fn new(max: usize) -> DecodeShares {
+        DecodeShares {
+            max,
+            gates: Arc::default(),
+        }
+    }
+
+    /// The most bodies of one source decoded at once.
+    pub fn limit(&self) -> usize {
+        self.max
+    }
+
+    /// A place for decoding a body of `source`; waits while the source already
+    /// has [`Self::limit`] bodies being decoded. The request counts as a user
+    /// of the source's gate from the moment this is called, also while it
+    /// waits, and until the returned share is dropped (or this future is).
+    pub async fn acquire(&self, source: Uuid) -> DecodeShare {
+        let (places, user) = {
+            let mut gates = lock(&self.gates);
+            let gate = gates.entry(source).or_insert_with(|| Gate {
+                places: Arc::new(Semaphore::new(self.max)),
+                users: 0,
+            });
+            gate.users += 1;
+            (
+                gate.places.clone(),
+                GateUser {
+                    source,
+                    gates: self.gates.clone(),
+                },
+            )
+        };
+        let place = places
+            .acquire_owned()
+            .await
+            .expect("the semaphore of a gate is never closed");
+        DecodeShare {
+            _place: place,
+            _user: user,
+        }
+    }
+
+    /// How many requests of `source` are decoding a body or waiting to.
+    pub fn count(&self, source: Uuid) -> usize {
+        lock(&self.gates).get(&source).map_or(0, |gate| gate.users)
+    }
+
+    /// How many sources have a gate now.
+    pub fn tracked(&self) -> usize {
+        lock(&self.gates).len()
+    }
+}
+
+/// A place for decoding one body of a source; given back when dropped.
+#[derive(Debug)]
+pub struct DecodeShare {
+    // The place goes back before the gate can be removed.
+    _place: OwnedSemaphorePermit,
+    _user: GateUser,
+}
+
+#[derive(Debug)]
+struct GateUser {
+    source: Uuid,
+    gates: Arc<Mutex<HashMap<Uuid, Gate>>>,
+}
+
+impl Drop for GateUser {
+    fn drop(&mut self) {
+        let mut gates = lock(&self.gates);
+        if let Some(gate) = gates.get_mut(&self.source) {
+            gate.users = gate.users.saturating_sub(1);
+            if gate.users == 0 {
+                gates.remove(&self.source);
+            }
+        }
+    }
+}
+
 /// The counts stay valid whatever a panicking holder left behind: every
 /// update is a single step.
-fn lock(counts: &Mutex<HashMap<Uuid, usize>>) -> MutexGuard<'_, HashMap<Uuid, usize>> {
+fn lock<T>(counts: &Mutex<T>) -> MutexGuard<'_, T> {
     counts
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -273,5 +384,53 @@ mod tests {
             thread.join().unwrap();
         }
         assert_eq!(in_flight.count(source), 0);
+    }
+
+    #[tokio::test]
+    async fn a_source_decodes_at_most_its_share_at_once_and_the_rest_wait() {
+        let shares = DecodeShares::new(2);
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let first = shares.acquire(a).await;
+        let second = shares.acquire(a).await;
+        assert_eq!(shares.count(a), 2);
+
+        // A third of the same source waits; another source does not.
+        let third = tokio::time::timeout(Duration::from_millis(100), shares.acquire(a)).await;
+        assert!(third.is_err(), "a has both its places");
+        let other = tokio::time::timeout(Duration::from_millis(100), shares.acquire(b)).await;
+        assert!(other.is_ok(), "b is not held back by a");
+        assert_eq!(shares.count(a), 2, "the waiter that gave up is not counted");
+
+        let waiting = tokio::spawn({
+            let shares = Arc::new(shares);
+            async move {
+                let share = shares.acquire(a).await;
+                (shares.count(a), share)
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        drop(first);
+        let (count, _share) = waiting.await.unwrap();
+        assert_eq!(count, 2, "the waiter took the place that came free");
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn gates_are_removed_when_their_source_is_done_waiting_ones_included() {
+        let shares = DecodeShares::new(1);
+        let sources: Vec<Uuid> = (0..50).map(|_| Uuid::new_v4()).collect();
+        let mut held = Vec::new();
+        for source in &sources {
+            held.push(shares.acquire(*source).await);
+        }
+        assert_eq!(shares.tracked(), 50);
+        // A waiter that is dropped before it is served leaves nothing behind.
+        let impatient = tokio::time::timeout(Duration::from_millis(50), shares.acquire(sources[0]));
+        assert!(impatient.await.is_err());
+        assert_eq!(shares.count(sources[0]), 1);
+        drop(held);
+        assert_eq!(shares.tracked(), 0);
+        assert_eq!(shares.count(sources[0]), 0);
     }
 }
