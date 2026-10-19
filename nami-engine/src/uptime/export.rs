@@ -23,23 +23,19 @@
 //! messages), so they are attacker-controlled.
 
 use std::{
-    borrow::Cow,
     future::Future,
-    io,
-    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    task::{Context, Poll},
     time::Duration,
 };
 
 use axum::{
-    Extension, Json,
+    Extension,
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::header,
     response::{IntoResponse, Response},
     routing::{MethodRouter, get},
 };
@@ -55,8 +51,10 @@ use super::{
     checker::CheckStatus,
     store::{self, CHECKS_BETWEEN_LIMIT, UptimeCheckRow},
 };
+pub use crate::download::neutralize;
 use crate::{
     clickhouse::ClickHouseError,
+    download::{AbortableBody, instance_busy, user_busy},
     error::AppError,
     logs::slots::UserSlots,
     middleware::rbac::{CurrentUser, require_project_role},
@@ -68,7 +66,8 @@ use crate::{
 pub const MAX_EXPORT_DAYS: i64 = 180;
 /// First line of every export.
 pub const HEADER: &str = "checked_at,status,status_code,response_time_ms,error\r\n";
-/// Exports running at once across the engine; one more is a 503.
+/// Exports running at once across the engine; one more is a 503
+/// (`Retry-After: 5`).
 pub const MAX_EXPORTS_IN_FLIGHT: usize = 4;
 /// Size the producer batches lines into before sending them to the body.
 pub const CHUNK_BYTES: usize = 64 * 1024;
@@ -83,10 +82,9 @@ pub const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// client that reads just fast enough to dodge [`SEND_STALL_TIMEOUT`] (one
 /// chunk every 29 s) still gives its slot back after this, aborted.
 pub const EXPORT_TOTAL_DEADLINE: Duration = Duration::from_secs(600);
-/// Exports one user may run at once, so one viewer cannot take every slot.
+/// Exports one user may run at once, so one viewer cannot take every slot;
+/// one more is a 429 (`Retry-After: 5`).
 pub const MAX_EXPORTS_PER_USER: usize = 2;
-/// `Retry-After` of the 503 when every slot is taken.
-const BUSY_RETRY_AFTER_SECS: &str = "5";
 
 /// The export slots: one semaphore per router, so one per engine process
 /// (each test app builds its own router and gets its own slots), plus the
@@ -106,30 +104,9 @@ impl Default for ExportSlots {
     }
 }
 
-/// The 503 for an export that found no free slot.
-fn busy(message: &str) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [
-            (header::RETRY_AFTER, BUSY_RETRY_AFTER_SECS),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        Json(serde_json::json!({ "error": message })),
-    )
-        .into_response()
-}
-
 /// The method router of the export route, with its slots attached.
 pub fn route() -> MethodRouter<AppState> {
     get(export_checks).layer(Extension(ExportSlots::default()))
-}
-
-/// `cell`, with a leading `'` when a spreadsheet would read it as a formula.
-pub fn neutralize(cell: &str) -> Cow<'_, str> {
-    match cell.chars().next() {
-        Some('=' | '+' | '-' | '@' | '\t' | '\r') => Cow::Owned(format!("'{cell}")),
-        _ => Cow::Borrowed(cell),
-    }
 }
 
 /// One RFC 4180 record (CRLF-terminated) for `row`, every cell neutralized.
@@ -194,12 +171,10 @@ async fn export_checks(
     // Both permits are RAII guards: every early return below (and the end of
     // the producer task) gives them back.
     let Ok(user_permit) = slots.users.acquire(user.id, MAX_EXPORTS_PER_USER) else {
-        return Ok(busy(
-            "you already have 2 exports running; retry when one finishes",
-        ));
+        return Ok(user_busy(MAX_EXPORTS_PER_USER));
     };
     let Ok(permit) = slots.global.try_acquire_owned() else {
-        return Ok(busy("busy, retry shortly"));
+        return Ok(instance_busy());
     };
 
     // Before the response starts: an outage here is the JSON 500.
@@ -244,11 +219,7 @@ async fn export_checks(
             ),
             (header::CACHE_CONTROL, "no-store".to_string()),
         ],
-        Body::from_stream(ExportStream {
-            rx,
-            aborted,
-            done: false,
-        }),
+        Body::from_stream(AbortableBody::new(rx, aborted)),
     )
         .into_response())
 }
@@ -386,37 +357,6 @@ fn error_kind(e: &ClickHouseError) -> &'static str {
         ClickHouseError::ResponseTooLarge { .. } => "response too large",
         ClickHouseError::Decode { .. } => "decode error",
         _ => "transport error",
-    }
-}
-
-/// The response body: the producer's chunks, then a clean end, or an error
-/// when the producer marked the export aborted (hyper then cuts the
-/// connection instead of ending the chunked body).
-struct ExportStream {
-    rx: mpsc::Receiver<Bytes>,
-    aborted: Arc<AtomicBool>,
-    done: bool,
-}
-
-impl tokio_stream::Stream for ExportStream {
-    type Item = Result<Bytes, io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.done {
-            return Poll::Ready(None);
-        }
-        match self.rx.poll_recv(cx) {
-            Poll::Ready(Some(chunk)) => Poll::Ready(Some(Ok(chunk))),
-            Poll::Ready(None) => {
-                self.done = true;
-                if self.aborted.load(Ordering::Acquire) {
-                    Poll::Ready(Some(Err(io::Error::other("export aborted"))))
-                } else {
-                    Poll::Ready(None)
-                }
-            }
-            Poll::Pending => Poll::Pending,
-        }
     }
 }
 
@@ -616,7 +556,7 @@ mod tests {
         }
     }
 
-    async fn collect(stream: ExportStream) -> (String, bool) {
+    async fn collect(stream: AbortableBody) -> (String, bool) {
         let mut body = String::new();
         let mut failed = false;
         tokio::pin!(stream);
@@ -685,12 +625,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let aborted = Arc::new(AtomicBool::new(false));
         tokio::spawn(producer(to, tx, aborted.clone()).run(first, to, fetch));
-        let (body, failed) = collect(ExportStream {
-            rx,
-            aborted,
-            done: false,
-        })
-        .await;
+        let (body, failed) = collect(AbortableBody::new(rx, aborted)).await;
         assert!(!failed);
         assert_eq!(body.split_terminator("\r\n").count(), 1 + 43_200);
         let limit = i64::from(CHECKS_BETWEEN_LIMIT);
@@ -742,12 +677,7 @@ mod tests {
             .await;
         assert!(started.elapsed() >= SEND_STALL_TIMEOUT);
         assert!(aborted.load(Ordering::Acquire));
-        let (body, failed) = collect(ExportStream {
-            rx,
-            aborted,
-            done: false,
-        })
-        .await;
+        let (body, failed) = collect(AbortableBody::new(rx, aborted)).await;
         assert!(failed, "the body must end with an error");
         assert!(body.starts_with(HEADER));
         assert!(body.len() <= CHANNEL_CAPACITY * (CHUNK_BYTES + 1024));
@@ -768,12 +698,7 @@ mod tests {
             }))
         };
         tokio::spawn(producer(to, tx, aborted.clone()).run(first, at(day(1)), fetch));
-        let (body, failed) = collect(ExportStream {
-            rx,
-            aborted,
-            done: false,
-        })
-        .await;
+        let (body, failed) = collect(AbortableBody::new(rx, aborted)).await;
         assert!(failed);
         assert!(body.starts_with(HEADER));
     }
@@ -797,11 +722,7 @@ mod tests {
             let _permit = permit;
             producer.run(first, slice_end(at(0), to), fetch).await;
         });
-        let mut stream = Box::pin(ExportStream {
-            rx,
-            aborted: aborted.clone(),
-            done: false,
-        });
+        let mut stream = Box::pin(AbortableBody::new(rx, aborted.clone()));
         let mut chunks = 0;
         let failed = loop {
             tokio::time::sleep(Duration::from_secs(29)).await;

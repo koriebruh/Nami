@@ -4,8 +4,10 @@
 //! HTTP ingestion (`ingest`, `msgpack`, with the `budget` that caps what a
 //! body may decode to) with its per-source limits (`rate_limit`) and usage accounting
 //! (`usage`), syslog ingestion over TCP and UDP (`syslog`), and search
-//! (`query`, `search`, `patterns`) and the live tail (`tail`).
+//! (`query`, `search`, `patterns`), the live tail (`tail`) and the streamed
+//! export (`export`).
 pub mod budget;
+pub mod export;
 pub mod ingest;
 pub mod msgpack;
 pub mod normalize;
@@ -50,4 +52,9 @@ pub struct LogsState {
     pub entry_slots: std::sync::Arc<slots::UserSlots>,
     /// The compiled pipeline of each source, keyed on its `updated_at`.
     pub pipelines: pipeline_cache::PipelineCache,
+    /// Exports running per user and in all (see
+    /// [`export::MAX_EXPORTS_PER_USER`], [`export::MAX_EXPORTS_PER_INSTANCE`]).
+    pub export_slots: std::sync::Arc<slots::UserSlots>,
+    /// The caps of every export (tests shrink them).
+    pub export_limits: export::ExportLimits,
 }

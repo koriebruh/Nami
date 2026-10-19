@@ -45,10 +45,16 @@ export const GET: RequestHandler = async (event) => {
 	}
 
 	if (response.status === 401) throw redirect(303, '/login');
-	if (response.status === 503) {
+	// 429: this user already runs their 2 exports; 503: every export slot of
+	// the engine is taken. Both keep the engine's Retry-After.
+	if (response.status === 429 || response.status === 503) {
 		const wait = response.headers.get('retry-after');
 		await response.body?.cancel();
-		return plain(503, 'Too many exports are running. Try again in a few seconds.', wait && /^\d{1,4}$/.test(wait) ? { 'retry-after': wait } : {});
+		const message =
+			response.status === 429
+				? 'You already have 2 exports running. Try again when one finishes.'
+				: 'Too many exports are running. Try again in a few seconds.';
+		return plain(response.status, message, wait && /^\d{1,4}$/.test(wait) ? { 'retry-after': wait } : {});
 	}
 	if (!response.ok || !response.body) {
 		const message = response.ok ? 'The export returned no data.' : await engineErrorMessage(response, 'Could not export checks.');

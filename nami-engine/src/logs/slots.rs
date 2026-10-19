@@ -1,5 +1,7 @@
 //! Per-user counting slots: how many of one kind of request each user has
-//! running (entry reads, see [`super::search::MAX_ENTRY_READS_PER_USER`]).
+//! running (entry reads, see [`super::search::MAX_ENTRY_READS_PER_USER`];
+//! exports, see [`super::export::MAX_EXPORTS_PER_USER`]), and optionally how
+//! many run in all.
 
 use std::{
     collections::HashMap,
@@ -10,10 +12,26 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 
-/// How many requests each user has running.
+/// How many requests each user has running, and how many in all.
 #[derive(Debug, Default)]
 pub struct UserSlots {
-    per_user: Mutex<HashMap<Uuid, usize>>,
+    counts: Mutex<Counts>,
+}
+
+#[derive(Debug, Default)]
+struct Counts {
+    per_user: HashMap<Uuid, usize>,
+    /// Every permit out, all users together.
+    total: usize,
+}
+
+/// Why [`UserSlots::acquire_capped`] refused a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRefused {
+    /// The user already holds their share.
+    User,
+    /// Every slot of the instance is out.
+    Total,
 }
 
 /// One running request; dropping it gives the slot back.
@@ -27,12 +45,30 @@ impl UserSlots {
     /// A slot for `user_id`, or `RateLimited` (429) when the user already has
     /// `max` running.
     pub fn acquire(self: &Arc<Self>, user_id: Uuid, max: usize) -> Result<UserPermit, AppError> {
-        let mut counts = self.per_user.lock().unwrap_or_else(PoisonError::into_inner);
-        let count = counts.entry(user_id).or_insert(0);
-        if *count >= max {
-            return Err(AppError::RateLimited);
+        self.acquire_capped(user_id, max, usize::MAX)
+            .map_err(|_| AppError::RateLimited)
+    }
+
+    /// As [`Self::acquire`], and also refused once `total` permits of every
+    /// user together are out (exports, see
+    /// [`super::export::MAX_EXPORTS_PER_INSTANCE`]). The refusal says which
+    /// cap was hit, so the caller can answer each its own way.
+    pub fn acquire_capped(
+        self: &Arc<Self>,
+        user_id: Uuid,
+        per_user: usize,
+        total: usize,
+    ) -> Result<UserPermit, SlotRefused> {
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        if counts.per_user.get(&user_id).copied().unwrap_or(0) >= per_user {
+            return Err(SlotRefused::User);
         }
+        if counts.total >= total {
+            return Err(SlotRefused::Total);
+        }
+        let count = counts.per_user.entry(user_id).or_insert(0);
         *count += 1;
+        counts.total += 1;
         Ok(UserPermit {
             slots: self.clone(),
             user_id,
@@ -41,8 +77,16 @@ impl UserSlots {
 
     /// Requests `user_id` has running.
     pub fn open(&self, user_id: Uuid) -> usize {
-        let counts = self.per_user.lock().unwrap_or_else(PoisonError::into_inner);
-        counts.get(&user_id).copied().unwrap_or(0)
+        let counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        counts.per_user.get(&user_id).copied().unwrap_or(0)
+    }
+
+    /// Requests running, all users together.
+    pub fn total(&self) -> usize {
+        self.counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .total
     }
 }
 
@@ -50,13 +94,14 @@ impl Drop for UserPermit {
     fn drop(&mut self) {
         let mut counts = self
             .slots
-            .per_user
+            .counts
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(count) = counts.get_mut(&self.user_id) {
+        counts.total = counts.total.saturating_sub(1);
+        if let Some(count) = counts.per_user.get_mut(&self.user_id) {
             *count = count.saturating_sub(1);
             if *count == 0 {
-                counts.remove(&self.user_id);
+                counts.per_user.remove(&self.user_id);
             }
         }
     }
@@ -77,5 +122,33 @@ mod tests {
         drop(first);
         assert_eq!(slots.open(a), 1);
         assert!(slots.acquire(a, 2).is_ok());
+    }
+
+    #[test]
+    fn a_total_caps_every_user_together() {
+        let slots = Arc::new(UserSlots::default());
+        let held: Vec<_> = (0..3)
+            .map(|_| slots.acquire_capped(Uuid::new_v4(), 2, 3).unwrap())
+            .collect();
+        assert!(matches!(
+            slots.acquire_capped(Uuid::new_v4(), 2, 3),
+            Err(SlotRefused::Total)
+        ));
+        drop(held);
+        assert!(slots.acquire_capped(Uuid::new_v4(), 2, 3).is_ok());
+    }
+
+    #[test]
+    fn a_capped_permit_still_counts_against_its_user() {
+        let slots = Arc::new(UserSlots::default());
+        let user = Uuid::new_v4();
+        let _a = slots.acquire_capped(user, 2, 8).unwrap();
+        let _b = slots.acquire_capped(user, 2, 8).unwrap();
+        assert!(matches!(
+            slots.acquire_capped(user, 2, 8),
+            Err(SlotRefused::User)
+        ));
+        assert_eq!(slots.open(user), 2);
+        assert_eq!(slots.total(), 2);
     }
 }

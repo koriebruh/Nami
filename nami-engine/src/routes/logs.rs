@@ -1,7 +1,10 @@
+use std::sync::{Arc, atomic::AtomicBool};
+
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, RawQuery, State},
-    http::{HeaderValue, header::HeaderName},
+    http::{HeaderValue, header, header::HeaderName},
     response::{
         IntoResponse, Response,
         sse::{KeepAlive, Sse},
@@ -15,24 +18,30 @@ use tower_sessions::Session;
 use uuid::Uuid;
 
 use crate::{
+    download::{AbortableBody, instance_busy, user_busy},
     error::AppError,
     logs::{
+        export::{self, ExportFormat},
         patterns, query,
         search::{self, Histogram, LogEntry, QueryPermit, SearchPage},
+        slots::SlotRefused,
         tail,
     },
     middleware::rbac::{CurrentUser, require_project_role},
+    models::source,
     state::AppState,
 };
 
 // Viewers and up. The project is always the one in the path: a source_id
-// of another project simply matches nothing.
+// of another project (or of none) simply matches nothing, in search,
+// histogram, patterns, tail and export alike.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/projects/{id}/logs", get(search_logs))
         .route("/projects/{id}/logs/histogram", get(log_histogram))
         .route("/projects/{id}/logs/patterns", get(log_patterns))
         .route("/projects/{id}/logs/tail", get(tail_logs))
+        .route("/projects/{id}/logs/export", get(export_logs))
         .route("/projects/{id}/logs/{log_id}", get(log_entry))
 }
 
@@ -143,6 +152,88 @@ async fn tail_logs(
         .into_response();
     // Tell reverse proxies (nginx) not to buffer the stream.
     response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    Ok(response)
+}
+
+/// `GET /projects/{id}/logs/export?format=csv|ndjson&from&to&<search
+/// filters>&columns*`: the matching rows as a streamed download, newest
+/// first, at most `ExportLimits::rows` (see `logs::export`). Viewer.
+///
+/// Everything that can fail before the file starts is answered as JSON
+/// (400 parameters, 429 the user's 2 exports already running, 503 every
+/// export slot of the instance taken, both with `Retry-After: 5`, 400/500
+/// ClickHouse refusing the query); after that, only the file itself can say
+/// it stopped early.
+async fn export_logs(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(project_id): Path<Uuid>,
+    RawQuery(raw): RawQuery,
+) -> Result<Response, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    let params = export::parse_export(&query::query_pairs(raw.as_deref()), Utc::now())
+        .map_err(AppError::Validation)?;
+    // Names for the CSV `source` column. A `source_id` filter naming a
+    // source that is not one of the project's simply matches nothing, as in
+    // search: the project in the WHERE is always the path's.
+    let sources = source::names_for_project(&state.db, project_id).await?;
+    // Moved into the streaming task below: held exactly as long as the file
+    // streams (at most the deadline), and given back on every early return.
+    let permit = match state.logs.export_slots.acquire_capped(
+        user.id,
+        export::MAX_EXPORTS_PER_USER,
+        export::MAX_EXPORTS_PER_INSTANCE,
+    ) {
+        Ok(permit) => permit,
+        Err(SlotRefused::User) => return Ok(user_busy(export::MAX_EXPORTS_PER_USER)),
+        Err(SlotRefused::Total) => return Ok(instance_busy()),
+    };
+    let limits = state.logs.export_limits;
+    let sql = export::export_sql(project_id, &params, limits.rows);
+    let rows = state
+        .clickhouse
+        .stream_rows_with(sql.text(), &sql.params(), &[], limits.line_bytes)
+        .await
+        .map_err(search::user_error)?;
+
+    let (content_type, name) = match params.format {
+        ExportFormat::Csv => (
+            "text/csv; charset=utf-8",
+            export::file_name(params.format, params.window.to),
+        ),
+        ExportFormat::Ndjson => (
+            "application/x-ndjson",
+            export::file_name(params.format, params.window.to),
+        ),
+    };
+    let (tx, rx) = mpsc::channel(export::EXPORT_CHANNEL_CHUNKS);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let task_aborted = aborted.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        export::stream(rows, params, sources, limits, tx, task_aborted).await;
+    });
+    let mut response = Response::new(Body::from_stream(AbortableBody::new(rx, aborted)));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+            .expect("the file name is ASCII"),
+    );
+    headers.insert(
+        HeaderName::from_static(export::EXPORT_LIMIT_HEADER),
+        HeaderValue::from(limits.rows),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
     );

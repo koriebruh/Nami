@@ -96,6 +96,22 @@ describe('checks.csv GET', () => {
 		expect(await response.text()).toMatch(/try again/i);
 	});
 
+	it('turns the per-user 429 into a friendly message that keeps Retry-After', async () => {
+		const { event } = fakeEvent({
+			url: url(`from=${FROM}&to=${TO}`),
+			respond: () =>
+				new Response('{"error":"you already have 2 exports running"}', {
+					status: 429,
+					headers: { 'retry-after': '5' }
+				})
+		});
+		const response = await GET(event);
+		expect(response.status).toBe(429);
+		expect(response.headers.get('retry-after')).toBe('5');
+		expect(response.headers.get('cache-control')).toBe('no-store');
+		expect(await response.text()).toMatch(/already have 2 exports running/i);
+	});
+
 	it('is a 502 when the engine is unreachable', async () => {
 		const { event } = fakeEvent({ url: url(`from=${FROM}&to=${TO}`), unreachable: true });
 		expect((await GET(event)).status).toBe(502);

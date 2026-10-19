@@ -283,6 +283,20 @@ pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Sou
         .await
 }
 
+/// Every source of the project as id → name (the log export's `source`
+/// column). At most `MAX_SOURCES_PER_PROJECT` rows.
+pub async fn names_for_project(
+    pool: &PgPool,
+    project_id: Uuid,
+) -> Result<std::collections::HashMap<Uuid, String>, sqlx::Error> {
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("select id, name from sources where project_id = $1")
+            .bind(project_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
 /// Scoped by both ids: another project's source is not found (404).
 pub async fn find_in_project(
     pool: &PgPool,

@@ -122,14 +122,17 @@ pub fn query_pairs(raw: Option<&str>) -> Vec<(String, String)> {
         .collect()
 }
 
-fn values<'a>(pairs: &'a [(String, String)], key: &str) -> impl Iterator<Item = &'a str> {
+pub(crate) fn values<'a>(
+    pairs: &'a [(String, String)],
+    key: &str,
+) -> impl Iterator<Item = &'a str> {
     pairs
         .iter()
         .filter(move |(k, _)| k == key)
         .map(|(_, v)| v.as_str())
 }
 
-fn last<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+pub(crate) fn last<'a>(pairs: &'a [(String, String)], key: &str) -> Option<&'a str> {
     values(pairs, key).last()
 }
 
@@ -462,6 +465,14 @@ fn push_text(sql: &mut Sql, segments: &[usize]) {
     sql.push("), JSONExtractRaw(fields");
     push_path(sql, segments);
     sql.push("))");
+}
+
+/// The text of the value at `path` (see `push_text`, the expression the
+/// `eq` filters compare), each segment a bound parameter: the log export's
+/// CSV columns.
+pub fn push_field_text(sql: &mut Sql, path: &[String]) {
+    let segments: Vec<usize> = path.iter().map(|s| sql.bind(s.clone())).collect();
+    push_text(sql, &segments);
 }
 
 /// The value at the path as a number: JSON numbers, and strings that parse

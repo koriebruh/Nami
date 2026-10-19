@@ -44,6 +44,17 @@ const BASE_SETTINGS: [(&str, &str); 3] = [
 /// than with the client giving up first.
 pub const QUERY_MAX_EXECUTION_SECS: u64 = 25;
 
+/// The longest a streamed export query may run on the server
+/// ([`ClickHouse::stream_rows_with`]).
+pub const EXPORT_MAX_EXECUTION_SECS: u64 = 120;
+
+/// The per-request timeout of a streamed query. reqwest's per-request
+/// timeout replaces the client's 30 s one; it covers connecting, the headers
+/// and reading the whole body, but is only checked while the body is polled
+/// (the export task has its own deadline for a reader that stops). 5 s over
+/// `logs::export::EXPORT_DEADLINE`, so the task's deadline comes first.
+pub const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(155);
+
 /// The largest response body the client reads from ClickHouse; a larger one
 /// is refused with [`ClickHouseError::ResponseTooLarge`] as soon as it passes
 /// this, before more of it is read. Every request is bounded by it, also one
@@ -108,10 +119,11 @@ TTL toDateTime(received_at) + INTERVAL 180 DAY",
 /// this client. That is the query text, its parameters and the database;
 /// the output format, buffering, read-only guard, server-side time limit
 /// ([`QUERY_MAX_EXECUTION_SECS`]) and cancel-on-disconnect of
-/// [`ClickHouse::query_rows_with`]; the strict row parsing of
+/// [`ClickHouse::query_rows_with`]; the in-body error marking of
+/// [`ClickHouse::stream_rows_with`]; the strict row parsing of
 /// [`ClickHouse::insert_rows_with`]; and the wire formats of
 /// [`BASE_SETTINGS`], which every request pins.
-const RESERVED_SETTINGS: [&str; 11] = [
+const RESERVED_SETTINGS: [&str; 12] = [
     "query",
     "database",
     "readonly",
@@ -123,6 +135,7 @@ const RESERVED_SETTINGS: [&str; 11] = [
     "output_format_json_quote_64bit_integers",
     "max_execution_time",
     "cancel_http_readonly_queries_on_client_close",
+    "http_write_exception_in_output_format",
 ];
 
 /// Prefix of the throwaway databases created by
@@ -153,6 +166,10 @@ pub enum ClickHouseError {
         line: String,
         source: serde_json::Error,
     },
+    /// A streamed result line passed the caller's per-line limit
+    /// ([`RowStream::next_line`]); nothing more of the response is read.
+    #[error("a clickhouse result line is longer than {limit} bytes")]
+    LineTooLong { limit: usize },
     /// A database or table name that is not a plain `[A-Za-z_][A-Za-z0-9_]*`
     /// identifier. Nothing was sent to ClickHouse.
     #[error("invalid clickhouse identifier {0:?}: expected [A-Za-z_][A-Za-z0-9_]*")]
@@ -355,6 +372,73 @@ impl ClickHouse {
             .collect()
     }
 
+    /// Runs a `SELECT` whose `JSONEachRow` result is read line by line as
+    /// ClickHouse produces it ([`RowStream::next_line`]), never held whole:
+    /// for results too large for [`Self::query_rows_with`]'s capped,
+    /// buffered read (the log export). Placeholders and `params` work as in
+    /// [`Self::query_rows`]; `settings` as in [`Self::query_rows_with`].
+    ///
+    /// Not sent with `wait_end_of_query`, so rows flow at once. An error
+    /// ClickHouse raises before its first row is still a non-2xx status,
+    /// returned here as [`ClickHouseError::Server`] (body read through the
+    /// capped reader). After that the status is already 200: with
+    /// `http_write_exception_in_output_format=1` ClickHouse writes the error
+    /// into the body instead, so the caller must recognize rows by their
+    /// shape and stop at anything else. Also sent: `readonly=2`,
+    /// `max_execution_time` ([`EXPORT_MAX_EXECUTION_SECS`]) and
+    /// `cancel_http_readonly_queries_on_client_close=1` (dropping the
+    /// [`RowStream`] closes the connection, which ends the query). The request
+    /// has its own timeout, [`STREAM_REQUEST_TIMEOUT`].
+    ///
+    /// A line over `max_line_bytes` ends the stream with
+    /// [`ClickHouseError::LineTooLong`].
+    pub async fn stream_rows_with(
+        &self,
+        sql: &str,
+        params: &[(&str, String)],
+        settings: &[(&'static str, &'static str)],
+        max_line_bytes: usize,
+    ) -> Result<RowStream, ClickHouseError> {
+        let mut pairs = self.settings_with_database()?;
+        push_extra_settings(&mut pairs, settings);
+        pairs.push(("default_format".to_string(), "JSONEachRow".to_string()));
+        pairs.push(("readonly".to_string(), "2".to_string()));
+        pairs.push((
+            "max_execution_time".to_string(),
+            EXPORT_MAX_EXECUTION_SECS.to_string(),
+        ));
+        pairs.push((
+            "cancel_http_readonly_queries_on_client_close".to_string(),
+            "1".to_string(),
+        ));
+        pairs.push((
+            "http_write_exception_in_output_format".to_string(),
+            "1".to_string(),
+        ));
+        for (name, value) in params {
+            pairs.push((format!("param_{name}"), escape_param_value(value)));
+        }
+        let response = self
+            .send(pairs, sql.to_string(), Some(STREAM_REQUEST_TIMEOUT))
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = read_capped(response, self.max_response_bytes).await?;
+            return Err(ClickHouseError::Server {
+                status: status.as_u16(),
+                body: text.trim().to_string(),
+            });
+        }
+        Ok(RowStream {
+            response,
+            buffer: Vec::new(),
+            start: 0,
+            scanned: 0,
+            max_line: max_line_bytes,
+            finished: false,
+        })
+    }
+
     /// Creates the database if needed, then applies every migration.
     /// Idempotent: safe to run on every startup.
     pub async fn migrate(&self) -> Result<(), ClickHouseError> {
@@ -434,14 +518,16 @@ impl ClickHouse {
         Ok(pairs)
     }
 
-    /// POSTs `body` with `pairs` as URL parameters. Always POST: ClickHouse
-    /// treats GET as read-only. Credentials go in an `Authorization: Basic`
-    /// header, never the URL.
-    async fn post(
+    /// POSTs `body` with `pairs` as URL parameters and returns the response
+    /// once its headers are in, body unread. Always POST: ClickHouse treats
+    /// GET as read-only. Credentials go in an `Authorization: Basic` header,
+    /// never the URL. `timeout` replaces the client's 30 s for this request.
+    async fn send(
         &self,
         pairs: Vec<(String, String)>,
         body: String,
-    ) -> Result<String, ClickHouseError> {
+        timeout: Option<Duration>,
+    ) -> Result<reqwest::Response, ClickHouseError> {
         let mut url = self.url.clone();
         {
             let mut query = url.query_pairs_mut();
@@ -449,15 +535,27 @@ impl ClickHouse {
                 query.append_pair(name, value);
             }
         }
-        let response = self
+        let mut request = self
             .http
             .post(url)
             // `basic_auth` marks the header sensitive: it is redacted from
             // `Debug` output and never put in HTTP/2's header compression table.
             .basic_auth(&self.user, Some(&self.password))
-            .body(body)
-            .send()
-            .await?;
+            .body(body);
+        if let Some(timeout) = timeout {
+            request = request.timeout(timeout);
+        }
+        Ok(request.send().await?)
+    }
+
+    /// [`Self::send`] with the client's timeout, then the whole body through
+    /// the capped reader; a non-2xx status is [`ClickHouseError::Server`].
+    async fn post(
+        &self,
+        pairs: Vec<(String, String)>,
+        body: String,
+    ) -> Result<String, ClickHouseError> {
+        let response = self.send(pairs, body, None).await?;
         let status = response.status();
         let text = read_capped(response, self.max_response_bytes).await?;
         if !status.is_success() {
@@ -467,6 +565,73 @@ impl ClickHouse {
             });
         }
         Ok(text)
+    }
+}
+
+/// A streamed `JSONEachRow` result ([`ClickHouse::stream_rows_with`]). It
+/// holds at most one line plus one network chunk; dropping it closes the
+/// connection, and ClickHouse then cancels the query.
+pub struct RowStream {
+    response: reqwest::Response,
+    buffer: Vec<u8>,
+    /// Where the unread part of `buffer` starts.
+    start: usize,
+    /// How much of `buffer[start..]` is known to hold no newline.
+    scanned: usize,
+    max_line: usize,
+    /// The response body has ended.
+    finished: bool,
+}
+
+impl RowStream {
+    /// The next non-empty line, without its newline; `None` at the end of
+    /// the result. A line longer than the limit is refused without reading
+    /// on.
+    ///
+    /// Lines are taken from `buffer[start..]` by moving `start`, never by
+    /// draining the front of the Vec per line (a chunk holding thousands of
+    /// short lines would be shifted thousands of times). The consumed front
+    /// is dropped once per chunk, before the next one is appended.
+    pub async fn next_line(&mut self) -> Result<Option<Vec<u8>>, ClickHouseError> {
+        loop {
+            let from = self.start + self.scanned;
+            if let Some(offset) = self.buffer[from..].iter().position(|b| *b == b'\n') {
+                let end = from + offset;
+                if end - self.start > self.max_line {
+                    return Err(ClickHouseError::LineTooLong {
+                        limit: self.max_line,
+                    });
+                }
+                let line = self.buffer[self.start..end].to_vec();
+                self.start = end + 1;
+                self.scanned = 0;
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                return Ok(Some(line));
+            }
+            self.scanned = self.buffer.len() - self.start;
+            if self.scanned > self.max_line {
+                return Err(ClickHouseError::LineTooLong {
+                    limit: self.max_line,
+                });
+            }
+            if self.finished {
+                let rest = self.buffer.split_off(self.start);
+                self.buffer.clear();
+                self.start = 0;
+                self.scanned = 0;
+                return Ok((!rest.iter().all(u8::is_ascii_whitespace)).then_some(rest));
+            }
+            match self.response.chunk().await? {
+                Some(chunk) => {
+                    self.buffer.drain(..self.start);
+                    self.start = 0;
+                    self.buffer.extend_from_slice(&chunk);
+                }
+                None => self.finished = true,
+            }
+        }
     }
 }
 
@@ -638,6 +803,101 @@ mod tests {
         BASE_SETTINGS, ClickHouse, ClickHouseError, RESERVED_SETTINGS, encode_rows,
         encode_rows_within, escape_param_value, push_extra_settings, validate_identifier,
     };
+
+    #[tokio::test]
+    async fn streamed_rows_arrive_line_by_line_and_long_lines_are_refused() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string("{\"a\":1}\n\n{\"a\":2}\n{\"a\":\"xxxxxxxxxxxxxxxxxxxx\"}\n"),
+            )
+            .mount(&server)
+            .await;
+        let ch = ClickHouse::new(&server.uri(), "u", "p", "nami_test_stream");
+        let mut rows = ch
+            .stream_rows_with("SELECT 1", &[("x", "a\tb".to_string())], &[], 16)
+            .await
+            .unwrap();
+        assert_eq!(rows.next_line().await.unwrap().unwrap(), b"{\"a\":1}");
+        assert_eq!(rows.next_line().await.unwrap().unwrap(), b"{\"a\":2}");
+        assert!(matches!(
+            rows.next_line().await,
+            Err(ClickHouseError::LineTooLong { limit: 16 })
+        ));
+        let sent = &server.received_requests().await.unwrap()[0];
+        let query: Vec<(String, String)> = sent.url.query_pairs().into_owned().collect();
+        let has = |k: &str, v: &str| query.iter().any(|(n, x)| n == k && x == v);
+        assert!(
+            has("max_execution_time", "120")
+                && has("readonly", "2")
+                && has("default_format", "JSONEachRow")
+                && has("http_write_exception_in_output_format", "1")
+                && has("cancel_http_readonly_queries_on_client_close", "1")
+                && has("param_x", "a\\tb"),
+            "{query:?}"
+        );
+        assert!(
+            !query.iter().any(|(n, _)| n == "wait_end_of_query"),
+            "rows must stream"
+        );
+        assert!(
+            !query.iter().any(|(n, _)| n == "max_result_bytes"),
+            "the export bounds itself"
+        );
+    }
+
+    /// The last line needs no newline; whitespace-only lines are skipped and
+    /// a line split over many network chunks is put back together.
+    #[tokio::test]
+    async fn lines_are_rebuilt_across_chunks_and_the_tail_is_returned() {
+        let server = wiremock::MockServer::start().await;
+        let long = format!("{{\"a\":\"{}\"}}", "y".repeat(200_000));
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(format!("{long}\n  \r\n{{\"b\":1}}")),
+            )
+            .mount(&server)
+            .await;
+        let ch = ClickHouse::new(&server.uri(), "u", "p", "nami_test_stream");
+        let mut rows = ch
+            .stream_rows_with("SELECT 1", &[], &[], 300_000)
+            .await
+            .unwrap();
+        assert_eq!(rows.next_line().await.unwrap().unwrap(), long.as_bytes());
+        assert_eq!(rows.next_line().await.unwrap().unwrap(), b"{\"b\":1}");
+        assert!(rows.next_line().await.unwrap().is_none());
+        assert!(rows.next_line().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_streamed_query_error_is_returned_before_any_row() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_string("Code: 427. CANNOT_COMPILE_REGEXP"),
+            )
+            .mount(&server)
+            .await;
+        let ch = ClickHouse::new(&server.uri(), "u", "p", "nami_test_stream");
+        let error = ch
+            .stream_rows_with("SELECT 1", &[], &[], 1024)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, ClickHouseError::Server { status: 400, .. }));
+    }
+
+    #[test]
+    #[should_panic(expected = "managed by the client")]
+    fn a_stream_cannot_turn_off_its_error_marking() {
+        push_extra_settings(
+            &mut Vec::new(),
+            &[("http_write_exception_in_output_format", "0")],
+        );
+    }
 
     /// Every SELECT is bounded on the server and stops there when the client
     /// gives up (say, a request whose own deadline passed): a slow query left
