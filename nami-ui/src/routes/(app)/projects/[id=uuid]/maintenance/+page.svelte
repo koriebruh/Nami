@@ -1,4 +1,5 @@
 <script lang="ts">
+	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import MaintenanceWindowForm from '#lib/components/MaintenanceWindowForm.svelte';
 	import { describeSchedule, describeScope } from '#lib/maintenance';
@@ -35,8 +36,7 @@
 	const pending = $derived(
 		form && 'confirmDelete' in form ? data.windows.find((w) => w.id === form.confirmDelete) : undefined
 	);
-	const button =
-		'rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-400 transition-colors hover:border-red-500/30 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50';
+	const button = 'btn btn-danger btn-sm';
 </script>
 
 <svelte:head>
@@ -44,10 +44,10 @@
 </svelte:head>
 
 <div class="space-y-6">
-	<div class="rounded-xl border border-[#262626] bg-[#141414]">
-		<div class="border-b border-[#262626] px-6 py-4">
-			<h2 class="text-base font-semibold text-neutral-100">Maintenance windows</h2>
-			<p class="text-xs text-neutral-500">
+	<div class="card">
+		<div class="border-b border-border px-5 py-4 sm:px-6">
+			<h2 class="text-lg font-light text-ink">Maintenance windows</h2>
+			<p class="text-xs text-muted">
 				While a window is active its monitors and heartbeats are still checked, but they open no incidents and send
 				no alerts.
 			</p>
@@ -55,9 +55,7 @@
 		{#if form?.action === 'delete' && 'message' in form && form.message}
 			<div
 				role={form.success ? 'status' : 'alert'}
-				class="mx-6 mt-4 rounded-md border px-3 py-2 text-sm {form.success
-					? 'border-teal-500/30 bg-teal-500/10 text-teal-300'
-					: 'border-red-500/30 bg-red-500/10 text-red-400'}"
+				class="alert mx-5 mt-4 sm:mx-6 {form.success ? 'alert-success' : 'alert-danger'}"
 			>
 				{form.message}
 			</div>
@@ -68,39 +66,36 @@
 				method="POST"
 				action="?/delete"
 				use:enhance={submit}
-				class="mx-6 mt-4 flex flex-wrap items-center gap-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300"
+				class="alert alert-danger mx-5 mt-4 flex flex-wrap items-center gap-3 sm:mx-6"
 			>
 				<input type="hidden" name="window_id" value={pending.id} />
 				<input type="hidden" name="confirm" value="yes" />
 				<span class="wrap-anywhere">Delete maintenance window "{pending.title}"?</span>
-				<button type="submit" disabled={busy} class={button}>Yes, delete</button>
-				<a href="/projects/{data.project.id}/maintenance" class="text-neutral-400 hover:text-neutral-200">Cancel</a>
+				<button type="submit" disabled={busy} class="btn btn-danger-solid btn-sm">Yes, delete</button>
+				<a href="/projects/{data.project.id}/maintenance" class="text-ink-2 hover:text-ink">Cancel</a>
 			</form>
 		{/if}
 		{#if data.windows.length === 0}
-			<p class="px-6 py-10 text-center text-sm text-neutral-500">No maintenance windows yet — schedule one below.</p>
+			<EmptyState icon="maintenance" message="No maintenance windows yet — schedule one below." />
 		{:else}
 			<ul>
 				{#each data.windows as window (window.id)}
-					<li class="flex flex-wrap items-center justify-between gap-3 border-b border-[#262626] px-6 py-4 last:border-0">
+					<li class="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4 last:border-0 sm:px-6">
 						<div class="min-w-0 space-y-1">
 							<div class="flex flex-wrap items-center gap-2">
-								<span class="font-medium wrap-anywhere text-neutral-100">{window.title}</span>
+								<span class="font-medium wrap-anywhere text-ink">{window.title}</span>
 								{#if window.active}
-									<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-xs text-sky-300">
+									<span class="badge badge-info">
+										<span class="h-1.5 w-1.5 rounded-full bg-status-maintenance" aria-hidden="true"></span>
 										Active now
 									</span>
 								{/if}
 							</div>
-							<p class="text-xs text-neutral-400">{describeSchedule(window)}</p>
-							<p class="text-xs wrap-anywhere text-neutral-500">{describeScope(window.monitor_id, data.monitors)}</p>
+							<p class="text-xs text-ink-2">{describeSchedule(window)}</p>
+							<p class="text-xs wrap-anywhere text-muted">{describeScope(window.monitor_id, data.monitors)}</p>
 						</div>
 						<div class="flex items-center gap-2">
-							<a
-								href="/projects/{data.project.id}/maintenance/{window.id}"
-								class="rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:border-teal-500/30 hover:text-neutral-100"
-								>Edit</a
-							>
+							<a href="/projects/{data.project.id}/maintenance/{window.id}" class="btn btn-secondary btn-sm">Edit</a>
 							<form method="POST" action="?/delete" use:enhance={confirmDelete(window.title)}>
 								<input type="hidden" name="window_id" value={window.id} />
 								<button type="submit" disabled={busy} class={button}>Delete</button>
@@ -112,10 +107,10 @@
 		{/if}
 	</div>
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h2 class="text-base font-semibold text-neutral-100">New maintenance window</h2>
+	<div class="card p-5 sm:p-6">
+		<h2 class="text-lg font-light text-ink">New maintenance window</h2>
 		{#if form?.action === 'create' && form.success}
-			<div role="status" class="mt-4 rounded-md border border-teal-500/30 bg-teal-500/10 px-3 py-2 text-sm text-teal-300">
+			<div role="status" class="alert alert-success mt-4">
 				{form.message}
 			</div>
 		{/if}

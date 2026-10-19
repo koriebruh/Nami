@@ -28,7 +28,7 @@
 <button
 	type="button"
 	onclick={copy}
-	class="shrink-0 rounded-md border border-[#262626] px-2 py-1 text-xs text-neutral-400 transition-colors hover:border-teal-500/30 hover:text-neutral-100"
+	class="btn btn-secondary btn-sm shrink-0"
 >
 	{outcome === 'copied' ? 'Copied' : outcome === 'failed' ? 'Copy failed' : label}
 </button>

@@ -1,8 +1,9 @@
 <script lang="ts">
 	// Average response time per 30-minute bucket over the last 24 hours.
-	// One series, so no legend (the card title names it). The line is
-	// teal-600, validated in-band against the #141414 card surface; gaps
-	// (buckets without checks) break the line instead of being interpolated.
+	// One series in the primary token over a soft gradient area, with a dot
+	// legend under the plot; gaps (buckets without checks) break the line
+	// instead of being interpolated.
+	import Legend from '#lib/components/ui/Legend.svelte';
 	import {
 		formatClockUtc,
 		formatMs,
@@ -68,6 +69,12 @@
 			.join(' ');
 	}
 
+	// The area under a run, closed along the x axis.
+	function areaFor(run: { i: number; v: number }[]): string {
+		const floor = (PAD.top + PLOT_HEIGHT).toFixed(1);
+		return `${pathFor(run)} L${xAt(run[run.length - 1].i).toFixed(1)},${floor} L${xAt(run[0].i).toFixed(1)},${floor} Z`;
+	}
+
 	function bucketRange(bucket: SeriesBucket): string {
 		const end = new Date(Date.parse(bucket.bucket_start) + BUCKET_MS).toISOString();
 		return `${formatClockUtc(bucket.bucket_start)}–${formatClockUtc(end)} UTC`;
@@ -109,17 +116,23 @@
 		height={HEIGHT}
 		role="img"
 		aria-label="Average response time per 30 minutes over the last 24 hours"
-		class="block rounded-md peer-focus-visible:ring-2 peer-focus-visible:ring-teal-500/50"
+		class="block rounded-md peer-focus-visible:ring-2 peer-focus-visible:ring-primary"
 		onpointermove={onPointerMove}
 		onpointerleave={() => (hoverIndex = null)}
 	>
+		<defs>
+			<linearGradient id="response-time-area" x1="0" x2="0" y1="0" y2="1">
+				<stop offset="0%" stop-color="var(--color-primary)" stop-opacity="0.18" />
+				<stop offset="100%" stop-color="var(--color-accent-cyan)" stop-opacity="0.02" />
+			</linearGradient>
+		</defs>
 		{#each ticks as tick (tick)}
 			<line
 				x1={PAD.left}
 				x2={PAD.left + plotWidth}
 				y1={yAt(tick)}
 				y2={yAt(tick)}
-				class="stroke-[#262626]"
+				class="stroke-border"
 				stroke-width="1"
 			/>
 			<text
@@ -127,7 +140,7 @@
 				y={yAt(tick)}
 				dy="0.32em"
 				text-anchor="end"
-				class="fill-neutral-500 text-[11px] tabular-nums">{tick} ms</text
+				class="fill-muted text-[11px] tabular-nums">{tick} ms</text
 			>
 		{/each}
 
@@ -137,22 +150,23 @@
 					x={xAt(i)}
 					y={HEIGHT - 8}
 					text-anchor="middle"
-					class="fill-neutral-500 text-[11px] tabular-nums">{formatClockUtc(bucket.bucket_start)}</text
+					class="fill-muted text-[11px] tabular-nums">{formatClockUtc(bucket.bucket_start)}</text
 				>
 			{/if}
 		{/each}
-		<text x={PAD.left + plotWidth} y={HEIGHT - 8} text-anchor="end" class="fill-neutral-500 text-[11px]"
+		<text x={PAD.left + plotWidth} y={HEIGHT - 8} text-anchor="end" class="fill-muted text-[11px]"
 			>{labelEvery === 12 ? 'now (UTC)' : 'now'}</text
 		>
 
 		{#each runs as run (run[0].i)}
 			{#if run.length === 1}
-				<circle cx={xAt(run[0].i)} cy={yAt(run[0].v)} r="4" class="fill-teal-600" />
+				<circle cx={xAt(run[0].i)} cy={yAt(run[0].v)} r="4" class="fill-primary" />
 			{:else}
+				<path d={areaFor(run)} fill="url(#response-time-area)" />
 				<path
 					d={pathFor(run)}
 					fill="none"
-					class="stroke-teal-600"
+					class="stroke-primary"
 					stroke-width="2"
 					stroke-linejoin="round"
 					stroke-linecap="round"
@@ -166,7 +180,7 @@
 				x2={xAt(active)}
 				y1={PAD.top}
 				y2={PAD.top + PLOT_HEIGHT}
-				class="stroke-neutral-600"
+				class="stroke-faint"
 				stroke-width="1"
 			/>
 		{/if}
@@ -180,7 +194,7 @@
 				cx={xAt(last.i)}
 				cy={yAt(last.v)}
 				r="5"
-				class="fill-teal-600 stroke-[#141414]"
+				class="fill-primary stroke-surface"
 				stroke-width="2"
 			/>
 			<!-- The latest value is the chart's only direct label. -->
@@ -188,13 +202,13 @@
 				x={xAt(last.i) + 10}
 				y={yAt(last.v)}
 				dy="0.32em"
-				class="fill-neutral-200 text-xs font-medium tabular-nums">{formatMs(last.v)}</text
+				class="fill-ink text-xs font-medium tabular-nums">{formatMs(last.v)}</text
 			>
 		{/if}
 	</svg>
 
 	{#if points.length === 0}
-		<p class="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-neutral-500">
+		<p class="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-muted">
 			{series.some((bucket) => bucket.up_ratio !== null)
 				? 'No response times in the last 24 hours: every check failed before a response arrived.'
 				: 'No checks in the last 24 hours yet.'}
@@ -204,32 +218,34 @@
 	{#if active !== null && series[active]}
 		{@const bucket = series[active]}
 		<div
-			class="pointer-events-none absolute top-2 w-52 rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-xs shadow-lg"
+			class="pointer-events-none absolute top-2 w-52 rounded-card border border-border bg-surface px-3 py-2 text-xs shadow-pop"
 			style:left="{Math.max(0, Math.min(xAt(active) + 12, width - 216))}px"
 		>
-			<div class="text-sm font-semibold text-neutral-100 tabular-nums">
+			<div class="text-sm font-semibold text-ink tabular-nums">
 				{formatMs(bucket.avg_response_ms)}
 			</div>
-			<div class="text-neutral-400">avg response · {formatUptime(bucket.up_ratio)} up</div>
-			<div class="text-neutral-500">{bucketRange(bucket)}</div>
+			<div class="text-ink-2">avg response · {formatUptime(bucket.up_ratio)} up</div>
+			<div class="text-muted">{bucketRange(bucket)}</div>
 		</div>
 	{/if}
 </div>
 
+<Legend class="mt-2" items={[{ label: 'Avg response time', tone: 'primary' }]} />
+
 <details class="mt-3 text-sm">
-	<summary class="cursor-pointer text-neutral-500 hover:text-neutral-300">Show data table</summary>
+	<summary class="summary">Show data table</summary>
 	<div class="mt-2 max-h-64 overflow-y-auto">
 		<table class="w-full text-left text-xs">
-			<thead class="text-neutral-500">
+			<thead class="text-muted">
 				<tr>
 					<th class="py-1 font-medium">Half hour (UTC)</th>
 					<th class="py-1 font-medium">Avg response</th>
 					<th class="py-1 font-medium">Uptime</th>
 				</tr>
 			</thead>
-			<tbody class="text-neutral-300 tabular-nums">
+			<tbody class="text-ink-2 tabular-nums">
 				{#each series as bucket (bucket.bucket_start)}
-					<tr class="border-t border-[#262626]">
+					<tr class="border-t border-border">
 						<td class="py-1">{formatUtc(bucket.bucket_start)}</td>
 						<td class="py-1">{formatMs(bucket.avg_response_ms)}</td>
 						<td class="py-1">{formatUptime(bucket.up_ratio)}</td>

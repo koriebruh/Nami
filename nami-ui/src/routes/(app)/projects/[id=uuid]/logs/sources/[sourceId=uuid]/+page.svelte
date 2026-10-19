@@ -95,16 +95,14 @@
 		`Delete source "${data.source.name}"? Ingestion stops now; stored logs age out with their retention.`
 	);
 
-	const input =
-		'w-full rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:border-teal-500/50 focus:ring-2 focus:ring-teal-500/50 focus:outline-none';
-	const label = 'mb-1.5 block text-sm font-medium text-neutral-300';
-	const disabled = 'disabled:cursor-not-allowed disabled:opacity-50';
-	const button = `rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:border-teal-500/30 hover:text-neutral-100 ${disabled}`;
-	const dangerButton = `rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-400 transition-colors hover:border-red-500/30 hover:text-red-400 ${disabled}`;
-	const primaryButton = `rounded-md bg-teal-500 px-4 py-2 text-sm font-medium text-neutral-950 transition-colors hover:bg-teal-400 focus:ring-2 focus:ring-teal-500/50 focus:ring-offset-2 focus:ring-offset-[#141414] focus:outline-none ${disabled}`;
-	const alertBox = 'rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400';
+	const input = 'input';
+	const label = 'label';
+	const button = `btn btn-secondary btn-sm`;
+	const dangerButton = `btn btn-danger btn-sm`;
+	const primaryButton = `btn btn-primary`;
+	const alertBox = 'alert alert-danger';
 	const confirmBox =
-		'flex flex-wrap items-center gap-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300';
+		'alert alert-danger flex flex-wrap items-center gap-3';
 </script>
 
 <svelte:head>
@@ -116,18 +114,18 @@
 {/snippet}
 
 <div class="space-y-6">
-	<a href="/projects/{data.project.id}/logs/sources" class="text-sm text-neutral-500 hover:text-neutral-300">← Sources</a>
+	<a href="/projects/{data.project.id}/logs/sources" class="text-sm text-muted hover:text-primary">← Sources</a>
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
+	<div class="card p-5 sm:p-6">
 		<div class="flex flex-wrap items-start justify-between gap-4">
 			<div class="space-y-1">
-				<h2 class="text-base font-semibold wrap-anywhere text-neutral-100">{data.source.name}</h2>
-				<p class="text-sm text-neutral-500">
+				<h2 class="text-lg font-light wrap-anywhere text-ink">{data.source.name}</h2>
+				<p class="text-sm text-muted">
 					{PLATFORM_LABELS[data.source.platform]} · {data.source.retention_days} days retention · {formatQuota(
 						data.source.daily_byte_quota
 					)}
 				</p>
-				<p class="text-xs text-neutral-600">Created {formatUtc(data.source.created_at)}</p>
+				<p class="text-xs text-muted">Created {formatUtc(data.source.created_at)}</p>
 			</div>
 			<form method="POST" action="?/delete" use:enhance={confirmed(deleteQuestion)}>
 				{@render submitButton('Delete', dangerButton)}
@@ -141,25 +139,25 @@
 			<form method="POST" action="?/delete" use:enhance={submit} class="mt-4 {confirmBox}">
 				<input type="hidden" name="confirm" value="yes" />
 				<span class="wrap-anywhere">{deleteQuestion}</span>
-				{@render submitButton('Yes, delete', `${dangerButton} border-red-500/40 text-red-300`)}
-				<a href={base} class="text-neutral-400 hover:text-neutral-200">Cancel</a>
+				{@render submitButton('Yes, delete', `btn btn-danger-solid btn-sm`)}
+				<a href={base} class="text-ink-2 hover:text-ink">Cancel</a>
 			</form>
 		{/if}
 	</div>
 
-	<div class="space-y-3 rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h3 class="text-sm font-semibold text-neutral-200">Source token</h3>
+	<div class="card space-y-3 p-5 sm:p-6">
+		<h3 class="card-title">Source token</h3>
 		{#if form?.token}
 			<div role="group" aria-label="Source token" class="flex items-center gap-2">
 				<code
-					class="block flex-1 rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 font-mono text-xs break-all text-neutral-200 select-all"
+					class="block flex-1 rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs break-all text-ink select-all"
 					>{form.token}</code
 				>
 				<CopyButton value={form.token} />
 			</div>
-			<p class="text-xs text-neutral-500">Shown until you leave this page. Treat it like a password.</p>
+			<p class="text-xs text-muted">Shown until you leave this page. Treat it like a password.</p>
 		{:else}
-			<p class="text-sm text-neutral-500">
+			<p class="text-sm text-muted">
 				The token is visible to project members. Revealing it also fills it into the snippets below.
 			</p>
 			<form method="POST" action="?/reveal" use:enhance={submit}>
@@ -170,30 +168,30 @@
 			<div role="alert" class={alertBox}>{form.message}</div>
 		{/if}
 		{#if form?.rotated}
-			<div role="status" class="rounded-md border border-teal-500/30 bg-teal-500/10 px-3 py-2 text-sm text-teal-300">
+			<div role="status" class="alert alert-success">
 				Token rotated. Update your senders: the old token no longer works.
 			</div>
 		{/if}
-		<div class="flex flex-wrap items-center gap-3 border-t border-[#262626] pt-3">
+		<div class="flex flex-wrap items-center gap-3 border-t border-border pt-3">
 			<form method="POST" action="?/rotate" use:enhance={confirmed(rotateQuestion)}>
 				{@render submitButton('Rotate token', button)}
 			</form>
-			<p class="text-xs text-neutral-500">Gives the source a new token. The current one stops working immediately.</p>
+			<p class="text-xs text-muted">Gives the source a new token. The current one stops working immediately.</p>
 		</div>
 		<!-- The second step of a rotate without JavaScript (see the rotate action). -->
 		{#if form?.confirmRotate}
 			<form method="POST" action="?/rotate" use:enhance={submit} class={confirmBox}>
 				<input type="hidden" name="confirm" value="yes" />
 				<span class="wrap-anywhere">{rotateQuestion}</span>
-				{@render submitButton('Yes, rotate', `${dangerButton} border-red-500/40 text-red-300`)}
-				<a href={base} class="text-neutral-400 hover:text-neutral-200">Cancel</a>
+				{@render submitButton('Yes, rotate', `btn btn-danger-solid btn-sm`)}
+				<a href={base} class="text-ink-2 hover:text-ink">Cancel</a>
 			</form>
 		{/if}
 	</div>
 
-	<div class="space-y-3 rounded-xl border border-[#262626] bg-[#141414] p-6">
+	<div class="card space-y-3 p-5 sm:p-6">
 		<div class="flex flex-wrap items-center justify-between gap-2">
-			<h3 class="text-sm font-semibold text-neutral-200">Send logs</h3>
+			<h3 class="card-title">Send logs</h3>
 			<div class="flex gap-1" role="tablist" aria-label="Setup snippets">
 				{#each Object.entries(SNIPPET_LABELS) as [kind, title] (kind)}
 					<button
@@ -201,55 +199,55 @@
 						role="tab"
 						aria-selected={snippetKind === kind}
 						onclick={() => (snippetKind = kind as SnippetKind)}
-						class="rounded-md px-2.5 py-1 text-xs transition-colors {snippetKind === kind
-							? 'bg-[#1f1f1f] text-neutral-100'
-							: 'text-neutral-500 hover:text-neutral-300'}">{title}</button
+						class="rounded-control border px-2.5 py-1 text-xs transition-colors {snippetKind === kind
+							? 'border-primary text-primary'
+							: 'border-transparent text-ink-2 hover:text-primary'}">{title}</button
 					>
 				{/each}
 			</div>
 		</div>
 		<div class="flex items-start gap-2">
 			<pre
-				class="min-w-0 flex-1 overflow-x-auto rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 font-mono text-xs text-neutral-300">{snippet}</pre>
+				class="min-w-0 flex-1 overflow-x-auto rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs text-ink-2">{snippet}</pre>
 			<CopyButton value={snippet} />
 		</div>
-		<p class="text-xs text-neutral-500">
+		<p class="text-xs text-muted">
 			HTTP accepts a JSON object, a JSON array, NDJSON or MessagePack (gzip optional) up to 10 MiB and 10,000 events per
 			request, 50 requests per second per source. Syslog needs the engine's <code>SYSLOG_ENABLED=true</code>.
 		</p>
 	</div>
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h3 class="text-sm font-semibold text-neutral-200">Today (UTC)</h3>
+	<div class="card p-5 sm:p-6">
+		<h3 class="card-title">Today (UTC)</h3>
 		{#if data.today}
 			<dl class="mt-3 grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
 				<div>
-					<dt class="text-xs text-neutral-500">Events</dt>
-					<dd class="text-neutral-100 tabular-nums">{data.today.events.toLocaleString('en-US')}</dd>
+					<dt class="text-xs text-muted">Events</dt>
+					<dd class="mt-1 text-2xl font-normal tracking-tight text-ink tabular-nums">{data.today.events.toLocaleString('en-US')}</dd>
 				</div>
 				<div>
-					<dt class="text-xs text-neutral-500">Volume</dt>
-					<dd class="text-neutral-100 tabular-nums">{formatBytes(data.today.bytes)}</dd>
+					<dt class="text-xs text-muted">Volume</dt>
+					<dd class="mt-1 text-2xl font-normal tracking-tight text-ink tabular-nums">{formatBytes(data.today.bytes)}</dd>
 				</div>
 				<div>
-					<dt class="text-xs text-neutral-500">Rate limited</dt>
-					<dd class="text-neutral-100 tabular-nums">{data.today.requests_rate_limited.toLocaleString('en-US')}</dd>
+					<dt class="text-xs text-muted">Rate limited</dt>
+					<dd class="mt-1 text-2xl font-normal tracking-tight text-ink tabular-nums">{data.today.requests_rate_limited.toLocaleString('en-US')}</dd>
 				</div>
 				<div>
-					<dt class="text-xs text-neutral-500">Over quota</dt>
-					<dd class="text-neutral-100 tabular-nums">{data.today.requests_over_quota.toLocaleString('en-US')}</dd>
+					<dt class="text-xs text-muted">Over quota</dt>
+					<dd class="mt-1 text-2xl font-normal tracking-tight text-ink tabular-nums">{data.today.requests_over_quota.toLocaleString('en-US')}</dd>
 				</div>
 			</dl>
-			<p class="mt-2 text-xs text-neutral-600">Counts reach this page within about 10 seconds.</p>
+			<p class="mt-2 text-xs text-muted">Counts reach this page within about 10 seconds.</p>
 		{:else}
-			<p class="mt-2 text-sm text-neutral-500">No usage data.</p>
+			<p class="mt-2 text-sm text-muted">No usage data.</p>
 		{/if}
 	</div>
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h3 class="text-sm font-semibold text-neutral-200">Settings</h3>
+	<div class="card p-5 sm:p-6">
+		<h3 class="card-title">Settings</h3>
 		{#if form?.saved}
-			<div role="status" class="mt-4 rounded-md border border-teal-500/30 bg-teal-500/10 px-3 py-2 text-sm text-teal-300">Saved.</div>
+			<div role="status" class="alert alert-success mt-4">Saved.</div>
 		{/if}
 		{#if form?.message && form.action === 'update'}
 			<div role="alert" class="mt-4 {alertBox}">{form.message}</div>
@@ -281,7 +279,7 @@
 						value={savedRetention}
 						class={input}
 					/>
-					<p class="mt-1 text-xs text-neutral-500">Changes affect new rows only; stored rows keep their retention.</p>
+					<p class="hint">Changes affect new rows only; stored rows keep their retention.</p>
 				</div>
 				<div>
 					<label for="source-quota" class={label}>Daily quota (MiB)</label>
@@ -295,7 +293,7 @@
 						value={savedQuota}
 						class={input}
 					/>
-					<p class="mt-1 text-xs text-neutral-500">
+					<p class="hint">
 						Over the quota, requests get 429 <code>quota_exceeded</code> until midnight UTC; one request plus about 10 s of
 						traffic per engine instance can go over.
 					</p>

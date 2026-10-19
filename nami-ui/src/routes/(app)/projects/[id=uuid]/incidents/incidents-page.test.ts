@@ -38,9 +38,9 @@ describe('incidents page', () => {
 			incident(),
 			incident({ id: 'i2', monitor_id: null, heartbeat_id: HEARTBEAT_ID, title: 'Backup missed its heartbeat' })
 		]);
-		expect(body).toContain(`<a href="/projects/${PROJECT_ID}/monitors/${MONITOR_ID}" class="hover:text-teal-300">API is down</a>`);
+		expect(body).toContain(`<a href="/projects/${PROJECT_ID}/monitors/${MONITOR_ID}" class="hover:text-primary">API is down</a>`);
 		expect(body).toContain(
-			`<a href="/projects/${PROJECT_ID}/heartbeats/${HEARTBEAT_ID}" class="hover:text-teal-300">Backup missed its heartbeat</a>`
+			`<a href="/projects/${PROJECT_ID}/heartbeats/${HEARTBEAT_ID}" class="hover:text-primary">Backup missed its heartbeat</a>`
 		);
 	});
 

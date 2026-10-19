@@ -81,16 +81,14 @@
 		return submit(submission);
 	};
 
-	const input =
-		'w-full rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-sm text-neutral-100 focus:border-teal-500/50 focus:ring-2 focus:ring-teal-500/50 focus:outline-none';
-	const label = 'mb-1.5 block text-sm font-medium text-neutral-300';
-	const disabled = 'disabled:cursor-not-allowed disabled:opacity-50';
-	const button = `rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:border-teal-500/30 hover:text-neutral-100 ${disabled}`;
-	const dangerButton = `rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-400 transition-colors hover:border-red-500/30 hover:text-red-400 ${disabled}`;
-	const primaryButton = `rounded-md bg-teal-500 px-4 py-2 text-sm font-medium text-neutral-950 transition-colors hover:bg-teal-400 focus:ring-2 focus:ring-teal-500/50 focus:ring-offset-2 focus:ring-offset-[#141414] focus:outline-none ${disabled}`;
-	const alertBox = 'rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400';
+	const input = 'input';
+	const label = 'label';
+	const button = `btn btn-secondary btn-sm`;
+	const dangerButton = `btn btn-danger btn-sm`;
+	const primaryButton = `btn btn-primary`;
+	const alertBox = 'alert alert-danger';
 	const confirmBox =
-		'flex flex-wrap items-center gap-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300';
+		'alert alert-danger flex flex-wrap items-center gap-3';
 </script>
 
 <svelte:head>
@@ -109,15 +107,15 @@
 {/snippet}
 
 <div class="space-y-6">
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
+	<div class="card p-5 sm:p-6">
 		<div class="flex flex-wrap items-start justify-between gap-4">
 			<div class="space-y-2">
 				<div class="flex flex-wrap items-center gap-3">
 					<StatusBadge status={data.heartbeat.current_status} paused={data.heartbeat.paused} />
 					{#if data.heartbeat.in_maintenance}<MaintenanceBadge />{/if}
 				</div>
-				<h2 class="text-base font-semibold wrap-anywhere text-neutral-100">{data.heartbeat.name}</h2>
-				<p class="text-sm text-neutral-500">
+				<h2 class="text-lg font-light wrap-anywhere text-ink">{data.heartbeat.name}</h2>
+				<p class="text-sm text-muted">
 					Last ping:
 					{#if data.heartbeat.last_ping_at}
 						{formatUtc(data.heartbeat.last_ping_at)} ({timeAgo(data.heartbeat.last_ping_at, now)})
@@ -125,7 +123,7 @@
 						never
 					{/if}
 				</p>
-				<p class="text-sm text-neutral-500">
+				<p class="text-sm text-muted">
 					Expected every {formatSeconds(data.heartbeat.period_seconds)}, with {formatSeconds(data.heartbeat.grace_seconds)} grace.
 				</p>
 			</div>
@@ -148,39 +146,39 @@
 			<form method="POST" action="?/delete" use:enhance={submit} class="mt-4 {confirmBox}">
 				<input type="hidden" name="confirm" value="yes" />
 				<span class="wrap-anywhere">Delete heartbeat "{data.heartbeat.name}"? Its incidents are deleted too.</span>
-				{@render submitButton('Yes, delete', `${dangerButton} border-red-500/40 text-red-300`)}
-				<a href={base} class="text-neutral-400 hover:text-neutral-200">Cancel</a>
+				{@render submitButton('Yes, delete', `btn btn-danger-solid btn-sm`)}
+				<a href={base} class="text-ink-2 hover:text-ink">Cancel</a>
 			</form>
 		{/if}
 	</div>
 
-	<div class="space-y-3 rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h3 class="text-sm font-semibold text-neutral-200">Ping URL</h3>
+	<div class="card space-y-3 p-5 sm:p-6">
+		<h3 class="card-title">Ping URL</h3>
 		{#if url && cron}
-			<p class="text-sm text-neutral-500">
+			<p class="text-sm text-muted">
 				Request it (GET or POST, no login needed) at the end of every successful run.
 			</p>
 			<div role="group" aria-label="Ping URL" class="flex items-center gap-2">
-				<code class="block flex-1 rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 font-mono text-xs break-all text-neutral-300 select-all">{url}</code>
+				<code class="block flex-1 rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs break-all text-ink-2 select-all">{url}</code>
 				<CopyButton value={url} />
 			</div>
-			<p class="pt-2 text-sm text-neutral-500">Example crontab entry:</p>
+			<p class="pt-2 text-sm text-muted">Example crontab entry:</p>
 			<div role="group" aria-label="Example crontab entry" class="flex items-center gap-2">
-				<code class="block flex-1 rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 font-mono text-xs break-all text-neutral-300 select-all">{cron}</code>
+				<code class="block flex-1 rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs break-all text-ink-2 select-all">{cron}</code>
 				<CopyButton value={cron} />
 			</div>
 
-			<div class="space-y-3 border-t border-[#262626] pt-4">
+			<div class="space-y-3 border-t border-border pt-4">
 				<div class="flex flex-wrap items-center gap-3">
 					<form method="POST" action="?/rotate" use:enhance={confirmRotate}>
 						{@render submitButton('Rotate token', button)}
 					</form>
-					<p class="text-xs text-neutral-500">
+					<p class="text-xs text-muted">
 						Gives the heartbeat a new ping URL. The old URL stops working immediately.
 					</p>
 				</div>
 				{#if form?.rotated}
-					<div role="status" class="rounded-md border border-teal-500/30 bg-teal-500/10 px-3 py-2 text-sm text-teal-300">
+					<div role="status" class="alert alert-success">
 						Token rotated. The old ping URL no longer works: use the new one above.
 					</div>
 				{/if}
@@ -195,20 +193,20 @@
 							Rotate the ping token of "{data.heartbeat.name}"? The old ping URL stops working immediately, so update
 							every cron job that uses it.
 						</span>
-						{@render submitButton('Yes, rotate', `${dangerButton} border-red-500/40 text-red-300`)}
-						<a href={base} class="text-neutral-400 hover:text-neutral-200">Cancel</a>
+						{@render submitButton('Yes, rotate', `btn btn-danger-solid btn-sm`)}
+						<a href={base} class="text-ink-2 hover:text-ink">Cancel</a>
 					</form>
 				{/if}
 			</div>
 		{:else}
-			<p class="text-sm text-neutral-500">Ping URL is visible to project members.</p>
+			<p class="text-sm text-muted">Ping URL is visible to project members.</p>
 		{/if}
 	</div>
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h3 class="text-sm font-semibold text-neutral-200">Settings</h3>
+	<div class="card p-5 sm:p-6">
+		<h3 class="card-title">Settings</h3>
 		{#if form?.saved}
-			<div role="status" class="mt-4 rounded-md border border-teal-500/30 bg-teal-500/10 px-3 py-2 text-sm text-teal-300">Saved.</div>
+			<div role="status" class="alert alert-success mt-4">Saved.</div>
 		{/if}
 		{#if form?.message && form.action === 'update'}
 			<div role="alert" class="mt-4 {alertBox}">{form.message}</div>
@@ -254,7 +252,7 @@
 					/>
 				</div>
 				{@render submitButton('Save', primaryButton)}
-				<p id="hb-hint" class="text-xs text-neutral-500 sm:col-span-4">
+				<p id="hb-hint" class="text-xs text-muted sm:col-span-4">
 					Period: at least 30, grace: 0 or more, both at most 2678400 (31 days).
 				</p>
 			</form>

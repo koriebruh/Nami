@@ -199,9 +199,9 @@ describe('row helpers', () => {
 
 	it('formats times, levels and toggles', () => {
 		expect(formatLogTime('2026-10-13T14:30:05.123Z')).toBe('2026-10-13 14:30:05.123');
-		expect(levelClasses('error')).toContain('text-red-300');
+		expect(levelClasses('error')).toContain('text-danger-ink');
 		expect(levelClasses('fatal')).toContain('font-semibold');
-		expect(levelClasses('unknown')).toContain('text-neutral-400');
+		expect(levelClasses('unknown')).toContain('text-paused-ink');
 		expect(toggled(['a'], 'b')).toEqual(['a', 'b']);
 		expect(toggled(['a', 'b'], 'a')).toEqual(['b']);
 		expect(toInputValue('2026-10-13T14:30:00.000Z')).toBe('2026-10-13T14:30');

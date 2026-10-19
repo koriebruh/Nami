@@ -1,4 +1,5 @@
 <script lang="ts">
+	import Card from '#lib/components/ui/Card.svelte';
 	import MonitorForm from '#lib/components/MonitorForm.svelte';
 	import type { PageProps } from './$types';
 
@@ -9,14 +10,11 @@
 	<title>New monitor · {data.project.name}</title>
 </svelte:head>
 
-<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-	<h2 class="text-base font-semibold text-neutral-100">New monitor</h2>
-	<div class="mt-4">
-		<MonitorForm
-			groups={data.groups}
-			submitLabel="Create monitor"
-			message={form?.message ?? null}
-			cancelHref="/projects/{data.project.id}/monitors"
-		/>
-	</div>
-</div>
+<Card title="New monitor">
+	<MonitorForm
+		groups={data.groups}
+		submitLabel="Create monitor"
+		message={form?.message ?? null}
+		cancelHref="/projects/{data.project.id}/monitors"
+	/>
+</Card>

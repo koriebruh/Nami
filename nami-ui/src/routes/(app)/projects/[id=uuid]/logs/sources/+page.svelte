@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import CopyButton from '#lib/components/CopyButton.svelte';
+	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import { formatQuota, PLATFORM_LABELS, PLATFORMS } from '#lib/logs';
 	import { formatUtc } from '#lib/uptime';
 	import type { PageProps } from './$types';
@@ -21,9 +22,8 @@
 	};
 
 	const base = $derived(`/projects/${data.project.id}/logs/sources`);
-	const input =
-		'w-full rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:border-teal-500/50 focus:ring-2 focus:ring-teal-500/50 focus:outline-none';
-	const label = 'mb-1.5 block text-sm font-medium text-neutral-300';
+	const input = 'input';
+	const label = 'label';
 </script>
 
 <svelte:head>
@@ -32,55 +32,55 @@
 
 <div class="space-y-6">
 	{#if form?.created}
-		<div class="space-y-3 rounded-xl border border-teal-500/30 bg-teal-500/10 p-6" role="status">
-			<p class="text-sm text-teal-200">
+		<div class="space-y-3 rounded-card border border-success-ink/25 bg-success-soft p-5 sm:p-6" role="status">
+			<p class="text-sm text-success-ink">
 				Source <span class="font-medium wrap-anywhere">{form.created.name}</span> created. Send logs with this token; project
 				members can reveal it again on the source page.
 			</p>
 			<div role="group" aria-label="Source token" class="flex items-center gap-2">
 				<code
-					class="block flex-1 rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 font-mono text-xs break-all text-neutral-200 select-all"
+					class="block flex-1 rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs break-all text-ink select-all"
 					>{form.created.token}</code
 				>
 				<CopyButton value={form.created.token} />
 			</div>
-			<a href="{base}/{form.created.id}" class="text-sm text-teal-300 hover:text-teal-200">Setup instructions →</a>
+			<a href="{base}/{form.created.id}" class="link text-sm">Setup instructions →</a>
 		</div>
 	{/if}
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414]">
-		<div class="border-b border-[#262626] px-6 py-4">
-			<h2 class="text-base font-semibold text-neutral-100">Log sources</h2>
-			<p class="text-xs text-neutral-500">
+	<div class="card">
+		<div class="border-b border-border px-5 py-4 sm:px-6">
+			<h2 class="text-lg font-light text-ink">Log sources</h2>
+			<p class="text-xs text-muted">
 				Each source has its own ingest token and retention. Send logs over HTTP (JSON, NDJSON, MessagePack) or syslog.
 			</p>
 		</div>
 		{#if data.sources.length === 0}
-			<p class="px-6 py-10 text-center text-sm text-neutral-500">No sources yet. Create one below.</p>
+			<EmptyState icon="source" message="No sources yet. Create one below." />
 		{:else}
 			<div class="overflow-x-auto">
-				<table class="w-full text-left text-sm">
-					<thead class="text-xs text-neutral-500">
-						<tr class="border-b border-[#262626]">
-							<th class="px-6 py-2 font-medium">Name</th>
-							<th class="px-6 py-2 font-medium">Platform</th>
-							<th class="px-6 py-2 font-medium">Retention</th>
-							<th class="px-6 py-2 font-medium">Daily quota</th>
-							<th class="px-6 py-2 font-medium">Created</th>
+				<table class="table table-hover">
+					<thead>
+						<tr>
+							<th>Name</th>
+							<th>Platform</th>
+							<th>Retention</th>
+							<th>Daily quota</th>
+							<th>Created</th>
 						</tr>
 					</thead>
 					<tbody>
 						{#each data.sources as source (source.id)}
-							<tr class="border-b border-[#262626] last:border-0">
-								<td class="px-6 py-3">
-									<a href="{base}/{source.id}" class="font-medium wrap-anywhere text-neutral-100 hover:text-teal-300"
+							<tr>
+								<td>
+									<a href="{base}/{source.id}" class="font-medium wrap-anywhere text-ink hover:text-primary"
 										>{source.name}</a
 									>
 								</td>
-								<td class="px-6 py-3 text-neutral-400">{PLATFORM_LABELS[source.platform]}</td>
-								<td class="px-6 py-3 text-neutral-400">{source.retention_days} days</td>
-								<td class="px-6 py-3 text-neutral-400">{formatQuota(source.daily_byte_quota)}</td>
-								<td class="px-6 py-3 text-xs text-neutral-500">{formatUtc(source.created_at)}</td>
+								<td>{PLATFORM_LABELS[source.platform]}</td>
+								<td>{source.retention_days} days</td>
+								<td>{formatQuota(source.daily_byte_quota)}</td>
+								<td class="text-xs text-muted">{formatUtc(source.created_at)}</td>
 							</tr>
 						{/each}
 					</tbody>
@@ -89,10 +89,10 @@
 		{/if}
 	</div>
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h2 class="text-base font-semibold text-neutral-100">New source</h2>
+	<div class="card p-5 sm:p-6">
+		<h2 class="text-lg font-light text-ink">New source</h2>
 		{#if form?.message}
-			<div class="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400" role="alert">
+			<div class="alert alert-danger mt-4" role="alert">
 				{form.message}
 			</div>
 		{/if}
@@ -122,13 +122,7 @@
 				<label for="source-quota" class={label}>Daily quota (MiB)</label>
 				<input id="source-quota" name="daily_quota_mib" type="number" min="1" step="any" placeholder="Unlimited" class={input} />
 			</div>
-			<button
-				type="submit"
-				disabled={busy}
-				class="rounded-md bg-teal-500 px-4 py-2 text-sm font-medium text-neutral-950 transition-colors hover:bg-teal-400 focus:ring-2 focus:ring-teal-500/50 focus:ring-offset-2 focus:ring-offset-[#141414] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-			>
-				Create
-			</button>
+			<button type="submit" disabled={busy} class="btn btn-primary">Create</button>
 		</form>
 	</div>
 </div>

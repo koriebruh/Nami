@@ -1,5 +1,9 @@
 <script lang="ts">
 	import { refreshAll } from '$app/navigation';
+	import Card from '#lib/components/ui/Card.svelte';
+	import EmptyState from '#lib/components/ui/EmptyState.svelte';
+	import Icon from '#lib/components/ui/Icon.svelte';
+	import SegmentedTabs from '#lib/components/ui/SegmentedTabs.svelte';
 	import { formatDuration, formatUtc } from '#lib/uptime';
 	import type { PageProps } from './$types';
 
@@ -19,6 +23,9 @@
 		{ status: 'open', label: 'Open' },
 		{ status: 'resolved', label: 'Resolved' }
 	] as const;
+	const tabItems = $derived(
+		tabs.map((tab) => ({ href: `?status=${tab.status}`, label: tab.label, active: data.status === tab.status }))
+	);
 
 	// An incident belongs to a monitor or to a heartbeat (one of the two ids is null).
 	function sourceHref(incident: (typeof data.incidents)[number]): string | null {
@@ -32,54 +39,50 @@
 	<title>Incidents · {data.project.name}</title>
 </svelte:head>
 
-<div class="rounded-xl border border-[#262626] bg-[#141414]">
-	<div class="flex items-center justify-between border-b border-[#262626] px-6 py-4">
-		<h2 class="text-base font-semibold text-neutral-100">Incidents</h2>
-		<div class="flex gap-1 rounded-md border border-[#262626] bg-[#0a0a0a] p-0.5">
-			{#each tabs as tab (tab.status)}
-				<a
-					href="?status={tab.status}"
-					aria-current={data.status === tab.status ? 'page' : undefined}
-					class="rounded px-3 py-1 text-sm transition-colors {data.status === tab.status
-						? 'bg-[#262626] text-neutral-100'
-						: 'text-neutral-500 hover:text-neutral-300'}">{tab.label}</a
-				>
-			{/each}
-		</div>
-	</div>
+<Card title="Incidents" padded={false}>
+	{#snippet tabs()}
+		<SegmentedTabs label="Incident status" items={tabItems} />
+	{/snippet}
 
 	{#if data.incidents.length === 0}
-		<p class="px-6 py-10 text-center text-sm text-neutral-500">
-			{data.status === 'open' ? 'No open incidents — everything is up.' : 'No resolved incidents yet.'}
-		</p>
+		<EmptyState
+			icon={data.status === 'open' ? 'heartbeat' : 'incident'}
+			message={data.status === 'open' ? 'No open incidents — everything is up.' : 'No resolved incidents yet.'}
+		/>
 	{:else}
-		<ul>
+		<ul class="divide-y divide-border">
 			{#each data.incidents as incident (incident.id)}
 				{@const href = sourceHref(incident)}
-				<li class="flex flex-wrap items-start justify-between gap-3 border-b border-[#262626] px-6 py-4 last:border-0">
-					<div class="space-y-1">
-						<!-- Titles and causes carry text from the target (a name, an error
-						     message) with no spaces to wrap at: break anywhere. -->
-						<p class="text-sm font-medium wrap-anywhere text-neutral-100">
-							{#if href}
-								<a {href} class="hover:text-teal-300">{incident.title}</a>
-							{:else}
-								{incident.title}
+				<li class="flex flex-wrap items-start justify-between gap-3 px-5 py-4 sm:px-6">
+					<div class="flex min-w-0 gap-3">
+						<span
+							class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full {incident.status === 'open'
+								? 'bg-danger-soft text-danger-ink'
+								: 'bg-success-soft text-success-ink'}"
+							aria-hidden="true"
+						>
+							<Icon name={incident.status === 'open' ? 'incident' : 'heartbeat'} size={16} />
+						</span>
+						<div class="min-w-0 space-y-1">
+							<!-- Titles and causes carry text from the target (a name, an error
+							     message) with no spaces to wrap at: break anywhere. -->
+							<p class="text-sm font-medium wrap-anywhere text-ink">
+								{#if href}
+									<a {href} class="hover:text-primary">{incident.title}</a>
+								{:else}
+									{incident.title}
+								{/if}
+							</p>
+							{#if incident.cause}
+								<p class="text-sm wrap-anywhere text-ink-2">{incident.cause}</p>
 							{/if}
-						</p>
-						{#if incident.cause}
-							<p class="text-sm wrap-anywhere text-neutral-400">{incident.cause}</p>
-						{/if}
-						<p class="text-xs text-neutral-500">
-							Started {formatUtc(incident.started_at)}
-							{#if incident.resolved_at}· resolved {formatUtc(incident.resolved_at)}{/if}
-						</p>
+							<p class="text-xs text-muted">
+								Started {formatUtc(incident.started_at)}
+								{#if incident.resolved_at}· resolved {formatUtc(incident.resolved_at)}{/if}
+							</p>
+						</div>
 					</div>
-					<span
-						class="rounded-full border px-2 py-0.5 text-xs {incident.status === 'open'
-							? 'border-red-500/30 bg-red-500/10 text-red-400'
-							: 'border-[#262626] text-neutral-400'}"
-					>
+					<span class="badge {incident.status === 'open' ? 'badge-danger' : 'badge-neutral'}">
 						{incident.status === 'open' ? 'Ongoing' : 'Resolved'} · {formatDuration(
 							incident.started_at,
 							incident.resolved_at,
@@ -90,4 +93,4 @@
 			{/each}
 		</ul>
 	{/if}
-</div>
+</Card>

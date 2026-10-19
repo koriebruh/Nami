@@ -120,3 +120,39 @@ task review — disclose this in every PR description.
   (`SaiNanamii`, `koriebruh`). This repo requires `koriebruh` (owner) —
   check `gh auth status` and `gh auth switch -h github.com -u koriebruh`
   before pushing/opening PRs if a push gets a 403.
+
+## UI conventions
+
+- Visual reference: `docs/superpowers/design/ui-reference-atom.png` (light
+  "Atom" dashboard: grey-blue canvas, white cards, indigo primary, cyan and
+  periwinkle accents, thin large headings, icon sidebar).
+- All UI must use the design tokens in `nami-ui/src/routes/layout.css`
+  (`@theme`: `canvas`, `surface`, `ink`, `muted`, `primary`, `success`/
+  `danger`/`warning`/`info` with AA `-ink` and `-soft` variants, `status-*`
+  for up/down/pending/paused/maintenance) and the components in
+  `nami-ui/src/lib/components/ui/` (AppShell, Card, PageHeader,
+  SegmentedTabs, StatCard, Sparkline, Legend, Badge, Button, Input, Select,
+  EmptyState, Icon). Form controls that need raw attributes use the
+  primitive classes (`.input`, `.select`, `.btn .btn-primary|secondary|ghost|danger`,
+  `.alert-*`, `.badge-*`, `.table`). Never use raw hex values or Tailwind's
+  stock palette in pages.
+- No CDN assets: Inter is self-hosted via `@fontsource-variable/inter`;
+  icons are inline SVG (`Icon.svelte`).
+- Component APIs to reuse (all exported from `$lib/components/ui`):
+  - `SegmentedTabs`: link mode (`items: {href,label,active}[]`, aria-current)
+    or button mode (`items: {value,label}[]` + `bind:value` / `onselect`,
+    aria-pressed); arrow keys/Home/End in both.
+  - `CardMenu` and other menus: put `<a>` / `<button>` (form buttons too)
+    inside with `.menu-item` (`.menu-item-danger` for destructive ones).
+    Native `<details>` menus get `use:dismissible` (outside click + Escape).
+  - `StatStrip cols={2..6|'auto'}`; `StatCard` has `unit`, `loading`, `hint`,
+    optional `delta`/`direction` (only for real trends) and `spark`.
+  - `Sparkline` draws a flat baseline below two finite points.
+  - `CardGrid` (`wide` + `narrow` snippets, `ratio` 2:1 / 3:2 / 1:1) for the
+    reference's wide-plus-narrow card rows.
+  - Multi-series charts take colours from `seriesColor(i)` (tokens
+    `--color-series-1..6`); chart primitives (bar, donut, axes) belong to the
+    Metrics plan.
+- Accessibility floor: text >= 4.5:1, focus rings and functional icons
+  >= 3:1 (focus uses full `--color-primary`, icons use `muted`/`faint`),
+  modal surfaces (the mobile drawer) trap focus via `inert` and return it.

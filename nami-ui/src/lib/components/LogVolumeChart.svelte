@@ -1,12 +1,12 @@
 <script lang="ts">
-	// Log volume per bucket, stacked by severity: errors (status critical,
-	// #d03b3b) at the baseline, then warnings (status warning, #fab219), then
-	// everything else in neutral #737373 (3.9:1 on the #141414 card). Status
-	// steps from the dataviz reference palette (deutan/tritan ΔE 24 apart);
-	// identity is never color alone: legend, tooltip and table name each part.
+	// Log volume per bucket, stacked by severity: errors (danger token) at
+	// the baseline, then warnings (warning token), then everything else in
+	// the periwinkle accent, all on the white card. Identity is never colour
+	// alone: the dot legend, tooltip and table name each part.
 	// A click on a bar zooms the explorer into that bucket; keyboard users get
 	// the same through the range input (arrows to inspect, Enter to zoom),
 	// hence the a11y ignore on the chart's click handler.
+	import Legend from '#lib/components/ui/Legend.svelte';
 	import { formatUtc, niceTicks } from '#lib/uptime';
 	import { bucketEnd, bucketParts, type Histogram, type HistogramBucket } from '#lib/logs';
 
@@ -20,9 +20,9 @@
 	const PLOT_HEIGHT = HEIGHT - PAD.top - PAD.bottom;
 	const GAP = 2;
 	const SERIES = [
-		{ key: 'errors', label: 'Errors', fill: 'fill-[#d03b3b]', swatch: 'bg-[#d03b3b]' },
-		{ key: 'warnings', label: 'Warnings', fill: 'fill-[#fab219]', swatch: 'bg-[#fab219]' },
-		{ key: 'other', label: 'Other', fill: 'fill-[#737373]', swatch: 'bg-[#737373]' }
+		{ key: 'errors', label: 'Errors', fill: 'fill-danger', tone: 'danger' },
+		{ key: 'warnings', label: 'Warnings', fill: 'fill-warning', tone: 'warning' },
+		{ key: 'other', label: 'Other', fill: 'fill-accent-periwinkle', tone: 'periwinkle' }
 	] as const;
 
 	let width = $state(720);
@@ -95,11 +95,7 @@
 </script>
 
 <div class="space-y-2">
-	<div class="flex flex-wrap items-center gap-4 text-xs text-neutral-400">
-		{#each SERIES as series (series.key)}
-			<span class="flex items-center gap-1.5"><span class="h-2.5 w-2.5 rounded-sm {series.swatch}"></span>{series.label}</span>
-		{/each}
-	</div>
+	<Legend items={SERIES.map((series) => ({ label: series.label, tone: series.tone }))} />
 	<div class="relative" bind:clientWidth={width}>
 		<label class="sr-only" for="log-volume-inspector">Inspect log volume by time bucket</label>
 		<input
@@ -124,20 +120,20 @@
 			height={HEIGHT}
 			role="img"
 			aria-label="Log volume over the selected time range, stacked by errors, warnings and other levels"
-			class="block cursor-pointer rounded-md peer-focus-visible:ring-2 peer-focus-visible:ring-teal-500/50"
+			class="block cursor-pointer rounded-md peer-focus-visible:ring-2 peer-focus-visible:ring-primary"
 			onpointermove={onPointerMove}
 			onpointerleave={() => (hoverIndex = null)}
 			onclick={() => select(hoverIndex)}
 		>
 			{#each ticks as tick (tick)}
-				<line x1={PAD.left} x2={PAD.left + plotWidth} y1={yAt(tick)} y2={yAt(tick)} class="stroke-[#262626]" stroke-width="1" />
-				<text x={PAD.left - 8} y={yAt(tick)} dy="0.32em" text-anchor="end" class="fill-neutral-500 text-[11px] tabular-nums"
+				<line x1={PAD.left} x2={PAD.left + plotWidth} y1={yAt(tick)} y2={yAt(tick)} class="stroke-border" stroke-width="1" />
+				<text x={PAD.left - 8} y={yAt(tick)} dy="0.32em" text-anchor="end" class="fill-muted text-[11px] tabular-nums"
 					>{tick}</text
 				>
 			{/each}
 			{#each buckets as bucket, i (bucket.start)}
 				{#if active === i}
-					<rect x={PAD.left + i * band} y={PAD.top} width={band} height={PLOT_HEIGHT} class="fill-neutral-800/60" />
+					<rect x={PAD.left + i * band} y={PAD.top} width={band} height={PLOT_HEIGHT} class="fill-primary-soft" />
 				{/if}
 				{#each segments(bucket, i) as segment (segment.key)}
 					{#if segment.last}
@@ -147,7 +143,7 @@
 					{/if}
 				{/each}
 				{#if i % labelEvery === 0}
-					<text x={PAD.left + i * band + band / 2} y={HEIGHT - 8} text-anchor="middle" class="fill-neutral-500 text-[11px] tabular-nums"
+					<text x={PAD.left + i * band + band / 2} y={HEIGHT - 8} text-anchor="middle" class="fill-muted text-[11px] tabular-nums"
 						>{label(bucket.start)}</text
 					>
 				{/if}
@@ -155,7 +151,7 @@
 		</svg>
 
 		{#if histogram.total === 0}
-			<p class="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-neutral-500">
+			<p class="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-muted">
 				No logs in this time range.
 			</p>
 		{/if}
@@ -164,21 +160,21 @@
 			{@const bucket = buckets[active]}
 			{@const p = parts(bucket)}
 			<div
-				class="pointer-events-none absolute top-2 w-48 rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-xs shadow-lg"
+				class="pointer-events-none absolute top-2 w-48 rounded-card border border-border bg-surface px-3 py-2 text-xs shadow-pop"
 				style:left="{Math.max(0, Math.min(PAD.left + active * band + band + 8, width - 200))}px"
 			>
-				<div class="text-sm font-semibold text-neutral-100 tabular-nums">{bucket.count.toLocaleString('en-US')} logs</div>
-				<div class="text-neutral-400 tabular-nums">{p.errors} errors · {p.warnings} warnings · {p.other} other</div>
-				<div class="text-neutral-500">{formatUtc(bucket.start)}</div>
-				{#if onselect}<div class="text-neutral-600">Click to zoom in</div>{/if}
+				<div class="text-sm font-semibold text-ink tabular-nums">{bucket.count.toLocaleString('en-US')} logs</div>
+				<div class="text-ink-2 tabular-nums">{p.errors} errors · {p.warnings} warnings · {p.other} other</div>
+				<div class="text-muted">{formatUtc(bucket.start)}</div>
+				{#if onselect}<div class="text-primary">Click to zoom in</div>{/if}
 			</div>
 		{/if}
 	</div>
 	<details class="text-sm">
-		<summary class="cursor-pointer text-neutral-500 hover:text-neutral-300">Show data table</summary>
+		<summary class="summary">Show data table</summary>
 		<div class="mt-2 max-h-64 overflow-y-auto">
 			<table class="w-full text-left text-xs">
-				<thead class="text-neutral-500">
+				<thead class="text-muted">
 					<tr>
 						<th class="py-1 font-medium">Bucket start (UTC)</th>
 						<th class="py-1 font-medium">Logs</th>
@@ -186,9 +182,9 @@
 						<th class="py-1 font-medium">Warnings</th>
 					</tr>
 				</thead>
-				<tbody class="text-neutral-300 tabular-nums">
+				<tbody class="text-ink-2 tabular-nums">
 					{#each buckets as bucket (bucket.start)}
-						<tr class="border-t border-[#262626]">
+						<tr class="border-t border-border">
 							<td class="py-1">{formatUtc(bucket.start)}</td>
 							<td class="py-1">{bucket.count}</td>
 							<td class="py-1">{bucket.errors}</td>

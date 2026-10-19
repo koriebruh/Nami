@@ -1,66 +1,70 @@
 <script lang="ts">
+	import Card from '#lib/components/ui/Card.svelte';
+	import EmptyState from '#lib/components/ui/EmptyState.svelte';
+	import Icon from '#lib/components/ui/Icon.svelte';
+	import PageHeader from '#lib/components/ui/PageHeader.svelte';
 	import type { PageData, ActionData } from './$types';
 
 	let { data, form }: { data: PageData; form: ActionData } = $props();
 </script>
 
+<svelte:head>
+	<title>Projects · nami</title>
+</svelte:head>
+
 <div class="space-y-6">
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h1 class="text-lg font-semibold text-neutral-100">Projects</h1>
+	<PageHeader title="Projects" subtitle="Each project groups monitors, heartbeats, logs and incidents." />
 
-		<div class="mt-4 space-y-2">
-			{#if data.projects.length === 0}
-				<p class="text-sm text-neutral-500">No projects yet.</p>
-			{:else}
-				{#each data.projects as project (project.id)}
-					<a
-						href="/projects/{project.id}"
-						class="flex items-center justify-between rounded-md border border-[#262626] px-4 py-3 text-sm hover:border-teal-500/30"
-					>
-						<span class="font-medium text-neutral-100">{project.name}</span>
-						<span class="text-neutral-500">{project.slug}</span>
-					</a>
-				{/each}
-			{/if}
+	<div class="grid gap-6 lg:grid-cols-3">
+		<div class="lg:col-span-2">
+			<Card title="All projects" padded={false}>
+				{#if data.projects.length === 0}
+					<EmptyState icon="folder" message="No projects yet." />
+				{:else}
+					<ul class="divide-y divide-border">
+						{#each data.projects as project (project.id)}
+							<li>
+								<a
+									href="/projects/{project.id}"
+									class="group flex items-center gap-4 px-5 py-4 transition-colors hover:bg-surface-2 sm:px-6"
+								>
+									<span
+										class="flex h-10 w-10 shrink-0 items-center justify-center rounded-card bg-primary-soft text-sm font-semibold text-primary uppercase"
+										aria-hidden="true">{project.name.slice(0, 2)}</span
+									>
+									<span class="min-w-0 flex-1">
+										<span class="block truncate font-medium text-ink group-hover:text-primary">{project.name}</span>
+										<span class="block truncate text-xs text-muted">{project.slug}</span>
+									</span>
+									<Icon name="chevronRight" size={16} class="text-faint group-hover:text-primary" />
+								</a>
+							</li>
+						{/each}
+					</ul>
+				{/if}
+			</Card>
 		</div>
-	</div>
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h2 class="text-lg font-semibold text-neutral-100">Create project</h2>
+		<Card title="Create project">
+			{#if form?.success === false}
+				<div role="alert" class="alert alert-danger mb-4">
+					{form.message}
+				</div>
+			{/if}
 
-		{#if form?.success === false}
-			<div class="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">
-				{form.message}
-			</div>
-		{/if}
-
-		<form method="POST" class="mt-4 space-y-4">
-			<div>
-				<label for="name" class="mb-1.5 block text-sm font-medium text-neutral-300">Name</label>
-				<input
-					id="name"
-					name="name"
-					type="text"
-					required
-					class="w-full rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:border-teal-500/50 focus:ring-2 focus:ring-teal-500/50 focus:outline-none"
-				/>
-			</div>
-			<div>
-				<label for="slug" class="mb-1.5 block text-sm font-medium text-neutral-300">Slug</label>
-				<input
-					id="slug"
-					name="slug"
-					type="text"
-					required
-					class="w-full rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:border-teal-500/50 focus:ring-2 focus:ring-teal-500/50 focus:outline-none"
-				/>
-			</div>
-			<button
-				type="submit"
-				class="rounded-md bg-teal-500 px-4 py-2 text-sm font-medium text-neutral-950 transition-colors hover:bg-teal-400 focus:ring-2 focus:ring-teal-500/50 focus:ring-offset-2 focus:ring-offset-[#141414] focus:outline-none"
-			>
-				Create project
-			</button>
-		</form>
+			<form method="POST" class="space-y-4">
+				<div>
+					<label for="name" class="label">Name</label>
+					<input id="name" name="name" type="text" required class="input" />
+				</div>
+				<div>
+					<label for="slug" class="label">Slug</label>
+					<input id="slug" name="slug" type="text" required class="input" />
+				</div>
+				<button type="submit" class="btn btn-primary">
+					<Icon name="plus" size={16} /> Create project
+				</button>
+			</form>
+		</Card>
 	</div>
 </div>
