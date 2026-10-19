@@ -428,7 +428,10 @@ mod tests {
             error: None,
             ..row(None)
         };
-        assert_eq!(csv_line(&up), "\"2026-10-14T17:46:40.123Z\",\"up\",\"\",\"\",\"\"\r\n");
+        assert_eq!(
+            csv_line(&up),
+            "\"2026-10-14T17:46:40.123Z\",\"up\",\"\",\"\",\"\"\r\n"
+        );
     }
 
     /// Every cell is quoted, so a spreadsheet that splits on `;` (Excel in

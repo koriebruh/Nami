@@ -235,7 +235,11 @@ mod tests {
     #[test]
     fn rejects_invisible_and_text_direction_characters_anywhere_in_the_input() {
         let chars = invisible_or_bidi_chars();
-        assert_eq!(chars.len(), 35 + 3 + 128, "the rejected set is 166 code points");
+        assert_eq!(
+            chars.len(),
+            35 + 3 + 128,
+            "the rejected set is 166 code points"
+        );
         for c in chars {
             // Also at the edges and alone: U+2028 / U+2029 are whitespace,
             // so a trim-first check would let them through there.

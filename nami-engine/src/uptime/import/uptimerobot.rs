@@ -71,14 +71,14 @@ pub fn parse(content: &str) -> Result<Vec<ParsedEntry>, ParseError> {
             // header is line 1), quoted multi-line cells included.
             let line = record.position().map_or(0, |p| p.line() as usize);
             let parsed = entry(
-                    cell(Some(name)),
-                    cell(Some(target)),
-                    cell(Some(kind)),
-                    cell(columns.keyword_type),
-                    cell(columns.keyword),
-                    cell(columns.port),
-                    cell(columns.interval),
-                );
+                cell(Some(name)),
+                cell(Some(target)),
+                cell(Some(kind)),
+                cell(columns.keyword_type),
+                cell(columns.keyword),
+                cell(columns.port),
+                cell(columns.interval),
+            );
             let (body, warning) = match parsed {
                 Ok((body, warning)) => (Ok(body), warning),
                 Err(message) => (Err(message), None),

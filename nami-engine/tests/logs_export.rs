@@ -467,7 +467,10 @@ async fn export_needs_access_and_valid_parameters(pool: sqlx::PgPool) {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(text(response).await, "\"dt\",\"level\",\"source\",\"message\",\"trace_id\"\r\n");
+        assert_eq!(
+            text(response).await,
+            "\"dt\",\"level\",\"source\",\"message\",\"trace_id\"\r\n"
+        );
         let response = get(
             &app,
             &format!("{base}?format=ndjson&source_id={source}&{}", window()),
