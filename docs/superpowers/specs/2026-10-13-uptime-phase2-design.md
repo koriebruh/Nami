@@ -163,3 +163,43 @@ parity). They override the sections above where they differ; the plan is
   UI groups monitors client-side.
 - **D. SSRF** stays a non-goal for monitor targets, as in Phase 1: Nami is
   self-hosted and internal hosts are legitimate targets.
+
+## Decisions at Phase 2 close (2026-10-19)
+
+From the Phase 2 final security review and its fix wave. They override the
+sections above where they differ.
+
+- **Origin = scheme + host + port**, compared as browsers do (a port left
+  out is the scheme's default). A check whose request carries secrets
+  (custom headers, basic auth, credentials in the URL) or a request body
+  only follows redirects that stay on the monitored origin; anything else
+  goes down with `headers, credentials and request bodies are only sent to
+  the monitored origin, so the redirect to <host or origin> was not
+  followed`. An http-to-https redirect of such a monitor is a change of
+  origin and goes down too: point the monitor at the final URL.
+- **Secrets stay where they were entered.** A PATCH that moves the URL to
+  another origin, or turns `verify_ssl` off on an https URL, must enter
+  every stored header value and the basic-auth password again or clear
+  them; otherwise 400 (`changing the url's scheme, host or port requires
+  entering the header values and password again, or clearing them`, and
+  the `turning off certificate verification ...` variant). The UI takes
+  "Keep" away in that case.
+- **Basic auth or credentials in the URL, not both** (400), and basic auth
+  or an `Authorization` header, not both.
+- **Header lists:** no blank value, no name repeated ignoring case, and
+  `Host`, `Content-Length`, `Transfer-Encoding`, `Connection`, `TE`,
+  `Upgrade`, `Keep-Alive`, `Proxy-Connection`, `Trailer`, `Expect` are
+  reserved.
+- **Viewers** read `***` for URL secrets (userinfo, query values,
+  fragment), the request body, the basic-auth username and the UDP
+  payload; every monitor view carries `redacted: true|false` and clients
+  decide on that flag, never on the text.
+- **Counters:** editing what is checked, or resuming a paused monitor,
+  zeroes `consecutive_failures` and `consecutive_successes`.
+- **Default ports follow the type:** a stored port that was the default of
+  the old type and `use_tls` follows a type or `use_tls` change to the new
+  default; a chosen port stays.
+- **Refused destinations** add Alibaba Cloud's metadata address
+  `100.100.100.200`; dns monitors look up names only (no IP literals).
+- **Quotas:** at most 200 maintenance windows and 200 monitor groups per
+  project.
