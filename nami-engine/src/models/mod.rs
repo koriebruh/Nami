@@ -154,6 +154,11 @@ pub(crate) fn is_invisible_or_bidi_char(c: char) -> bool {
             | '\u{3164}'
             | '\u{FEFF}'
             | '\u{FFA0}'
+            // Interlinear annotation controls.
+            | '\u{FFF9}'..='\u{FFFB}'
+            // Tag characters: invisible, and able to spell hidden ASCII text
+            // ("ASCII smuggling").
+            | '\u{E0000}'..='\u{E007F}'
     )
 }
 
@@ -165,13 +170,20 @@ mod tests {
 
     /// Every character `validate_name` must reject: U+00AD, U+034F, U+061C,
     /// U+115F, U+1160, U+180E, U+200B, U+200E, U+200F, U+2028..=U+202E,
-    /// U+2060..=U+2064, U+2066..=U+206F, U+2800, U+3164, U+FEFF and U+FFA0.
+    /// U+2060..=U+2064, U+2066..=U+206F, U+2800, U+3164, U+FEFF, U+FFA0,
+    /// U+FFF9..=U+FFFB and the tag characters U+E0000..=U+E007F.
     fn invisible_or_bidi_chars() -> Vec<char> {
         let mut chars = vec![
             '\u{00AD}', '\u{034F}', '\u{061C}', '\u{115F}', '\u{1160}', '\u{180E}', '\u{200B}',
             '\u{200E}', '\u{200F}', '\u{2800}', '\u{3164}', '\u{FEFF}', '\u{FFA0}',
         ];
-        for range in [0x2028..=0x202E, 0x2060..=0x2064, 0x2066..=0x206F] {
+        for range in [
+            0x2028..=0x202E,
+            0x2060..=0x2064,
+            0x2066..=0x206F,
+            0xFFF9..=0xFFFB,
+            0xE0000..=0xE007F,
+        ] {
             chars.extend(range.map(|code| char::from_u32(code).unwrap()));
         }
         chars
@@ -223,7 +235,7 @@ mod tests {
     #[test]
     fn rejects_invisible_and_text_direction_characters_anywhere_in_the_input() {
         let chars = invisible_or_bidi_chars();
-        assert_eq!(chars.len(), 35, "the rejected set is 35 code points");
+        assert_eq!(chars.len(), 35 + 3 + 128, "the rejected set is 166 code points");
         for c in chars {
             // Also at the edges and alone: U+2028 / U+2029 are whitespace,
             // so a trim-first check would let them through there.
