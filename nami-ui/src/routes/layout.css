@@ -1,10 +1,240 @@
 @import 'tailwindcss';
 @plugin '@tailwindcss/forms';
 
+/*
+ * Nami design tokens. Reference: docs/superpowers/design/ui-reference-atom.png
+ * (a light "Atom" analytics dashboard). Every page uses these tokens and the
+ * components in src/lib/components/ui/ — never raw hex values or Tailwind's
+ * stock palette. Text pairs are WCAG AA (>= 4.5:1) on surface and canvas:
+ * ink 14.4, ink-2 7.2, muted 5.3/4.9, primary 6.4, success-ink 5.4,
+ * danger-ink 5.6, warning-ink 5.4, info-ink 6.1, paused-ink 4.9 (on its soft).
+ */
+@theme {
+	--font-sans: 'Inter Variable', 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
+		'Helvetica Neue', Arial, sans-serif;
+	--font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+
+	/* Surfaces */
+	--color-canvas: #f4f7fe;
+	--color-surface: #ffffff;
+	--color-surface-2: #f8faff;
+	--color-border: #e4e9f5;
+	--color-border-strong: #cfd7ea;
+
+	/* Text */
+	--color-ink: #1b2559;
+	--color-ink-2: #47548c;
+	--color-muted: #5f6b8f;
+	--color-faint: #8b95b4;
+
+	/* Brand */
+	--color-primary: #3a4fd8;
+	--color-primary-hover: #2f43c4;
+	--color-primary-soft: #eef1fe;
+	--color-accent-cyan: #31c3f0;
+	--color-accent-periwinkle: #8e9bf5;
+
+	/* Feedback: a fill colour, an AA text colour ("-ink") and a tint ("-soft") */
+	--color-success: #12b76a;
+	--color-success-ink: #0b7a54;
+	--color-success-soft: #e7f7ef;
+	--color-danger: #e5484d;
+	--color-danger-ink: #c42a3f;
+	--color-danger-soft: #fdeef0;
+	--color-warning: #f5a524;
+	--color-warning-ink: #9a5b00;
+	--color-warning-soft: #fff4e0;
+	--color-info: #0ea5e9;
+	--color-info-ink: #0b6a8f;
+	--color-info-soft: #e6f6fc;
+
+	/* Uptime status: up / down / pending / paused / maintenance */
+	--color-status-up: var(--color-success);
+	--color-status-down: var(--color-danger);
+	--color-status-pending: var(--color-warning);
+	--color-status-paused: #9aa3bd;
+	--color-status-maintenance: var(--color-info);
+	--color-paused-ink: #5d6788;
+	--color-paused-soft: #eef0f6;
+
+	/* Shape and depth */
+	--radius-card: 0.375rem;
+	--radius-control: 0.375rem;
+	--shadow-card: 0 1px 2px rgb(27 37 89 / 0.04), 0 4px 16px rgb(27 37 89 / 0.05);
+	--shadow-pop: 0 8px 28px rgb(27 37 89 / 0.14);
+
+	/* Weights: thin display headings like the reference's "Dashboard" */
+	--font-weight-display: 300;
+}
+
 :root {
-	color-scheme: dark;
+	color-scheme: light;
+}
+
+html {
+	-webkit-text-size-adjust: 100%;
 }
 
 body {
-	background-color: #0a0a0a;
+	background-color: var(--color-canvas);
+	color: var(--color-ink);
+	font-family: var(--font-sans);
+	-webkit-font-smoothing: antialiased;
+}
+
+/*
+ * Primitive classes. Svelte components wrap the structural pieces (Card,
+ * PageHeader, StatCard ...); these classes are for the elements a form needs
+ * to own directly (inputs and buttons carrying `name`, `form`, `formaction`,
+ * `defaultValue`, enhance), so no-JS fallbacks keep working.
+ */
+@layer components {
+	/* Card */
+	.card {
+		@apply rounded-card border border-border/70 bg-surface shadow-card;
+	}
+	.card-header {
+		@apply flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4 sm:px-6;
+	}
+	.card-title {
+		@apply text-lg font-light text-ink;
+	}
+	.card-body {
+		@apply px-5 py-5 sm:px-6;
+	}
+
+	/* Typography */
+	.display {
+		@apply text-3xl font-light tracking-tight text-ink sm:text-[2rem];
+	}
+	.eyebrow {
+		@apply text-xs font-medium tracking-wide text-muted uppercase;
+	}
+	.link {
+		@apply font-medium text-primary underline-offset-2 hover:text-primary-hover hover:underline;
+	}
+
+	/* Buttons */
+	.btn {
+		@apply inline-flex items-center justify-center gap-1.5 rounded-control border px-3.5 py-2 text-sm font-medium whitespace-nowrap transition-colors focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50;
+	}
+	.btn-sm {
+		@apply px-2.5 py-1 text-xs;
+	}
+	.btn-primary {
+		@apply border-primary bg-primary text-white hover:border-primary-hover hover:bg-primary-hover;
+	}
+	.btn-secondary {
+		@apply border-border-strong bg-surface text-ink hover:border-primary/50 hover:text-primary;
+	}
+	.btn-ghost {
+		@apply border-transparent bg-transparent text-ink-2 hover:bg-primary-soft hover:text-primary;
+	}
+	.btn-danger {
+		@apply border-danger-ink/30 bg-surface text-danger-ink hover:border-danger-ink hover:bg-danger-soft;
+	}
+	.btn-danger-solid {
+		@apply border-danger-ink bg-danger-ink text-white hover:bg-[#a82235];
+	}
+
+	/* Form controls */
+	.label {
+		@apply mb-1.5 block text-sm font-medium text-ink;
+	}
+	.hint {
+		@apply mt-1.5 text-xs text-muted;
+	}
+	.input {
+		@apply block w-full rounded-control border border-border-strong bg-surface px-3 py-2 text-sm text-ink shadow-none placeholder:text-faint focus:border-primary focus:ring-2 focus:ring-primary/25 focus:outline-none disabled:cursor-not-allowed disabled:bg-surface-2 disabled:text-muted;
+	}
+	.select {
+		@apply block w-full rounded-control border border-border-strong bg-surface py-2 pr-9 pl-3 text-sm text-ink focus:border-primary focus:ring-2 focus:ring-primary/25 focus:outline-none disabled:cursor-not-allowed disabled:bg-surface-2 disabled:text-muted;
+	}
+	.checkbox {
+		@apply h-4 w-4 rounded border-border-strong text-primary focus:ring-2 focus:ring-primary/30 focus:ring-offset-0;
+	}
+	.radio {
+		@apply h-4 w-4 border-border-strong text-primary focus:ring-2 focus:ring-primary/30 focus:ring-offset-0;
+	}
+
+	/* Alerts (role="alert" / role="status" stay on the element) */
+	.alert {
+		@apply rounded-control border px-3.5 py-2.5 text-sm;
+	}
+	.alert-danger {
+		@apply border-danger-ink/25 bg-danger-soft text-danger-ink;
+	}
+	.alert-success {
+		@apply border-success-ink/25 bg-success-soft text-success-ink;
+	}
+	.alert-info {
+		@apply border-primary/25 bg-primary-soft text-primary-hover;
+	}
+	.alert-warning {
+		@apply border-warning-ink/25 bg-warning-soft text-warning-ink;
+	}
+
+	/* Badges */
+	.badge {
+		@apply inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium whitespace-nowrap;
+	}
+	.badge-neutral {
+		@apply bg-paused-soft text-paused-ink;
+	}
+	.badge-primary {
+		@apply bg-primary-soft text-primary-hover;
+	}
+	.badge-success {
+		@apply bg-success-soft text-success-ink;
+	}
+	.badge-danger {
+		@apply bg-danger-soft text-danger-ink;
+	}
+	.badge-warning {
+		@apply bg-warning-soft text-warning-ink;
+	}
+	.badge-info {
+		@apply bg-info-soft text-info-ink;
+	}
+
+	/* Data tables */
+	.table {
+		@apply w-full text-sm;
+	}
+	.table thead {
+		@apply text-left;
+	}
+	.table th {
+		@apply px-5 py-2.5 text-[11px] font-medium tracking-wider whitespace-nowrap text-muted uppercase sm:px-6;
+	}
+	.table td {
+		@apply px-5 py-3 text-ink-2 sm:px-6;
+	}
+	.table tbody tr {
+		@apply border-t border-border;
+	}
+	.table-hover tbody tr {
+		@apply transition-colors hover:bg-surface-2;
+	}
+	.table-compact td,
+	.table-compact th {
+		@apply py-2;
+	}
+
+	/* Code blocks */
+	.code {
+		@apply rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs text-ink-2;
+	}
+
+	/* Disclosure summaries (native <details>) */
+	.summary {
+		@apply cursor-pointer text-sm text-muted select-none hover:text-primary;
+	}
+}
+
+/* Visible keyboard focus everywhere, without a ring on mouse clicks. */
+:where(a, button, summary, [tabindex]):not(.btn):focus-visible {
+	outline: 2px solid color-mix(in srgb, var(--color-primary) 55%, transparent);
+	outline-offset: 2px;
+	border-radius: 4px;
 }
