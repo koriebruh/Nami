@@ -98,7 +98,7 @@ UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `sv
 - **R-P2-24 Syslog row chunking off the runtime (controller follow-up).** The batcher calls `store::chunk_rows` (which JSON-encodes every row to measure it) on the async task. Task 11 moves it into the blocking task that builds the `RowBatch`. That task returns the rows, the runs and the oversized count together, and only the per-run encode and the insert stay as they are.
 - **R-P2-25 A tail poll reads only new rows, pinned by a counter (controller follow-up).** `LogsState.tail_stats: tail::TailStats { id_polls: AtomicU64, rows_fetched: AtomicU64 }` counts id polls and list rows read by `fetch_rows`. Task 15's test asserts that 10 polls over 100 old rows read exactly the 2 new rows. The counters are cheap and are also what a later metrics endpoint would export.
 
-## Roadmap §3 coverage (verified against `main` 6e78618)
+## Roadmap §3 coverage (verified against `main` 95940ee, which already ticks Part 1's items)
 
 | Roadmap item | Status on `main` | Part 2 task |
 |---|---|---|
@@ -120,7 +120,7 @@ UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `sv
 | Log alerts | missing | T14, T18 |
 | UI: sources, explorer, live tail, saved views, alerts | sources/explorer/tail done | T16, T17, T18 |
 
-After Task 18 merges, the controller ticks every §3 item, since Part 1's items are verified done above.
+After Task 18 merges, the controller ticks the six items still open: pipeline, patterns, export, saved views, log alerts, and the UI line.
 
 ## File Structure
 
@@ -3769,5 +3769,5 @@ Per CLAUDE.md, every sub-project ends with a dedicated security review and fix w
    - Export output: the CSV formula guard on every cell (header included), RFC 4180 quoting, fixed `Content-Disposition`, `nosniff`, `no-store`.
    - Alerts: atomic claim (`overlapping_passes_evaluate_each_alert_once`), outage safety (`a_failed_count_changes_nothing`), email header-injection safety for alert names (`log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert`), the evaluation-load bound (100 alerts per project, 8 concurrent, 25 s query limit). No outbound call other than `notify_transition`.
    - UI: JSON relays refuse cross-origin and non-JSON. Tail `Last-Event-ID` is validated. No `{@html}` on log, pattern, view or alert text. Two-step deletes. `[id=uuid]`/`isUuid` on every new id.
-3. **Fix wave** on `fix/NAMI-LOG-part2-final-review` for every Important finding and for the Minor findings the reviewer marks fix-now. Then a scoped re-review, merge, the roadmap §3 ticks (all items, see "Roadmap §3 coverage") and a decisions log `docs/superpowers/decisions/2026-10-13-log-management.md` recording R-P2-1 … R-P2-22.
+3. **Fix wave** on `fix/NAMI-LOG-part2-final-review` for every Important finding and for the Minor findings the reviewer marks fix-now. Then a scoped re-review, merge, the roadmap §3 ticks (the open items, see "Roadmap §3 coverage") and a decisions log `docs/superpowers/decisions/2026-10-13-log-management-part2.md` recording R-P2-1 … R-P2-25 (same format as the Part 1 log).
 4. **Known follow-ups and accepted risks to carry, not fix here:** fold `search::QuerySlots` and `slots::UserSlots` into one type (R-P2-15). The 512-connection caps (`serve::MAX_PUBLIC_CONNECTIONS`, `MAX_API_CONNECTIONS`) are global per listener: one client holding many connections can fill the public listener for everyone until the header deadline drops them. Per-IP limits and graceful shutdown → Platform. Alert no-data/confirmation periods → Metrics' shared evaluator. Escalation routing → Incident Management. "View trace" → Traces.
