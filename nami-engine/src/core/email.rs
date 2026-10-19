@@ -6,7 +6,7 @@ use lettre::{
     transport::smtp::{self, authentication::Credentials},
 };
 
-use crate::error::AppError;
+use crate::core::error::AppError;
 
 /// The longest one email may take, from connecting to the last SMTP command.
 ///
@@ -158,7 +158,7 @@ impl SmtpSettings {
         }
     }
 
-    pub fn from_config(config: &crate::config::Config) -> Self {
+    pub fn from_config(config: &crate::core::config::Config) -> Self {
         Self {
             host: config.smtp_host.clone(),
             port: config.smtp_port,

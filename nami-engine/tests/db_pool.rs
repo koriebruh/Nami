@@ -1,13 +1,13 @@
 // Requires `docker compose up -d postgres`.
 //
-// The Postgres pool as `main.rs` builds it (`db::pool_options`): bounded in
+// The Postgres pool as `main.rs` builds it (`core::db::pool_options`): bounded in
 // size, in how long a caller waits for a connection, and in how long any one
 // statement may run.
 use std::time::{Duration, Instant};
 
 use nami_engine::{
-    config::Config,
-    db::{PoolSettings, pool_options, run_migrations},
+    core::config::Config,
+    core::db::{PoolSettings, pool_options, run_migrations},
 };
 
 /// A pool with `settings` over this test's database.

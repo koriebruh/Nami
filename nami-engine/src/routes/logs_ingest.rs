@@ -12,7 +12,8 @@ use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    clickhouse::ClickHouse,
+    core::clickhouse::ClickHouse,
+    core::state::AppState,
     logs::{
         LogsState,
         ingest::{self, BodyEncoding, BodyPace, IngestError, Prepared},
@@ -21,7 +22,6 @@ use crate::{
         store,
     },
     models::source::{self, IngestSource},
-    state::AppState,
 };
 
 /// How many ingest requests may be handled at once. The endpoint is public: a
@@ -117,7 +117,7 @@ impl Default for IngestLimits {
 }
 
 /// `POST /api/v1/logs`, served on the public listener only (see
-/// `router::build_public_router`). No session: the source token in
+/// `core::router::build_public_router`). No session: the source token in
 /// `Authorization: Bearer` is the credential, and shippers call the engine
 /// directly. The token is only ever hashed, never logged. A request must hold
 /// one of `limits.places` while it runs.

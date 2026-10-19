@@ -1,4 +1,4 @@
-use nami_engine::email::Mailer;
+use nami_engine::core::email::Mailer;
 use serde_json::Value;
 
 #[tokio::test]
@@ -12,7 +12,11 @@ async fn sent_email_is_captured_by_mailpit() {
 
     let mailer = Mailer::new("localhost", 1025);
     mailer
-        .send("someone@example.com", "Verify your email", "click here".to_string())
+        .send(
+            "someone@example.com",
+            "Verify your email",
+            "click here".to_string(),
+        )
         .await
         .unwrap();
 

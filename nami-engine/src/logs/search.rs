@@ -17,8 +17,8 @@ use super::{
     query::{self, Cursor, ERROR_LEVELS_SQL, LogFilters, SearchParams, Sql, Window},
 };
 use crate::{
-    clickhouse::{ClickHouse, ClickHouseError},
-    error::AppError,
+    core::clickhouse::{ClickHouse, ClickHouseError},
+    core::error::AppError,
 };
 
 /// The most characters of a message a list row (search page, live tail)
@@ -59,7 +59,7 @@ pub const FULL_COLUMNS: &str = "SELECT id, source_id, dt, level, message, fields
 
 /// Extra settings of every log read: ClickHouse refuses a result larger than
 /// this (in memory) rather than building it, and the client refuses a
-/// response body over [`crate::clickhouse::MAX_RESPONSE_BYTES`] as it reads
+/// response body over [`crate::core::clickhouse::MAX_RESPONSE_BYTES`] as it reads
 /// it. With list rows cut ([`ENTRY_COLUMNS`]) and at most
 /// [`query::MAX_LIMIT`] rows a page, neither is reached by a legitimate query.
 pub const READ_SETTINGS: [(&str, &str); 2] = [

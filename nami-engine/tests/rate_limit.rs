@@ -1,20 +1,27 @@
-use axum::{body::Body, http::{Request, StatusCode}};
-use tower::ServiceExt;
-use nami_engine::state::AppState;
+use axum::{
+    body::Body,
+    http::{Request, StatusCode},
+};
+use nami_engine::core::state::AppState;
 use serde_json::json;
+use tower::ServiceExt;
 
 fn build_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState::for_test(pool);
     // Same governor config/error_handler and session-layer settings as
-    // main.rs, defined once in `nami_engine::router` and shared here (see
+    // main.rs, defined once in `nami_engine::core::router` and shared here (see
     // Fix 4 in the final hardening round). `SmartIpKeyExtractor` checks
     // `X-Forwarded-For` / `X-Real-IP` / `Forwarded` before falling back to
     // `ConnectInfo`, which `oneshot()` never supplies — these tests drive
     // the key via an explicit `X-Forwarded-For` header on each request,
     // which takes precedence over `with_fallback_connect_info`'s fallback.
-    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state)).layer(
-        nami_engine::router::configure_session_layer(tower_sessions::MemoryStore::default(), false),
-    )
+    nami_engine::core::router::with_fallback_connect_info(nami_engine::core::router::build_router(
+        state,
+    ))
+    .layer(nami_engine::core::router::configure_session_layer(
+        tower_sessions::MemoryStore::default(),
+        false,
+    ))
 }
 
 fn login_request(forwarded_for: &str) -> Request<Body> {
@@ -23,7 +30,9 @@ fn login_request(forwarded_for: &str) -> Request<Body> {
         .uri("/auth/login")
         .header("content-type", "application/json")
         .header("x-forwarded-for", forwarded_for)
-        .body(Body::from(json!({"email": "nobody@example.com", "password": "x"}).to_string()))
+        .body(Body::from(
+            json!({"email": "nobody@example.com", "password": "x"}).to_string(),
+        ))
         .unwrap()
 }
 
@@ -110,7 +119,11 @@ async fn sixth_rapid_totp_verify_attempt_is_rate_limited(pool: sqlx::PgPool) {
         &[StatusCode::UNAUTHORIZED; 5],
         "first 5 requests should fail auth normally, not be rate-limited: {statuses:?}"
     );
-    assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS, "6th request should be rate-limited: {statuses:?}");
+    assert_eq!(
+        statuses[5],
+        StatusCode::TOO_MANY_REQUESTS,
+        "6th request should be rate-limited: {statuses:?}"
+    );
 }
 
 /// Fix 2: `/auth/password/forgot` was previously unrated and could be used to
@@ -125,7 +138,9 @@ async fn sixth_rapid_forgot_password_attempt_is_rate_limited(pool: sqlx::PgPool)
             .uri("/auth/password/forgot")
             .header("content-type", "application/json")
             .header("x-forwarded-for", "3.3.3.3")
-            .body(Body::from(json!({"email": "nobody@example.com"}).to_string()))
+            .body(Body::from(
+                json!({"email": "nobody@example.com"}).to_string(),
+            ))
             .unwrap()
     };
 
@@ -140,7 +155,11 @@ async fn sixth_rapid_forgot_password_attempt_is_rate_limited(pool: sqlx::PgPool)
         &[StatusCode::OK; 5],
         "first 5 requests should succeed with the generic response, not be rate-limited: {statuses:?}"
     );
-    assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS, "6th request should be rate-limited: {statuses:?}");
+    assert_eq!(
+        statuses[5],
+        StatusCode::TOO_MANY_REQUESTS,
+        "6th request should be rate-limited: {statuses:?}"
+    );
 }
 
 /// Fix 2: `/auth/password/reset` was previously unrated, letting an attacker
@@ -156,7 +175,9 @@ async fn sixth_rapid_reset_password_attempt_is_rate_limited(pool: sqlx::PgPool) 
             .uri("/auth/password/reset")
             .header("content-type", "application/json")
             .header("x-forwarded-for", "4.4.4.4")
-            .body(Body::from(json!({"token": "not-a-real-token", "new_password": "whatever123"}).to_string()))
+            .body(Body::from(
+                json!({"token": "not-a-real-token", "new_password": "whatever123"}).to_string(),
+            ))
             .unwrap()
     };
 
@@ -171,5 +192,9 @@ async fn sixth_rapid_reset_password_attempt_is_rate_limited(pool: sqlx::PgPool) 
         &[StatusCode::BAD_REQUEST; 5],
         "first 5 requests should fail normally (invalid token), not be rate-limited: {statuses:?}"
     );
-    assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS, "6th request should be rate-limited: {statuses:?}");
+    assert_eq!(
+        statuses[5],
+        StatusCode::TOO_MANY_REQUESTS,
+        "6th request should be rate-limited: {statuses:?}"
+    );
 }

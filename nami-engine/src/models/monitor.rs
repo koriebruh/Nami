@@ -19,9 +19,9 @@ use super::{
     validate_name, with_unchanged_values,
 };
 use crate::{
-    crypto::{Cipher, SecretString},
-    error::AppError,
-    middleware::rbac::ProjectReader,
+    core::crypto::{Cipher, SecretString},
+    core::error::AppError,
+    core::middleware::rbac::ProjectReader,
     uptime::expiry::{DEFAULT_DOMAIN_THRESHOLD_DAYS, DEFAULT_SSL_THRESHOLD_DAYS},
 };
 
@@ -1696,7 +1696,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::crypto::SecretString;
+    use crate::core::crypto::SecretString;
 
     #[test]
     fn credentials_query_values_and_the_fragment_are_masked() {
@@ -2260,7 +2260,7 @@ mod tests {
 
     #[test]
     fn members_read_the_monitor_whole_and_viewers_without_its_credentials() {
-        use crate::middleware::rbac::ProjectReader;
+        use crate::core::middleware::rbac::ProjectReader;
 
         let monitor = Monitor {
             url: Some("https://u:pw@example.com/x?k=v".to_string()),
@@ -2361,7 +2361,7 @@ mod tests {
 
     #[test]
     fn viewers_read_the_udp_payload_masked() {
-        use crate::middleware::rbac::ProjectReader;
+        use crate::core::middleware::rbac::ProjectReader;
 
         let monitor = Monitor {
             check_type: "udp".to_string(),
@@ -2378,7 +2378,7 @@ mod tests {
 
     #[test]
     fn a_view_says_whether_it_was_redacted_for_its_reader() {
-        use crate::middleware::rbac::ProjectReader;
+        use crate::core::middleware::rbac::ProjectReader;
 
         // A member's URL can hold a literal `***`: that is not redaction.
         let monitor = Monitor {
@@ -2778,7 +2778,7 @@ mod tests {
 
     #[test]
     fn viewers_read_the_proxy_username_masked_and_the_proxy_url_redacted() {
-        use crate::middleware::rbac::ProjectReader;
+        use crate::core::middleware::rbac::ProjectReader;
 
         let monitor = proxied_monitor();
         let viewer = MonitorView::for_reader(monitor.clone(), ProjectReader::Viewer, false);

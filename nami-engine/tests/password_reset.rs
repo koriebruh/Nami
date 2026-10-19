@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
-use nami_engine::{email::Mailer, state::AppState};
+use nami_engine::{core::email::Mailer, core::state::AppState};
 use serde_json::json;
 use tower::ServiceExt;
 
@@ -27,9 +27,13 @@ async fn login(app: &axum::Router, email: &str, password: &str) -> axum::http::H
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState::for_test(pool);
-    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state)).layer(
-        nami_engine::router::configure_session_layer(tower_sessions::MemoryStore::default(), false),
-    )
+    nami_engine::core::router::with_fallback_connect_info(nami_engine::core::router::build_router(
+        state,
+    ))
+    .layer(nami_engine::core::router::configure_session_layer(
+        tower_sessions::MemoryStore::default(),
+        false,
+    ))
 }
 
 #[sqlx::test]
@@ -405,8 +409,9 @@ async fn forgot_password_returns_generic_200_even_if_mail_send_fails(pool: sqlx:
         mailer: Mailer::new("localhost", 1),
         ..AppState::for_test(pool)
     };
-    let app =
-        nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state));
+    let app = nami_engine::core::router::with_fallback_connect_info(
+        nami_engine::core::router::build_router(state),
+    );
 
     let response = app
         .oneshot(
@@ -432,8 +437,9 @@ async fn register_returns_generic_200_even_if_mail_send_fails(pool: sqlx::PgPool
         mailer: Mailer::new("localhost", 1),
         ..AppState::for_test(pool)
     };
-    let app =
-        nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state));
+    let app = nami_engine::core::router::with_fallback_connect_info(
+        nami_engine::core::router::build_router(state),
+    );
 
     let response = app
         .oneshot(

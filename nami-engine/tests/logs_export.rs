@@ -15,12 +15,12 @@ use common::{
     public_app, seed_project, state_with_clickhouse, user_with_role,
 };
 use nami_engine::{
-    clickhouse::ClickHouse,
+    core::clickhouse::ClickHouse,
+    core::state::AppState,
     logs::{
         LogsState,
         export::{ExportLimits, MAX_EXPORTS_PER_INSTANCE},
     },
-    state::AppState,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;

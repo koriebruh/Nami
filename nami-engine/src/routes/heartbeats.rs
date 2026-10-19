@@ -20,16 +20,18 @@ use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::{
-    error::AppError,
+    core::error::AppError,
+    core::middleware::rbac::{
+        CurrentUser, ProjectReader, require_project_reader, require_project_role,
+    },
+    core::state::AppState,
     logs::rate_limit::{InFlight, TokenBuckets},
-    middleware::rbac::{CurrentUser, ProjectReader, require_project_reader, require_project_role},
     models::{
         heartbeat::{
             self, CreateHeartbeatRequest, Heartbeat, HeartbeatView, PatchHeartbeatRequest,
         },
         maintenance, monitor_group,
     },
-    state::AppState,
     uptime::{
         alerts,
         availability::{self, Availability, RangeQuery},
@@ -178,7 +180,7 @@ struct PingGuards {
 }
 
 /// The public ping endpoint, served on the public listener only (see
-/// `router::build_public_router`). No session: the token in the path is the
+/// `core::router::build_public_router`). No session: the token in the path is the
 /// secret, and cron jobs call it directly. `/{token}` is a success ping,
 /// `/{token}/fail` a failure and `/{token}/{exit_code}` either (`0` is a
 /// success). Each database step of a ping must hold one of `ping_slots`'

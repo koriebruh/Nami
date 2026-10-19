@@ -11,16 +11,16 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    error::AppError,
+    core::error::AppError,
+    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::state::AppState,
     logs::{
         normalize, pipeline,
         pipeline::Outcome,
         store,
         usage::{self, DailyUsage},
     },
-    middleware::rbac::{CurrentUser, require_project_role},
     models::source::{self, CreateSourceRequest, PatchSourceRequest, Source, SourceWithToken},
-    state::AppState,
 };
 
 /// Sent with every response that carries a token (create, reveal, rotate):

@@ -7,7 +7,7 @@ use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use super::{ProjectQuota, validate_name, with_unchanged_values};
-use crate::error::AppError;
+use crate::core::error::AppError;
 
 pub const MAX_POSITION: i32 = 1_000_000;
 

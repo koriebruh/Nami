@@ -1,12 +1,13 @@
 use nami_engine::{
-    clickhouse::ClickHouse,
-    config::Config,
-    crypto::{Cipher, TEST_KEY},
-    db, email,
+    core::clickhouse::ClickHouse,
+    core::config::Config,
+    core::crypto::{Cipher, TEST_KEY},
+    core::db,
+    core::email,
+    core::router,
+    core::serve::{ServeLimits, serve},
+    core::state::AppState,
     logs::LogsState,
-    router,
-    serve::{ServeLimits, serve},
-    state::AppState,
 };
 use std::sync::Arc;
 use tower_sessions_sqlx_store::PostgresStore;
@@ -65,7 +66,7 @@ async fn main() {
 
     // Session-layer settings (Expiry::OnInactivity + with_always_save(true))
     // and the rate limiter's governor config/error_handler are defined once
-    // in `nami_engine::router` and shared with every test, so a regression
+    // in `nami_engine::core::router` and shared with every test, so a regression
     // removing either can't silently go untested again.
     let session_layer = router::configure_session_layer(session_store, config.cookie_secure);
 

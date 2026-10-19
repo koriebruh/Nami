@@ -10,7 +10,7 @@
 use std::process::{Command, Output};
 
 use base64::Engine;
-use nami_engine::crypto::TEST_KEY;
+use nami_engine::core::crypto::TEST_KEY;
 
 /// A fresh, empty directory of this test's own under the system temp dir.
 fn scratch_dir(name: &str) -> std::path::PathBuf {

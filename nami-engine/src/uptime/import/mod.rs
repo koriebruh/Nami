@@ -15,8 +15,8 @@ use std::{collections::HashSet, fmt};
 use uuid::Uuid;
 
 use crate::{
-    crypto::Cipher,
-    error::AppError,
+    core::crypto::Cipher,
+    core::error::AppError,
     models::{
         monitor::{self, CreateMonitorRequest, MonitorConfig},
         monitor_group,

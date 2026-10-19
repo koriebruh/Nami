@@ -23,7 +23,7 @@ use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
 use super::{ProjectQuota, nullable, validate_label, with_unchanged_values};
-use crate::error::AppError;
+use crate::core::error::AppError;
 
 /// The longest a one-off window may last.
 pub const MAX_ONE_OFF_DAYS: i64 = 366;

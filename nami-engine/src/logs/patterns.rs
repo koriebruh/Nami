@@ -9,7 +9,7 @@ use super::{
     query::{self, LogFilters, Sql, Window},
     search,
 };
-use crate::{clickhouse::ClickHouse, error::AppError};
+use crate::{core::clickhouse::ClickHouse, core::error::AppError};
 
 pub const TOP_PATTERNS: u32 = 100;
 
@@ -65,7 +65,10 @@ mod tests {
         // Grouping stays bounded and approximate past a million patterns (R-P2-10).
         assert_eq!(
             PATTERN_SETTINGS[2..],
-            [("max_rows_to_group_by", "1000000"), ("group_by_overflow_mode", "any")]
+            [
+                ("max_rows_to_group_by", "1000000"),
+                ("group_by_overflow_mode", "any")
+            ]
         );
     }
 }

@@ -15,7 +15,8 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    crypto::{Cipher, SecretString},
+    core::crypto::{Cipher, SecretString},
+    core::state::AppState,
     models::{
         monitor::{IpVersion, Monitor, url_has_credentials},
         monitor_request::{
@@ -23,7 +24,6 @@ use crate::{
             open_password, open_proxy_password,
         },
     },
-    state::AppState,
 };
 
 /// Keyword checks read at most this much of the body; a keyword that only

@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use super::checker::{CheckOutcome, CheckStatus};
 use crate::{
-    clickhouse::{ClickHouse, ClickHouseError},
+    core::clickhouse::{ClickHouse, ClickHouseError},
     models::monitor::Monitor,
 };
 
@@ -165,7 +165,7 @@ pub const CHECKS_BETWEEN_LIMIT: u32 = 20_000;
 /// The monitor's checks with `from <= checked_at < to`, oldest first, at most
 /// [`CHECKS_BETWEEN_LIMIT`] of them. `error` is cut to the checker's
 /// `MAX_ERROR_CHARS` plus its `…` truncation marker here too, so one result
-/// stays far below the client's response cap (`clickhouse::MAX_RESPONSE_BYTES`)
+/// stays far below the client's response cap (`core::clickhouse::MAX_RESPONSE_BYTES`)
 /// whatever a row holds.
 pub async fn checks_between(
     ch: &ClickHouse,

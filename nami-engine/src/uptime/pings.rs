@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::heartbeat::PingKind;
-use crate::clickhouse::{ClickHouse, ClickHouseError};
+use crate::core::clickhouse::{ClickHouse, ClickHouseError};
 
 /// One row of `heartbeat_pings`; also the JSON shape of
 /// `GET /projects/{id}/heartbeats/{heartbeat_id}/pings`.

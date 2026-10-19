@@ -25,8 +25,8 @@ use tower_governor::{
 use tower_sessions::{Expiry, SessionManagerLayer, SessionStore, cookie::SameSite};
 
 use crate::{
-    error::AppError, logs::rate_limit::TokenBuckets, routes, routes::logs_ingest::IngestLimits,
-    state::AppState,
+    core::error::AppError, core::state::AppState, logs::rate_limit::TokenBuckets, routes,
+    routes::logs_ingest::IngestLimits,
 };
 
 /// Wraps `rate_limited_router()` with the real governor config: per-IP
@@ -69,7 +69,7 @@ fn rate_limited_with_governor(router: Router<AppState>) -> Router<AppState> {
 /// [`require_json_body`]).
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .merge(routes::health::router())
+        .merge(crate::core::health::router())
         .merge(routes::auth::router())
         .merge(rate_limited_with_governor(
             routes::auth::rate_limited_router(),
@@ -196,7 +196,7 @@ fn build_public_router_with_limits(
     ingest_limits: IngestLimits,
 ) -> Router {
     Router::new()
-        .merge(routes::health::public_router())
+        .merge(crate::core::health::public_router())
         .merge(routes::heartbeats::public_router(ping_slots, ping_limits))
         .merge(routes::logs_ingest::public_router(ingest_limits))
         .with_state(state)

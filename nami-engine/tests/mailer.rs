@@ -1,4 +1,4 @@
-// `email::Mailer`: what a message looks like on the wire, and how long a send
+// `core::email::Mailer`: what a message looks like on the wire, and how long a send
 // may take. Requires `docker compose up -d mailpit`.
 //
 // Kept apart from `tests/email.rs`, whose test clears the whole Mailpit inbox:
@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use common::{LogCapture, settled_mail, stored_mail_for, unique_email};
 use nami_engine::{
-    email::{Mailer, SMTP_TIMEOUT, SmtpCredentials, SmtpSettings, SmtpTls},
-    error::AppError,
+    core::email::{Mailer, SMTP_TIMEOUT, SmtpCredentials, SmtpSettings, SmtpTls},
+    core::error::AppError,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},

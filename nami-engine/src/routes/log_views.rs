@@ -10,14 +10,14 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    error::AppError,
+    core::error::AppError,
+    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::state::AppState,
     logs::saved_query::{self, ViewQuery},
-    middleware::rbac::{CurrentUser, require_project_role},
     models::{
         log_view::{self, CreatedView, LogView, MAX_VIEWS_PER_PROJECT},
         validate_label,
     },
-    state::AppState,
 };
 
 #[derive(Debug, Deserialize)]

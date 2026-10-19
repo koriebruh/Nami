@@ -41,9 +41,9 @@ use super::{
     store::{self, UptimeCheckRow},
 };
 use crate::{
-    error::AppError,
+    core::error::AppError,
+    core::state::AppState,
     models::{incident, maintenance, monitor::Monitor},
-    state::AppState,
 };
 
 /// How often a check pass starts.

@@ -52,15 +52,15 @@ use super::{
     checker::CheckStatus,
     store::{self, CHECKS_BETWEEN_LIMIT, UptimeCheckRow},
 };
-pub use crate::download::neutralize;
+pub use crate::core::download::neutralize;
 use crate::{
-    clickhouse::ClickHouseError,
-    download::{AbortableBody, ProjectSlots, instance_busy, project_busy, user_busy},
-    error::AppError,
+    core::clickhouse::ClickHouseError,
+    core::download::{AbortableBody, ProjectSlots, instance_busy, project_busy, user_busy},
+    core::error::AppError,
+    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::state::AppState,
     logs::slots::UserSlots,
-    middleware::rbac::{CurrentUser, require_project_role},
     models::monitor,
-    state::AppState,
 };
 
 /// Longest range one export may cover (`uptime_checks` keeps 180 days).
@@ -117,7 +117,7 @@ pub fn route() -> MethodRouter<AppState> {
 }
 
 /// One RFC 4180 record (CRLF-terminated) for `row`, every cell neutralized
-/// and quoted (see [`crate::download::push_csv_field`]).
+/// and quoted (see [`crate::core::download::push_csv_field`]).
 pub fn csv_line(row: &UptimeCheckRow) -> String {
     let checked_at = row.checked_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let status = match row.status {
@@ -130,7 +130,7 @@ pub fn csv_line(row: &UptimeCheckRow) -> String {
         .map(|ms| ms.to_string())
         .unwrap_or_default();
     let error = row.error.as_deref().unwrap_or_default();
-    crate::download::csv_record(&[&checked_at, status, &status_code, &response_time, error])
+    crate::core::download::csv_record(&[&checked_at, status, &status_code, &response_time, error])
 }
 
 /// `from < to` and at most [`MAX_EXPORT_DAYS`] apart.
@@ -510,7 +510,7 @@ mod tests {
         let json_line = serde_json::to_string(&worst).unwrap().len() + 1;
         let slice = json_line * CHECKS_BETWEEN_LIMIT as usize;
         assert!(
-            slice * 5 / 4 < crate::clickhouse::MAX_RESPONSE_BYTES,
+            slice * 5 / 4 < crate::core::clickhouse::MAX_RESPONSE_BYTES,
             "{slice} bytes per slice"
         );
     }

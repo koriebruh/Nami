@@ -12,7 +12,7 @@ use common::{
     add_member, seed_http_monitor, seed_project, seed_user, settled_mail, silent_server,
     state_with_clickhouse, unique_email,
 };
-use nami_engine::{state::AppState, uptime::worker::run_forever};
+use nami_engine::{core::state::AppState, uptime::worker::run_forever};
 use serde::Deserialize;
 use uuid::Uuid;
 

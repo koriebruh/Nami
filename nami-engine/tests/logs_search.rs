@@ -33,7 +33,7 @@ fn filter(value: Value) -> String {
 struct Fixture {
     app: Router,
     public: Router,
-    ch: nami_engine::clickhouse::ClickHouse,
+    ch: nami_engine::core::clickhouse::ClickHouse,
     project: Uuid,
     other_project: Uuid,
     api: Uuid,

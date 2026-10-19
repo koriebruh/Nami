@@ -5,7 +5,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{error::AppError, logs::saved_query::ViewQuery};
+use crate::{core::error::AppError, logs::saved_query::ViewQuery};
 
 /// Most saved views a project may hold.
 pub const MAX_VIEWS_PER_PROJECT: i64 = 200;

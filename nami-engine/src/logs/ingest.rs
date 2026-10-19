@@ -48,7 +48,9 @@ use super::{
     rate_limit::{DecodeShare, DecodeShares, REQUESTS_PER_SECOND},
     store::{self, LogRow, PipelineCounts},
 };
-use crate::{clickhouse::ClickHouseError, error::AppError, models::source::IngestSource};
+use crate::{
+    core::clickhouse::ClickHouseError, core::error::AppError, models::source::IngestSource,
+};
 
 /// Largest accepted request body, as sent (compressed or not).
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
@@ -154,8 +156,8 @@ impl From<sqlx::Error> for IngestError {
     }
 }
 
-impl From<crate::clickhouse::ClickHouseError> for IngestError {
-    fn from(error: crate::clickhouse::ClickHouseError) -> Self {
+impl From<crate::core::clickhouse::ClickHouseError> for IngestError {
+    fn from(error: crate::core::clickhouse::ClickHouseError) -> Self {
         IngestError::App(AppError::ClickHouse(error))
     }
 }

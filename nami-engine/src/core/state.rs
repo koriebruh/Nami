@@ -3,8 +3,8 @@ use std::sync::Arc;
 use sqlx::PgPool;
 
 use crate::{
-    clickhouse::ClickHouse, config::Config, crypto::Cipher, email, logs::LogsState,
-    uptime::alert_throttle::AlertThrottle,
+    core::clickhouse::ClickHouse, core::config::Config, core::crypto::Cipher, core::email,
+    logs::LogsState, uptime::alert_throttle::AlertThrottle,
 };
 
 /// A ClickHouse database name that is never created. `AppState::for_test`
@@ -29,10 +29,10 @@ pub struct AppState {
 
 impl AppState {
     /// Test-only constructor (same precedent as
-    /// `router::with_fallback_connect_info`): every field gets the
+    /// `core::router::with_fallback_connect_info`): every field gets the
     /// defaults tests expect — `Config::from_env_for_test()`, the Mailpit
     /// mailer, a ClickHouse client bound to a database that does not
-    /// exist, a cipher over the fixed `crypto::TEST_KEY`, and fresh log
+    /// exist, a cipher over the fixed `core::crypto::TEST_KEY`, and fresh log
     /// ingest state (default rate limits, no usage) and fresh alert flap
     /// control. Tests override
     /// single fields with struct-update syntax, e.g.

@@ -17,11 +17,11 @@ use common::{
 };
 use http_body_util::BodyExt;
 use nami_engine::{
+    core::state::AppState,
     logs::{
         LogsState,
         tail::{MAX_TAILS_PER_USER, TAIL_BATCH, TailTimings},
     },
-    state::AppState,
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;

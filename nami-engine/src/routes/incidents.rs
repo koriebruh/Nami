@@ -7,10 +7,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    error::AppError,
-    middleware::rbac::{CurrentUser, require_project_role},
+    core::error::AppError,
+    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::state::AppState,
     models::incident::{self, IncidentListItem},
-    state::AppState,
 };
 
 pub fn router() -> Router<AppState> {

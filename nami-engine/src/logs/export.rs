@@ -32,7 +32,7 @@
 //! column's key (`{"id":` NDJSON, `{"dt":` CSV), and anything else ends the
 //! file with the "query failed" trailer without being written.
 //!
-//! CSV cells go through [`crate::download::neutralize`] (formula guard), the
+//! CSV cells go through [`crate::core::download::neutralize`] (formula guard), the
 //! header included (a column path may start with `-`), and are always quoted
 //! ([`push_csv_field`]).
 
@@ -55,7 +55,7 @@ use tokio::{
 use uuid::Uuid;
 
 use super::query::{self, LogFilters, Sql, Window};
-use crate::clickhouse::{ClickHouseError, RowStream};
+use crate::core::clickhouse::{ClickHouseError, RowStream};
 
 /// Rows one export carries at most (the SQL `LIMIT`).
 pub const MAX_EXPORT_ROWS: u64 = 100_000;
@@ -71,7 +71,7 @@ pub const MAX_EXPORTS_PER_USER: usize = 2;
 /// it, R-P2-15): each runs a ClickHouse query for up to 120 s.
 pub const MAX_EXPORTS_PER_INSTANCE: usize = 8;
 /// When the streaming task ends whatever the client does (R-P2-13). The
-/// ClickHouse request timeout ([`crate::clickhouse::STREAM_REQUEST_TIMEOUT`])
+/// ClickHouse request timeout ([`crate::core::clickhouse::STREAM_REQUEST_TIMEOUT`])
 /// is 5 s longer, so a long export ends here, with the time-limit trailer.
 ///
 /// These caps are the export's own. ClickHouse has one more: its
@@ -206,7 +206,7 @@ pub fn export_sql(project_id: Uuid, params: &ExportParams, limit: u64) -> Sql {
     sql
 }
 
-pub use crate::download::{csv_record, push_csv_field};
+pub use crate::core::download::{csv_record, push_csv_field};
 
 /// `nami-logs-<to as %Y%m%dT%H%M%SZ>.<csv|ndjson>`: no user text.
 pub fn file_name(format: ExportFormat, to: DateTime<Utc>) -> String {
@@ -448,8 +448,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        clickhouse::ClickHouse,
-        download::{AbortableBody, neutralize},
+        core::clickhouse::ClickHouse,
+        core::download::{AbortableBody, neutralize},
     };
 
     #[test]
@@ -606,7 +606,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_timeout_is_reported_as_the_time_limit() {
         assert_eq!(
-            crate::clickhouse::STREAM_REQUEST_TIMEOUT,
+            crate::core::clickhouse::STREAM_REQUEST_TIMEOUT,
             EXPORT_DEADLINE + Duration::from_secs(5)
         );
         let server = wiremock::MockServer::start().await;

@@ -457,7 +457,7 @@ impl ClickHouse {
         Ok(())
     }
 
-    /// Test-only (same precedent as `router::with_fallback_connect_info` and
+    /// Test-only (same precedent as `core::router::with_fallback_connect_info` and
     /// `AppState::for_test`): creates a uniquely named `nami_test_<uuid>`
     /// database on the server named by `CLICKHOUSE_URL`/`CLICKHOUSE_USER`/
     /// `CLICKHOUSE_PASSWORD` (defaults match docker-compose), applies the
@@ -466,7 +466,7 @@ impl ClickHouse {
     /// end of the test; a test that panics first leaves its database behind,
     /// which is harmless.
     pub async fn create_test_database() -> Result<ClickHouse, ClickHouseError> {
-        let config = crate::config::Config::from_env_for_test();
+        let config = crate::core::config::Config::from_env_for_test();
         let name = format!("{TEST_DATABASE_PREFIX}{}", uuid::Uuid::new_v4().simple());
         let client = ClickHouse::new(
             &config.clickhouse_url,

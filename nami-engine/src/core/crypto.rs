@@ -227,7 +227,7 @@ pub fn parse_key(raw: &str) -> Result<[u8; KEY_LEN], String> {
 ///
 /// ```compile_fail
 /// fn assert_serialize<T: serde::Serialize>() {}
-/// assert_serialize::<nami_engine::crypto::SecretString>();
+/// assert_serialize::<nami_engine::core::crypto::SecretString>();
 /// ```
 ///
 /// The same assertion holds for a type that does implement `Serialize`, so the

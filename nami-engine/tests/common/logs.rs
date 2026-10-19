@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
 };
 use nami_engine::{
-    clickhouse::ClickHouse,
+    core::clickhouse::ClickHouse,
     models::source::{self, SourceConfig},
 };
 use serde_json::Value;

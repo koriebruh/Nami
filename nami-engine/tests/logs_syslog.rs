@@ -10,10 +10,10 @@ use common::{
     seed_project, state_with_clickhouse, test_cipher,
 };
 use nami_engine::{
-    clickhouse::ClickHouse,
+    core::clickhouse::ClickHouse,
+    core::state::AppState,
     logs::syslog::{self, SyslogConfig, SyslogHandle, SyslogStatsSnapshot},
     models::source::{self, SourceConfig},
-    state::AppState,
 };
 use serde_json::{Value, json};
 use tokio::{

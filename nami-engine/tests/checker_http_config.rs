@@ -13,12 +13,12 @@ use common::{
     test_cipher, tls, unique_email, unsaved_monitor, user_with_role, with_basic_auth, with_headers,
 };
 use nami_engine::{
-    crypto::{Cipher, SecretString},
+    core::crypto::{Cipher, SecretString},
+    core::state::AppState,
     models::{
         monitor::Monitor,
         monitor_request::{RequestHeader, seal_headers, seal_password},
     },
-    state::AppState,
     uptime::{
         checker::{CONFIG_DECRYPT_ERROR, CheckContext, CheckStatus, MAX_REDIRECTS, perform_check},
         worker::run_due_checks,

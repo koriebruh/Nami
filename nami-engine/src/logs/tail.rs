@@ -43,9 +43,9 @@ use super::{
     search::{self, ENTRY_COLUMNS, LogEntry, RawEntry},
 };
 use crate::{
-    error::AppError,
-    middleware::rbac::{require_project_role, user_from_session},
-    state::AppState,
+    core::error::AppError,
+    core::middleware::rbac::{require_project_role, user_from_session},
+    core::state::AppState,
 };
 
 /// Most rows one poll reads; beyond that the newest are shown.

@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::query::{self, LogFilters, MAX_WINDOW};
-use crate::error::AppError;
+use crate::core::error::AppError;
 
 pub const VIEW_RANGES: [&str; 6] = ["15m", "1h", "6h", "24h", "7d", "custom"];
 pub const MAX_VIEW_COLUMNS: usize = 10;

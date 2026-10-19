@@ -6,7 +6,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{monitor_group, nullable, validate_name, with_unchanged_values};
-use crate::error::AppError;
+use crate::core::error::AppError;
 
 /// The longest a heartbeat's period, or its grace, may be: 31 days.
 pub const MAX_SECONDS: i32 = 31 * 24 * 60 * 60;

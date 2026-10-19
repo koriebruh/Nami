@@ -15,12 +15,12 @@ use common::{
     public_app, seed_project, state_with_clickhouse, user_with_role,
 };
 use nami_engine::{
+    core::state::AppState,
     logs::{
         LogsState,
         usage::{self, UsageCounters},
     },
     models::source::SourceConfig,
-    state::AppState,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -38,7 +38,7 @@ async fn usage_row(pool: &sqlx::PgPool, source_id: Uuid) -> UsageCounters {
 }
 
 /// Bytes as ClickHouse stores them: UTF-8 length of message + fields.
-async fn stored_bytes(ch: &nami_engine::clickhouse::ClickHouse, source_id: Uuid) -> i64 {
+async fn stored_bytes(ch: &nami_engine::core::clickhouse::ClickHouse, source_id: Uuid) -> i64 {
     let rows: Vec<Value> = ch
         .query_rows(
             "SELECT sum(length(message) + length(fields)) AS n FROM logs WHERE source_id = {s:UUID}",

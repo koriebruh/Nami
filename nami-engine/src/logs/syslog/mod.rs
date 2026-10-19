@@ -89,10 +89,10 @@ use self::{
 use super::{pipeline::CompiledPipeline, rate_limit::TokenBuckets, store};
 use crate::{
     auth::token::hash_token,
-    clickhouse::ClickHouseError,
-    config::Config,
+    core::clickhouse::ClickHouseError,
+    core::config::Config,
+    core::state::AppState,
     models::source::{self, IngestSource},
-    state::AppState,
 };
 
 pub const DEFAULT_PORT: u16 = 5140;

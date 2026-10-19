@@ -10,8 +10,8 @@ use common::{
     settled_mail, test_app, unique_email, user_with_role,
 };
 use nami_engine::{
+    core::state::AppState,
     models::monitor::Monitor,
-    state::AppState,
     uptime::{
         alerts::TransitionKind,
         checker::{CheckOutcome, CheckStatus},

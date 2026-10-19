@@ -18,7 +18,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{validate_name, with_unchanged_values};
-use crate::{auth::token::hash_token, crypto::Cipher, error::AppError};
+use crate::{auth::token::hash_token, core::crypto::Cipher, core::error::AppError};
 
 pub const PLATFORMS: [&str; 5] = ["http", "syslog", "vector", "docker", "other"];
 pub const DEFAULT_PLATFORM: &str = "http";
@@ -678,7 +678,7 @@ mod tests {
         assert_eq!(token_context(a), format!("sources.token:{a}"));
         assert_ne!(token_context(a), token_context(b));
 
-        let cipher = Cipher::new(&crate::crypto::TEST_KEY);
+        let cipher = Cipher::new(&crate::core::crypto::TEST_KEY);
         let sealed = cipher.encrypt(&token_context(a), b"token");
         assert_eq!(
             cipher.decrypt(&token_context(a), &sealed).unwrap(),

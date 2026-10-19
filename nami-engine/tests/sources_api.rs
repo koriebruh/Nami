@@ -8,7 +8,7 @@ use common::{
 };
 use nami_engine::{
     auth::token::hash_token,
-    crypto::{Cipher, TEST_KEY},
+    core::crypto::{Cipher, TEST_KEY},
     models::source::{self, TOKEN_CONTEXT},
 };
 use serde_json::{Value, json};
@@ -680,7 +680,7 @@ async fn find_by_token_never_queries_for_a_token_of_the_wrong_shape() {
 /// and deleting one makes room again.
 #[sqlx::test]
 async fn a_project_has_at_most_its_maximum_number_of_sources(pool: sqlx::PgPool) {
-    use nami_engine::state::AppState;
+    use nami_engine::core::state::AppState;
 
     let mut state = AppState::for_test(pool.clone());
     state.config.max_sources_per_project = 3;

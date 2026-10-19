@@ -13,7 +13,7 @@ use common::{
     app, call, seed_http_monitor, seed_project, state_with_clickhouse, test_app, user_with_role,
 };
 use nami_engine::{
-    clickhouse::ClickHouse,
+    core::clickhouse::ClickHouse,
     uptime::{
         checker::CheckStatus,
         checker::MAX_ERROR_CHARS,

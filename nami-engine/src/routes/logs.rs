@@ -18,8 +18,10 @@ use tower_sessions::Session;
 use uuid::Uuid;
 
 use crate::{
-    download::{AbortableBody, instance_busy, user_busy},
-    error::AppError,
+    core::download::{AbortableBody, instance_busy, user_busy},
+    core::error::AppError,
+    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::state::AppState,
     logs::{
         export::{self, ExportFormat},
         patterns, query,
@@ -27,9 +29,7 @@ use crate::{
         slots::SlotRefused,
         tail,
     },
-    middleware::rbac::{CurrentUser, require_project_role},
     models::source,
-    state::AppState,
 };
 
 // Viewers and up. The project is always the one in the path: a source_id

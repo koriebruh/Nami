@@ -6,7 +6,7 @@
 //! variables. Alone in its process, it can do that before any other thread
 //! exists, and no other test builds a client while the variables are set.
 
-use nami_engine::clickhouse::ClickHouse;
+use nami_engine::core::clickhouse::ClickHouse;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
 
 #[test]

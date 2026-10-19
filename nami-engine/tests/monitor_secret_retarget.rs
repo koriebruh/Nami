@@ -6,7 +6,7 @@ mod common;
 
 use axum::{Router, http::HeaderValue, http::StatusCode};
 use common::{call, seed_project, user_with_role};
-use nami_engine::{state::AppState, uptime::worker::run_due_checks};
+use nami_engine::{core::state::AppState, uptime::worker::run_due_checks};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};

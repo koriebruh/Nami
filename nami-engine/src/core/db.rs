@@ -5,7 +5,7 @@ use sqlx::{
     postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions},
 };
 
-use crate::config::Config;
+use crate::core::config::Config;
 
 /// How the Postgres pool is sized and bounded (see the `database_*` fields of
 /// [`Config`]).

@@ -1,7 +1,7 @@
+use crate::core::error::AppError;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
-use chrono::{DateTime, Utc};
-use crate::error::AppError;
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct User {
@@ -58,14 +58,16 @@ pub async fn mark_email_verified(pool: &PgPool, user_id: Uuid) -> Result<(), sql
     Ok(())
 }
 
-pub async fn update_password(pool: &PgPool, user_id: Uuid, new_hash: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "update users set password_hash = $1, password_changed_at = now() where id = $2",
-    )
-    .bind(new_hash)
-    .bind(user_id)
-    .execute(pool)
-    .await?;
+pub async fn update_password(
+    pool: &PgPool,
+    user_id: Uuid,
+    new_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("update users set password_hash = $1, password_changed_at = now() where id = $2")
+        .bind(new_hash)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -83,10 +85,12 @@ pub async fn find_or_create_oauth_user(
     .fetch_optional(pool)
     .await?
     {
-        return Ok(sqlx::query_as::<_, User>("select * from users where id = $1")
-            .bind(user_id)
-            .fetch_one(pool)
-            .await?);
+        return Ok(
+            sqlx::query_as::<_, User>("select * from users where id = $1")
+                .bind(user_id)
+                .fetch_one(pool)
+                .await?,
+        );
     }
 
     let mut tx = pool.begin().await?;

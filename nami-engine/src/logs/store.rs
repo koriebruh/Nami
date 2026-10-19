@@ -1,4 +1,4 @@
-//! Log rows in ClickHouse (`logs`, see `clickhouse::MIGRATIONS`).
+//! Log rows in ClickHouse (`logs`, see `core::clickhouse::MIGRATIONS`).
 
 use std::{collections::HashMap, ops::Range};
 
@@ -12,7 +12,7 @@ use super::{
     pipeline::{CompiledPipeline, Outcome},
 };
 use crate::{
-    clickhouse::{ClickHouse, ClickHouseError},
+    core::clickhouse::{ClickHouse, ClickHouseError},
     models::source::{IngestSource, MAX_RETENTION_DAYS},
 };
 
@@ -300,7 +300,7 @@ pub fn chunk_rows(
     let mut start = 0;
     let mut size = 0usize;
     for (index, row) in rows.iter().enumerate() {
-        let len = crate::clickhouse::encoded_len(row)? + 1;
+        let len = crate::core::clickhouse::encoded_len(row)? + 1;
         if len > max_bytes {
             if start < index {
                 runs.push(start..index);
@@ -335,10 +335,10 @@ pub async fn insert_logs(ch: &ClickHouse, rows: &[LogRow]) -> Result<(), ClickHo
 ///
 /// A batch that would encode to more than `max_bytes` is refused with
 /// [`ClickHouseError::TooLarge`] before anything is built (see
-/// [`crate::clickhouse::encode_rows_within`]): escaping can make the body far
+/// [`crate::core::clickhouse::encode_rows_within`]): escaping can make the body far
 /// larger than the rows it is made of.
 pub fn encode_logs(rows: &[LogRow], max_bytes: usize) -> Result<String, ClickHouseError> {
-    crate::clickhouse::encode_rows_within(rows, max_bytes)
+    crate::core::clickhouse::encode_rows_within(rows, max_bytes)
 }
 
 /// [`insert_logs`] for a body made by [`encode_logs`]: the same table, the
@@ -479,7 +479,7 @@ mod tests {
             .iter()
             .map(|len| row_of_size(&source, *len))
             .collect();
-        let one = crate::clickhouse::encoded_len(&rows[0]).unwrap() + 1;
+        let one = crate::core::clickhouse::encoded_len(&rows[0]).unwrap() + 1;
         let (runs, oversized) = chunk_rows(&rows, 2 * one).unwrap();
         assert_eq!(runs, vec![0..2, 2..3, 4..5]);
         assert_eq!(oversized, 1);
@@ -519,7 +519,7 @@ mod tests {
             Err(ClickHouseError::TooLarge { .. })
         ));
 
-        let one = crate::clickhouse::encoded_len(&batch.rows()[0]).unwrap() + 1;
+        let one = crate::core::clickhouse::encoded_len(&batch.rows()[0]).unwrap() + 1;
         let (runs, oversized) = chunk_rows(batch.rows(), one + 5).unwrap();
         assert_eq!((runs.len(), oversized), (2, 0));
         for run in runs {

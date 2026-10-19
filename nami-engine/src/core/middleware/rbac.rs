@@ -1,4 +1,4 @@
-use crate::{error::AppError, models, state::AppState};
+use crate::{core::error::AppError, core::state::AppState, models};
 use axum::{extract::FromRequestParts, http::request::Parts};
 use tower_sessions::Session;
 
@@ -101,7 +101,7 @@ pub async fn require_project_role(
     user: &CurrentUser,
     project_id: uuid::Uuid,
     min: &str,
-) -> Result<(), crate::error::AppError> {
+) -> Result<(), crate::core::error::AppError> {
     if user.global_role == "admin" {
         return Ok(());
     }
@@ -117,9 +117,9 @@ pub async fn require_project_role(
     match row {
         Some((role,)) => match (role_rank(&role), role_rank(min)) {
             (Some(user_rank), Some(min_rank)) if user_rank >= min_rank => Ok(()),
-            _ => Err(crate::error::AppError::Forbidden),
+            _ => Err(crate::core::error::AppError::Forbidden),
         },
-        None => Err(crate::error::AppError::Forbidden),
+        None => Err(crate::core::error::AppError::Forbidden),
     }
 }
 

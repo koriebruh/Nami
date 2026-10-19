@@ -15,10 +15,10 @@ use common::{
     settled_mail, silent_server, state_with_clickhouse, stored_mail_for, unique_email,
 };
 use nami_engine::{
-    clickhouse::ClickHouse,
-    email::Mailer,
+    core::clickhouse::ClickHouse,
+    core::email::Mailer,
+    core::state::AppState,
     models::monitor::Monitor,
-    state::AppState,
     uptime::{
         alert_throttle::ALERT_FLAP_WINDOW,
         alerts::{Transition, TransitionKind, notify_transition, send_deferred},

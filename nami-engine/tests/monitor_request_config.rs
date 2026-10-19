@@ -7,12 +7,12 @@ use common::{
     unique_email, user_with_role,
 };
 use nami_engine::{
-    crypto::{Cipher, DecryptError, SecretString, TEST_KEY},
+    core::crypto::{Cipher, DecryptError, SecretString, TEST_KEY},
+    core::state::AppState,
     models::{
         monitor::{CreateMonitorRequest, Monitor, MonitorView, PatchMonitorRequest},
         monitor_request::{RequestHeader, open_headers, open_password},
     },
-    state::AppState,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;

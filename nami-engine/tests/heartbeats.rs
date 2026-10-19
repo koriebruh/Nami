@@ -17,14 +17,14 @@ use common::{
     silent_server, test_app, unique_email, user_with_role,
 };
 use nami_engine::{
-    email::Mailer,
+    core::email::Mailer,
+    core::state::AppState,
     logs::rate_limit::TokenBuckets,
     models::incident,
     routes::heartbeats::{
         MAX_PING_BODIES_IN_FLIGHT, MAX_PING_BODIES_PER_PROJECT, MAX_PING_BODY_BYTES,
         MAX_PINGS_IN_FLIGHT, PING_BODY_TIMEOUT, PING_BURST, PING_SLOT_WAIT,
     },
-    state::AppState,
     uptime::{
         alerts::{Subject, Transition, TransitionKind},
         heartbeat::{
@@ -1793,7 +1793,7 @@ async fn ping_replies_are_never_cacheable(pool: sqlx::PgPool) {
     // The failure and exit-code routes, a bad suffix (400) and a heartbeat
     // over its rate limit (429).
     let limits = Arc::new(TokenBuckets::new(0.000_1, 2.0));
-    let limited = nami_engine::router::build_public_router_with_ping_limits(
+    let limited = nami_engine::core::router::build_public_router_with_ping_limits(
         AppState::for_test(pool.clone()),
         Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT)),
         limits,
@@ -2457,7 +2457,7 @@ async fn the_public_listener_serves_none_of_the_api(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn a_full_ping_endpoint_turns_pings_away_with_retry_after(pool: sqlx::PgPool) {
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(2));
-    let public = nami_engine::router::build_public_router_with_ping_slots(
+    let public = nami_engine::core::router::build_public_router_with_ping_slots(
         AppState::for_test(pool.clone()),
         slots.clone(),
     );
@@ -2538,7 +2538,7 @@ async fn simultaneous_pings_of_many_heartbeats_all_succeed(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn a_ping_holds_its_place_while_it_waits_for_the_database(pool: sqlx::PgPool) {
     let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-    let public = nami_engine::router::build_public_router_with_ping_slots(
+    let public = nami_engine::core::router::build_public_router_with_ping_slots(
         AppState::for_test(pool.clone()),
         slots,
     );
@@ -2810,7 +2810,7 @@ fn unreadable_body() -> Body {
 #[sqlx::test]
 async fn no_body_is_read_for_an_unknown_token(pool: sqlx::PgPool) {
     let slots = Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT));
-    let public = nami_engine::router::build_public_router_with_ping_slots(
+    let public = nami_engine::core::router::build_public_router_with_ping_slots(
         AppState::for_test(pool.clone()),
         slots.clone(),
     );
@@ -2838,7 +2838,7 @@ async fn no_body_is_read_for_an_unknown_token(pool: sqlx::PgPool) {
 async fn one_body_per_heartbeat_is_read_at_a_time(pool: sqlx::PgPool) {
     // One database place: the slow body must not hold it while it arrives,
     // or B's ping below would be 503.
-    let public = nami_engine::router::build_public_router_with_ping_slots(
+    let public = nami_engine::core::router::build_public_router_with_ping_slots(
         AppState::for_test(pool.clone()),
         Arc::new(Semaphore::new(1)),
     );
@@ -3036,7 +3036,7 @@ async fn more_than_the_burst_of_pings_per_heartbeat_is_429(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     // A refill rate of ~0 makes the test independent of how fast pings run.
     let limits = Arc::new(TokenBuckets::new(0.000_1, PING_BURST));
-    let public = nami_engine::router::build_public_router_with_ping_limits(
+    let public = nami_engine::core::router::build_public_router_with_ping_limits(
         state,
         Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT)),
         limits,
@@ -3085,7 +3085,7 @@ async fn more_than_the_burst_of_pings_per_heartbeat_is_429(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn the_rate_limit_is_checked_before_any_body_is_read(pool: sqlx::PgPool) {
     let limits = Arc::new(TokenBuckets::new(0.000_1, 1.0));
-    let public = nami_engine::router::build_public_router_with_ping_limits(
+    let public = nami_engine::core::router::build_public_router_with_ping_limits(
         AppState::for_test(pool.clone()),
         Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT)),
         limits,
@@ -3252,7 +3252,7 @@ async fn the_database_refuses_a_group_of_another_project(pool: sqlx::PgPool) {
 
 /// A public router whose rate limit never gets in the way.
 fn unthrottled_public(state: AppState) -> Router {
-    nami_engine::router::build_public_router_with_ping_limits(
+    nami_engine::core::router::build_public_router_with_ping_limits(
         state,
         Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT)),
         Arc::new(TokenBuckets::new(1000.0, 1000.0)),

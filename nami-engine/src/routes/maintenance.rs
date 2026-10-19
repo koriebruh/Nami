@@ -9,12 +9,12 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    error::AppError,
-    middleware::rbac::{CurrentUser, require_project_role},
+    core::error::AppError,
+    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::state::AppState,
     models::maintenance::{
         self, CreateWindowRequest, PatchWindowRequest, WindowConfig, WindowView,
     },
-    state::AppState,
 };
 
 // Same RBAC as monitors: viewer reads, member creates/edits, admin deletes.

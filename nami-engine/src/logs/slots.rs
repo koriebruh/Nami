@@ -10,7 +10,7 @@ use std::{
 
 use uuid::Uuid;
 
-use crate::error::AppError;
+use crate::core::error::AppError;
 
 /// How many requests each user has running, and how many in all.
 #[derive(Debug, Default)]

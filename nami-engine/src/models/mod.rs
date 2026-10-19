@@ -111,21 +111,21 @@ impl ProjectQuota {
         self,
         conn: &mut sqlx::PgConnection,
         project_id: uuid::Uuid,
-    ) -> Result<(), crate::error::AppError> {
+    ) -> Result<(), crate::core::error::AppError> {
         let exists: Option<uuid::Uuid> =
             sqlx::query_scalar("select id from projects where id = $1 for no key update")
                 .bind(project_id)
                 .fetch_optional(&mut *conn)
                 .await?;
         if exists.is_none() {
-            return Err(crate::error::AppError::NotFound);
+            return Err(crate::core::error::AppError::NotFound);
         }
         let count: i64 = sqlx::query_scalar(self.count_query())
             .bind(project_id)
             .fetch_one(&mut *conn)
             .await?;
         if count >= Self::MAX_ROWS {
-            return Err(crate::error::AppError::Validation(format!(
+            return Err(crate::core::error::AppError::Validation(format!(
                 "a project can have at most {} {}: delete one first",
                 Self::MAX_ROWS,
                 self.label()

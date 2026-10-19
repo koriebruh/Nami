@@ -24,7 +24,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::core::state::AppState;
 
 pub const FLUSH_INTERVAL: Duration = Duration::from_secs(10);
 pub const RETENTION_DAYS: i64 = 400;

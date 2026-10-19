@@ -19,7 +19,9 @@ use common::{
     public_app, seed_project, state_with_clickhouse, test_cipher, test_public_app,
 };
 use nami_engine::{
-    clickhouse::ClickHouse,
+    core::clickhouse::ClickHouse,
+    core::router::{build_public_router, build_public_router_with_ingest_limits},
+    core::state::AppState,
     logs::{
         LogsState,
         ingest::BodyPace,
@@ -27,9 +29,7 @@ use nami_engine::{
         rate_limit::{DecodeShares, InFlight, TokenBuckets},
     },
     models::source::{self, SourceConfig},
-    router::{build_public_router, build_public_router_with_ingest_limits},
     routes::logs_ingest::IngestLimits,
-    state::AppState,
 };
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;

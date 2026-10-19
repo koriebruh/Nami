@@ -6,7 +6,7 @@ use aes_gcm::{
 };
 use base64::Engine;
 use hkdf::Hkdf;
-use nami_engine::crypto::{Cipher, DecryptError, KEY_LEN, SecretString, TEST_KEY, parse_key};
+use nami_engine::core::crypto::{Cipher, DecryptError, KEY_LEN, SecretString, TEST_KEY, parse_key};
 use sha2::Sha256;
 
 const CONTEXT: &str = "monitors.auth_password";

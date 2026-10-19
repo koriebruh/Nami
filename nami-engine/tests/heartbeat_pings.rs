@@ -12,7 +12,7 @@ use common::{
     test_public_app, unique_email, user_with_role,
 };
 use nami_engine::{
-    state::AppState,
+    core::state::AppState,
     uptime::{
         heartbeat::{MAX_OUTPUT_BYTES, PingKind, SUCCESS_OUTPUT_MAX, TRUNCATED_MARKER},
         pings::{HeartbeatPingRow, insert_ping},

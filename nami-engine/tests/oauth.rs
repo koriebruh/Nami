@@ -1,8 +1,11 @@
-use axum::{body::Body, http::{Request, StatusCode, header}};
+use axum::{
+    body::Body,
+    http::{Request, StatusCode, header},
+};
+use nami_engine::{core::config::Config, core::state::AppState};
 use tower::ServiceExt;
-use nami_engine::{state::AppState, config::Config};
-use wiremock::{MockServer, Mock, ResponseTemplate};
 use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn test_config(mock_server_uri: &str) -> Config {
     let mut config = Config::from_env_for_test();
@@ -16,12 +19,17 @@ fn test_config(mock_server_uri: &str) -> Config {
 }
 
 fn test_app(pool: sqlx::PgPool, config: Config) -> axum::Router {
-    let state = AppState { config, ..AppState::for_test(pool) };
-    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state))
-        .layer(nami_engine::router::configure_session_layer(
-            tower_sessions::MemoryStore::default(),
-            false,
-        ))
+    let state = AppState {
+        config,
+        ..AppState::for_test(pool)
+    };
+    nami_engine::core::router::with_fallback_connect_info(nami_engine::core::router::build_router(
+        state,
+    ))
+    .layer(nami_engine::core::router::configure_session_layer(
+        tower_sessions::MemoryStore::default(),
+        false,
+    ))
 }
 
 /// Drives `/auth/oauth/{provider}/start` then `/callback` through the real
@@ -43,7 +51,13 @@ async fn run_oauth_flow(
         .await
         .unwrap();
     let session_cookie = start_res.headers().get(header::SET_COOKIE).unwrap().clone();
-    let location = start_res.headers().get(header::LOCATION).unwrap().to_str().unwrap().to_string();
+    let location = start_res
+        .headers()
+        .get(header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
     let real_state = url::Url::parse(&location)
         .unwrap()
         .query_pairs()
@@ -55,7 +69,9 @@ async fn run_oauth_flow(
     let callback_res = app
         .oneshot(
             Request::builder()
-                .uri(format!("/auth/oauth/{provider}/callback?code=fake-code&state={real_state}"))
+                .uri(format!(
+                    "/auth/oauth/{provider}/callback?code=fake-code&state={real_state}"
+                ))
                 .header(header::COOKIE, session_cookie.clone())
                 .body(Body::empty())
                 .unwrap(),
@@ -83,14 +99,16 @@ async fn run_oauth_flow(
 #[sqlx::test]
 async fn oauth_callback_creates_and_logs_in_user(pool: sqlx::PgPool) {
     let mock_server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/token"))
+    Mock::given(method("POST"))
+        .and(path("/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "access_token": "fake-token", "token_type": "bearer"
         })))
         .mount(&mock_server)
         .await;
     // Google's real userinfo shape: subject identifier is `sub`, not `id`.
-    Mock::given(method("GET")).and(path("/userinfo"))
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "sub": "google-123", "email": "oauth@example.com"
         })))
@@ -128,14 +146,16 @@ async fn oauth_callback_creates_and_logs_in_user(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn oauth_callback_creates_and_logs_in_github_user(pool: sqlx::PgPool) {
     let mock_server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/token"))
+    Mock::given(method("POST"))
+        .and(path("/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "access_token": "fake-token", "token_type": "bearer"
         })))
         .mount(&mock_server)
         .await;
     // GitHub's real userinfo shape: `id` is a JSON integer, `email` present.
-    Mock::given(method("GET")).and(path("/userinfo"))
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": 12345678, "email": "github-oauth@example.com"
         })))
@@ -171,14 +191,16 @@ async fn oauth_callback_creates_and_logs_in_github_user(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn oauth_callback_rejects_github_user_with_no_public_email(pool: sqlx::PgPool) {
     let mock_server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/token"))
+    Mock::given(method("POST"))
+        .and(path("/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "access_token": "fake-token", "token_type": "bearer"
         })))
         .mount(&mock_server)
         .await;
     // GitHub: `email` can be null when the user has no public email set.
-    Mock::given(method("GET")).and(path("/userinfo"))
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": 99999999, "email": serde_json::Value::Null
         })))
@@ -211,7 +233,12 @@ async fn oauth_callback_rejects_mismatched_csrf_state(pool: sqlx::PgPool) {
 
     let start_res = app
         .clone()
-        .oneshot(Request::builder().uri("/auth/oauth/google/start").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/auth/oauth/google/start")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let session_cookie = start_res.headers().get(header::SET_COOKIE).unwrap().clone();
@@ -248,13 +275,15 @@ async fn oauth_callback_conflicts_with_existing_password_account_same_email(pool
         .unwrap();
 
     let mock_server = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/token"))
+    Mock::given(method("POST"))
+        .and(path("/token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "access_token": "fake-token", "token_type": "bearer"
         })))
         .mount(&mock_server)
         .await;
-    Mock::given(method("GET")).and(path("/userinfo"))
+    Mock::given(method("GET"))
+        .and(path("/userinfo"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "sub": "google-999", "email": "shared@example.com"
         })))

@@ -1,6 +1,6 @@
 //! Request configuration of http/keyword monitors: method, body, custom
 //! headers and basic auth. Header values and the basic-auth password are
-//! write-only secrets: they are sealed with `crypto::Cipher` before they
+//! write-only secrets: they are sealed with `core::crypto::Cipher` before they
 //! reach the database and no API response ever contains them.
 //!
 //! Every sealed value is bound to its column and to its monitor (see
@@ -12,7 +12,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use super::has_invisible_or_bidi;
-use crate::crypto::{Cipher, DecryptError, SecretString};
+use crate::core::crypto::{Cipher, DecryptError, SecretString};
 
 pub const HTTP_METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
 /// The only methods that may carry `request_body`.
@@ -415,7 +415,7 @@ pub fn validate_proxy_password(password: &SecretString) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::TEST_KEY;
+    use crate::core::crypto::TEST_KEY;
 
     fn header(name: &str, value: &str) -> RequestHeader {
         RequestHeader {

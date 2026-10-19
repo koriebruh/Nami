@@ -29,16 +29,16 @@ pub struct Config {
     pub smtp_port: u16,
     /// How the SMTP connection is protected (`SMTP_TLS`: `none`, the default
     /// for Mailpit in development, `starttls` or `tls`).
-    pub smtp_tls: crate::email::SmtpTls,
+    pub smtp_tls: crate::core::email::SmtpTls,
     /// `SMTP_USERNAME` and `SMTP_PASSWORD`, set together or not at all. The
     /// password is never logged (`SmtpCredentials`' `Debug` hides it).
-    pub smtp_credentials: Option<crate::email::SmtpCredentials>,
+    pub smtp_credentials: Option<crate::core::email::SmtpCredentials>,
     /// The sender of every email (`SMTP_FROM`, default
     /// `Nami <noreply@nami.local>`).
     pub smtp_from: lettre::message::Mailbox,
     /// `SMTP_ALLOW_PLAINTEXT_AUTH=true` accepts sending SMTP credentials
     /// without TLS to a server that is not this machine (refused otherwise,
-    /// see `email::check_plaintext_auth`). Default false.
+    /// see `core::email::check_plaintext_auth`). Default false.
     pub smtp_allow_plaintext_auth: bool,
     pub cookie_secure: bool,
     pub oauth_redirect_base_url: String,
@@ -65,7 +65,7 @@ pub struct Config {
     pub uptime_worker_enabled: bool,
     /// AES-256 key for secrets at rest (`NAMI_ENCRYPTION_KEY`, base64). Never
     /// logged: `Config` deliberately does not implement `Debug`.
-    pub encryption_key: [u8; crate::crypto::KEY_LEN],
+    pub encryption_key: [u8; crate::core::crypto::KEY_LEN],
     /// `SYSLOG_ENABLED=true` starts the RFC 5424 syslog listeners for log
     /// ingestion (off by default; same spellings as `UPTIME_WORKER_ENABLED`).
     /// They are a public ingress, like `PUBLIC_PORT`.
@@ -111,14 +111,14 @@ impl Config {
                 .unwrap_or_else(|_| "1025".to_string())
                 .parse()
                 .expect("SMTP_PORT must be a number"),
-            smtp_tls: or_stop(crate::email::parse_smtp_tls(
+            smtp_tls: or_stop(crate::core::email::parse_smtp_tls(
                 std::env::var("SMTP_TLS").ok().as_deref(),
             )),
-            smtp_credentials: or_stop(crate::email::smtp_credentials(
+            smtp_credentials: or_stop(crate::core::email::smtp_credentials(
                 std::env::var("SMTP_USERNAME").ok(),
                 std::env::var("SMTP_PASSWORD").ok(),
             )),
-            smtp_from: or_stop(crate::email::parse_from(
+            smtp_from: or_stop(crate::core::email::parse_from(
                 std::env::var("SMTP_FROM").ok().as_deref(),
             )),
             smtp_allow_plaintext_auth: env_flag("SMTP_ALLOW_PLAINTEXT_AUTH", false),
@@ -137,9 +137,9 @@ impl Config {
     }
 
     /// SMTP credentials never cross the network in the clear unless the
-    /// operator accepts it (see `email::check_plaintext_auth`).
+    /// operator accepts it (see `core::email::check_plaintext_auth`).
     fn with_safe_smtp_auth(self) -> Self {
-        or_stop(crate::email::check_plaintext_auth(
+        or_stop(crate::core::email::check_plaintext_auth(
             &self.smtp_host,
             self.smtp_tls,
             self.smtp_credentials.as_ref(),
@@ -181,9 +181,9 @@ impl Config {
             database_statement_timeout: Duration::from_secs(30),
             smtp_host: "localhost".to_string(),
             smtp_port: 1025,
-            smtp_tls: crate::email::SmtpTls::None,
+            smtp_tls: crate::core::email::SmtpTls::None,
             smtp_credentials: None,
-            smtp_from: crate::email::DEFAULT_FROM
+            smtp_from: crate::core::email::DEFAULT_FROM
                 .parse()
                 .expect("the default sender is valid"),
             smtp_allow_plaintext_auth: false,
@@ -218,7 +218,7 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:5173".to_string()),
             uptime_worker_enabled: env_flag("UPTIME_WORKER_ENABLED", true),
             // Tests only: `from_env` always replaces it with the real key.
-            encryption_key: crate::crypto::TEST_KEY,
+            encryption_key: crate::core::crypto::TEST_KEY,
             syslog_enabled: env_flag("SYSLOG_ENABLED", false),
             syslog_tcp_port: env_port("SYSLOG_TCP_PORT", crate::logs::syslog::DEFAULT_PORT),
             syslog_udp_port: env_port("SYSLOG_UDP_PORT", crate::logs::syslog::DEFAULT_PORT),
@@ -235,9 +235,9 @@ pub const DEFAULT_MAX_SOURCES_PER_PROJECT: i64 = 50;
 /// `NAMI_ENCRYPTION_KEY` is required outside tests: a missing or malformed
 /// key stops startup instead of running with secrets nobody can decrypt
 /// later (or encrypted under a key nobody kept).
-fn encryption_key_from_env() -> [u8; crate::crypto::KEY_LEN] {
+fn encryption_key_from_env() -> [u8; crate::core::crypto::KEY_LEN] {
     let raw = std::env::var("NAMI_ENCRYPTION_KEY").unwrap_or_default();
-    crate::crypto::parse_key(&raw).unwrap_or_else(|message| panic!("{message}"))
+    crate::core::crypto::parse_key(&raw).unwrap_or_else(|message| panic!("{message}"))
 }
 
 /// Loads the `.env` file of the working directory (or its nearest parent), see

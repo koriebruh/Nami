@@ -2,7 +2,7 @@
 // `docker compose up -d clickhouse`.
 use chrono::{DateTime, Duration, Utc};
 use nami_engine::{
-    clickhouse::{ClickHouse, ClickHouseError},
+    core::clickhouse::{ClickHouse, ClickHouseError},
     logs::{
         normalize,
         store::{self, LogRow},
