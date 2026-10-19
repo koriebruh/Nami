@@ -13,8 +13,8 @@
 		rsyslogSnippet,
 		TOKEN_PLACEHOLDER,
 		vectorSnippet
-	} from '#lib/logs';
-	import { formatUtc } from '#lib/uptime';
+	} from '#lib/logs/logs';
+	import { formatUtc } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();

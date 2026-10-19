@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::{alert_throttle::Decision, checker::is_unsafe_in_text, heartbeat::sanitize_output};
-use crate::{models::maintenance, state::AppState};
+use crate::{core::state::AppState, uptime::maintenance::model as maintenance};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionKind {

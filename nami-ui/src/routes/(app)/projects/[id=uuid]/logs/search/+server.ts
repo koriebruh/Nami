@@ -1,7 +1,7 @@
 import { error } from '@sveltejs/kit';
-import { callEngine, enginePath } from '#lib/server/engine';
-import { pickLogParams, SEARCH_PARAMS } from '#lib/server/log-proxy';
-import { isUuid } from '#lib/uuid';
+import { callEngine, enginePath } from '#lib/server/core/engine';
+import { pickLogParams, SEARCH_PARAMS } from '#lib/server/logs/log-proxy';
+import { isUuid } from '#lib/core/uuid';
 import type { RequestHandler } from './$types';
 
 /**

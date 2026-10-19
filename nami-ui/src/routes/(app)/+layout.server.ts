@@ -1,5 +1,5 @@
 import { redirect } from '@sveltejs/kit';
-import { getCurrentUser } from '#lib/server/engine';
+import { getCurrentUser } from '#lib/server/core/engine';
 import type { LayoutServerLoad } from './$types';
 
 export const load: LayoutServerLoad = async (event) => {

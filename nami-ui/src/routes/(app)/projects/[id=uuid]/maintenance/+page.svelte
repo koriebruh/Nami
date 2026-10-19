@@ -2,7 +2,7 @@
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import MaintenanceWindowForm from '#lib/components/MaintenanceWindowForm.svelte';
-	import { describeSchedule, describeScope } from '#lib/maintenance';
+	import { describeSchedule, describeScope } from '#lib/uptime/maintenance';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();

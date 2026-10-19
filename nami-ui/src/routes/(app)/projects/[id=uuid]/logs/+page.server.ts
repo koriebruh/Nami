@@ -4,8 +4,8 @@ import {
 	engineErrorMessage,
 	enginePath,
 	redirectToLoginIfUnauthorized
-} from '#lib/server/engine';
-import { pickLogParams, SEARCH_PARAMS } from '#lib/server/log-proxy';
+} from '#lib/server/core/engine';
+import { pickLogParams, SEARCH_PARAMS } from '#lib/server/logs/log-proxy';
 import {
 	engineParams,
 	PAGE_SIZE,
@@ -14,7 +14,7 @@ import {
 	type Histogram,
 	type LogEntry,
 	type Source
-} from '#lib/logs';
+} from '#lib/logs/logs';
 import type { PageServerLoad } from './$types';
 
 /**

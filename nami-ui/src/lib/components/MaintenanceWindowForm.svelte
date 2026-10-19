@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import { onMount } from 'svelte';
-	import { WEEKDAYS, shortTime, toUtcInputValue, type MaintenanceWindow, type WindowKind } from '#lib/maintenance';
+	import { WEEKDAYS, shortTime, toUtcInputValue, type MaintenanceWindow, type WindowKind } from '#lib/uptime/maintenance';
 
 	let {
 		maintenanceWindow = null,

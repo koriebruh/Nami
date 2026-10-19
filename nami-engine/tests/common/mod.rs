@@ -15,13 +15,13 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use nami_engine::{
-    crypto::{Cipher, SecretString, TEST_KEY},
-    models::{
-        monitor::Monitor,
-        monitor_request::{RequestHeader, seal_headers, seal_password, seal_proxy_password},
-    },
-    state::AppState,
+    core::crypto::{Cipher, SecretString, TEST_KEY},
+    core::state::AppState,
     uptime::checker::{CheckContext, CheckOutcome, CheckStatus},
+    uptime::monitor::{
+        model::Monitor,
+        request::{RequestHeader, seal_headers, seal_password, seal_proxy_password},
+    },
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -40,9 +40,13 @@ fn password_hash() -> &'static str {
 
 /// The full production router (same layers as `main.rs`) over `state`.
 pub fn app(state: AppState) -> Router {
-    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state)).layer(
-        nami_engine::router::configure_session_layer(tower_sessions::MemoryStore::default(), false),
-    )
+    nami_engine::core::router::with_fallback_connect_info(nami_engine::core::router::build_router(
+        state,
+    ))
+    .layer(nami_engine::core::router::configure_session_layer(
+        tower_sessions::MemoryStore::default(),
+        false,
+    ))
 }
 
 pub fn test_app(pool: sqlx::PgPool) -> Router {
@@ -53,7 +57,7 @@ pub fn test_app(pool: sqlx::PgPool) -> Router {
 /// `main.rs` serves it: the heartbeat ping endpoint, log ingest
 /// (`POST /api/v1/logs`) and `/health`, no session.
 pub fn public_app(state: AppState) -> Router {
-    nami_engine::router::build_public_router(state)
+    nami_engine::core::router::build_public_router(state)
 }
 
 pub fn test_public_app(pool: sqlx::PgPool) -> Router {
@@ -205,8 +209,8 @@ pub async fn seed_http_monitor(
 /// Call `clickhouse.drop_database()` at the end of the test.
 pub async fn state_with_clickhouse(
     pool: &sqlx::PgPool,
-) -> (AppState, nami_engine::clickhouse::ClickHouse) {
-    let clickhouse = nami_engine::clickhouse::ClickHouse::create_test_database()
+) -> (AppState, nami_engine::core::clickhouse::ClickHouse) {
+    let clickhouse = nami_engine::core::clickhouse::ClickHouse::create_test_database()
         .await
         .expect("ClickHouse must be running: docker compose up -d clickhouse");
     (

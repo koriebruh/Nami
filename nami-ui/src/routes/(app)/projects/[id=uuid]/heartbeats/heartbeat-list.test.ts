@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { fakeEvent, HEARTBEAT_ID, PROJECT_ID } from '#lib/server/fake-event';
+import { fakeEvent, HEARTBEAT_ID, PROJECT_ID } from '#lib/server/core/fake-event';
 import { actions, load } from './+page.server';
 
 const heartbeatsPath = `/projects/${PROJECT_ID}/heartbeats`;

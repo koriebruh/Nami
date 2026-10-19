@@ -7,8 +7,8 @@
 	// the same through the range input (arrows to inspect, Enter to zoom),
 	// hence the a11y ignore on the chart's click handler.
 	import Legend from '#lib/components/ui/Legend.svelte';
-	import { formatUtc, niceTicks } from '#lib/uptime';
-	import { bucketEnd, bucketParts, type Histogram, type HistogramBucket } from '#lib/logs';
+	import { formatUtc, niceTicks } from '#lib/uptime/uptime';
+	import { bucketEnd, bucketParts, type Histogram, type HistogramBucket } from '#lib/logs/logs';
 
 	let {
 		histogram,

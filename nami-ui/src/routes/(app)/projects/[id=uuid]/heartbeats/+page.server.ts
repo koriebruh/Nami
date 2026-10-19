@@ -6,9 +6,9 @@ import {
 	enginePath,
 	publicEngineUrl,
 	redirectToLoginIfUnauthorized
-} from '#lib/server/engine';
-import { heartbeatPayloadFromForm } from '#lib/server/heartbeat-form';
-import type { Heartbeat, MonitorGroup } from '#lib/uptime';
+} from '#lib/server/core/engine';
+import { heartbeatPayloadFromForm } from '#lib/server/uptime/heartbeat-form';
+import type { Heartbeat, MonitorGroup } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad } from './$types';
 
 async function jsonArray<T>(response: Response): Promise<T[]> {

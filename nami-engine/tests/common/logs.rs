@@ -8,8 +8,8 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
 };
 use nami_engine::{
-    clickhouse::ClickHouse,
-    models::source::{self, SourceConfig},
+    core::clickhouse::ClickHouse,
+    logs::source::model::{self as source, SourceConfig},
 };
 use serde_json::Value;
 use tower::ServiceExt;

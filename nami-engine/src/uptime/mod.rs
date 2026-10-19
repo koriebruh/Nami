@@ -1,23 +1,22 @@
-//! Uptime monitoring: performing checks (`checker`, with one module per
-//! non-http probe), storing results in ClickHouse (`store`), the background
-//! worker and its state machine (`worker`), heartbeat pings and the overdue
-//! sweep (`heartbeat`), the heartbeat ping log in ClickHouse (`pings`), TLS for
-//! the non-http checks (`tls`), alert delivery (`alerts`) and its flap control
-//! (`alert_throttle`), and the streaming
-//! CSV export of check history (`export`).
+//! Uptime monitoring: monitors and their request options (`monitor`),
+//! monitor groups (`group`), maintenance windows (`maintenance`), heartbeats
+//! with their pings, ping log and overdue sweep (`heartbeat`), performing
+//! checks (`checker`, with one module per non-http probe and TLS for them),
+//! storing results in ClickHouse (`store`), the background worker and its
+//! state machine (`worker`), alert delivery (`alerts`) and its flap control
+//! (`alert_throttle`), availability reports (`availability`), the streaming
+//! CSV export of check history (`export`), monitor import (`import`) and the
+//! per-project row caps (`quota`).
 pub mod alert_throttle;
 pub mod alerts;
 pub mod availability;
 pub mod checker;
-pub mod dns;
-pub mod expiry;
 pub mod export;
+pub mod group;
 pub mod heartbeat;
 pub mod import;
-pub mod mail;
-pub mod ping;
-pub mod pings;
+pub mod maintenance;
+pub mod monitor;
+pub(crate) mod quota;
 pub mod store;
-pub mod tls;
-pub mod udp;
 pub mod worker;

@@ -7,10 +7,10 @@ import {
 	publicEngineUrl,
 	publicSyslogAddress,
 	redirectToLoginIfUnauthorized
-} from '#lib/server/engine';
-import { formText } from '#lib/server/monitor-form';
-import { sourcePayloadFromForm } from '#lib/server/source-form';
-import type { DailyUsage, Source, SourceWithToken } from '#lib/logs';
+} from '#lib/server/core/engine';
+import { formText } from '#lib/server/uptime/monitor-form';
+import { sourcePayloadFromForm } from '#lib/server/logs/source-form';
+import type { DailyUsage, Source, SourceWithToken } from '#lib/logs/logs';
 import type { Actions, PageServerLoad } from './$types';
 
 function sourcePath(params: { id: string; sourceId: string }): string {

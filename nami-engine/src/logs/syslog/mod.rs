@@ -12,9 +12,9 @@
 //! There is no TLS and no per-IP limit; the token is the credential, and
 //! what a sender can cost is bounded below.
 //!
-//! The pipeline is the one of HTTP ingest (`routes::logs_ingest`), batched:
+//! The pipeline is the one of HTTP ingest (`logs::ingest::routes`), batched:
 //! 1. at intake, on the connection's task: size cap, parse, token shape
-//!    check ([`crate::models::source::is_well_formed_token`], so garbage costs
+//!    check ([`crate::logs::source::model::is_well_formed_token`], so garbage costs
 //!    no query), then the frame is queued;
 //! 2. the batcher takes up to `batch_max_rows` frames (or waits at most
 //!    `batch_max_wait`) and looks all their tokens up with ONE Postgres query
@@ -25,7 +25,7 @@
 //!    quota (read once per source and batch, like HTTP's check before the
 //!    body), both counted in the usage tables like HTTP ingest;
 //! 4. per source of the batch, its compiled pipeline
-//!    (`logs::pipeline_cache`, keyed on the `updated_at` the token lookup
+//!    (`logs::ingest::pipeline_cache`, keyed on the `updated_at` the token lookup
 //!    returned, so an edit applies from the next batch); the frames of a
 //!    source whose stored pipeline no longer compiles are dropped and
 //!    counted as `store_failed` (fail closed: a redact rule must never stop
@@ -86,13 +86,13 @@ use self::{
     framing::{FrameError, FrameReader, MAX_FRAME_BYTES},
     parse::SyslogMessage,
 };
-use super::{pipeline::CompiledPipeline, rate_limit::TokenBuckets, store};
+use crate::logs::ingest::{pipeline::CompiledPipeline, rate_limit::TokenBuckets, store};
 use crate::{
     auth::token::hash_token,
-    clickhouse::ClickHouseError,
-    config::Config,
-    models::source::{self, IngestSource},
-    state::AppState,
+    core::clickhouse::ClickHouseError,
+    core::config::Config,
+    core::state::AppState,
+    logs::source::model::{self as source, IngestSource},
 };
 
 pub const DEFAULT_PORT: u16 = 5140;
@@ -152,7 +152,7 @@ impl SyslogConfig {
             queue_max_bytes: QUEUE_MAX_BYTES,
             events_per_second: EVENTS_PER_SECOND,
             events_burst: EVENTS_BURST,
-            max_insert_bytes: super::ingest::MAX_ENCODED_BYTES,
+            max_insert_bytes: crate::logs::ingest::MAX_ENCODED_BYTES,
         }
     }
 }
@@ -912,8 +912,8 @@ mod tests {
             received_at: Utc::now(),
             _bytes: Arc::clone(&budget).try_acquire_many_owned(1).unwrap(),
         };
-        let pipeline = crate::logs::pipeline::compile(
-            &crate::logs::pipeline::parse_rules(
+        let pipeline = crate::logs::ingest::pipeline::compile(
+            &crate::logs::ingest::pipeline::parse_rules(
                 &serde_json::json!([{"type":"drop","match":{"message_regex":"^noise"}}]),
             )
             .unwrap(),

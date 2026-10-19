@@ -1,5 +1,5 @@
 import { redirect } from '@sveltejs/kit';
-import { enginePath } from '#lib/server/engine';
+import { enginePath } from '#lib/server/core/engine';
 import type { PageServerLoad } from './$types';
 
 // The project page is now a section (see +layout.svelte): land on its

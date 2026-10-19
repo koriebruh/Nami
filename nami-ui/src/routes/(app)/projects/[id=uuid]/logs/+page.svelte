@@ -29,8 +29,8 @@
 		type FieldFilter,
 		type FilterOp,
 		type LogEntry
-	} from '#lib/logs';
-	import { formatUtc } from '#lib/uptime';
+	} from '#lib/logs/logs';
+	import { formatUtc } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();

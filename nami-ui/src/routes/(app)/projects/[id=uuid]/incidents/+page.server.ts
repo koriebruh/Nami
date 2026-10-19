@@ -4,8 +4,8 @@ import {
 	engineErrorMessage,
 	enginePath,
 	redirectToLoginIfUnauthorized
-} from '#lib/server/engine';
-import type { Incident } from '#lib/uptime';
+} from '#lib/server/core/engine';
+import type { Incident } from '#lib/uptime/uptime';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {

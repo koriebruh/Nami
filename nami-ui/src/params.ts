@@ -1,7 +1,7 @@
 import { defineParams } from '@sveltejs/kit/params';
 // The ".ts" is needed: `vite build` loads this file with Node itself, which
 // does not resolve extensionless imports.
-import { isUuid } from './lib/uuid.ts';
+import { isUuid } from './lib/core/uuid.ts';
 
 // SvelteKit decodes a route param (%2F becomes "/") before it runs the matcher
 // of a `[id=uuid]` segment, and a value the matcher refuses never becomes a

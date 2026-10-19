@@ -11,7 +11,7 @@
 		formatUtc,
 		niceTicks,
 		type SeriesBucket
-	} from '#lib/uptime';
+	} from '#lib/uptime/uptime';
 
 	let { series }: { series: SeriesBucket[] } = $props();
 

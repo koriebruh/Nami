@@ -1,6 +1,6 @@
 import type { Actions } from './$types';
 import { redirect } from '@sveltejs/kit';
-import { callEngine } from '#lib/server/engine';
+import { callEngine } from '#lib/server/core/engine';
 
 export const actions: Actions = {
 	login: async (event) => {

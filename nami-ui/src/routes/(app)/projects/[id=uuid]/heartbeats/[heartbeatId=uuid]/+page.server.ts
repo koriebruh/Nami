@@ -6,11 +6,11 @@ import {
 	enginePath,
 	publicEngineUrl,
 	redirectToLoginIfUnauthorized
-} from '#lib/server/engine';
-import { loadAvailability } from '#lib/server/availability';
-import { heartbeatPayloadFromForm } from '#lib/server/heartbeat-form';
-import { formText } from '#lib/server/monitor-form';
-import type { Heartbeat, HeartbeatPing, MonitorGroup } from '#lib/uptime';
+} from '#lib/server/core/engine';
+import { loadAvailability } from '#lib/server/uptime/availability';
+import { heartbeatPayloadFromForm } from '#lib/server/uptime/heartbeat-form';
+import { formText } from '#lib/server/uptime/monitor-form';
+import type { Heartbeat, HeartbeatPing, MonitorGroup } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
 async function jsonArray<T>(response: Response): Promise<T[]> {

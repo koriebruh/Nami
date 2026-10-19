@@ -2,7 +2,7 @@ use oauth2::{
     basic::BasicClient, AuthUrl, ClientId, ClientSecret, EndpointNotSet, EndpointSet,
     RedirectUrl, TokenUrl,
 };
-use crate::config::Config;
+use crate::core::config::Config;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Provider {

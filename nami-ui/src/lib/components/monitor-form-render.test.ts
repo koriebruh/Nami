@@ -2,7 +2,7 @@
 // a stored monitor, and that no secret value ever reaches the markup.
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
-import type { Monitor } from '#lib/uptime';
+import type { Monitor } from '#lib/uptime/uptime';
 import MonitorForm from './MonitorForm.svelte';
 
 function monitor(overrides: Partial<Monitor> = {}): Monitor {

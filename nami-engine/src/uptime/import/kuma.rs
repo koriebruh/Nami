@@ -3,7 +3,7 @@
 //! document are never touched, so their secrets cannot leak.
 use super::printable;
 use super::{MAX_ENTRIES, ParseError, ParsedEntry};
-use crate::models::monitor::DNS_RECORD_TYPES;
+use crate::uptime::monitor::model::DNS_RECORD_TYPES;
 use serde_json::{Map, Value};
 
 pub fn parse(content: &str) -> Result<Vec<ParsedEntry>, ParseError> {

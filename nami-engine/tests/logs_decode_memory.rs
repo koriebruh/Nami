@@ -18,14 +18,14 @@ use std::{
 
 use axum::body::Bytes;
 use nami_engine::{
+    logs::source::model::IngestSource,
     logs::{
-        budget::MAX_DECODED_BYTES,
+        ingest::budget::MAX_DECODED_BYTES,
         ingest::{
             self, BodyEncoding, BodyFormat, IngestError, LARGE_BODY_BYTES, MAX_DECOMPRESSED_BYTES,
             MAX_ENCODED_BYTES, MAX_EVENTS, gunzip,
         },
     },
-    models::source::IngestSource,
 };
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -326,7 +326,7 @@ fn batch(
             body,
             encoding,
             &source(),
-            &nami_engine::logs::pipeline::CompiledPipeline::empty(),
+            &nami_engine::logs::ingest::pipeline::CompiledPipeline::empty(),
             chrono::Utc::now(),
         )
     });

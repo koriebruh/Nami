@@ -7,8 +7,8 @@ mod common;
 
 use common::{check_context, proxy::FakeProxy, unsaved_monitor, with_headers, with_proxy};
 use nami_engine::{
-    models::monitor::Monitor,
     uptime::checker::{CheckStatus, perform_check},
+    uptime::monitor::model::Monitor,
 };
 use wiremock::{
     Mock, MockServer, ResponseTemplate,

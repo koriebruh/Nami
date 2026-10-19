@@ -13,16 +13,17 @@ BetterStack subscription.
 - Postgres — users, sessions, RBAC
 - Mailpit — local SMTP catcher for verification/reset emails in dev
 - ClickHouse — time-series store (uptime check results, then logs and
-  metrics), accessed over its HTTP interface via `nami-engine/src/clickhouse.rs`
+  metrics), accessed over its HTTP interface via
+  `nami-engine/src/core/clickhouse.rs`
 
 ## Project structure
 
 The project is decomposed into sequential sub-projects (BetterStack bundles
 several independent products, too large for one spec/plan):
 
-1. **Foundation: auth, org, RBAC, session** — done (see below)
-2. Uptime monitoring (Phases 1-3) — in progress
-3. Log management
+1. **Foundation: auth, org, RBAC, session** — done
+2. **Uptime monitoring** (Phases 1-3) — done
+3. Log management — Part 1 done, Part 2 in progress
 4. Incident management + on-call alerting
 5. Status page
 6. Metrics + dashboards (+ collector bundle)
@@ -36,19 +37,66 @@ Each sub-project gets its own spec → plan → implementation cycle under
 `docs/superpowers/specs/` and `docs/superpowers/plans/`. The feature-parity
 checklist that defines "done" for the whole rebuild (11 sub-projects, incl.
 traces, error tracking, RUM, AI SRE and a final production-hardening pass) is
-`docs/superpowers/roadmap.md` — tick items there as their PRs merge. Every
-sub-project ends with a dedicated security review + fix wave.
+`docs/superpowers/roadmap.md` — tick items there as their phase PR merges.
+Every phase ends with a dedicated security review + fix wave. The rulings,
+limits and deferred items of each finished phase are recorded in
+`docs/superpowers/decisions/`.
 
-Completed sub-project: **Foundation** (14 tasks, PRs #1-#15, all merged to
-`main`). Per-task review findings and fix rounds are in each PR's
-description on GitHub; the working ledger used during execution was
-scratch and has been deleted.
-- Spec: `docs/superpowers/specs/2026-10-12-foundation-auth-rbac-design.md`
-- Plan: `docs/superpowers/plans/2026-10-12-foundation-auth-rbac.md`
+Completed sub-projects:
+- **Foundation** (PRs #1-#16). Spec
+  `docs/superpowers/specs/2026-10-12-foundation-auth-rbac-design.md`, plan
+  `docs/superpowers/plans/2026-10-12-foundation-auth-rbac.md`.
+- **Uptime monitoring** (Phases 1-3, last fix wave #77). Spec
+  `docs/superpowers/specs/2026-10-13-uptime-monitoring-design.md` (plus the
+  phase 2 and 3 specs); decisions
+  `docs/superpowers/decisions/2026-10-13-uptime-phase{1,2,3}.md`.
 
-Current sub-project: **Uptime monitoring**
-- Spec: `docs/superpowers/specs/2026-10-13-uptime-monitoring-design.md`
-- Phase 2 done: plan `docs/superpowers/plans/2026-10-13-uptime-phase2.md`
+Current sub-project: **Log management, Part 2**
+- Spec: `docs/superpowers/specs/2026-10-13-log-management-design.md`
+- Plan: `docs/superpowers/plans/2026-10-13-log-management-part2.md`
+- NAMI-LOG-9..13 are merged (PRs #56, #63, #67, #75, #76, under the old
+  one-PR-per-task flow). NAMI-LOG-14..18 remain (log alerts, live-tail
+  resume and explorer fixes, and the UI tasks 16-18), then the Part 2
+  security review + fix wave. They ship as one phase PR (branch
+  `feat/logs-part2`).
+- Part 1 decisions: `docs/superpowers/decisions/2026-10-13-log-management-part1.md`.
+
+Plans written before 2026-10-19 use the old file layout and migration
+numbers: translate them with
+`docs/superpowers/decisions/2026-10-19-domain-restructure.md`.
+
+### Code layout (by domain)
+
+- `nami-engine/src/`: `core/` (config, db, clickhouse, crypto, email,
+  error, state, router, serve, middleware, shared validation; no domain
+  logic), `auth/`, `projects/`, `uptime/` (`monitor/`, `heartbeat/`,
+  `group/`, `maintenance/`, `checker/`, worker, store, alerts,
+  availability, export, import), `incidents/`, `logs/` (`source/`, `view/`,
+  `ingest/`, `query/`, `syslog/`). Each domain owns its models and routes;
+  `core/router.rs` mounts every domain's routes. New sub-projects add a
+  top-level domain module (`statuspages/`, `metrics/`, ...).
+- `nami-engine/tests/`: one test target per domain,
+  `tests/<domain>/main.rs`, which mounts `tests/common/` via
+  `#[path = "../common/mod.rs"] mod common;` and declares one `mod` per test
+  file. Only a test that changes process-wide state (environment variables,
+  the global allocator) is a standalone `tests/<name>.rs`. Run one domain
+  with `cargo test --test <domain>`.
+- `nami-engine/migrations/`: Postgres migrations, see "Migrations" below.
+- `nami-ui/src/lib/`: `core/`, `uptime/`, `logs/` (shared code),
+  `server/{core,uptime,logs}/` (server-only BFF code), `components/`
+  (Svelte components; `components/ui/` is the design system).
+
+### Migrations
+
+- `0001_auth.sql` … `0005_logs.sql` are the domain baselines (squashed on
+  2026-10-19). New files are numbered sequentially after the newest file
+  (the first is `0006_`) and named `NNNN_<domain>_<change>.sql`.
+- At most one migration file per domain per phase PR; a phase that changes
+  several domains adds one file for each. Never edit a merged migration.
+- The old reserved number ranges (0022-0039, 0040-0059, 0060-0099,
+  0100-0119, 0120-0139, ...) are retired.
+- ClickHouse DDL lives in `core/clickhouse.rs` (`MIGRATIONS`), grouped by
+  domain; statements are idempotent (`CREATE TABLE IF NOT EXISTS`).
 
 Task IDs per sub-project: `NAMI-UP-<n>` (uptime), `NAMI-LOG-<n>` (logs),
 `NAMI-INC-<n>` (incident/on-call), `NAMI-SP-<n>` (status page),
@@ -61,35 +109,42 @@ kongfirmasii ... looping terus").
 
 ## Git branching workflow
 
-This project uses one-task-per-branch, one-PR-per-task. Rules:
+One PR per sub-project phase (owner decision 2026-10-19: PRs were too small
+and too many). Rules:
 
 1. Never implement feature work directly on `main`.
-2. Start every task from the latest `origin/main`, unless the task
-   explicitly depends on another unmerged branch.
-3. One task per branch, one reviewable pull request per task.
-4. Branch naming: `feat/<TASK-ID>-<description>`, `fix/<TASK-ID>-<description>`,
-   `refactor/...`, `test/...`, `docs/...`, `chore/...`.
-5. Task IDs: `NAMI-<N>` where `<N>` is the task number from the active
-   plan file (e.g. `NAMI-1` = Task 1 of the foundation plan). No external
-   tracker is linked — never invent a different ID scheme without the
-   user's explicit approval.
-6. Use git worktrees for isolation — one worktree per task, under
-   `.worktrees/NAMI-<N>/` (gitignored). Tasks in the current plan are
-   mostly sequential (each builds on the previous task's interfaces), so
-   worktrees are used for isolation/cleanliness, not necessarily run in
-   parallel — only parallelize tasks confirmed independent.
-7. Don't touch unrelated files, perform unrelated refactors, or overwrite
+2. A phase starts from the latest `origin/main`, on branch
+   `feat/<subproject>-<phase>` (e.g. `feat/logs-part2`,
+   `feat/incidents-part1`), in the worktree `.worktrees/<subproject>-<phase>/`
+   (gitignored). The phase is everything one plan file covers, including its
+   final security review and fix wave.
+3. Each plan task is one or more commits on the phase branch, with the task
+   ID in the commit message (e.g. `feat(engine): log alert worker
+   (NAMI-LOG-14)`). Conventional Commits.
+4. No separate PRs for plans, docs or small fixes: a plan is committed on
+   the branch of the phase it plans (or on the previous phase's branch),
+   and a fix goes on the branch of the phase it belongs to.
+5. Tasks run in order on the one branch. Parallel work (e.g. engine and UI
+   tasks confirmed independent) uses extra worktrees on short-lived local
+   branches that are merged back into the phase branch before review; agree
+   on API contracts/schemas first.
+6. Don't touch unrelated files, perform unrelated refactors, or overwrite
    another agent's work.
-8. Agree on API contracts/schemas before parallel frontend/backend work.
+7. Task IDs follow the scheme above. No external tracker is linked — never
+   invent a different ID scheme without the user's explicit approval.
 
-**Per-task flow:** worktree + branch from latest `origin/main` → implement
-(TDD per the plan's steps) → commit (Conventional Commits) → task review
-(spec compliance + quality) → fix loop if needed → push → open PR (purpose/
-scope, implementation summary, tests executed + results, breaking changes,
-risks/follow-up) → **auto-merge once review is clean** (pre-authorized for
-every remaining sub-project's plans — user directive 2026-10-13) → delete
-branch + worktree → next task branches from
-updated `origin/main`.
+**Per-phase flow:** worktree + `feat/<subproject>-<phase>` from latest
+`origin/main` → for each plan task: implement (TDD per the plan's steps) →
+commit(s) with the task ID → task review (spec compliance + quality) → fix
+commits on the same branch until the review is clean → next task. After the
+last task: whole-phase security review → fix wave on the same branch →
+re-review → commit the decisions doc
+(`docs/superpowers/decisions/<date>-<subproject>-<phase>.md`) and the
+roadmap ticks → push → open the phase PR (purpose/scope, task list with
+commit ranges, implementation summary, tests executed + results, breaking
+changes, risks/follow-up) → **auto-merge once review is clean**
+(pre-authorized — user directive 2026-10-13) → delete branch + worktree →
+next phase branches from updated `origin/main`.
 
 No CI is configured on this repo yet. "Required checks" currently means
 the task's own test suite, run locally and verified from the diff during

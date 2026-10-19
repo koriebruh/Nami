@@ -1,5 +1,5 @@
 import type { Actions } from './$types';
-import { callEngine } from '#lib/server/engine';
+import { callEngine } from '#lib/server/core/engine';
 
 export const actions: Actions = {
 	setup: async (event) => {

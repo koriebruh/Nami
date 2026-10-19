@@ -7,7 +7,7 @@
 	import Icon from '#lib/components/ui/Icon.svelte';
 	import StatCard from '#lib/components/ui/StatCard.svelte';
 	import StatStrip from '#lib/components/ui/StatStrip.svelte';
-	import { CHECK_TYPE_LABELS, formatUptime, groupMonitors, monitorTarget, timeAgo } from '#lib/uptime';
+	import { CHECK_TYPE_LABELS, formatUptime, groupMonitors, monitorTarget, timeAgo } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();

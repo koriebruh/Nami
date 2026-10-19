@@ -2,8 +2,8 @@
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
-	import { formatQuota, PLATFORM_LABELS, PLATFORMS } from '#lib/logs';
-	import { formatUtc } from '#lib/uptime';
+	import { formatQuota, PLATFORM_LABELS, PLATFORMS } from '#lib/logs/logs';
+	import { formatUtc } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();

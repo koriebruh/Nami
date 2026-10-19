@@ -2,7 +2,7 @@
 //! or an UptimeRobot CSV export into `POST /projects/{id}/monitors` bodies.
 //!
 //! Pure functions, no I/O. A parser never validates monitors itself: every
-//! body is judged later by `models::monitor::validate`, the same code a
+//! body is judged later by `uptime::monitor::model::validate`, the same code a
 //! hand-made monitor goes through (so invisible characters in names, private
 //! URLs and the like are refused there). Secrets found in a source (headers,
 //! basic-auth passwords) are carried in the bodies, in memory only; error text
@@ -15,12 +15,10 @@ use std::{collections::HashSet, fmt};
 use uuid::Uuid;
 
 use crate::{
-    crypto::Cipher,
-    error::AppError,
-    models::{
-        monitor::{self, CreateMonitorRequest, MonitorConfig},
-        monitor_group,
-    },
+    core::crypto::Cipher,
+    core::error::AppError,
+    uptime::group::model as monitor_group,
+    uptime::monitor::model::{self as monitor, CreateMonitorRequest, MonitorConfig},
 };
 
 pub mod kuma;
@@ -108,7 +106,7 @@ impl fmt::Debug for ParsedEntry {
 pub(crate) fn printable(text: &str, max_chars: usize) -> String {
     let visible: String = text
         .chars()
-        .filter(|c| !crate::models::is_invisible_or_bidi_char(*c))
+        .filter(|c| !crate::core::validate::is_invisible_or_bidi_char(*c))
         .collect();
     crate::uptime::checker::printable(&visible, max_chars)
 }
@@ -321,7 +319,7 @@ pub async fn run_import(
 ) -> Result<ImportReport, AppError> {
     // A global admin bypasses membership, so the project itself may not
     // exist: 404 before anything else, as a single create answers.
-    if crate::models::project::find_by_id(pool, project_id)
+    if crate::projects::model::find_by_id(pool, project_id)
         .await?
         .is_none()
     {

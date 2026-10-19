@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/fake-event';
+import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/core/fake-event';
 import { actions as detailActions, load as loadDetail } from './+page.server';
 import { actions as editActions, load as loadEdit } from './edit/+page.server';
 

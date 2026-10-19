@@ -1,6 +1,6 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
-import { selectRange, type Availability } from '#lib/availability';
+import { selectRange, type Availability } from '#lib/uptime/availability';
 import AvailabilityCard from './AvailabilityCard.svelte';
 
 const NOW = new Date('2026-05-17T12:00:00Z');
