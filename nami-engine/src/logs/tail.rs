@@ -49,6 +49,17 @@ use crate::{
 /// Most rows one poll reads; beyond that the newest are shown.
 pub const TAIL_BATCH: u32 = 1000;
 
+/// Rows dated further ahead than this are not tailed yet (ingest accepts a
+/// `dt` up to a day ahead; without an upper bound such rows would fill the
+/// newest-first batch and starve current ones). They arrive once their `dt`
+/// is within this much of now.
+pub const FUTURE_ALLOWANCE: Duration = Duration::from_secs(5);
+
+/// Consecutive failed session re-checks (store or database down) after which
+/// the stream ends: a session that cannot be verified is not served for the
+/// whole maximum duration.
+pub const MAX_UNKNOWN_CHECKS: u32 = 3;
+
 /// Concurrent tail streams one user may hold; the next is refused with 429.
 pub const MAX_TAILS_PER_USER: usize = 5;
 
@@ -67,6 +78,11 @@ pub struct TailTimings {
     pub recheck: Duration,
     pub max_duration: Duration,
     pub lookback: Duration,
+    /// How long one event may wait for a client that stopped reading before
+    /// the stream is dropped.
+    pub send_timeout: Duration,
+    /// Most rows one poll reads (tests shrink it).
+    pub batch: u32,
 }
 
 impl Default for TailTimings {
@@ -77,6 +93,8 @@ impl Default for TailTimings {
             recheck: Duration::from_secs(60),
             max_duration: Duration::from_secs(30 * 60),
             lookback: Duration::from_secs(60),
+            send_timeout: Duration::from_secs(10),
+            batch: TAIL_BATCH,
         }
     }
 }
@@ -207,14 +225,18 @@ async fn fetch(
     project_id: Uuid,
     filters: &LogFilters,
     since: DateTime<Utc>,
+    until: DateTime<Utc>,
+    batch: u32,
 ) -> Result<Vec<LogEntry>, AppError> {
     let mut sql = Sql::new();
     sql.push(ENTRY_COLUMNS);
     query::push_where(&mut sql, project_id, filters);
     sql.push(" AND dt >= fromUnixTimestamp64Milli(")
         .value("Int64", since.timestamp_millis().to_string())
+        .push(", 'UTC') AND dt <= fromUnixTimestamp64Milli(")
+        .value("Int64", until.timestamp_millis().to_string())
         .push(", 'UTC') ORDER BY dt DESC, id DESC LIMIT ")
-        .value("UInt32", TAIL_BATCH.to_string());
+        .value("UInt32", batch.to_string());
     let rows: Vec<RawEntry> = state
         .clickhouse
         .query_rows(sql.text(), &sql.params())
@@ -249,6 +271,22 @@ async fn check_session(state: &AppState, session: &Session, project_id: Uuid) ->
     }
 }
 
+/// Sends `event`, waiting at most `send_timeout` and never past `deadline`.
+/// False when the client is gone or not reading: the stream must end, so a
+/// stalled client cannot pin its slot (and skip the deadline and re-checks).
+async fn send_bounded(
+    tx: &EventSender,
+    event: Event,
+    deadline: Instant,
+    send_timeout: Duration,
+) -> bool {
+    let limit = deadline.min(Instant::now() + send_timeout);
+    matches!(
+        tokio::time::timeout_at(limit, tx.send(Ok(event))).await,
+        Ok(Ok(()))
+    )
+}
+
 /// Streams into `tx` until the client goes away, the session becomes
 /// invalid, or the maximum duration passes.
 pub async fn run(
@@ -267,6 +305,7 @@ pub async fn run(
     // Until one poll succeeded, rows are only remembered, never sent: they
     // were stored before the tail started.
     let mut primed = false;
+    let mut unknown_checks = 0u32;
     let mut ticker = tokio::time::interval(timings.poll);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -275,7 +314,13 @@ pub async fn run(
             _ = tx.closed() => return,
         }
         if Instant::now() >= deadline {
-            let _ = tx.send(Ok(end_event("timeout"))).await;
+            let _ = send_bounded(
+                &tx,
+                end_event("timeout"),
+                Instant::now() + timings.send_timeout,
+                timings.send_timeout,
+            )
+            .await;
             return;
         }
         if Instant::now() >= next_recheck {
@@ -284,17 +329,41 @@ pub async fn run(
                 _ = tx.closed() => return,
             };
             match check {
-                SessionCheck::Valid => next_recheck = Instant::now() + timings.recheck,
+                SessionCheck::Valid => {
+                    unknown_checks = 0;
+                    next_recheck = Instant::now() + timings.recheck;
+                }
                 SessionCheck::Gone => {
-                    let _ = tx.send(Ok(end_event("session"))).await;
+                    let _ = send_bounded(
+                        &tx,
+                        end_event("session"),
+                        Instant::now() + timings.send_timeout,
+                        timings.send_timeout,
+                    )
+                    .await;
                     return;
                 }
-                SessionCheck::Unknown => {}
+                SessionCheck::Unknown => {
+                    unknown_checks += 1;
+                    if unknown_checks >= MAX_UNKNOWN_CHECKS {
+                        let _ = send_bounded(
+                            &tx,
+                            end_event("session"),
+                            Instant::now() + timings.send_timeout,
+                            timings.send_timeout,
+                        )
+                        .await;
+                        return;
+                    }
+                    next_recheck = Instant::now() + timings.recheck / 4;
+                }
             }
         }
-        let since = Utc::now() - lookback;
+        let now = Utc::now();
+        let since = now - lookback;
+        let until = now + chrono::Duration::from_std(FUTURE_ALLOWANCE).unwrap_or_default();
         let polled = tokio::select! {
-            polled = fetch(&state, project_id, &filters, since) => polled,
+            polled = fetch(&state, project_id, &filters, since, until, timings.batch) => polled,
             _ = tx.closed() => return,
         };
         let rows = match polled {
@@ -315,11 +384,8 @@ pub async fn run(
             let Ok(data) = serde_json::to_string(&row) else {
                 continue;
             };
-            if tx
-                .send(Ok(Event::default().event("log").data(data)))
-                .await
-                .is_err()
-            {
+            let event = Event::default().event("log").data(data);
+            if !send_bounded(&tx, event, deadline, timings.send_timeout).await {
                 return;
             }
         }

@@ -12,14 +12,14 @@ use axum::{
 use chrono::{SecondsFormat, Utc};
 use common::{
     app, call,
-    logs::{post_json, seed_source},
+    logs::{post_json as post_json_raw, seed_source},
     public_app, seed_project, state_with_clickhouse, user_with_role,
 };
 use http_body_util::BodyExt;
 use nami_engine::{
     logs::{
         LogsState,
-        tail::{MAX_TAILS_PER_USER, TailTimings},
+        tail::{MAX_TAILS_PER_USER, TAIL_BATCH, TailTimings},
     },
     state::AppState,
 };
@@ -34,6 +34,8 @@ fn fast(overrides: impl FnOnce(&mut TailTimings)) -> Arc<LogsState> {
         recheck: Duration::from_secs(60),
         max_duration: Duration::from_secs(60),
         lookback: Duration::from_secs(60),
+        send_timeout: Duration::from_secs(10),
+        batch: TAIL_BATCH,
     };
     overrides(&mut tail);
     Arc::new(LogsState {
@@ -146,6 +148,12 @@ fn parse_block(block: &str) -> Sse {
             data: serde_json::from_str(&data).unwrap(),
         },
     }
+}
+
+/// Ingests through the public router; ingestion must be accepted (202).
+async fn post_json(public: &Router, token: &str, body: Value) {
+    let (status, json) = post_json_raw(public, token, body).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{json}");
 }
 
 fn ago(seconds: i64) -> String {
@@ -444,5 +452,92 @@ async fn streams_are_capped_per_user_and_freed_when_the_client_disconnects(pool:
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(logs.tail_slots.open(user_id).1, 0, "no leaked task or slot");
+    ch.drop_database().await.unwrap();
+}
+
+/// A client that stops reading must not pin its slot: the bounded send ends
+/// the stream (and so releases the slot) even though the body is never read.
+#[sqlx::test]
+async fn a_client_that_stops_reading_loses_its_stream_and_slot(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let state = AppState {
+        logs: fast(|t| {
+            t.send_timeout = Duration::from_millis(300);
+            t.max_duration = Duration::from_secs(30);
+        }),
+        ..state
+    };
+    let logs = state.logs.clone();
+    let public = public_app(state.clone());
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let (user_id, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let stream = SseStream::open(
+        &app,
+        &format!("/projects/{project}/logs/tail"),
+        Some(&viewer),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // More rows than the channel holds, and nobody reads.
+    let rows: Vec<Value> = (0..150)
+        .map(|i| json!({ "message": format!("row {i}") }))
+        .collect();
+    post_json(&public, &token, Value::Array(rows)).await;
+    assert_eq!(logs.tail_slots.open(user_id).1, 1);
+    let mut freed = false;
+    for _ in 0..60 {
+        if logs.tail_slots.open(user_id).1 == 0 {
+            freed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(freed, "the slot of a stalled client is released");
+    drop(stream);
+    ch.drop_database().await.unwrap();
+}
+
+/// Rows dated in the future must not fill the newest-first batch and hide
+/// current rows.
+#[sqlx::test]
+async fn future_dated_rows_do_not_starve_current_ones(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let state = AppState {
+        logs: fast(|t| t.batch = 5),
+        ..state
+    };
+    let public = public_app(state.clone());
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let mut stream = SseStream::open(
+        &app,
+        &format!("/projects/{project}/logs/tail"),
+        Some(&viewer),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let future =
+        (Utc::now() + chrono::Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let rows: Vec<Value> = (0..8)
+        .map(|i| json!({ "message": format!("future {i}"), "dt": future }))
+        .collect();
+    post_json(&public, &token, Value::Array(rows)).await;
+    post_json(&public, &token, json!({ "message": "current" })).await;
+    let row = stream
+        .next_log(Duration::from_secs(5))
+        .await
+        .expect("the current row");
+    assert_eq!(row["message"], "current");
+    assert_eq!(
+        stream.next(Duration::from_millis(500)).await,
+        None,
+        "future rows wait for their time"
+    );
     ch.drop_database().await.unwrap();
 }
