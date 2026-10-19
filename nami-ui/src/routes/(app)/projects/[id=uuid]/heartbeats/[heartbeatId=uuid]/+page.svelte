@@ -235,7 +235,7 @@
 			<EmptyState icon="heartbeat" message="No pings received yet." />
 		{:else}
 			<ul class="divide-y divide-border">
-				{#each data.pings as ping (ping.received_at + ping.kind + (ping.exit_code ?? ''))}
+				{#each data.pings as ping, i (i)}
 					<li class="space-y-2 px-5 py-3 sm:px-6">
 						<div class="flex flex-wrap items-center gap-3 text-sm">
 							<span class="badge {ping.kind === 'fail' ? 'badge-danger' : 'badge-success'}">
