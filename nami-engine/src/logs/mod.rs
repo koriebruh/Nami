@@ -3,7 +3,7 @@
 //! (`ingest`, `msgpack`, with the `budget` that caps what a body may decode
 //! to) with its per-source limits (`rate_limit`) and usage accounting
 //! (`usage`), syslog ingestion over TCP and UDP (`syslog`), and search
-//! (`query`, `search`).
+//! (`query`, `search`) and the live tail (`tail`).
 pub mod budget;
 pub mod ingest;
 pub mod msgpack;
@@ -14,6 +14,7 @@ pub mod rate_limit;
 pub mod search;
 pub mod store;
 pub mod syslog;
+pub mod tail;
 pub mod usage;
 
 /// In-memory state of the ingest paths, one per engine instance: rate
@@ -29,4 +30,7 @@ pub struct LogsState {
     /// [`rate_limit::MAX_DECODES_PER_SOURCE`]).
     pub decode_shares: rate_limit::DecodeShares,
     pub usage: usage::UsageTracker,
+    /// Live-tail timings (tests shorten them) and open-stream counts.
+    pub tail: tail::TailTimings,
+    pub tail_slots: tail::TailSlots,
 }
