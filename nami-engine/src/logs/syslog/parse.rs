@@ -14,6 +14,15 @@ use crate::logs::normalize::{LogEvent, in_accepted_range, level_from_number};
 /// The structured-data element that carries the source token:
 /// `[nami token="<source token>"]`. It is never stored.
 pub const NAMI_SD_ID: &str = "nami";
+/// Field names `into_event` sets itself.
+const RESERVED_FIELDS: [&str; 6] = [
+    "facility",
+    "hostname",
+    "app_name",
+    "procid",
+    "msgid",
+    "timestamp",
+];
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// `Debug` hides the structured-data values (the source token is one) and
@@ -322,8 +331,9 @@ impl SyslogMessage {
     }
 
     /// The event this message becomes: severity -> level; every
-    /// structured-data element except `nami` -> `fields.<SD-ID>` (a param
-    /// repeated within an element becomes an array); `facility`,
+    /// structured-data element except `nami` -> `fields.<SD-ID>` (elements with
+    /// the same SD-ID merge, and a repeated param becomes an array; an SD-ID
+    /// that is also a field name below is stored as `sd_<SD-ID>`); `facility`,
     /// `hostname`, `app_name`, `procid` and `msgid` -> fields of those
     /// names. A timestamp outside the accepted range is replaced by the
     /// receive time and kept as `fields.timestamp`.
@@ -333,7 +343,21 @@ impl SyslogMessage {
             if element.id == NAMI_SD_ID {
                 continue;
             }
-            let mut params = Map::new();
+            // An element named like one of the header fields would replace it
+            // (or be replaced by it): it is kept under `sd_<id>` instead.
+            let key = if RESERVED_FIELDS.contains(&element.id.as_str()) {
+                format!("sd_{}", element.id)
+            } else {
+                element.id
+            };
+            // The same SD-ID may appear more than once (RFC 5424 allows it):
+            // the elements merge, a repeated param becoming an array.
+            let Value::Object(params) = fields
+                .entry(key)
+                .or_insert_with(|| Value::Object(Map::new()))
+            else {
+                continue;
+            };
             for (name, value) in element.params {
                 match params.get_mut(&name) {
                     Some(Value::Array(values)) => values.push(Value::String(value)),
@@ -345,7 +369,6 @@ impl SyslogMessage {
                     }
                 }
             }
-            fields.insert(element.id, Value::Object(params));
         }
         fields.insert("facility".to_string(), Value::from(self.facility));
         for (key, value) in [
@@ -544,6 +567,27 @@ mod tests {
                 level
             );
         }
+    }
+
+    #[test]
+    fn repeated_sd_ids_merge_and_reserved_ids_are_namespaced() {
+        let received = at("2026-10-13T12:00:00Z");
+        let frame = b"<14>1 - web-1 app 9 M1 [o a=\"1\"][o a=\"2\" b=\"3\"][hostname x=\"y\"][facility z=\"1\"][timestamp t=\"u\"] m";
+        let event = parse(frame).unwrap().into_event(received);
+        assert_eq!(
+            Value::Object(event.fields),
+            json!({
+                "o": { "a": ["1", "2"], "b": "3" },
+                "sd_hostname": { "x": "y" },
+                "sd_facility": { "z": "1" },
+                "sd_timestamp": { "t": "u" },
+                "facility": 1,
+                "hostname": "web-1",
+                "app_name": "app",
+                "procid": "9",
+                "msgid": "M1"
+            })
+        );
     }
 
     #[test]

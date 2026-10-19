@@ -28,16 +28,22 @@
 //!    one ClickHouse insert, then usage is recorded.
 //!
 //! Resource bounds (nothing grows with what a peer sends):
-//! - at most [`MAX_TCP_CONNECTIONS`] TCP connections; further ones are closed
-//!   at once and counted as `refused_connections`;
+//! - at most [`MAX_TCP_CONNECTIONS`] TCP connections, and at most
+//!   [`MAX_TCP_CONNECTIONS_PER_IP`] of one peer address; further ones are
+//!   closed at once and counted as `refused_connections`. A connection also
+//!   ends at its first frame that does not parse or has no well-formed token
+//!   (an honest shipper never sends one), and only frames that pass intake
+//!   restart its idle timer, so a peer cannot keep a slot with garbage;
 //! - a frame is at most 64 KiB ([`MAX_FRAME_BYTES`]); an octet count above
 //!   that is refused before anything is allocated, a UDP datagram larger than
 //!   that is dropped; a TCP connection buffers at most one frame;
 //! - a TCP connection that completes no frame in `idle_timeout` (5 minutes)
 //!   is closed, also in the middle of a frame;
 //! - frames wait in a queue of at most [`QUEUE_CAPACITY`] frames and
-//!   [`QUEUE_MAX_BYTES`] of frame bytes (a frame holds its bytes until it is
-//!   stored or dropped); beyond that frames are dropped (`overloaded`);
+//!   [`QUEUE_MAX_BYTES`] of frame bytes (a frame holds its bytes until its
+//!   batch has been inserted or the frame is dropped, so the budget bounds
+//!   frames in flight; the rows built from them add about as much again
+//!   while the insert runs); beyond that frames are dropped (`overloaded`);
 //! - one batch is at most [`BATCH_MAX_ROWS`] rows, and a source's usage and
 //!   quota are read at most once per batch.
 
@@ -46,7 +52,7 @@ pub mod parse;
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -78,6 +84,8 @@ pub const DEFAULT_PORT: u16 = 5140;
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// Open TCP connections; extra ones are closed at once.
 pub const MAX_TCP_CONNECTIONS: usize = 256;
+/// Open TCP connections of one peer address; extra ones are closed at once.
+pub const MAX_TCP_CONNECTIONS_PER_IP: usize = 16;
 /// Frames waiting for the batcher; beyond this they are dropped (counted as
 /// `overloaded`) instead of growing memory.
 pub const QUEUE_CAPACITY: usize = 10_000;
@@ -101,6 +109,7 @@ pub struct SyslogConfig {
     pub batch_max_rows: usize,
     pub batch_max_wait: Duration,
     pub max_tcp_connections: usize,
+    pub max_tcp_connections_per_ip: usize,
     pub queue_max_bytes: usize,
     pub events_per_second: f64,
     pub events_burst: f64,
@@ -116,6 +125,7 @@ impl SyslogConfig {
             batch_max_rows: BATCH_MAX_ROWS,
             batch_max_wait: BATCH_MAX_WAIT,
             max_tcp_connections: MAX_TCP_CONNECTIONS,
+            max_tcp_connections_per_ip: MAX_TCP_CONNECTIONS_PER_IP,
             queue_max_bytes: QUEUE_MAX_BYTES,
             events_per_second: EVENTS_PER_SECOND,
             events_burst: EVENTS_BURST,
@@ -221,6 +231,7 @@ pub async fn spawn(state: AppState, config: SyslogConfig) -> std::io::Result<Sys
         Arc::clone(&intake),
         config.idle_timeout,
         config.max_tcp_connections,
+        config.max_tcp_connections_per_ip,
     ));
     tokio::spawn(run_udp(udp, intake));
     Ok(handle)
@@ -256,9 +267,20 @@ struct Pending {
     token_hash: String,
     message: SyslogMessage,
     received_at: DateTime<Utc>,
-    /// The frame's share of [`QUEUE_MAX_BYTES`], given back once it is
-    /// stored or dropped.
+    /// The frame's share of [`QUEUE_MAX_BYTES`], given back once its batch
+    /// has been inserted or the frame is dropped.
     _bytes: OwnedSemaphorePermit,
+}
+
+/// What became of a frame at intake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Intaken {
+    /// Queued for the batcher.
+    Queued,
+    /// Not parsed or queued: no room. Not the sender's fault.
+    Overloaded,
+    /// Not RFC 5424, or no well-formed token: a TCP connection ends here.
+    Rejected,
 }
 
 /// Parses frames from both listeners and queues them for the batcher.
@@ -270,21 +292,21 @@ struct Intake {
 }
 
 impl Intake {
-    fn handle_frame(&self, frame: &[u8], peer: SocketAddr) {
+    fn handle_frame(&self, frame: &[u8], peer: SocketAddr) -> Intaken {
         bump(&self.stats.received, 1);
         // Room first: under a flood, a frame that cannot be queued is not
         // even parsed.
         let permits = u32::try_from(frame.len().max(1)).unwrap_or(u32::MAX);
         let Ok(bytes) = Arc::clone(&self.queue_bytes).try_acquire_many_owned(permits) else {
             self.overloaded(peer);
-            return;
+            return Intaken::Overloaded;
         };
         let message = match parse::parse(frame) {
             Ok(message) => message,
             Err(error) => {
                 bump(&self.stats.malformed, 1);
                 self.warnings.warn(Some(peer), &error.to_string());
-                return;
+                return Intaken::Rejected;
             }
         };
         // A token of the wrong shape is no source's token: no query for it.
@@ -292,7 +314,7 @@ impl Intake {
             bump(&self.stats.unauthenticated, 1);
             self.warnings
                 .warn(Some(peer), "no valid [nami token=\"...\"] structured data");
-            return;
+            return Intaken::Rejected;
         };
         let token_hash = hash_token(token);
         let pending = Pending {
@@ -303,7 +325,9 @@ impl Intake {
         };
         if self.tx.try_send(pending).is_err() {
             self.overloaded(peer);
+            return Intaken::Overloaded;
         }
+        Intaken::Queued
     }
 
     fn overloaded(&self, peer: SocketAddr) {
@@ -312,18 +336,77 @@ impl Intake {
     }
 }
 
+/// How many connections each peer address has open, capped. An entry exists
+/// only while its count is above zero.
+#[derive(Debug)]
+struct PeerConnections {
+    max: usize,
+    open: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// One open connection of a peer; its count goes down when it is dropped.
+struct PeerConnection {
+    peers: Arc<PeerConnections>,
+    ip: IpAddr,
+}
+
+impl PeerConnections {
+    fn new(max: usize) -> Arc<PeerConnections> {
+        Arc::new(PeerConnections {
+            max,
+            open: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn try_enter(self: &Arc<Self>, ip: IpAddr) -> Option<PeerConnection> {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        let count = open.entry(ip).or_insert(0);
+        if *count >= self.max {
+            return None;
+        }
+        *count += 1;
+        Some(PeerConnection {
+            peers: Arc::clone(self),
+            ip,
+        })
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.open.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+impl Drop for PeerConnection {
+    fn drop(&mut self) {
+        let mut open = self.peers.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = open.get_mut(&self.ip) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.ip);
+            }
+        }
+    }
+}
+
 async fn run_tcp(
     listener: TcpListener,
     intake: Arc<Intake>,
     idle_timeout: Duration,
     max_connections: usize,
+    max_per_ip: usize,
 ) {
     let permits = Arc::new(Semaphore::new(max_connections));
+    let peers = PeerConnections::new(max_per_ip);
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                    // Over the limit: close at once, nothing is read.
+                let place = Arc::clone(&permits)
+                    .try_acquire_owned()
+                    .ok()
+                    .and_then(|permit| Some((permit, peers.try_enter(peer.ip())?)));
+                let Some((permit, peer_slot)) = place else {
+                    // Over a limit: close at once, nothing is read.
                     bump(&intake.stats.refused_connections, 1);
                     intake.warnings.warn(Some(peer), "too many connections");
                     drop(stream);
@@ -332,7 +415,7 @@ async fn run_tcp(
                 let intake = Arc::clone(&intake);
                 tokio::spawn(async move {
                     read_connection(stream, peer, &intake, idle_timeout).await;
-                    drop(permit);
+                    drop((permit, peer_slot));
                 });
             }
             Err(error) => {
@@ -351,11 +434,19 @@ async fn read_connection(
     idle_timeout: Duration,
 ) {
     let mut frames = FrameReader::new(stream);
+    // Restarted only by a frame that passes intake: a peer sending garbage or
+    // frames nobody can use does not keep its connection alive.
+    let mut deadline = tokio::time::Instant::now() + idle_timeout;
     loop {
-        match tokio::time::timeout(idle_timeout, frames.next_frame()).await {
+        match tokio::time::timeout_at(deadline, frames.next_frame()).await {
             // Idle for too long, closed by the peer, or a socket error.
             Err(_) | Ok(Ok(None)) | Ok(Err(FrameError::Io(_))) => return,
-            Ok(Ok(Some(frame))) => intake.handle_frame(&frame, peer),
+            Ok(Ok(Some(frame))) => match intake.handle_frame(&frame, peer) {
+                Intaken::Queued => deadline = tokio::time::Instant::now() + idle_timeout,
+                Intaken::Overloaded => {}
+                // Already counted; nothing legitimate sends these.
+                Intaken::Rejected => return,
+            },
             Ok(Err(error)) => {
                 bump(&intake.stats.malformed, 1);
                 intake.warnings.warn(Some(peer), &error.to_string());
@@ -492,9 +583,11 @@ impl Batcher {
         // Normalization and row building are CPU work: off the async runtime.
         let built = tokio::task::spawn_blocking(move || {
             let mut per_source: HashMap<Uuid, (u64, u64)> = HashMap::new();
+            let mut budget = Vec::with_capacity(allowed.len());
             let rows: Vec<store::LogRow> = allowed
                 .into_iter()
                 .map(|(pending, source)| {
+                    budget.push(pending._bytes);
                     let event = pending.message.into_event(pending.received_at);
                     let row = store::build_row(event, &source);
                     let counted = per_source.entry(source.id).or_default();
@@ -503,10 +596,10 @@ impl Batcher {
                     row
                 })
                 .collect();
-            (rows, per_source)
+            (rows, per_source, budget)
         })
         .await;
-        let (rows, per_source) = match built {
+        let (rows, per_source, _budget) = match built {
             Ok(built) => built,
             Err(error) => {
                 bump(&self.stats.store_failed, count);
@@ -529,5 +622,30 @@ impl Batcher {
                 tracing::error!(%error, rows = rows.len(), "syslog: failed to store log rows");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_connections_are_capped_per_address_and_forgotten_at_zero() {
+        let peers = PeerConnections::new(2);
+        let (a, b): (IpAddr, IpAddr) = ("10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap());
+        let first = peers.try_enter(a).unwrap();
+        let second = peers.try_enter(a).unwrap();
+        assert!(
+            peers.try_enter(a).is_none(),
+            "the third of one address is refused"
+        );
+        let other = peers.try_enter(b).expect("another address is not affected");
+        drop(first);
+        let third = peers
+            .try_enter(a)
+            .expect("a closed connection frees its place");
+        assert!(peers.try_enter(a).is_none());
+        drop((second, third, other));
+        assert_eq!(peers.tracked(), 0, "entries are removed at zero");
     }
 }
