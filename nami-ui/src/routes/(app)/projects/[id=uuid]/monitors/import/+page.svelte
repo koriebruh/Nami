@@ -96,9 +96,8 @@
 					rows="10"
 					spellcheck="false"
 					class="input font-mono text-xs"
-					defaultValue={form?.content ?? ''}
 					aria-describedby="content-hint"
-				></textarea>
+				>{form?.content ?? ''}</textarea>
 				<p id="content-hint" class="hint">Up to 2 MiB and 500 entries.</p>
 			</div>
 
