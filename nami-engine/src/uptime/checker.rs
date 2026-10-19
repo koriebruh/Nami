@@ -106,7 +106,7 @@ fn is_forbidden_v4(v4: Ipv4Addr) -> bool {
 /// The addresses among `resolved` that a check may contact. An error when
 /// some were resolved and every one of them is forbidden; nothing resolved is
 /// an empty list, which fails later as any unresolvable name does.
-fn allowed_addresses(
+pub(crate) fn allowed_addresses(
     resolved: impl IntoIterator<Item = SocketAddr>,
 ) -> Result<Vec<SocketAddr>, DestinationNotAllowed> {
     let mut forbidden = false;
@@ -476,6 +476,8 @@ pub async fn perform_check(ctx: &CheckContext, monitor: &Monitor) -> CheckOutcom
         match monitor.check_type.as_str() {
             "http" | "keyword" => probe_http(ctx, monitor).await,
             "tcp" => probe_tcp(monitor, started).await,
+            "ping" => super::ping::probe(monitor, timeout).await,
+            "dns" => super::dns::probe(monitor, timeout, started).await,
             other => Observation::down(None, None, format!("unsupported check type {other:?}")),
         }
     };
@@ -502,14 +504,16 @@ pub async fn perform_check(ctx: &CheckContext, monitor: &Monitor) -> CheckOutcom
     }
 }
 
-struct Observation {
-    status_code: Option<u16>,
-    response_time_ms: Option<u32>,
-    error: Option<String>,
+/// What one probe saw; `perform_check` turns it into a [`CheckOutcome`] (up
+/// exactly when `error` is `None`).
+pub(crate) struct Observation {
+    pub(crate) status_code: Option<u16>,
+    pub(crate) response_time_ms: Option<u32>,
+    pub(crate) error: Option<String>,
 }
 
 impl Observation {
-    fn up(status_code: Option<u16>, started: Instant) -> Self {
+    pub(crate) fn up(status_code: Option<u16>, started: Instant) -> Self {
         Self {
             status_code,
             response_time_ms: Some(elapsed_ms(started)),
@@ -517,7 +521,20 @@ impl Observation {
         }
     }
 
-    fn down(status_code: Option<u16>, response_time_ms: Option<u32>, error: String) -> Self {
+    /// Up with a response time the probe measured itself (ping's round trip).
+    pub(crate) fn up_after(response_time: Duration) -> Self {
+        Self {
+            status_code: None,
+            response_time_ms: Some(u32::try_from(response_time.as_millis()).unwrap_or(u32::MAX)),
+            error: None,
+        }
+    }
+
+    pub(crate) fn down(
+        status_code: Option<u16>,
+        response_time_ms: Option<u32>,
+        error: String,
+    ) -> Self {
         Self {
             status_code,
             response_time_ms,
@@ -526,8 +543,22 @@ impl Observation {
     }
 }
 
-fn elapsed_ms(started: Instant) -> u32 {
+pub(crate) fn elapsed_ms(started: Instant) -> u32 {
     u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
+}
+
+/// Text from the monitored service (DNS answers, banners) trimmed for check
+/// history and alert emails: control characters dropped, at most `max_chars`
+/// characters kept, a cut marked with an ellipsis. The final cleaning of the
+/// whole error (direction controls, the overall cap) is `clean_error`'s.
+pub(crate) fn printable(text: &str, max_chars: usize) -> String {
+    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+    if clean.chars().count() <= max_chars {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(max_chars).collect();
+    cut.push('…');
+    cut
 }
 
 async fn probe_http(ctx: &CheckContext, monitor: &Monitor) -> Observation {
@@ -866,6 +897,15 @@ mod tests {
         // 256 chars, 512 bytes: kept whole.
         let wide = "é".repeat(MAX_ERROR_CHARS);
         assert_eq!(truncate_error(wide.clone()), wide);
+    }
+
+    #[test]
+    fn printable_drops_control_characters_and_cuts_with_an_ellipsis() {
+        assert_eq!(printable("a\nb\u{0}c\u{1b}d", 10), "abcd");
+        assert_eq!(printable("abcdef", 6), "abcdef");
+        assert_eq!(printable("abcdefg", 6), "abcdef…");
+        assert_eq!(printable(&"é".repeat(5), 3), "ééé…");
+        assert_eq!(printable("", 3), "");
     }
 
     #[test]

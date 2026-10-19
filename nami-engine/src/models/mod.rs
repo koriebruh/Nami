@@ -4,6 +4,7 @@ pub mod monitor;
 pub mod monitor_request;
 pub mod project;
 pub mod source;
+pub mod target;
 pub mod token;
 pub mod user;
 

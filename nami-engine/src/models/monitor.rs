@@ -11,7 +11,9 @@ use super::{
         self, BODY_METHODS, HTTP_METHODS, HeaderView, HeadersChange, MAX_BODY_BYTES,
         PasswordChange, RequestHeader, seal_headers, seal_password,
     },
-    nullable, validate_name,
+    nullable,
+    target::{check_host_text, parse_nameserver, validate_host},
+    validate_name,
 };
 use crate::{
     crypto::{Cipher, SecretString},
@@ -23,8 +25,19 @@ use crate::{
 /// request-body limit bounds what is stored, returned to every viewer and
 /// put in alert emails.
 const MAX_URL_BYTES: usize = 2048;
-const MAX_HOST_CHARS: usize = 253;
 const MAX_KEYWORD_BYTES: usize = 1024;
+
+/// What `check_type` may be.
+pub const CHECK_TYPES: [&str; 5] = ["http", "keyword", "tcp", "ping", "dns"];
+
+/// The record types a dns monitor can look up (the `dns_record_type` column's
+/// check constraint lists the same).
+pub const DNS_RECORD_TYPES: [&str; 6] = ["A", "AAAA", "CNAME", "MX", "TXT", "NS"];
+
+/// The longest `expected_value`, in bytes: the cap of a keyword, which it
+/// resembles (text matched against what the target says, and quoted in error
+/// text).
+pub const MAX_EXPECTED_VALUE_BYTES: usize = 1024;
 
 /// One `monitors` row. The `*_enc` columns and `request_header_names` are
 /// never serialized: API responses go through [`MonitorView`]. `Debug` leaves
@@ -74,6 +87,12 @@ pub struct Monitor {
     /// The successes counted toward that so far. Only the worker moves it
     /// (see `uptime::worker::apply_outcome`); no API request can.
     pub consecutive_successes: i32,
+    /// dns: the record type to look up, one of [`DNS_RECORD_TYPES`].
+    pub dns_record_type: Option<String>,
+    /// dns: `ip:port` of the nameserver to ask; `None` is the system resolver.
+    pub dns_nameserver: Option<String>,
+    /// dns: text that one answer must contain (case-insensitive).
+    pub expected_value: Option<String>,
 }
 
 /// What `Debug` prints in place of a sealed column that holds a value.
@@ -113,6 +132,9 @@ impl fmt::Debug for Monitor {
             verify_ssl,
             recovery_threshold,
             consecutive_successes,
+            dns_record_type,
+            dns_nameserver,
+            expected_value,
         } = self;
         f.debug_struct("Monitor")
             .field("id", id)
@@ -151,6 +173,9 @@ impl fmt::Debug for Monitor {
             .field("verify_ssl", verify_ssl)
             .field("recovery_threshold", recovery_threshold)
             .field("consecutive_successes", consecutive_successes)
+            .field("dns_record_type", dns_record_type)
+            .field("dns_nameserver", dns_nameserver)
+            .field("expected_value", expected_value)
             .finish()
     }
 }
@@ -274,6 +299,9 @@ pub struct MonitorConfig {
     pub follow_redirects: bool,
     pub verify_ssl: bool,
     pub recovery_threshold: i32,
+    pub dns_record_type: Option<String>,
+    pub dns_nameserver: Option<String>,
+    pub expected_value: Option<String>,
 }
 
 impl From<&Monitor> for MonitorConfig {
@@ -304,6 +332,9 @@ impl From<&Monitor> for MonitorConfig {
             follow_redirects: m.follow_redirects,
             verify_ssl: m.verify_ssl,
             recovery_threshold: m.recovery_threshold,
+            dns_record_type: m.dns_record_type.clone(),
+            dns_nameserver: m.dns_nameserver.clone(),
+            expected_value: m.expected_value.clone(),
         }
     }
 }
@@ -331,6 +362,9 @@ impl MonitorConfig {
             || !matches!(self.auth_password, PasswordChange::Keep { .. })
             || self.follow_redirects != current.follow_redirects
             || self.verify_ssl != current.verify_ssl
+            || self.dns_record_type != current.dns_record_type
+            || self.dns_nameserver != current.dns_nameserver
+            || self.expected_value != current.expected_value
     }
 }
 
@@ -371,6 +405,9 @@ pub struct CreateMonitorRequest {
     pub verify_ssl: bool,
     #[serde(default = "default_recovery_threshold")]
     pub recovery_threshold: i32,
+    pub dns_record_type: Option<String>,
+    pub dns_nameserver: Option<String>,
+    pub expected_value: Option<String>,
 }
 
 fn default_http_method() -> String {
@@ -431,6 +468,9 @@ impl CreateMonitorRequest {
             follow_redirects: self.follow_redirects,
             verify_ssl: self.verify_ssl,
             recovery_threshold: self.recovery_threshold,
+            dns_record_type: self.dns_record_type,
+            dns_nameserver: self.dns_nameserver,
+            expected_value: self.expected_value,
         }
     }
 }
@@ -467,6 +507,11 @@ pub struct PatchMonitorRequest {
     pub follow_redirects: Option<bool>,
     pub verify_ssl: Option<bool>,
     pub recovery_threshold: Option<i32>,
+    pub dns_record_type: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub dns_nameserver: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub expected_value: Option<Option<String>>,
 }
 
 /// A nullable PATCH field applied to its current value.
@@ -511,6 +556,9 @@ impl PatchMonitorRequest {
             follow_redirects: self.follow_redirects.unwrap_or(base.follow_redirects),
             verify_ssl: self.verify_ssl.unwrap_or(base.verify_ssl),
             recovery_threshold: self.recovery_threshold.unwrap_or(base.recovery_threshold),
+            dns_record_type: self.dns_record_type.or(base.dns_record_type),
+            dns_nameserver: patched(self.dns_nameserver, base.dns_nameserver),
+            expected_value: patched(self.expected_value, base.expected_value),
         }
     }
 }
@@ -533,11 +581,16 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
     match c.check_type.as_str() {
         "http" | "keyword" => validate_http(&mut c)?,
         "tcp" => validate_tcp(&mut c)?,
-        _ => return Err("check_type must be http, keyword or tcp".into()),
+        "ping" => validate_ping(&mut c)?,
+        "dns" => validate_dns(&mut c)?,
+        _ => {
+            return Err(format!(
+                "check_type must be one of {}",
+                CHECK_TYPES.join(", ")
+            ));
+        }
     }
-    if !matches!(c.check_type.as_str(), "http" | "keyword") {
-        clear_request_config(&mut c);
-    }
+    clear_unused_fields(&mut c);
     if c.interval_seconds < 30 {
         return Err("interval_seconds must be at least 30".into());
     }
@@ -597,8 +650,6 @@ fn validate_http(c: &mut MonitorConfig) -> Result<(), String> {
     }
     let credentials_in_url = url_has_credentials(&parsed);
     c.url = Some(url);
-    c.host = None;
-    c.port = None;
     if c.check_type == "keyword" {
         let keyword = c.keyword.as_deref().unwrap_or_default();
         if keyword.trim().is_empty() {
@@ -617,8 +668,6 @@ fn validate_http(c: &mut MonitorConfig) -> Result<(), String> {
                     .into(),
             );
         }
-    } else {
-        c.keyword = None;
     }
     validate_request_config(c, credentials_in_url)
 }
@@ -685,6 +734,32 @@ fn validate_request_config(c: &mut MonitorConfig, credentials_in_url: bool) -> R
     Ok(())
 }
 
+/// Clears every type-specific field the check type does not use, so a monitor
+/// never keeps stale config from a type it had before. Every type's
+/// validation adds the fields it uses to the lists here.
+fn clear_unused_fields(c: &mut MonitorConfig) {
+    let check_type = c.check_type.clone();
+    let uses = |types: &[&str]| types.contains(&check_type.as_str());
+    if !uses(&["http", "keyword"]) {
+        c.url = None;
+        clear_request_config(c);
+    }
+    if !uses(&["keyword"]) {
+        c.keyword = None;
+    }
+    if !uses(&["tcp", "ping", "dns"]) {
+        c.host = None;
+    }
+    if !uses(&["tcp"]) {
+        c.port = None;
+    }
+    if !uses(&["dns"]) {
+        c.dns_record_type = None;
+        c.dns_nameserver = None;
+        c.expected_value = None;
+    }
+}
+
 /// Non-http types carry no request config. Secrets are only marked for
 /// clearing when one is stored or supplied, so editing such a monitor does
 /// not count as a check change (see `changes_check_of`).
@@ -703,30 +778,9 @@ fn clear_request_config(c: &mut MonitorConfig) {
 }
 
 fn validate_tcp(c: &mut MonitorConfig) -> Result<(), String> {
-    if c.host.as_deref().is_some_and(has_invisible_or_bidi_chars) {
-        return Err("host must not contain invisible or text-direction characters".into());
-    }
-    let host = c
-        .host
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_string();
+    let host = check_host_text(c.host.as_deref().unwrap_or_default())?.to_string();
     if host.is_empty() {
         return Err("host is required for tcp monitors".into());
-    }
-    if host.chars().count() > MAX_HOST_CHARS {
-        return Err(format!("host must be at most {MAX_HOST_CHARS} characters"));
-    }
-    // A bare hostname or IP literal: a scheme, path, query, fragment
-    // or credentials (`tcp://db/x`, `user@db`) can never be connected to.
-    if host
-        .chars()
-        .any(|ch| ch.is_control() || ch.is_whitespace() || matches!(ch, '/' | '?' | '#' | '@'))
-    {
-        return Err(
-            "host must not contain whitespace, control characters or any of / ? # @".into(),
-        );
     }
     // The port has its own field; a colon is only valid inside an
     // IPv6 literal. Without this, `db:5432` is stored and then
@@ -738,9 +792,76 @@ fn validate_tcp(c: &mut MonitorConfig) -> Result<(), String> {
         return Err("port must be between 1 and 65535".into());
     }
     c.host = Some(host);
-    c.url = None;
-    c.keyword = None;
     Ok(())
+}
+
+/// The trimmed, validated `host` every host-based type requires (see
+/// [`validate_host`], which a tcp monitor's host follows the text rules of).
+fn required_host(c: &MonitorConfig) -> Result<String, String> {
+    let host = check_host_text(c.host.as_deref().unwrap_or_default())?;
+    if host.is_empty() {
+        return Err(format!("host is required for {} monitors", c.check_type));
+    }
+    validate_host(host)
+}
+
+/// ping: a host and nothing else (ICMP has no port).
+fn validate_ping(c: &mut MonitorConfig) -> Result<(), String> {
+    c.host = Some(required_host(c)?);
+    Ok(())
+}
+
+/// dns: the name to look up, the record type (default `A`), an optional
+/// nameserver (`ip:port`, the system resolver when absent) and an optional
+/// text an answer must contain. The nameserver is only an address here: a
+/// check refuses the ones no check may contact (see `uptime::dns`).
+fn validate_dns(c: &mut MonitorConfig) -> Result<(), String> {
+    c.host = Some(required_host(c)?);
+    let record_type = c
+        .dns_record_type
+        .as_deref()
+        .map(|t| t.trim().to_ascii_uppercase())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "A".to_string());
+    if !DNS_RECORD_TYPES.contains(&record_type.as_str()) {
+        return Err(format!(
+            "dns_record_type must be one of {}",
+            DNS_RECORD_TYPES.join(", ")
+        ));
+    }
+    c.dns_record_type = Some(record_type);
+    c.dns_nameserver = match c
+        .dns_nameserver
+        .as_deref()
+        .map(str::trim)
+        .filter(|ns| !ns.is_empty())
+    {
+        Some(raw) => Some(parse_nameserver(raw)?),
+        None => None,
+    };
+    c.expected_value = validate_expected_value(c.expected_value.take())?;
+    Ok(())
+}
+
+/// Optional text an answer must contain: trimmed, empty means unset, and the
+/// rules of a keyword (at most [`MAX_EXPECTED_VALUE_BYTES`], no control
+/// characters): it is shown in error text, incidents and emails.
+fn validate_expected_value(raw: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = raw
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    if value.len() > MAX_EXPECTED_VALUE_BYTES {
+        return Err(format!(
+            "expected_value must be at most {MAX_EXPECTED_VALUE_BYTES} bytes"
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err("expected_value must not contain control characters".into());
+    }
+    Ok(Some(value))
 }
 
 fn has_invisible_or_bidi_chars(text: &str) -> bool {
@@ -811,7 +932,8 @@ async fn write_config(
              request_header_names = case when $21 then request_header_names else $22 end,
              request_headers_enc = case when $21 then request_headers_enc else $23 end,
              auth_password_enc = case when $24 then auth_password_enc else $25 end,
-             recovery_threshold = $26
+             recovery_threshold = $26,
+             dns_record_type = $27, dns_nameserver = $28, expected_value = $29
          where id = $1
          returning *",
     )
@@ -841,6 +963,9 @@ async fn write_config(
     .bind(keep_password)
     .bind(sealed_password)
     .bind(c.recovery_threshold)
+    .bind(&c.dns_record_type)
+    .bind(&c.dns_nameserver)
+    .bind(&c.expected_value)
     .fetch_one(&mut *conn)
     .await
 }
@@ -1391,6 +1516,88 @@ mod tests {
                 "recovery_threshold must be between 1 and 10",
                 "{threshold}"
             );
+        }
+    }
+
+    // ---- ping and dns ---------------------------------------------------
+
+    fn stored_dns() -> Monitor {
+        Monitor {
+            check_type: "dns".to_string(),
+            url: None,
+            host: Some("example.com".to_string()),
+            http_method: "GET".to_string(),
+            request_body: None,
+            request_headers_enc: None,
+            request_header_names: Vec::new(),
+            auth_username: None,
+            auth_password_enc: None,
+            dns_record_type: Some("MX".to_string()),
+            dns_nameserver: Some("9.9.9.9:53".to_string()),
+            expected_value: Some("mail".to_string()),
+            ..stored_monitor()
+        }
+    }
+
+    #[test]
+    fn only_a_change_to_the_dns_lookup_reschedules_the_check() {
+        let stored = stored_dns();
+        let reschedules = |body: serde_json::Value| {
+            validate(patch(body).apply_to(MonitorConfig::from(&stored)))
+                .unwrap()
+                .changes_check_of(&stored)
+        };
+        for body in [
+            json!({}),
+            json!({ "name": "renamed" }),
+            json!({ "dns_record_type": "mx" }),
+        ] {
+            assert!(!reschedules(body.clone()), "{body}");
+        }
+        for body in [
+            json!({ "dns_record_type": "TXT" }),
+            json!({ "dns_nameserver": null }),
+            json!({ "dns_nameserver": "1.1.1.1" }),
+            json!({ "expected_value": null }),
+            json!({ "expected_value": "other" }),
+            json!({ "host": "example.org" }),
+            json!({ "check_type": "ping" }),
+        ] {
+            assert!(reschedules(body.clone()), "{body}");
+        }
+    }
+
+    #[test]
+    fn ping_and_dns_keep_only_their_own_fields() {
+        let ping = validate(merged(
+            json!({ "check_type": "ping", "host": "Gateway.LAN" }),
+        ))
+        .unwrap();
+        assert_eq!(ping.host.as_deref(), Some("gateway.lan"));
+        assert_eq!((ping.url, ping.keyword, ping.port), (None, None, None));
+        assert_eq!(ping.request_headers, HeadersChange::Clear);
+
+        let dns = validate(
+            patch(json!({ "check_type": "tcp", "port": 53 }))
+                .apply_to(MonitorConfig::from(&stored_dns())),
+        );
+        let tcp = dns.unwrap();
+        assert_eq!(
+            (tcp.dns_record_type, tcp.dns_nameserver, tcp.expected_value),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn debug_shows_the_dns_fields() {
+        let printed = format!("{:?}", stored_dns());
+        for field in [
+            "dns_record_type",
+            "dns_nameserver",
+            "expected_value",
+            "9.9.9.9:53",
+        ] {
+            assert!(printed.contains(field), "{field} in {printed}");
         }
     }
 
