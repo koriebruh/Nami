@@ -151,7 +151,7 @@
 					<dl class="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
 						{#each advancedRows as row (row.label)}
 							<dt class="text-muted">{row.label}</dt>
-							<dd class="font-mono break-all text-ink-2">{row.value}</dd>
+							<dd class="font-mono wrap-anywhere text-ink-2">{row.value}</dd>
 						{/each}
 					</dl>
 				{/if}
