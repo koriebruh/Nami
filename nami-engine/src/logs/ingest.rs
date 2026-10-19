@@ -44,8 +44,9 @@ use super::{
     budget::{self, Budget, TooLarge, VALUE_BYTES},
     msgpack::{self, MsgpackError},
     normalize,
+    pipeline::CompiledPipeline,
     rate_limit::{DecodeShare, DecodeShares, REQUESTS_PER_SECOND},
-    store::{self, LogRow},
+    store::{self, LogRow, PipelineCounts},
 };
 use crate::{clickhouse::ClickHouseError, error::AppError, models::source::IngestSource};
 
@@ -408,6 +409,8 @@ pub struct Prepared {
     pub events: usize,
     /// What the rows count against usage and quotas ([`LogRow::stored_bytes`]).
     pub bytes: u64,
+    /// What the source's pipeline dropped and sampled out (not in `events`).
+    pub pipeline: PipelineCounts,
     /// The place the body was made in, still held when the body is larger than
     /// [`LARGE_BODY_BYTES`]: keep it until the body has been sent, so that no
     /// more than a few large bodies exist at the same time. `None` for a small
@@ -416,7 +419,7 @@ pub struct Prepared {
 }
 
 /// Turns a body into what to send to ClickHouse for `source`: decompress,
-/// parse, normalize ([`build_rows`]) and encode the insert body
+/// parse, normalize, run the source's `pipeline` ([`build_rows`]) and encode the insert body
 /// ([`store::encode_logs`]), on a blocking thread, with a place of `decodes`
 /// (and one of the source's `shares` and of its project's `project_shares`)
 /// held for as long as that runs. The work
@@ -431,10 +434,15 @@ pub struct Prepared {
 /// rows are dropped there too, so only the encoded body stays in memory while
 /// ClickHouse is waited for, and a body that is large ([`LARGE_BODY_BYTES`])
 /// takes the place with it ([`Prepared::place`]).
+// The three places are separate gates on purpose (engine, source, project)
+// and the pipeline travels with its source; a struct for them would only
+// rename the arguments.
+#[allow(clippy::too_many_arguments)]
 pub async fn prepare(
     body: Bytes,
     encoding: BodyEncoding,
     source: &IngestSource,
+    pipeline: Arc<CompiledPipeline>,
     received_at: DateTime<Utc>,
     decodes: &Arc<Semaphore>,
     shares: &DecodeShares,
@@ -457,7 +465,7 @@ pub async fn prepare(
     };
     let source = source.clone();
     tokio::task::spawn_blocking(move || {
-        let batch = build_batch(body, encoding, &source, received_at)?;
+        let batch = build_batch(body, encoding, &source, &pipeline, received_at)?;
         // Only the body is kept (the rows are gone); a large one keeps the
         // place too.
         let place = (batch.body.len() > LARGE_BODY_BYTES).then_some(place);
@@ -465,6 +473,7 @@ pub async fn prepare(
             body: batch.body,
             events: batch.events,
             bytes: batch.bytes,
+            pipeline: batch.pipeline,
             place,
         })
     })
@@ -484,6 +493,8 @@ pub struct Batch {
     pub events: usize,
     /// What the rows count against usage and quotas ([`LogRow::stored_bytes`]).
     pub bytes: u64,
+    /// What the source's pipeline dropped and sampled out (not in `events`).
+    pub pipeline: PipelineCounts,
 }
 
 /// The work of [`prepare`] without its thread and its places: decompress,
@@ -494,9 +505,17 @@ pub fn build_batch(
     body: Bytes,
     encoding: BodyEncoding,
     source: &IngestSource,
+    pipeline: &CompiledPipeline,
     received_at: DateTime<Utc>,
 ) -> Result<Batch, IngestError> {
-    let rows = row_batch(body, encoding, source, received_at, MAX_ENCODED_BYTES)?;
+    let rows = row_batch(
+        body,
+        encoding,
+        source,
+        pipeline,
+        received_at,
+        MAX_ENCODED_BYTES,
+    )?;
     let encoded = match rows.encode(MAX_ENCODED_BYTES) {
         Ok(encoded) => encoded,
         Err(ClickHouseError::TooLarge { .. }) => return Err(stored_too_large()),
@@ -509,6 +528,7 @@ pub fn build_batch(
         body: encoded.body,
         events: encoded.events,
         bytes: encoded.bytes,
+        pipeline: rows.pipeline_counts().clone(),
     })
 }
 
@@ -519,9 +539,17 @@ pub fn build_rows(
     body: Bytes,
     encoding: BodyEncoding,
     source: &IngestSource,
+    pipeline: &CompiledPipeline,
     received_at: DateTime<Utc>,
 ) -> Result<Vec<LogRow>, IngestError> {
-    build_rows_within(body, encoding, source, received_at, MAX_ENCODED_BYTES)
+    build_rows_within(
+        body,
+        encoding,
+        source,
+        pipeline,
+        received_at,
+        MAX_ENCODED_BYTES,
+    )
 }
 
 /// [`build_rows`] with the cap of the rows' stored bytes as a parameter.
@@ -529,19 +557,29 @@ pub fn build_rows_within(
     body: Bytes,
     encoding: BodyEncoding,
     source: &IngestSource,
+    pipeline: &CompiledPipeline,
     received_at: DateTime<Utc>,
     max_stored_bytes: usize,
 ) -> Result<Vec<LogRow>, IngestError> {
-    Ok(row_batch(body, encoding, source, received_at, max_stored_bytes)?.into_rows())
+    Ok(row_batch(
+        body,
+        encoding,
+        source,
+        pipeline,
+        received_at,
+        max_stored_bytes,
+    )?
+    .into_rows())
 }
 
 /// Decodes `body` and turns its events into rows with the shared step
-/// ([`store::RowBatch`]), refused with a 413 as soon as they store more than
-/// `max_stored_bytes`.
+/// ([`store::RowBatch`], which runs `pipeline` on each event first), refused
+/// with a 413 as soon as they store more than `max_stored_bytes`.
 fn row_batch(
     body: Bytes,
     encoding: BodyEncoding,
     source: &IngestSource,
+    pipeline: &CompiledPipeline,
     received_at: DateTime<Utc>,
     max_stored_bytes: usize,
 ) -> Result<store::RowBatch, IngestError> {
@@ -551,7 +589,7 @@ fn row_batch(
     // rows grow.
     for object in events {
         batch
-            .push(normalize::from_json(object, received_at), source)
+            .push(normalize::from_json(object, received_at), source, pipeline)
             .map_err(|store::StoredTooLarge| stored_too_large())?;
     }
     Ok(batch)
@@ -947,12 +985,17 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn no_rules() -> Arc<CompiledPipeline> {
+        Arc::new(CompiledPipeline::empty())
+    }
+
     fn source() -> IngestSource {
         IngestSource {
             id: uuid::Uuid::new_v4(),
             project_id: uuid::Uuid::new_v4(),
             retention_days: 30,
             daily_byte_quota: None,
+            updated_at: Utc::now(),
         }
     }
 
@@ -1504,7 +1547,14 @@ mod tests {
         let (body, inline_time) = loop {
             let body = workload(events);
             let started = Instant::now();
-            let rows = build_rows(body.clone(), JSON, &source, Utc::now()).unwrap();
+            let rows = build_rows(
+                body.clone(),
+                JSON,
+                &source,
+                &CompiledPipeline::empty(),
+                Utc::now(),
+            )
+            .unwrap();
             assert_eq!(rows.len(), events);
             let took = started.elapsed();
             if took >= Duration::from_millis(150) || events >= MAX_EVENTS {
@@ -1538,6 +1588,7 @@ mod tests {
             body,
             JSON,
             &source,
+            no_rules(),
             Utc::now(),
             &Arc::new(Semaphore::new(1)),
             &DecodeShares::default(),
@@ -1568,6 +1619,7 @@ mod tests {
             body.clone(),
             JSON,
             &source,
+            no_rules(),
             Utc::now(),
             &decodes,
             &shares,
@@ -1582,7 +1634,7 @@ mod tests {
             prepared.place.is_none(),
             "a small body gives its place back"
         );
-        let rows = build_rows(body, JSON, &source, Utc::now()).unwrap();
+        let rows = build_rows(body, JSON, &source, &CompiledPipeline::empty(), Utc::now()).unwrap();
         assert_eq!(
             prepared.bytes,
             rows.iter().map(LogRow::stored_bytes).sum::<u64>()
@@ -1596,6 +1648,7 @@ mod tests {
             Bytes::from_static(b"[]"),
             JSON,
             &source,
+            no_rules(),
             Utc::now(),
             &decodes,
             &shares,
@@ -1623,6 +1676,7 @@ mod tests {
                 good.clone(),
                 JSON,
                 &source,
+                no_rules(),
                 Utc::now(),
                 &decodes,
                 &shares,
@@ -1638,6 +1692,7 @@ mod tests {
             good,
             JSON,
             &source,
+            no_rules(),
             Utc::now(),
             &decodes,
             &shares,
@@ -1651,6 +1706,7 @@ mod tests {
             Bytes::from_static(b"{"),
             JSON,
             &source,
+            no_rules(),
             Utc::now(),
             &decodes,
             &shares,
@@ -1680,6 +1736,7 @@ mod tests {
                 good.clone(),
                 JSON,
                 &busy,
+                no_rules(),
                 Utc::now(),
                 &decodes,
                 &shares,
@@ -1698,6 +1755,7 @@ mod tests {
             good.clone(),
             JSON,
             &other,
+            no_rules(),
             Utc::now(),
             &decodes,
             &shares,
@@ -1706,9 +1764,18 @@ mod tests {
         .await
         .unwrap();
         drop(share);
-        prepare(good, JSON, &busy, Utc::now(), &decodes, &shares, &projects)
-            .await
-            .unwrap();
+        prepare(
+            good,
+            JSON,
+            &busy,
+            no_rules(),
+            Utc::now(),
+            &decodes,
+            &shares,
+            &projects,
+        )
+        .await
+        .unwrap();
     }
 
     /// The project's gate: two sources of one project that already has its
@@ -1733,6 +1800,7 @@ mod tests {
                 good.clone(),
                 JSON,
                 &sibling,
+                no_rules(),
                 Utc::now(),
                 &decodes,
                 &shares,
@@ -1746,6 +1814,7 @@ mod tests {
             good.clone(),
             JSON,
             &stranger,
+            no_rules(),
             Utc::now(),
             &decodes,
             &shares,
@@ -1758,6 +1827,7 @@ mod tests {
             good,
             JSON,
             &sibling,
+            no_rules(),
             Utc::now(),
             &decodes,
             &shares,
@@ -1797,6 +1867,7 @@ mod tests {
             events(20),
             JSON,
             &source,
+            no_rules(),
             Utc::now(),
             &decodes,
             &shares,
@@ -1813,6 +1884,7 @@ mod tests {
             events(180),
             JSON,
             &source,
+            no_rules(),
             Utc::now(),
             &decodes,
             &shares,
@@ -1838,8 +1910,24 @@ mod tests {
             .map(|n| json!({ "message": format!("{n} {}", "x".repeat(60_000)) }))
             .collect();
         let body = Bytes::from(serde_json::to_vec(&events).unwrap());
-        assert!(build_rows(body.clone(), JSON, &source, Utc::now()).is_ok());
-        let refused = build_rows_within(body, JSON, &source, Utc::now(), 5 * 1024 * 1024);
+        assert!(
+            build_rows(
+                body.clone(),
+                JSON,
+                &source,
+                &CompiledPipeline::empty(),
+                Utc::now()
+            )
+            .is_ok()
+        );
+        let refused = build_rows_within(
+            body,
+            JSON,
+            &source,
+            &CompiledPipeline::empty(),
+            Utc::now(),
+            5 * 1024 * 1024,
+        );
         match refused {
             Err(IngestError::PayloadTooLarge(message)) => {
                 assert!(message.contains("once stored"), "{message}")

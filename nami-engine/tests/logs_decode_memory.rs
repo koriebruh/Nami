@@ -266,6 +266,7 @@ fn source() -> IngestSource {
         project_id: Uuid::new_v4(),
         retention_days: 30,
         daily_byte_quota: None,
+        updated_at: chrono::Utc::now(),
     }
 }
 
@@ -320,8 +321,15 @@ fn batch(
 ) -> (Result<ingest::Batch, IngestError>, usize) {
     let body = Bytes::from(body);
     let started = Instant::now();
-    let (outcome, peak) =
-        peak_extra(|| ingest::build_batch(body, encoding, &source(), chrono::Utc::now()));
+    let (outcome, peak) = peak_extra(|| {
+        ingest::build_batch(
+            body,
+            encoding,
+            &source(),
+            &nami_engine::logs::pipeline::CompiledPipeline::empty(),
+            chrono::Utc::now(),
+        )
+    });
     eprintln!(
         "{what}: {} after {:?}, peak {} MiB (ceiling {} MiB)",
         match &outcome {

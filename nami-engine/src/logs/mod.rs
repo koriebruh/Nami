@@ -1,7 +1,8 @@
 //! Log management: turning ingested events into rows (`normalize`,
-//! per-source rules in `pipeline`, `pattern`), storing them in ClickHouse (`store`), and HTTP ingestion
-//! (`ingest`, `msgpack`, with the `budget` that caps what a body may decode
-//! to) with its per-source limits (`rate_limit`) and usage accounting
+//! per-source rules in `pipeline`, compiled once per source version in
+//! `pipeline_cache`, `pattern`), storing them in ClickHouse (`store`), and
+//! HTTP ingestion (`ingest`, `msgpack`, with the `budget` that caps what a
+//! body may decode to) with its per-source limits (`rate_limit`) and usage accounting
 //! (`usage`), syslog ingestion over TCP and UDP (`syslog`), and search
 //! (`query`, `search`, `patterns`) and the live tail (`tail`).
 pub mod budget;
@@ -11,6 +12,7 @@ pub mod normalize;
 pub mod pattern;
 pub mod patterns;
 pub mod pipeline;
+pub mod pipeline_cache;
 pub mod query;
 pub mod rate_limit;
 pub mod search;
@@ -46,4 +48,6 @@ pub struct LogsState {
     /// [`search::MAX_ENTRY_READS_PER_USER`]); apart from `query_slots` so a
     /// page's row clicks never compete with its searches.
     pub entry_slots: std::sync::Arc<slots::UserSlots>,
+    /// The compiled pipeline of each source, keyed on its `updated_at`.
+    pub pipelines: pipeline_cache::PipelineCache,
 }

@@ -24,11 +24,20 @@
 //!    one event where an HTTP request is a whole batch), then the daily
 //!    quota (read once per source and batch, like HTTP's check before the
 //!    body), both counted in the usage tables like HTTP ingest;
-//! 4. normalization and row building on a blocking thread (`spawn_blocking`),
-//!    with the step HTTP ingest uses (`store::RowBatch`, the same rows under
-//!    the same caps), then inserts of at most `max_insert_bytes` of encoded
-//!    body each (a frame whose row alone is larger is dropped and counted as
-//!    `too_large`), each followed by recording its usage.
+//! 4. per source of the batch, its compiled pipeline
+//!    (`logs::pipeline_cache`, keyed on the `updated_at` the token lookup
+//!    returned, so an edit applies from the next batch); the frames of a
+//!    source whose stored pipeline no longer compiles are dropped and
+//!    counted as `store_failed` (fail closed: a redact rule must never stop
+//!    applying silently);
+//! 5. normalization, the pipeline, row building and splitting the rows into
+//!    inserts of at most `max_insert_bytes` of encoded body each, all on one
+//!    blocking thread (`spawn_blocking`, [`build_and_chunk`]), with the step
+//!    HTTP ingest uses (`store::RowBatch`, the same pipeline and rows under
+//!    the same caps; a frame whose row alone is larger is dropped and counted
+//!    as `too_large`); then each insert, encoded off the runtime too, followed
+//!    by recording its usage. What the pipeline dropped or sampled out is
+//!    counted in the usage tables, never as `accepted`.
 //!
 //! Resource bounds (nothing grows with what a peer sends):
 //! - at most [`MAX_TCP_CONNECTIONS`] TCP connections, and at most
@@ -57,7 +66,7 @@ pub mod framing;
 pub mod parse;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc, Mutex,
@@ -77,9 +86,10 @@ use self::{
     framing::{FrameError, FrameReader, MAX_FRAME_BYTES},
     parse::SyslogMessage,
 };
-use super::{rate_limit::TokenBuckets, store};
+use super::{pipeline::CompiledPipeline, rate_limit::TokenBuckets, store};
 use crate::{
     auth::token::hash_token,
+    clickhouse::ClickHouseError,
     config::Config,
     models::source::{self, IngestSource},
     state::AppState,
@@ -706,38 +716,73 @@ impl Batcher {
         if allowed.is_empty() {
             return;
         }
-        let count = allowed.len() as u64;
-        // Normalization and row building are CPU work: off the async runtime.
-        // No stored cap here: the queue's byte budget already bounds a batch.
-        let built = tokio::task::spawn_blocking(move || {
-            let mut rows = store::RowBatch::with_capacity(allowed.len(), usize::MAX);
-            let mut budget = Vec::with_capacity(allowed.len());
-            for (pending, source) in allowed {
-                budget.push(pending._bytes);
-                let event = pending.message.into_event(pending.received_at);
-                // Cannot fail: the batch has no stored cap.
-                let _ = rows.push(event, &source);
+        // Each source's compiled pipeline (one query per cache miss). A
+        // source whose stored rules no longer compile has its frames dropped:
+        // stored without them, a redacted value could leak.
+        let mut pipelines: HashMap<Uuid, Arc<CompiledPipeline>> = HashMap::new();
+        let mut failed: HashSet<Uuid> = HashSet::new();
+        for (_, source) in &allowed {
+            if pipelines.contains_key(&source.id) || failed.contains(&source.id) {
+                continue;
             }
-            (Arc::new(rows), budget)
-        })
-        .await;
-        let (rows, _budget) = match built {
-            Ok(built) => built,
+            match state
+                .logs
+                .pipelines
+                .for_source(&state.db, source, None)
+                .await
+            {
+                Ok(pipeline) => {
+                    pipelines.insert(source.id, pipeline);
+                }
+                Err(error) => {
+                    tracing::error!(%error, source_id = %source.id, "syslog: log pipeline unavailable");
+                    failed.insert(source.id);
+                }
+            }
+        }
+        if !failed.is_empty() {
+            let before = allowed.len();
+            allowed.retain(|(_, source)| !failed.contains(&source.id));
+            bump(&self.stats.store_failed, (before - allowed.len()) as u64);
+            self.warnings
+                .warn(None, "a source's pipeline is unavailable");
+            if allowed.is_empty() {
+                return;
+            }
+        }
+        let count = allowed.len() as u64;
+        let max_bytes = self.max_insert_bytes;
+        // Normalization, the pipeline, row building and chunking (which
+        // encodes every row to measure it) are CPU work: off the async runtime.
+        let built =
+            tokio::task::spawn_blocking(move || build_and_chunk(allowed, &pipelines, max_bytes))
+                .await;
+        let Built {
+            rows,
+            runs,
+            oversized,
+            missing,
+            budget: _budget,
+        } = match built {
+            Ok(Ok(built)) => built,
+            Ok(Err(error)) => {
+                bump(&self.stats.store_failed, count);
+                tracing::error!(%error, "syslog: could not encode log rows");
+                return;
+            }
             Err(error) => {
                 bump(&self.stats.store_failed, count);
                 tracing::error!(%error, "syslog: building rows failed");
                 return;
             }
         };
-        let max_bytes = self.max_insert_bytes;
-        let (runs, oversized) = match store::chunk_rows(rows.rows(), max_bytes) {
-            Ok(split) => split,
-            Err(error) => {
-                bump(&self.stats.store_failed, count);
-                tracing::error!(%error, "syslog: could not encode log rows");
-                return;
-            }
-        };
+        if missing > 0 {
+            bump(&self.stats.store_failed, missing);
+            tracing::error!(
+                frames = missing,
+                "syslog: frames without a pipeline were dropped"
+            );
+        }
         if oversized > 0 {
             bump(&self.stats.too_large, oversized as u64);
             self.warnings
@@ -780,12 +825,150 @@ impl Batcher {
                 }
             }
         }
+        // What the pipeline left out does not depend on the inserts, so it is
+        // recorded even when an insert failed. HTTP differs on purpose: there
+        // a failed insert records nothing, because the client retries the
+        // whole request and would be counted twice; dropped syslog frames are
+        // never resent.
+        for (source_id, (dropped, sampled_out)) in rows.pipeline_counts() {
+            state
+                .logs
+                .usage
+                .record_pipeline(*source_id, today, *dropped, *sampled_out);
+        }
     }
+}
+
+/// What [`build_and_chunk`] makes of a batch's allowed frames.
+struct Built {
+    rows: Arc<store::RowBatch>,
+    /// Consecutive runs of `rows`, each one insert ([`store::chunk_rows`]).
+    runs: Vec<std::ops::Range<usize>>,
+    /// Rows left out because one alone encodes to more than an insert may.
+    oversized: usize,
+    /// Frames left out because their source had no pipeline (a bug; counted
+    /// as `store_failed`).
+    missing: u64,
+    /// The frames' shares of [`QUEUE_MAX_BYTES`], held until the inserts end.
+    budget: Vec<OwnedSemaphorePermit>,
+}
+
+/// The blocking half of a batch (R-P2-24): each frame's event through its
+/// source's pipeline into a row ([`store::RowBatch::push`]), then the rows
+/// split into inserts of at most `max_bytes` ([`store::chunk_rows`]). Every
+/// source in `allowed` has its entry in `pipelines`; a missing one (a bug)
+/// drops the frame rather than storing it unfiltered.
+fn build_and_chunk(
+    allowed: Vec<(Pending, IngestSource)>,
+    pipelines: &HashMap<Uuid, Arc<CompiledPipeline>>,
+    max_bytes: usize,
+) -> Result<Built, ClickHouseError> {
+    // No stored cap here: the queue's byte budget already bounds a batch.
+    let mut rows = store::RowBatch::with_capacity(allowed.len(), usize::MAX);
+    let mut budget = Vec::with_capacity(allowed.len());
+    let mut missing = 0;
+    for (pending, source) in allowed {
+        budget.push(pending._bytes);
+        debug_assert!(
+            pipelines.contains_key(&source.id),
+            "a frame's source has no pipeline"
+        );
+        let Some(pipeline) = pipelines.get(&source.id) else {
+            // Never stored without its rules (fail closed).
+            missing += 1;
+            continue;
+        };
+        let event = pending.message.into_event(pending.received_at);
+        // Cannot fail: the batch has no stored cap.
+        let _ = rows.push(event, &source, pipeline);
+    }
+    let (runs, oversized) = store::chunk_rows(rows.rows(), max_bytes)?;
+    Ok(Built {
+        rows: Arc::new(rows),
+        runs,
+        oversized,
+        missing,
+        budget,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_are_chunked_inside_the_blocking_build() {
+        let budget = Arc::new(Semaphore::new(1 << 20));
+        let source = IngestSource {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            retention_days: 30,
+            daily_byte_quota: None,
+            updated_at: Utc::now(),
+        };
+        let pending = |message: &str| Pending {
+            token_hash: String::new(),
+            message: parse::parse(format!("<14>1 - host app - - - {message}").as_bytes()).unwrap(),
+            received_at: Utc::now(),
+            _bytes: Arc::clone(&budget).try_acquire_many_owned(1).unwrap(),
+        };
+        let pipeline = crate::logs::pipeline::compile(
+            &crate::logs::pipeline::parse_rules(
+                &serde_json::json!([{"type":"drop","match":{"message_regex":"^noise"}}]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let pipelines = HashMap::from([(source.id, Arc::new(pipeline))]);
+        let allowed = vec![
+            (pending("small one"), source.clone()),
+            (pending(&"x".repeat(5000)), source.clone()),
+            (pending("noise"), source.clone()),
+            (pending("small two"), source.clone()),
+        ];
+        let built = build_and_chunk(allowed, &pipelines, 2000).unwrap();
+        assert_eq!(built.rows.len(), 3, "the dropped frame has no row");
+        assert_eq!(built.oversized, 1);
+        assert_eq!(built.missing, 0);
+        let in_runs: usize = built.runs.iter().map(|run| run.len()).sum();
+        assert_eq!(in_runs, 2);
+        assert_eq!(built.budget.len(), 4, "every frame's share is held");
+        assert_eq!(built.rows.pipeline_counts()[&source.id], (1, 0));
+    }
+
+    fn frame_without_pipeline() -> (Vec<(Pending, IngestSource)>, Arc<Semaphore>) {
+        let budget = Arc::new(Semaphore::new(16));
+        let source = IngestSource {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            retention_days: 30,
+            daily_byte_quota: None,
+            updated_at: Utc::now(),
+        };
+        let pending = Pending {
+            token_hash: String::new(),
+            message: parse::parse(b"<14>1 - host app - - - pw=hunter2").unwrap(),
+            received_at: Utc::now(),
+            _bytes: Arc::clone(&budget).try_acquire_many_owned(1).unwrap(),
+        };
+        (vec![(pending, source)], budget)
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a frame's source has no pipeline")]
+    fn a_frame_without_a_pipeline_is_a_bug_in_debug_builds() {
+        let (allowed, _budget) = frame_without_pipeline();
+        let _ = build_and_chunk(allowed, &HashMap::new(), usize::MAX);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_frame_without_a_pipeline_is_counted_not_stored() {
+        let (allowed, _budget) = frame_without_pipeline();
+        let built = build_and_chunk(allowed, &HashMap::new(), usize::MAX).unwrap();
+        assert_eq!((built.rows.len(), built.missing), (0, 1));
+    }
 
     #[test]
     fn unknown_tokens_expire_and_stay_bounded() {

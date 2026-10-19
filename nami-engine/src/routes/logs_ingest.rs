@@ -16,6 +16,7 @@ use crate::{
     logs::{
         LogsState,
         ingest::{self, BodyEncoding, BodyPace, IngestError, Prepared},
+        pipeline::CompiledPipeline,
         rate_limit::InFlightGuard,
         store,
     },
@@ -62,7 +63,8 @@ use crate::{
 pub const MAX_INGEST_IN_FLIGHT: usize = 32;
 
 /// How many Postgres statements ingest may have running at once (the token
-/// lookup and the quota check; the rest of a request touches only ClickHouse).
+/// lookup, the quota check and, on a pipeline cache miss, the pipeline read;
+/// the rest of a request touches only ClickHouse).
 /// It has to stay below the pool (`DATABASE_MAX_CONNECTIONS`, 20 by default):
 /// whatever the load on the public port, the API and the uptime worker always
 /// find connections free. A request that waits for one of these places holds
@@ -130,9 +132,12 @@ pub fn public_router(limits: IngestLimits) -> Router<AppState> {
 /// (429 `rate_limited`) -> the source's requests in flight (429
 /// `too_many_in_flight`) -> the project's requests in flight (429
 /// `too_many_in_flight`) -> the quota (429 `quota_exceeded`) -> content type
-/// (415) -> body size and pace (413, 408) -> parse (400, 413 for too many
-/// events or too much decoded) -> store -> 202. Only events that were stored
-/// count towards usage.
+/// (415) -> body size and pace (413, 408) -> the source's compiled pipeline
+/// (cached per `updated_at`; one that no longer compiles is a 500 and nothing
+/// is stored) -> parse, pipeline (400, 413 for too many events or too much
+/// decoded) -> store -> 202 with the events stored. Only events that were
+/// stored count towards usage; what the pipeline dropped or sampled out is
+/// counted apart.
 async fn ingest_logs(
     State(state): State<AppState>,
     Extension(limits): Extension<IngestLimits>,
@@ -214,12 +219,24 @@ async fn ingest_logs(
         }
         other => other?,
     };
+    let pipeline = state
+        .logs
+        .pipelines
+        .for_source(&state.db, &source, Some(&limits.queries))
+        .await
+        .map_err(|error| {
+            // Never the rules: a pattern can hold a secret's shape (the error
+            // names only the rule index and a fixed reason).
+            tracing::error!(%error, source_id = %source.id, "log pipeline unavailable");
+            IngestError::Internal
+        })?;
 
     let work = Work {
         clickhouse: state.clickhouse.clone(),
         logs: state.logs.clone(),
         decodes: limits.decodes.clone(),
         source,
+        pipeline,
         received_at,
         _place: place,
         _in_flight: in_flight,
@@ -247,6 +264,7 @@ struct Work {
     logs: Arc<LogsState>,
     decodes: Arc<Semaphore>,
     source: IngestSource,
+    pipeline: Arc<CompiledPipeline>,
     received_at: DateTime<Utc>,
     _place: OwnedSemaphorePermit,
     _in_flight: InFlightGuard,
@@ -254,26 +272,31 @@ struct Work {
 }
 
 impl Work {
-    /// Decodes the body, inserts the events and counts them: usage is
-    /// recorded right after the insert, with nothing that can be cancelled
-    /// in between. Returns how many events were stored.
+    /// Decodes the body, runs the pipeline, inserts the events and counts
+    /// them: usage is recorded right after the insert, with nothing that can
+    /// be cancelled in between. Returns how many events were stored. A failed
+    /// insert records nothing, the pipeline's counts included (the client
+    /// retries the whole request).
     async fn store(self, body: Bytes, encoding: BodyEncoding) -> Result<usize, IngestError> {
         let Prepared {
             body: encoded,
             events,
             bytes,
+            pipeline,
             // A large body keeps its place for decoding until the end.
             place: _held,
         } = ingest::prepare(
             body,
             encoding,
             &self.source,
+            self.pipeline,
             self.received_at,
             &self.decodes,
             &self.logs.decode_shares,
             &self.logs.project_limits.decode_shares,
         )
         .await?;
+        let day = self.received_at.date_naive();
         if events > 0 {
             store::insert_encoded_logs(&self.clickhouse, encoded)
                 .await
@@ -284,12 +307,16 @@ impl Work {
                     tracing::error!(%error, source_id = %self.source.id, "clickhouse error");
                     IngestError::Internal
                 })?;
-            self.logs.usage.record_accepted(
-                self.source.id,
-                self.received_at.date_naive(),
-                events as u64,
-                bytes,
-            );
+            self.logs
+                .usage
+                .record_accepted(self.source.id, day, events as u64, bytes);
+        }
+        // Zero events stored (every one dropped or sampled out) sends no
+        // insert, and its counts are recorded all the same.
+        for (source_id, (dropped, sampled_out)) in pipeline {
+            self.logs
+                .usage
+                .record_pipeline(source_id, day, dropped, sampled_out);
         }
         Ok(events)
     }

@@ -20,6 +20,7 @@ fn source() -> IngestSource {
         project_id: Uuid::new_v4(),
         retention_days: 14,
         daily_byte_quota: None,
+        updated_at: chrono::Utc::now(),
     }
 }
 

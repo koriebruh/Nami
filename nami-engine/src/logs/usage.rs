@@ -89,6 +89,20 @@ impl UsageTracker {
         self.record(source_id, day, delta);
     }
 
+    /// Events the source's pipeline dropped or sampled out (never stored,
+    /// never in `events`).
+    pub fn record_pipeline(&self, source_id: Uuid, day: NaiveDate, dropped: u64, sampled_out: u64) {
+        if dropped == 0 && sampled_out == 0 {
+            return;
+        }
+        let delta = UsageCounters {
+            events_dropped: dropped as i64,
+            events_sampled_out: sampled_out as i64,
+            ..UsageCounters::default()
+        };
+        self.record(source_id, day, delta);
+    }
+
     pub fn record_rate_limited(&self, source_id: Uuid, day: NaiveDate) {
         self.record(
             source_id,
@@ -298,5 +312,27 @@ pub async fn run_forever(state: AppState) {
                 Err(e) => tracing::error!(error = %e, "failed to prune log ingestion usage"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipeline_outcomes_are_counted() {
+        let tracker = UsageTracker::default();
+        let (id, day) = (Uuid::new_v4(), Utc::now().date_naive());
+        tracker.record_pipeline(id, day, 3, 5);
+        tracker.record_pipeline(id, day, 1, 0);
+        let pending = tracker.pending(id, day);
+        assert_eq!(
+            (
+                pending.events_dropped,
+                pending.events_sampled_out,
+                pending.events
+            ),
+            (4, 5, 0)
+        );
     }
 }
