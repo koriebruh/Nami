@@ -13,6 +13,7 @@
 	<h2 class="text-base font-semibold text-neutral-100">New monitor</h2>
 	<div class="mt-4">
 		<MonitorForm
+			groups={data.groups}
 			submitLabel="Create monitor"
 			message={form?.message ?? null}
 			cancelHref="/projects/{data.project.id}/monitors"

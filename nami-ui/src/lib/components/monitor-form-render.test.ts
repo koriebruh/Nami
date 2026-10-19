@@ -1,0 +1,87 @@
+// Server-side render of the monitor form: what a member and a viewer see of
+// a stored monitor, and that no secret value ever reaches the markup.
+import { render } from 'svelte/server';
+import { describe, expect, it } from 'vitest';
+import type { Monitor } from '#lib/uptime';
+import MonitorForm from './MonitorForm.svelte';
+
+function monitor(overrides: Partial<Monitor> = {}): Monitor {
+	return {
+		id: 'm',
+		project_id: 'p',
+		name: 'API',
+		check_type: 'http',
+		url: 'https://example.com/health',
+		host: null,
+		port: null,
+		http_method: 'POST',
+		keyword: null,
+		keyword_mode: 'contains',
+		expected_status_min: 200,
+		expected_status_max: 399,
+		interval_seconds: 60,
+		timeout_seconds: 10,
+		confirmation_threshold: 2,
+		paused: false,
+		current_status: 'up',
+		consecutive_failures: 0,
+		last_checked_at: null,
+		next_check_at: '2026-10-13T00:00:00Z',
+		created_at: '2026-10-13T00:00:00Z',
+		request_body: '{"a":1}',
+		request_headers: [{ name: 'X-Api-Key', value_set: true }],
+		auth_username: 'monitor',
+		has_auth_password: true,
+		follow_redirects: true,
+		verify_ssl: true,
+		recovery_threshold: 1,
+		consecutive_successes: 0,
+		dns_record_type: null,
+		dns_nameserver: null,
+		expected_value: null,
+		expiry_threshold_days: null,
+		use_tls: false,
+		udp_payload: null,
+		group_id: null,
+		in_maintenance: false,
+		...overrides
+	};
+}
+
+const props = { submitLabel: 'Save changes', cancelHref: '/x' };
+
+describe('monitor form render', () => {
+	it('shows stored header names and the password state, never a value', () => {
+		const { body } = render(MonitorForm, { props: { ...props, monitor: monitor() } });
+		expect(body).toContain('Stored: X-Api-Key');
+		expect(body).toContain('Keep (set)');
+		expect(body).toContain('>Save changes<');
+		expect(body).not.toContain('read-only');
+	});
+
+	it('shows a viewer the masked monitor read-only, without a save button', () => {
+		const { body } = render(MonitorForm, {
+			props: { ...props, monitor: monitor({ request_body: '***', auth_username: '***', url: 'https://example.com/h?k=***' }) }
+		});
+		expect(body).toContain('read-only');
+		expect(body).not.toContain('>Save changes<');
+		expect(body).toMatch(/<fieldset[^>]*disabled/);
+	});
+
+	it('hints at the final URL for secret-bearing monitors and caps field sizes', () => {
+		const { body } = render(MonitorForm, { props: { ...props, monitor: null } });
+		expect(body).toContain('point the monitor at the final URL');
+		expect(body).toContain('maxlength="2048"');
+		const post = render(MonitorForm, { props: { ...props, monitor: monitor() } }).body;
+		expect(post).toContain('maxlength="65536"');
+	});
+
+	it('starts an expiry monitor from the expiry defaults', () => {
+		const { body } = render(MonitorForm, {
+			props: { ...props, monitor: monitor({ check_type: 'ssl_expiry', url: null, host: 'example.com', port: 443, interval_seconds: 86400, confirmation_threshold: 1, expiry_threshold_days: 21 }) }
+		});
+		expect(body).toContain('min="3600"');
+		expect(body).toContain('placeholder="86400"');
+		expect(body).toContain('placeholder="1"');
+	});
+});

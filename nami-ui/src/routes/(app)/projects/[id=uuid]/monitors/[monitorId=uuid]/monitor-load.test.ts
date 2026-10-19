@@ -99,9 +99,23 @@ describe('detail page load', () => {
 describe('edit page load', () => {
 	it('returns the monitor', async () => {
 		const monitor = { id: MONITOR_ID, name: 'API' };
-		const { event, calls } = fakeEvent({ body: JSON.stringify(monitor) });
-		expect(await loadEdit(event)).toEqual({ monitor });
-		expect(calls().map((call) => call.path)).toEqual([monitorPath]);
+		const groups = [{ id: 'g1', name: 'APIs' }];
+		const { event, calls } = fakeEvent({
+			respond: (url) => new Response(JSON.stringify(url.pathname.endsWith('/monitor-groups') ? groups : monitor))
+		});
+		expect(await loadEdit(event)).toEqual({ monitor, groups });
+		expect(calls().map((call) => call.path)).toEqual([monitorPath, `/projects/${PROJECT_ID}/monitor-groups`]);
+	});
+
+	it('still opens, with no groups to pick, when they cannot be loaded', async () => {
+		const monitor = { id: MONITOR_ID, name: 'API' };
+		const { event } = fakeEvent({
+			respond: (url) =>
+				url.pathname.endsWith('/monitor-groups')
+					? new Response('{"error":"internal error"}', { status: 500 })
+					: new Response(JSON.stringify(monitor))
+		});
+		expect(await loadEdit(event)).toEqual({ monitor, groups: [] });
 	});
 });
 
@@ -165,7 +179,8 @@ describe('detail page actions', () => {
 });
 
 describe('edit page action', () => {
-	const fields = { name: 'API', check_type: 'http', url: 'https://example.com' };
+	// The checkboxes the form renders checked by default.
+	const fields = { name: 'API', check_type: 'http', url: 'https://example.com', follow_redirects: 'on', verify_ssl: 'on' };
 
 	it('patches the monitor and returns to its page', async () => {
 		const { event, calls } = fakeEvent({ form: fields });
@@ -175,7 +190,7 @@ describe('edit page action', () => {
 				method: 'PATCH',
 				path: monitorPath,
 				search: '',
-				body: '{"name":"API","check_type":"http","url":"https://example.com","http_method":"GET"}'
+				body: '{"name":"API","check_type":"http","group_id":null,"url":"https://example.com","http_method":"GET","request_body":null,"follow_redirects":true,"verify_ssl":true,"auth_username":null}'
 			}
 		]);
 	});

@@ -5,7 +5,7 @@ import {
 	enginePath,
 	redirectToLoginIfUnauthorized
 } from '#lib/server/engine';
-import type { MonitorSummary } from '#lib/uptime';
+import type { MonitorGroup, MonitorSummary } from '#lib/uptime';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {
@@ -14,7 +14,10 @@ export const load: PageServerLoad = async (event) => {
 	// keep it. Set first and only here (SvelteKit throws on a second set).
 	event.setHeaders({ 'cache-control': 'private, no-store' });
 
-	const response = await callEngine(event, enginePath`/projects/${event.params.id}/monitors`);
+	const [response, groupsResponse] = await Promise.all([
+		callEngine(event, enginePath`/projects/${event.params.id}/monitors`),
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`)
+	]);
 	redirectToLoginIfUnauthorized(response);
 	if (!response.ok) {
 		throw error(
@@ -23,5 +26,7 @@ export const load: PageServerLoad = async (event) => {
 		);
 	}
 	const monitors: MonitorSummary[] = await response.json();
-	return { monitors };
+	// Groups only arrange the list: without them it still renders, flat.
+	const groups: MonitorGroup[] = groupsResponse.ok ? await groupsResponse.json() : [];
+	return { monitors, groups };
 };

@@ -1,12 +1,15 @@
 import { execFileSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import {
+	escapePayload,
 	formatClockUtc,
 	formatDuration,
 	formatMs,
 	formatSeconds,
 	formatUptime,
 	formatUtc,
+	groupMonitors,
+	hasMaskedValues,
 	monitorTarget,
 	niceTicks,
 	pingCommand,
@@ -14,6 +17,7 @@ import {
 	shellQuote,
 	statusSince,
 	timeAgo,
+	unescapePayload,
 	type Incident
 } from './uptime';
 
@@ -254,5 +258,79 @@ describe('pingCommand', () => {
 		const echoed = execFileSync('/bin/sh', ['-c', pingCommand(url).replace(/^curl /, 'printf "%s\\n" ')], { encoding: 'utf8' });
 		// curl's options are separate words, the URL is the last one, intact.
 		expect(echoed.trimEnd().split('\n')).toEqual(['-fsS', '-m', '10', '--retry', '3', url]);
+	});
+});
+
+describe('monitorTarget for every check type', () => {
+	const base = { url: null, host: 'example.com', port: 443, dns_record_type: null, dns_nameserver: null };
+	it('picks the field each type checks', () => {
+		expect(monitorTarget({ ...base, check_type: 'ping' })).toBe('example.com');
+		expect(monitorTarget({ ...base, check_type: 'domain_expiry' })).toBe('example.com');
+		expect(monitorTarget({ ...base, check_type: 'ssl_expiry' })).toBe('example.com:443');
+		expect(monitorTarget({ ...base, check_type: 'udp', port: 27015 })).toBe('example.com:27015');
+		expect(monitorTarget({ ...base, check_type: 'smtp', port: 25 })).toBe('example.com:25');
+	});
+	it('shows the record type and nameserver of a DNS monitor', () => {
+		expect(monitorTarget({ ...base, check_type: 'dns', dns_record_type: 'MX' })).toBe('MX example.com');
+		expect(monitorTarget({ ...base, check_type: 'dns', dns_record_type: 'A', dns_nameserver: '1.1.1.1:53' })).toBe(
+			'A example.com @1.1.1.1:53'
+		);
+	});
+});
+
+describe('groupMonitors', () => {
+	const group = (id: string, name: string, position: number) => ({
+		id,
+		project_id: 'p',
+		name,
+		position,
+		created_at: '2026-10-13T00:00:00Z'
+	});
+	const monitor = (id: string, group_id: string | null) => ({ id, group_id });
+
+	it('keeps the engine order of groups and puts ungrouped monitors last', () => {
+		const groups = [group('g1', 'APIs', 0), group('g2', 'Websites', 1)];
+		const sections = groupMonitors(
+			[monitor('a', 'g2'), monitor('b', null), monitor('c', 'g1'), monitor('d', 'g2')],
+			groups
+		);
+		expect(sections.map((s) => [s.group?.name ?? null, s.monitors.map((m) => m.id)])).toEqual([
+			['APIs', ['c']],
+			['Websites', ['a', 'd']],
+			[null, ['b']]
+		]);
+	});
+
+	it('drops empty groups and treats an unknown group as ungrouped', () => {
+		const sections = groupMonitors([monitor('a', 'gone')], [group('g1', 'Empty', 0)]);
+		expect(sections).toEqual([{ group: null, monitors: [monitor('a', 'gone')] }]);
+	});
+
+	it('is a single ungrouped section when the project has no groups', () => {
+		expect(groupMonitors([monitor('a', null)], [])).toEqual([{ group: null, monitors: [monitor('a', null)] }]);
+		expect(groupMonitors([], [])).toEqual([]);
+	});
+});
+
+describe('UDP payload escapes', () => {
+	it('round-trips control characters through one-line text', () => {
+		expect(unescapePayload('PING\\r\\n\\tx\\\\y')).toBe('PING\r\n\tx\\y');
+		expect(escapePayload('PING\r\n\tx\\y')).toBe('PING\\r\\n\\tx\\\\y');
+		expect(unescapePayload(escapePayload('a\\nb\n'))).toBe('a\\nb\n');
+		expect(unescapePayload('no escapes \\q')).toBe('no escapes \\q');
+	});
+});
+
+describe('hasMaskedValues', () => {
+	const open = { url: 'https://x.test/h', request_body: null, auth_username: null };
+	it('is false for what a member reads', () => {
+		expect(hasMaskedValues(open)).toBe(false);
+		expect(hasMaskedValues({ ...open, request_body: '{"a":1}', auth_username: 'monitor' })).toBe(false);
+	});
+	it('spots the *** a viewer gets for a url secret, body or username', () => {
+		expect(hasMaskedValues({ ...open, url: 'https://x.test/h?token=***' })).toBe(true);
+		expect(hasMaskedValues({ ...open, url: 'https://u:***@x.test/h' })).toBe(true);
+		expect(hasMaskedValues({ ...open, request_body: '***' })).toBe(true);
+		expect(hasMaskedValues({ ...open, auth_username: '***' })).toBe(true);
 	});
 });

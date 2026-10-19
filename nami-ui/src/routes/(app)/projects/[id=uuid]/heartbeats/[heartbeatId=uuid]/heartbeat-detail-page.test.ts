@@ -24,6 +24,7 @@ function heartbeat(overrides: Partial<Heartbeat> = {}): Heartbeat {
 		current_status: 'up',
 		last_ping_at: '2026-10-13T10:00:00Z',
 		created_at: '2026-10-12T10:00:00Z',
+		in_maintenance: false,
 		...overrides
 	};
 }
@@ -176,5 +177,12 @@ describe('heartbeat detail page: what an action leaves in `form`', () => {
 	it('shows no alert when there is no error', () => {
 		expect(renderPage(heartbeat()).body).not.toContain('role="alert"');
 		expect(renderPage(heartbeat(), { saved: true }).body).not.toContain('role="alert"');
+	});
+});
+
+describe('heartbeat detail page: maintenance', () => {
+	it('shows the badge while a window covers the heartbeat', () => {
+		expect(renderPage(heartbeat({ in_maintenance: true })).body).toContain('Maintenance');
+		expect(renderPage(heartbeat()).body).not.toContain('Maintenance');
 	});
 });
