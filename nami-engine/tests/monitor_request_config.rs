@@ -1646,3 +1646,84 @@ async fn creating_in_a_project_that_does_not_exist_is_a_404_for_a_global_admin(p
         .unwrap();
     assert_eq!(count, 0);
 }
+
+/// A udp payload carries SNMP communities and RADIUS secrets as often as a
+/// body carries a token: viewers read `***`, and every view says whether it
+/// was redacted, so a client never has to guess from the text.
+#[sqlx::test]
+async fn viewers_read_the_udp_payload_masked_and_views_say_they_were_redacted(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let collection = format!("/projects/{project}/monitors");
+    let (status, created) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(json!({
+            "name": "SNMP",
+            "check_type": "udp",
+            "host": "127.0.0.1",
+            "port": 161,
+            "udp_payload": "community=SNMP-COMMUNITY-SECRET",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["redacted"], false);
+    let item = format!("{collection}/{}", created["id"].as_str().unwrap());
+
+    let (_, list) = call(&app, "GET", &collection, Some(&viewer), None).await;
+    let (_, detail) = call(&app, "GET", &item, Some(&viewer), None).await;
+    for read in [&list[0], &detail] {
+        assert_eq!(read["udp_payload"], "***", "{read}");
+        assert_eq!(read["redacted"], true);
+        assert!(!read.to_string().contains("SNMP-COMMUNITY-SECRET"));
+    }
+    let (_, list) = call(&app, "GET", &collection, Some(&member), None).await;
+    let (_, detail) = call(&app, "GET", &item, Some(&member), None).await;
+    for read in [&list[0], &detail] {
+        assert_eq!(read["udp_payload"], "community=SNMP-COMMUNITY-SECRET");
+        assert_eq!(read["redacted"], false);
+    }
+}
+
+#[sqlx::test]
+async fn blank_and_repeated_header_names_are_refused_through_the_api(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let collection = format!("/projects/{project}/monitors");
+    for (headers, error) in [
+        (
+            json!([{ "name": "X-A", "value": "" }]),
+            "header X-A: enter a value",
+        ),
+        (
+            json!([{ "name": "X-A", "value": "1" }, { "name": "x-a", "value": "2" }]),
+            "header x-a is listed twice",
+        ),
+        (
+            json!([{ "name": "Upgrade", "value": "h2c" }]),
+            "header Upgrade cannot be set: the checker manages Host, Content-Length, Transfer-Encoding, Connection and the other hop-by-hop headers",
+        ),
+    ] {
+        let (status, body) = call(
+            &app,
+            "POST",
+            &collection,
+            Some(&member),
+            Some(json!({
+                "name": "API",
+                "check_type": "http",
+                "url": "https://example.com/",
+                "request_headers": headers,
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{headers}");
+        assert_eq!(body["error"], error);
+    }
+}

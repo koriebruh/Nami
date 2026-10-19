@@ -450,7 +450,9 @@ async fn secrets_never_follow_a_redirect_to_another_origin() {
             let error = outcome.error.unwrap();
             assert!(error.contains(&expected), "{label}: {error}");
             assert!(
-                error.starts_with("headers and credentials are only sent to the monitored origin"),
+                error.starts_with(
+                    "headers, credentials and request bodies are only sent to the monitored origin"
+                ),
                 "the reason comes first: {error}"
             );
             assert!(
@@ -882,7 +884,8 @@ async fn headers_that_merely_resemble_the_reserved_ones_are_sent() {
         "Content-Type",
         "Content-Lengths",
         "Connection-Id",
-        "Keep-Alive",
+        "Keep-Alive-Timeout",
+        "X-Upgrade",
     ];
     let headers: Vec<(&str, &str)> = names.iter().map(|name| (*name, "v")).collect();
     let monitor = with_headers(http_monitor(format!("{}/", server.uri())), &headers);
@@ -1147,4 +1150,98 @@ async fn the_worker_sends_what_the_api_stored(pool: sqlx::PgPool) {
         current, "up",
         "the target answers 201 only to the exact request"
     );
+}
+
+/// Security (Phase 2 final review): a 307/308 re-sends the request body, and
+/// a body often carries a token. A body-carrying request only follows
+/// redirects that stay on the monitored origin, like headers and credentials.
+/// The live repro: POST with a JSON token, 307 to another host of the same
+/// machine, which received the whole body.
+#[tokio::test]
+async fn a_request_body_never_follows_a_redirect_to_another_origin() {
+    const BODY: &str = "{\"token\":\"BODY-SECRET-789\"}";
+    for status in [307, 308, 303, 302] {
+        let target = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&elsewhere)
+            .await;
+        let port = elsewhere.address().port();
+        Mock::given(path("/submit"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("Location", format!("http://localhost:{port}/collect")),
+            )
+            .mount(&target)
+            .await;
+        let monitor = Monitor {
+            http_method: "POST".to_string(),
+            request_body: Some(BODY.to_string()),
+            ..http_monitor(format!("{}/submit", target.uri()))
+        };
+
+        let outcome = perform_check(&check_context(), &monitor).await;
+
+        assert_eq!(outcome.status, CheckStatus::Down, "{status}");
+        let error = outcome.error.unwrap();
+        assert_eq!(
+            error,
+            "headers, credentials and request bodies are only sent to the monitored origin, so the redirect to another host (localhost) was not followed",
+            "{status}"
+        );
+        assert!(!error.contains("BODY-SECRET"));
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "{status}: nothing reached the other origin"
+        );
+    }
+}
+
+/// The same body still follows a redirect on its own origin, and a body
+/// stored with a method that sends none (a GET left over from an edit made
+/// around the API) changes nothing about where a redirect may go.
+#[tokio::test]
+async fn a_request_body_rides_along_on_redirects_that_stay_on_the_origin() {
+    let server = MockServer::start().await;
+    Mock::given(path("/submit"))
+        .respond_with(
+            ResponseTemplate::new(307)
+                .insert_header("Location", format!("{}/landing", server.uri())),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/landing"))
+        .and(body_string("{\"probe\":true}"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let monitor = Monitor {
+        http_method: "POST".to_string(),
+        request_body: Some("{\"probe\":true}".to_string()),
+        ..http_monitor(format!("{}/submit", server.uri()))
+    };
+    let outcome = perform_check(&check_context(), &monitor).await;
+    assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
+
+    let target = MockServer::start().await;
+    let elsewhere = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&elsewhere)
+        .await;
+    redirect(
+        &target,
+        "/start",
+        format!("http://localhost:{}/landing", elsewhere.address().port()),
+    )
+    .await;
+    let get_with_stale_body = Monitor {
+        request_body: Some("{\"unused\":true}".to_string()),
+        ..http_monitor(format!("{}/start", target.uri()))
+    };
+    let outcome = perform_check(&check_context(), &get_with_stale_body).await;
+    assert_eq!(outcome.status, CheckStatus::Up, "{:?}", outcome.error);
 }

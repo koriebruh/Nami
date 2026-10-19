@@ -188,6 +188,20 @@ async fn ping_and_dns_hosts_follow_the_hardened_host_rules(pool: sqlx::PgPool) {
         cases.push((host(&"\u{e9}".repeat(254)), "at most 253 characters"));
     }
     c.assert_rejected(cases).await;
+    // An address has no records to look up.
+    c.assert_rejected(
+        ["10.0.0.5", "::1", "2001:DB8:0:0::1", "[::1]"]
+            .iter()
+            .chain(&["169.254.169.254"])
+            .map(|host| {
+                (
+                    json!({ "name": "x", "check_type": "dns", "host": host }),
+                    "host must be a domain name to look up",
+                )
+            })
+            .collect(),
+    )
+    .await;
 
     for check_type in ["ping", "dns"] {
         let name_of_253 = format!(
@@ -203,10 +217,6 @@ async fn ping_and_dns_hosts_follow_the_hardened_host_rules(pool: sqlx::PgPool) {
             ("  Db.Example.COM\t", "db.example.com"),
             ("example.com.", "example.com."),
             ("_dmarc.example.com", "_dmarc.example.com"),
-            ("10.0.0.5", "10.0.0.5"),
-            ("::1", "::1"),
-            ("2001:DB8:0:0::1", "2001:db8::1"),
-            ("[::1]", "::1"),
             ("localhost", "localhost"),
             (name_of_253.as_str(), name_of_253.as_str()),
         ] {
@@ -220,6 +230,14 @@ async fn ping_and_dns_hosts_follow_the_hardened_host_rules(pool: sqlx::PgPool) {
             );
             assert_eq!(created["host"], stored, "{check_type} {host:?}");
         }
+    }
+    let addresses = ["10.0.0.5", "::1", "2001:DB8:0:0::1", "[::1]"];
+    for (host, stored) in addresses.iter().zip(["10.0.0.5", "::1", "2001:db8::1", "::1"]) {
+        let (status, created) = c
+            .create(json!({ "name": "ok", "check_type": "ping", "host": host }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "ping {host:?}: {created}");
+        assert_eq!(created["host"], stored, "ping {host:?}");
     }
 }
 

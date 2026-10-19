@@ -23,10 +23,22 @@ pub const MAX_HEADER_NAME_BYTES: usize = 256;
 pub const MAX_HEADER_VALUE_BYTES: usize = 1024;
 pub const MAX_USERNAME_CHARS: usize = 256;
 pub const MAX_PASSWORD_BYTES: usize = 1024;
-/// Framing headers the HTTP client owns; letting users set them would
-/// enable request smuggling or break the request.
-pub const RESERVED_HEADERS: [&str; 4] =
-    ["host", "content-length", "transfer-encoding", "connection"];
+/// Framing and hop-by-hop headers the HTTP client owns; letting users set
+/// them would enable request smuggling or break the request (hyper and h2
+/// mishandle `TE`, `Upgrade` and the like: an HTTP/2 target fails with an
+/// opaque error).
+pub const RESERVED_HEADERS: [&str; 10] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "te",
+    "upgrade",
+    "keep-alive",
+    "proxy-connection",
+    "trailer",
+    "expect",
+];
 
 /// The column part of the AES-GCM associated data (see `crypto`) of
 /// `monitors.request_headers_enc` and `monitors.auth_password_enc`. What is
@@ -140,10 +152,15 @@ pub fn validate_header(header: RequestHeader) -> Result<RequestHeader, String> {
     }
     if RESERVED_HEADERS.contains(&name.to_ascii_lowercase().as_str()) {
         return Err(format!(
-            "header {name} cannot be set: Host, Content-Length, Transfer-Encoding and Connection are managed by the checker"
+            "header {name} cannot be set: the checker manages Host, Content-Length, Transfer-Encoding, Connection and the other hop-by-hop headers"
         ));
     }
     let value = header.value.expose();
+    // An empty value would replace a stored secret with nothing ("Replace
+    // all" with a line left unfilled); HTTP trims the blanks around a value.
+    if value.trim_matches([' ', '\t']).is_empty() {
+        return Err(format!("header {name}: enter a value"));
+    }
     if value.contains(['\r', '\n']) {
         return Err(format!("header {name}: values must not contain CR or LF"));
     }
@@ -167,7 +184,20 @@ pub fn validate_headers(headers: Vec<RequestHeader>) -> Result<Vec<RequestHeader
     if headers.len() > MAX_HEADERS {
         return Err(format!("at most {MAX_HEADERS} request headers are allowed"));
     }
-    headers.into_iter().map(validate_header).collect()
+    let headers: Vec<RequestHeader> = headers
+        .into_iter()
+        .map(validate_header)
+        .collect::<Result<_, _>>()?;
+    // Header names are case-insensitive: `X-A` and `x-a` would both be sent.
+    for (i, header) in headers.iter().enumerate() {
+        if headers[..i]
+            .iter()
+            .any(|earlier| earlier.name.eq_ignore_ascii_case(&header.name))
+        {
+            return Err(format!("header {} is listed twice", header.name));
+        }
+    }
+    Ok(headers)
 }
 
 /// Basic-auth user id (RFC 7617): no `:` and no control characters. It is
@@ -307,6 +337,16 @@ mod tests {
             "Connection",
             "CONNECTION",
             " Host ",
+            // Hop-by-hop headers that hyper or h2 mishandle (an `Upgrade` or
+            // `TE` breaks an HTTP/2 target with an opaque error).
+            "TE",
+            "te",
+            "Upgrade",
+            "Keep-Alive",
+            "keep-alive",
+            "Proxy-Connection",
+            "Trailer",
+            "Expect",
         ] {
             let error = validate_header(header(name, "v")).unwrap_err();
             assert!(error.contains("cannot be set"), "{name:?}: {error}");
@@ -317,7 +357,10 @@ mod tests {
             "Content-Type",
             "Content-Lengths",
             "Connection-Id",
-            "Keep-Alive",
+            "Keep-Alive-Timeout",
+            "X-Upgrade",
+            "Tes",
+            "Expects",
         ] {
             assert!(validate_header(header(name, "v")).is_ok(), "{name}");
         }
@@ -326,7 +369,6 @@ mod tests {
     #[test]
     fn values_hold_text_and_tabs_but_no_line_breaks_or_control_characters() {
         for value in [
-            "",
             "Bearer abc.def",
             "a\tb",
             "caf\u{e9} \u{2615}",
@@ -356,6 +398,35 @@ mod tests {
                 "header X-A: values must be at most 1024 bytes"
             );
         }
+    }
+
+    /// "Replace all" with a value line left empty would store an empty
+    /// secret in place of the one the monitor had.
+    #[test]
+    fn a_header_needs_a_value() {
+        for value in ["", " ", "\t", "  \t "] {
+            assert_eq!(
+                validate_header(header("X-Api-Key", value)).unwrap_err(),
+                "header X-Api-Key: enter a value",
+                "{value:?}"
+            );
+        }
+        assert!(validate_header(header("X-A", " v ")).is_ok());
+    }
+
+    #[test]
+    fn a_name_may_appear_only_once_whatever_its_case() {
+        for names in [["X-A", "x-a"], ["Accept", "ACCEPT"], ["X-A", " X-A "]] {
+            let list = names.iter().map(|name| header(name, "v")).collect();
+            let error = validate_headers(list).unwrap_err();
+            assert_eq!(
+                error,
+                format!("header {} is listed twice", names[1].trim()),
+                "{names:?}"
+            );
+        }
+        let distinct = vec![header("X-A", "v"), header("X-B", "v"), header("X-AA", "v")];
+        assert_eq!(validate_headers(distinct).unwrap().len(), 3);
     }
 
     #[test]

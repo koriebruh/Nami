@@ -48,15 +48,8 @@ async fn create_group(
     require_project_role(&state.db, &user, project_id, "member").await?;
     let (name, position) =
         monitor_group::validate(&payload.name, payload.position).map_err(AppError::Validation)?;
-    let created = monitor_group::insert_group(&state.db, project_id, &name, position)
-        .await
-        .map_err(|e| match &e {
-            // Global admins skip membership: the project may not exist.
-            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
-                AppError::NotFound
-            }
-            _ => AppError::Database(e),
-        })?;
+    // Global admins skip membership: a project that does not exist is a 404.
+    let created = monitor_group::insert_group(&state.db, project_id, &name, position).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 

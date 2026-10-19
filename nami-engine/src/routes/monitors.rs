@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    middleware::rbac::{CurrentUser, require_project_reader, require_project_role},
+    middleware::rbac::{CurrentUser, ProjectReader, require_project_reader, require_project_role},
     models::{
         maintenance,
         monitor::{self, CreateMonitorRequest, Monitor, MonitorView, PatchMonitorRequest},
@@ -36,7 +36,8 @@ const MAX_CHECKS_LIMIT: u32 = 500;
 
 // RBAC mirrors routes/projects.rs: viewer reads, member creates/edits,
 // admin deletes. Viewers read monitors with the secrets of their URL masked
-// and their request body and username hidden (`Monitor::for_reader`); nobody
+// and their request body, username and udp payload hidden
+// (`Monitor::for_reader`, flagged `redacted`); nobody
 // ever reads a header value or the password: every monitor leaves here as a
 // `MonitorView`. `require_project_role` runs before any database or
 // ClickHouse lookup, so a caller without access gets 403 whether or not the
@@ -60,13 +61,18 @@ pub fn router() -> Router<AppState> {
         .route("/projects/{id}/monitors/{monitor_id}/stats", get(get_stats))
 }
 
-/// `monitor` as a [`MonitorView`], with `in_maintenance` looked up now (one
-/// query; a list looks the windows up once instead, see `list_monitors`).
-async fn view_one(state: &AppState, monitor: Monitor) -> Result<MonitorView, AppError> {
+/// `monitor` as a [`MonitorView`] for `reader`, with `in_maintenance` looked
+/// up now (one query; a list looks the windows up once instead, see
+/// `list_monitors`).
+async fn view_one(
+    state: &AppState,
+    monitor: Monitor,
+    reader: ProjectReader,
+) -> Result<MonitorView, AppError> {
     let in_maintenance =
         maintenance::monitor_in_maintenance(&state.db, monitor.project_id, monitor.id, Utc::now())
             .await?;
-    Ok(MonitorView::new(monitor, in_maintenance))
+    Ok(MonitorView::for_reader(monitor, reader, in_maintenance))
 }
 
 /// A monitor plus its 24-hour uptime (`null` when it has no checks in the
@@ -108,7 +114,7 @@ async fn list_monitors(
                 let uptime_24h = uptime.get(&monitor.id).copied();
                 let in_maintenance = windows.covers_monitor(monitor.id);
                 MonitorSummary {
-                    monitor: MonitorView::new(monitor.for_reader(reader), in_maintenance),
+                    monitor: MonitorView::for_reader(monitor, reader, in_maintenance),
                     uptime_24h,
                 }
             })
@@ -148,7 +154,10 @@ async fn create_monitor(
             }
             _ => AppError::Database(e),
         })?;
-    Ok((StatusCode::CREATED, Json(view_one(&state, created).await?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(view_one(&state, created, ProjectReader::Member).await?),
+    ))
 }
 
 async fn get_monitor(
@@ -160,7 +169,7 @@ async fn get_monitor(
     let found = monitor::find_in_project(&state.db, project_id, monitor_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(view_one(&state, found.for_reader(reader)).await?))
+    Ok(Json(view_one(&state, found, reader).await?))
 }
 
 async fn patch_monitor(
@@ -174,7 +183,9 @@ async fn patch_monitor(
         monitor::update_in_project(&state.db, &state.cipher, project_id, monitor_id, payload)
             .await?
             .ok_or(AppError::NotFound)?;
-    Ok(Json(view_one(&state, updated).await?))
+    Ok(Json(
+        view_one(&state, updated, ProjectReader::Member).await?,
+    ))
 }
 
 async fn delete_monitor(

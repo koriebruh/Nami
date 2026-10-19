@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
-use super::{nullable, validate_label};
+use super::{ProjectQuota, nullable, validate_label};
 use crate::error::AppError;
 
 /// The longest a one-off window may last.
@@ -396,15 +396,20 @@ fn not_found_on_foreign_key(e: sqlx::Error) -> AppError {
     }
 }
 
-/// Stores a validated window. A `monitor_id` outside the project (or a
-/// project that does not exist) is a 404: the composite foreign key refuses
+/// Stores a validated window, unless the project already holds
+/// [`ProjectQuota::MAX_ROWS`] (a 400). A `monitor_id` outside the project (or
+/// a project that does not exist) is a 404: the composite foreign key refuses
 /// it, so there is no check-then-write race.
 pub async fn insert_window(
     pool: &PgPool,
     project_id: Uuid,
     w: &ValidWindow,
 ) -> Result<MaintenanceWindow, AppError> {
-    sqlx::query_as(
+    let mut tx = pool.begin().await?;
+    ProjectQuota::MaintenanceWindows
+        .check(&mut tx, project_id)
+        .await?;
+    let window = sqlx::query_as(
         "insert into maintenance_windows
              (project_id, monitor_id, title, kind, starts_at, ends_at, days_of_week, start_time, end_time, timezone)
          values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -420,9 +425,11 @@ pub async fn insert_window(
     .bind(w.start_time)
     .bind(w.end_time)
     .bind(&w.timezone)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
-    .map_err(not_found_on_foreign_key)
+    .map_err(not_found_on_foreign_key)?;
+    tx.commit().await?;
+    Ok(window)
 }
 
 /// Every window of the project (both kinds, in effect or not), newest first.

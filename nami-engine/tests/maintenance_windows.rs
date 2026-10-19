@@ -6,8 +6,8 @@ mod common;
 use axum::http::StatusCode;
 use chrono::{DateTime, Duration, Utc};
 use common::{
-    add_member, call, public_app, seed_http_monitor, seed_project, seed_user, settled_mail,
-    test_app, unique_email, user_with_role,
+    add_member, call, outcome, public_app, seed_http_monitor, seed_project, seed_user,
+    settled_mail, test_app, unique_email, user_with_role,
 };
 use nami_engine::{
     models::monitor::Monitor,
@@ -57,16 +57,6 @@ async fn end_window(pool: &sqlx::PgPool, window: Uuid) {
     .execute(pool)
     .await
     .unwrap();
-}
-
-fn outcome(status: CheckStatus) -> CheckOutcome {
-    CheckOutcome {
-        status,
-        status_code: (status == CheckStatus::Up).then_some(200),
-        response_time_ms: Some(10),
-        error: (status == CheckStatus::Down).then(|| "connection refused".to_string()),
-        checked_at: Utc::now(),
-    }
 }
 
 fn outcome_at(status: CheckStatus, checked_at: DateTime<Utc>) -> CheckOutcome {
@@ -1141,4 +1131,53 @@ async fn reads_say_whether_a_monitor_or_heartbeat_is_in_maintenance(pool: sqlx::
     .await;
     assert_eq!(status, StatusCode::OK, "{rotated}");
     assert_eq!(rotated["in_maintenance"], true);
+}
+
+/// A member could otherwise create windows without end, and every monitor
+/// list, `apply_outcome` and heartbeat sweep reads them (Phase 2 final review).
+#[sqlx::test]
+async fn a_project_holds_at_most_200_windows(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let other = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    for _ in 0..199 {
+        seed_window_now(&pool, project, None).await;
+    }
+    let collection = format!("/projects/{project}/maintenance-windows");
+    let (status, body) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(window_now("200th", None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(window_now("201st", None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        "a project can have at most 200 maintenance windows: delete one first"
+    );
+    assert_eq!(window_count(&pool).await, 200);
+
+    // Another project has its own allowance.
+    let (_, _, elsewhere) = user_with_role(&app, &pool, other, Some("member")).await;
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/projects/{other}/maintenance-windows"),
+        Some(&elsewhere),
+        Some(window_now("first", None)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
 }

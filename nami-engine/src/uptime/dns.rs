@@ -9,7 +9,7 @@ use std::{
 
 use hickory_resolver::{
     TokioResolver,
-    config::{NameServerConfig, ResolveHosts, ResolverConfig},
+    config::{NameServerConfig, ResolveHosts, ResolverConfig, ResolverOpts},
     net::{DnsError, NetError, runtime::TokioRuntimeProvider},
     proto::{
         op::ResponseCode,
@@ -39,7 +39,7 @@ pub(crate) async fn probe(monitor: &Monitor, timeout: Duration, started: Instant
             format!("unsupported record type {record_type:?}"),
         );
     };
-    let resolver = match build_resolver(monitor.dns_nameserver.as_deref(), timeout) {
+    let resolver = match build_resolver(monitor.dns_nameserver.as_deref(), timeout).await {
         Ok(resolver) => resolver,
         Err(message) => return Observation::down(None, None, message),
     };
@@ -97,7 +97,10 @@ pub(crate) async fn probe(monitor: &Monitor, timeout: Duration, started: Instant
 /// (see `checker::is_forbidden_destination`). The system resolver's own
 /// servers are not judged: the host's configuration picks them, and the
 /// monitor only chooses the name to look up.
-fn build_resolver(nameserver: Option<&str>, timeout: Duration) -> Result<TokioResolver, String> {
+async fn build_resolver(
+    nameserver: Option<&str>,
+    timeout: Duration,
+) -> Result<TokioResolver, String> {
     let mut builder = match nameserver {
         Some(raw) => {
             let addr: SocketAddr = raw
@@ -115,8 +118,13 @@ fn build_resolver(nameserver: Option<&str>, timeout: Duration) -> Result<TokioRe
                 TokioRuntimeProvider::default(),
             )
         }
-        None => TokioResolver::builder_tokio()
-            .map_err(|e| format!("cannot read the system DNS configuration: {e}"))?,
+        None => {
+            let (config, options) = system_config().await?;
+            let mut builder =
+                TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
+            *builder.options_mut() = options;
+            builder
+        }
     };
     let options = builder.options_mut();
     options.timeout = timeout + Duration::from_secs(1);
@@ -126,6 +134,25 @@ fn build_resolver(nameserver: Option<&str>, timeout: Duration) -> Result<TokioRe
     builder
         .build()
         .map_err(|e| format!("cannot build a DNS resolver: {e}"))
+}
+
+/// The system resolver's configuration (`/etc/resolv.conf` on Unix), read
+/// once, off the async threads, and cloned for every check that uses it,
+/// instead of parsed synchronously on an async thread per check. A change to
+/// it takes effect when the engine restarts. A failed read is not kept, so the
+/// next check tries again.
+async fn system_config() -> Result<(ResolverConfig, ResolverOpts), String> {
+    static SYSTEM: tokio::sync::OnceCell<(ResolverConfig, ResolverOpts)> =
+        tokio::sync::OnceCell::const_new();
+    SYSTEM
+        .get_or_try_init(|| async {
+            tokio::task::spawn_blocking(hickory_resolver::system_conf::read_system_conf)
+                .await
+                .map_err(|e| format!("cannot read the system DNS configuration: {e}"))?
+                .map_err(|e| format!("cannot read the system DNS configuration: {e}"))
+        })
+        .await
+        .cloned()
 }
 
 /// One answer as the text `expected_value` is matched against: addresses as
