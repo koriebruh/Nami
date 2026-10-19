@@ -12,7 +12,22 @@
 
 **When to start:** after NAMI-UP-19 (merged as `6e78618`). The Phase 2 final security review + fix wave runs before or alongside this plan. It may touch the same files; every task below lists its touch points under **Files** and the exact functions it changes under **Interfaces**, so a rebase onto the fix wave is a matter of re-applying small, named hunks. Implementers adapt such drift minimally (same behaviour, same tests) and say so in the PR; they never redesign around it.
 
-**Verification status (2026-10-19):** written against `main` at `6e78618` by reading the merged modules named in each task. Unlike the Phase 2 plan, the code below has **not** been applied to a scratch copy and run. Treat signatures and test assertions as binding, bodies as guidance; run every step.
+**Verification status (2026-10-19):** written against `main` at `6e78618` by reading the merged modules named in each task. Unlike the Phase 2 plan, the code below has **not** been applied to a scratch copy and run. Treat signatures and test assertions as binding, bodies as guidance; run every step. A plan review (same day) re-read every touched module at `6e78618` (`routes/heartbeats.rs`, `router.rs`, `uptime/{heartbeat,alerts,worker,checker,tls,ping,expiry,mail,store}.rs`, `models/{monitor,monitor_request,heartbeat,incident,maintenance,monitor_group}.rs`, `clickhouse.rs`, `logs/rate_limit.rs`, `crypto.rs`, `tests/common/mod.rs`, `tests/heartbeats.rs`, reqwest 0.13.5 / hyper-util 0.1.21 sources, nami-ui `engine.ts`, `uptime.ts`, `MonitorForm.svelte`, the loads named in T29-T32) and fixed the drift and security gaps it found in place; those fixes are binding like the rest.
+
+## Interplay with the Phase 2 final fix wave (`.superpowers/sdd/2026-10-13-uptime-phase2/phase2-final-fixwave.md`)
+
+Whichever lands first, the other adapts; none of these may be regressed:
+
+| Fix-wave item | What this plan must do |
+|---|---|
+| 1 — secrets must be re-entered or cleared when the URL's origin changes (`update_in_project`) | NAMI-UP-23 extends the same check to the proxy (ruling "Proxy secrets follow the proxy origin"); NAMI-UP-30 extends the UI's forced keep/replace/clear to the proxy password. |
+| 2 — a request body makes a request "carry secrets" (same-origin redirects only) | NAMI-UP-24's per-check clients take their redirect mode from the **same** `carries_secrets` computation as the shared cache (one helper, body rule included); never recompute it. |
+| 3 — counters reset on reschedule/resume | Nothing extra: the new fields join `changes_check_of`, so editing them reschedules and resets. |
+| 7 — `MonitorView.redacted` flag replaces `***` sniffing in `hasMaskedValues` | NAMI-UP-23 masks `proxy_username` in `for_reader` (the flag already covers viewers); NAMI-UP-30 does **not** extend `hasMaskedValues` if the flag exists (only if the fix wave has not landed yet, and then the fix wave removes it again). |
+| 9 — at most 200 windows / 200 groups per project | NAMI-UP-27's span computation relies on that bound for its cost (≤ 200 windows × ~157 weeks × 7 days). |
+| 10 — `write_config` binds `project_id` (`and project_id = $34`); `Debug` prints `<set>` for `request_body` / `auth_username` | NAMI-UP-23 numbers its new placeholders **after the current last one** (`$34..$39` at `6e78618`, `$35..$40` once item 10 has landed) and prints `proxy_username` as `<set>` / `None`, `proxy_password_enc` as `<sealed>`. |
+| 11 — Alibaba `100.100.100.200` refused | Covered automatically for proxy hosts (they resolve through `allowed_addresses`); add it to NAMI-UP-24's link-local proxy list if it has landed. |
+| 4, 5 — empty / duplicate header values refused | Covered automatically for imports (every entry goes through `validate`). |
 
 **Execution:** per CLAUDE.md — one worktree per task under `.worktrees/NAMI-UP-<n>/`, branch from the latest `origin/main` (name under each task heading), Conventional Commits ending with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`, task review, PR (stating "No CI is configured on this repo yet" and the local test commands run), auto-merge on a clean review (pre-authorized), delete branch + worktree. Tasks are sequential unless a task says otherwise: each consumes the interfaces of the ones before it. NAMI-UP-25 (pure parsers) and NAMI-UP-27 (availability) have no dependency on NAMI-UP-23/24 and may run in parallel with them if the controller wants.
 
@@ -25,7 +40,7 @@
 - axum 0.8 `{param}` paths. Authorization failure 403, never 404; an id from another project inside an accessible project path is 404 (spec: "a `group_id` from another project → 404", "cross-project ids → 404").
 - RBAC: viewer reads (pings list, availability, CSV export), member creates/edits (import, heartbeat group, proxy settings), admin deletes.
 - Every API write stays JSON-only (`router::require_json_body`, 415 otherwise). The public listener keeps no JSON guard: ping bodies are raw bytes (`curl --data-binary`).
-- Pings (spec §1-§2): `GET|POST /api/v1/heartbeat/{token}`, `/{token}/fail`, `/{token}/{exit_code}` (`i32`; `0` = success; non-integer → 400); unknown token → 404; token must stay the strict 64-lowercase-hex shape (`is_well_formed_token`) checked before any database work; per-heartbeat rate limit 1 ping/s, burst 10 → 429 with `Retry-After: 1`; body > 1 MiB → 413; `Cache-Control: no-store` on every reply; the `MAX_PINGS_IN_FLIGHT` load shedding (503) stays. Tokens never appear in any log line.
+- Pings (spec §1-§2): `GET|POST /api/v1/heartbeat/{token}`, `/{token}/fail`, `/{token}/{exit_code}` (`i32`; `0` = success; non-integer → 400); unknown token → 404; token must stay the strict 64-lowercase-hex shape (`is_well_formed_token`) checked before any database work; per-heartbeat rate limit 1 ping/s, burst 10 → 429 with `Retry-After: 1`; body > 1 MiB → 413; `Cache-Control: no-store` on every reply; the `MAX_PINGS_IN_FLIGHT` load shedding (503) stays and still guards **every** database query of a ping, the token lookup included. No ping body is read before its token is known and its rate limit passed, and at most `MAX_PING_BODIES_IN_FLIGHT` (16) bodies are read at once, one per heartbeat, each within 10 s. Tokens never appear in any log line.
 - Output (spec §2): first **10 KiB** (10240 bytes) kept, `…[truncated]` marker beyond; invalid UTF-8 → U+FFFD; C0/C1 controls except `\n` and `\t`, DEL, and bidi controls (U+202A-U+202E, U+2066-U+2069; this plan also strips U+061C, U+200E, U+200F) removed. `heartbeat_pings` TTL 180 days. Pings list `?limit=` default 50, clamped to 1..=100.
 - Import (spec §4): body ≤ **2 MiB** → else 413; ≤ **500** entries → else 400 before anything is created; each entry validated exactly like `POST /projects/{id}/monitors` and created in its own transaction; `skip_existing` default true; `dry_run` creates nothing; secrets sealed like any create and never echoed; Kuma `notificationList` (and every other section) never stored or echoed.
 - Advanced options (spec §5): `ip_version` `any` (default) | `ipv4` | `ipv6` for http, keyword, tcp, ping, ssl_expiry, no fallback; `remember_cookies` (http/keyword, default false), jar per check execution; proxy (http/keyword) `proxy_url` `http://` or `https://` host:port, userinfo → 400, `proxy_password` AES-GCM sealed with AAD `monitors.proxy_password:{id}`, write-only (`has_proxy_password`), PATCH: omitted keeps, value replaces, `null` clears.
@@ -39,38 +54,45 @@
 
 - A cron job that keeps failing during a maintenance window, or while its heartbeat is paused, must not open an incident or send an alert — and must not leave a stale "down" when the window ends → NAMI-UP-20 (`fail_pings_during_maintenance_or_pause_change_nothing_but_last_ping_at`).
 - Job output that uses a carriage return or ANSI codes to overwrite or hide text (`"rm -rf done\rall good"`, `"\x1b[8mhidden"`) must show every byte that was sent, as plain text, in the UI and in the alert email → NAMI-UP-21 (`carriage_returns_and_escape_sequences_cannot_hide_text`).
-- Importing the same file twice (a retry after a timeout, a double click) must not create every monitor twice → NAMI-UP-26 (`importing_the_same_list_twice_creates_nothing_the_second_time`).
+- Importing the same file twice (a retry after a timeout, a double click) must not create every monitor twice → NAMI-UP-26 (`importing_the_same_list_twice_creates_nothing_the_second_time`, and for two requests at once `a_second_import_while_one_runs_is_409`).
+- A member who never saw the secrets must not get them by pointing the proxy at their own host (header values and basic auth of an `http://` target pass through the proxy readable) → NAMI-UP-23 (`changing_the_proxy_requires_every_secret_again`).
+- Nobody without a valid token can make the public listener buffer ping bodies, and one token holder cannot block other pings with slow bodies → NAMI-UP-20 (`no_body_is_read_for_an_unknown_token`, `one_body_per_heartbeat_is_read_at_a_time`).
 - Renaming or regrouping a monitor that has a proxy must keep the stored proxy password byte for byte, exactly like the basic-auth password → NAMI-UP-23 (`patch_keeps_omitted_proxy_password_replaces_given_and_null_clears`).
 - An availability range in which an incident started before `from`, is still open, and overlaps a maintenance window must count each second at most once and never report more than 100 % or less than 0 % → NAMI-UP-27 (`overlapping_incidents_and_maintenance_count_each_second_once`).
 
 ## Decisions the spec leaves open (rulings made by this plan)
 
-- **Path order on pings:** token shape (404) → suffix parse (400) → body size (413) → token lookup (404) → rate limit (429) → load-shedding slot (503) → record. A malformed suffix with a bogus token is a 400; that reveals nothing.
-- **Rate-limit key is the heartbeat id**, taken from the one indexed lookup the endpoint already did for unknown tokens: random tokens cost no bucket, so the map is bounded by the number of heartbeats. Buckets live in the public router (`PingLimits`), not in `AppState`.
+- **Path order on pings:** token shape (404) → suffix parse (400) → declared `Content-Length` > 1 MiB (413, nothing read) → load-shedding slot (503) held **only** around the token lookup (404) → rate limit (429) → body read: one body per heartbeat at a time (a second concurrent one → 429), at most `MAX_PING_BODIES_IN_FLIGHT = 16` at once (→ 503 `busy`), capped at 1 MiB while streaming (413, chunked bodies included), 10 s to arrive (→ 408 `{"error":"ping body not received in time"}`); an empty body (exact size hint 0) skips this step → slot again (503) held around `record_signal` → ClickHouse row (no slot held) → reply. A malformed suffix with a bogus token is a 400; that reveals nothing. Why: reading a 1 MiB body before the token is known would let anyone hold unbounded memory without a token, and holding a database slot while a slow body trickles in would let one token holder (a leaked cron token) block every other ping. The lookup stays under the slot exactly as today (`record_ping` took the slot before its lookup), so a flood of random well-formed tokens is still shed with 503 instead of queuing on the pool.
+- **Rate-limit key is the heartbeat id**, taken from the one indexed lookup the endpoint already did for unknown tokens: random tokens cost no bucket, so the map is bounded by the number of heartbeats pinged since start. Buckets live in the public router (`PingGuards`), not in `AppState`. `logs::rate_limit::TokenBuckets` never evicts, so NAMI-UP-20 adds `TokenBuckets::prune_full(now)` (drops every bucket that has refilled to `burst`, which behaves exactly like a missing bucket) and calls it when the map holds more than 10 000 entries; unit test in `rate_limit.rs`. The per-heartbeat body guard reuses `logs::rate_limit::InFlight::new(1)` (entries vanish when their guard drops).
 - **A failure ping on a heartbeat that is already down** only moves `last_ping_at`; the open incident keeps the output of the ping that opened it. A failure ping on `pending` or `up` opens the incident at once (title `{name} reported a failure`). Exit code `0` is a success ping and is stored with `exit_code = 0`.
 - **Paused / in-maintenance heartbeats** record every ping (Postgres `last_ping_at`, ClickHouse row) and change nothing else, failure pings included.
 - **`heartbeat_pings` writes are best effort:** inserted inline after the Postgres transaction commits, bounded by a 2 s timeout, failure logged without the token; the ping reply never depends on ClickHouse.
 - **`incidents.details`** is set only for heartbeat failure incidents with non-empty output; the incident list returns it (viewers included, like the pings list the spec gives viewers). Alert emails for a Down transition with details carry an `Output:` block, every line prefixed `> `, between `Since:` and `Details:`.
 - **Heartbeat groups use the composite FK** `(group_id, project_id) → monitor_groups (id, project_id) on delete set null (group_id)`, like monitors (stronger than the spec's single-column FK: another project's group cannot be referenced even by a bug).
 - **`ip_version` with a proxy is a 400** (`ip_version cannot be combined with a proxy: the proxy resolves the target`). For types outside http/keyword/tcp/ping/ssl_expiry the field is reset to `any` (not an error), like other unused fields.
-- **Proxy URL** must be `http://host:port` or `https://host:port` with an explicit port, no userinfo, no path other than `/`, no query or fragment. Removing `proxy_url` clears the username and password; a username without a URL, or a password without a username, is a 400. Viewers read `proxy_username` as `***`; `proxy_url` is shown (it cannot hold credentials).
-- **Proxied target names are resolved by the proxy.** The engine guards what it connects to — the proxy host (through `GuardedResolver`, pinned by a test that proves reqwest resolves the proxy through the custom resolver) and target IP literals (`names_forbidden_address`). Errors name the side that failed: `proxy connection failed: …`, `proxy authentication failed (HTTP 407)`, `proxy tunnel failed: …`; everything else is the target's.
+- **Proxy URL** must be `http://host:port` or `https://host:port` with an explicit port, no userinfo, no path other than `/`, no query or fragment. Removing `proxy_url` clears the username and password; a username without a URL, or a password without a username, is a 400. Viewers read `proxy_username` as `***`; `proxy_url` is shown to them through `redact_url` (a no-op for every URL validation accepts; it only matters for a row written around the API).
+- **Proxy secrets follow the proxy origin** (same rule as fix-wave item 1, applied in `monitor::update_in_project` after merge + validate): when a PATCH changes the proxy's origin (scheme, host, port; adding a proxy where there was none counts, removing one does not), every stored secret — request header values, the basic-auth password and the proxy password — must be replaced or cleared in the same request, else 400 `changing the proxy requires entering the header values and passwords again, or clearing them` (no name or value echoed). Why the target's secrets too: an `http://` target (or one with `verify_ssl = false`) sends its headers and basic auth through the proxy in a form the proxy can read, so retargeting the proxy to a member's own host would hand them over exactly like retargeting the URL. A change of the target URL's origin (fix-wave item 1) does **not** require the proxy password again: it only ever goes to the proxy, which did not change.
+- **Proxied target names are resolved by the proxy**, but never blindly: before a proxied request is sent, the target host is resolved locally (`resolve_target(host, port, IpVersion::Any)`); when it resolves and every address is forbidden the check is down with `destination not allowed` and nothing is sent, when it does not resolve locally (a name only the proxy knows) the request goes ahead. This keeps a proxy that runs next to the engine (`127.0.0.1:3128`) from being used to reach the engine host's metadata service by name. The proxy may still resolve differently (accepted residual risk, documented in the code). The engine also guards what it connects to itself — the proxy host (through `GuardedResolver`, pinned by a test that proves reqwest resolves the proxy through the custom resolver) and target IP literals (`names_forbidden_address`, on the monitor URL and on every redirect hop, through the same `follow_policy`). Errors name the side that failed: `proxy connection failed: …`, `proxy authentication failed (HTTP 407)`, `proxy tunnel failed: …`; everything else is the target's.
 - **Per-check clients:** a monitor with a proxy or `remember_cookies` gets a fresh client for each check (proxy and jar never shared); all others keep the per-pass shared cache, now 18 slots (3 redirect modes × verify × 3 IP versions).
 - **Import result rows** are `{line, status, name?, target?, monitor_id?, error?}`. `target` is the URL through `redact_url` or `host[:port]`; no header, password or body ever appears. In a dry run, valid entries say `created` with no `monitor_id` and the response has `"dry_run": true` (the UI says "will be created"). `line` is the 1-based input line for `urls` and CSV records, the 1-based position in `monitorList` for Kuma.
 - **Import defaults** (`interval_seconds`, `timeout_seconds`, `confirmation_threshold`, `recovery_threshold`, `group_id`) apply to every format: they fill what the source does not set; `group_id` applies to every entry. A foreign `group_id` makes the whole request 404 before parsing.
-- **`skip_existing` key:** the validated URL string for http/keyword; `lowercase(host)` plus `:port` when the type has a port, for the others. Compared against the project's monitors and against earlier entries of the same request.
-- **Kuma specifics:** `upsideDown: true` → per-entry error (inverted semantics are not supported); `authMethod` other than empty/`basic` → per-entry error; `headers` must be a JSON object string; `timeout` (if present) clamped to 1..=min(60, interval−1); `proxyId` ignored (Kuma proxies live in `proxyList`, which is never read). `active` accepts `true`/`false`/`1`/`0`.
+- **`skip_existing` key:** the validated URL string for http/keyword; `lowercase(host)` plus `:port` when the type has a port, for the others. Compared against the project's monitors and against earlier entries of the same request (dry runs included: a repeat inside the input is `skipped` in the preview too).
+- **One import at a time per project:** a non-dry-run import holds a transaction-scoped advisory lock (`select pg_try_advisory_xact_lock($1, hashtext($2::text))` with a fixed class id for imports and the project id, on a transaction opened for that purpose and rolled back at the end — dropping it on any error path releases the lock); a second import of the same project while one runs is 409 `another import is running in this project; try again when it finishes`. Without it, a double click (two concurrent requests) would build two `seen` sets before either inserted and create every monitor twice. The `seen` set is loaded after the lock is taken.
+- **Kuma specifics:** `upsideDown: true` → per-entry error (inverted semantics are not supported); `authMethod` other than null/empty/`basic` → per-entry error whether or not credentials are set (fixture entry 8 has none); `headers` must be a JSON object string; `timeout` (if present) clamped to 1..=min(60, interval−1); `proxyId` ignored (Kuma proxies live in `proxyList`, which is never read). `active` accepts `true`/`false`/`1`/`0`.
 - **UptimeRobot interval** is read as seconds (the unit of UptimeRobot's API) and raised to ≥ 30; this needs confirmation against a real export (see Open questions).
 - **Availability JSON:** `{from, to, total_seconds, maintenance_seconds, downtime_seconds, uptime_pct, incidents, longest_incident_seconds}` where `from`/`to` are the effective (clipped) bounds, `uptime_pct` is 0-100 (not 0-1), `incidents` counts incidents overlapping the effective range, and `longest_incident_seconds` is the largest per-incident downtime after maintenance is removed. Only windows that exist now count (deleted windows are gone).
-- **Maintenance spans of weekly windows** follow `Schedule::covers` wall-clock semantics; a window lying wholly inside a repeated DST hour is counted as one span from its first start to its second end (over-counts maintenance by at most that window's gap, once a year). Pinned by a sampling test against `covers`.
-- **CSV export** filename `checks-{monitor_id}.csv` (ids only, so no header injection); `Cache-Control: no-store`; ClickHouse is queried one UTC day at a time (`LIMIT 20000` per day) so memory stays bounded; the first slice is fetched before the response starts, so a ClickHouse outage is a JSON 500, a failure later aborts the stream (logged).
+- **Maintenance spans of weekly windows** follow `Schedule::covers` wall-clock semantics; a window whose start or end falls inside a repeated DST hour is counted as one span from the earliest start to the latest end, while `covers` has a hole there (over-counts maintenance by at most one hour, once a year, for that window). Pinned by a sampling test against `covers` whose cases avoid that hour by construction.
+- **CSV export** filename `checks-{monitor_id}.csv` (ids only, so no header injection); `Cache-Control: no-store`; ClickHouse is queried one UTC day at a time (`LIMIT 20000` per day — at the 30 s minimum interval a day has 2880 checks) so memory stays bounded; lines are sent in chunks of about 64 KiB over a channel of capacity 2, so at most a few chunks plus one day slice are in memory per export; at most `MAX_EXPORTS_IN_FLIGHT = 4` exports run at once across the engine (a fifth → 503 `{"error":"busy, retry shortly"}` with `Retry-After: 5`), so viewers cannot queue unbounded ClickHouse work; the producer task stops at the first failed `send` (the client went away). The first slice is fetched before the response starts, so a ClickHouse outage is a JSON 500, a failure later aborts the stream (logged with the monitor id only).
+- **Exit-code command shown in the UI** pipes the output on stdin instead of the spec's `--data-binary "$out"`: `out=$(your-job 2>&1); code=$?; printf '%s' "$out" | curl -fsS -m 10 --data-binary @- '<url>'/$code`. With `--data-binary "$out"`, output that starts with `@` makes curl read and upload the file it names (e.g. `@/etc/shadow` printed by a failing job), which would then be stored and shown to viewers.
 - **Request logging:** the engine has no request-logging layer (no `TraceLayer` is installed); "tokens redacted from request logs" is therefore enforced by extending `no_token_ever_reaches_a_log_line` to the new routes at TRACE level. Any future request logger must redact `/api/v1/heartbeat/*` paths.
 
 ## Open questions (flagged for the controller; the plan proceeds with the ruling given)
 
 1. **UptimeRobot header names.** No real UptimeRobot export is in the repo. The fixture in NAMI-UP-25 is reconstructed from UptimeRobot's documented export columns (`Friendly Name`, `URL/IP`, `Type`, `Keyword Type`, `Keyword Value`, `Port`, `Interval`) and the parser matches case-insensitive aliases. If anyone can export a real CSV, replace `tests/fixtures/import/uptimerobot.csv` with it (credentials removed) and adjust the alias table; the tests are written against the alias table, so that is a one-file change.
 2. **UptimeRobot interval unit** (seconds vs minutes) — ruling: seconds. Same fix path as 1.
-3. **adapter body size in nami-ui:** a 2 MiB import file passes SvelteKit's dev server, but `adapter-node` defaults `BODY_SIZE_LIMIT` to 512 KiB. NAMI-UP-31 documents `BODY_SIZE_LIMIT=3M` in `nami-ui/.env.example`; the deployment adapter itself is a Platform (sub-project 11) decision.
+3. **adapter body size in nami-ui:** the repo uses `adapter-auto` today. A 2 MiB import file passes SvelteKit's dev server, but `adapter-node` (the likely production adapter) defaults `BODY_SIZE_LIMIT` to 512 KiB. NAMI-UP-31 documents `BODY_SIZE_LIMIT=3M` in `nami-ui/.env.example`; the deployment adapter itself is a Platform (sub-project 11) decision.
+4. **Ping output storage amplification.** A token holder may send 10 ping/s bursts and then 1 ping/s, each with 10 KiB of stored output: up to ~860 MB/day per heartbeat in `heartbeat_pings` before compression, kept 180 days. The spec's rate limit is the only bound. Ruling for this plan: accepted (same exposure class as log ingest before quotas); a per-project daily byte budget for ping output belongs with NAMI-PLT quotas. Controller may instead rule that success pings store at most 1 KiB of output.
+5. **Spec deviations to confirm:** the exit-code example (ruling above, `@-` on stdin instead of `"$out"`), and an unknown import `format` being axum's **422** (a JSON data error), not 400 — the spec does not pin that status.
 
 ## File Structure
 
@@ -93,7 +115,7 @@ nami-engine/
       heartbeats.rs                     T20 signal routes, body, rate limit; T21 pings route + CH insert; T22 group check; T27 availability route
       monitors.rs                       T23 group/proxy untouched beyond view; T26 import route; T27 availability; T28 export
       incidents.rs                      T21 (no code change: list item gains `details`)
-    router.rs                           T20 public router takes PingLimits
+    router.rs                           T20 public router takes the ping limits
     uptime/
       heartbeat.rs                      T20 Ping, PingKind, parse_signal, lookup_token, record_signal; T21 sanitize_output, details
       pings.rs                          T21 heartbeat_pings rows: insert + recent
@@ -144,13 +166,13 @@ nami-ui/src/
 Branch `feat/NAMI-UP-20-heartbeat-fail-pings`, worktree `.worktrees/NAMI-UP-20/`.
 
 **Files:**
-- Modify: `nami-engine/src/uptime/heartbeat.rs` (new types and `record_signal`; `record_ping` becomes a wrapper), `nami-engine/src/routes/heartbeats.rs` (`public_router`, `ping`, new `ping_signal`), `nami-engine/src/router.rs` (`build_public_router*`)
-- Test: `nami-engine/tests/heartbeats.rs` (extend), unit tests in `src/uptime/heartbeat.rs`
+- Modify: `nami-engine/src/uptime/heartbeat.rs` (new types and `record_signal`; `record_ping` becomes a wrapper), `nami-engine/src/routes/heartbeats.rs` (`public_router`, `ping`, new `ping_signal`), `nami-engine/src/router.rs` (`build_public_router*`), `nami-engine/src/logs/rate_limit.rs` (`TokenBuckets::prune_full`, additive)
+- Test: `nami-engine/tests/heartbeats.rs` (extend), unit tests in `src/uptime/heartbeat.rs` and `src/logs/rate_limit.rs`
 
 **Interfaces:**
-- Consumes: `is_well_formed_token`, `incident::open_for_heartbeat(conn, project_id, heartbeat_id, title, cause, started_at) -> Option<Uuid>`, `incident::resolve_for_heartbeat`, `maintenance::heartbeat_in_maintenance`, `logs::rate_limit::TokenBuckets::{new(rate, burst), try_acquire(Uuid) -> bool}`, `AppError::RateLimited`.
+- Consumes: `is_well_formed_token`, `incident::open_for_heartbeat(conn: &mut PgConnection, project_id, heartbeat_id, title, cause, started_at) -> Result<Option<Uuid>, sqlx::Error>`, `incident::resolve_for_heartbeat`, `maintenance::heartbeat_in_maintenance`, `logs::rate_limit::{TokenBuckets::{new(rate, burst), try_acquire(Uuid) -> bool}, InFlight::{new(max), try_enter(Uuid) -> Option<InFlightGuard>}}`.
 - Produces (in `uptime::heartbeat`):
-  - `pub enum PingKind { Success, Fail }` (`Debug, Clone, Copy, PartialEq, Eq, Serialize` lowercase).
+  - `pub enum PingKind { Success, Fail }` (`Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize`, `#[serde(rename_all = "lowercase")]`; NAMI-UP-21 reads it back from ClickHouse).
   - `pub struct Ping { pub kind: PingKind, pub exit_code: Option<i32>, pub output: String }` (`Debug, Clone, PartialEq`); `Ping::success() -> Ping` (no code, empty output).
   - `pub fn parse_signal(segment: &str) -> Option<(PingKind, Option<i32>)>`: `"fail"` → `(Fail, None)`; an `i32` (`str::parse`) → `(Success, Some(0))` for 0, else `(Fail, Some(n))`; anything else `None`.
   - `pub fn failure_cause(exit_code: Option<i32>) -> String`: `Heartbeat reported failure (exit code N)` / `Heartbeat reported failure`.
@@ -159,8 +181,9 @@ Branch `feat/NAMI-UP-20-heartbeat-fail-pings`, worktree `.worktrees/NAMI-UP-20/`
   - `pub async fn record_signal(pool: &PgPool, token: &str, ping: &Ping) -> Result<Option<Recorded>, sqlx::Error>` (`None` = unknown token under the lock).
   - `record_ping(pool, token) -> Result<PingOutcome, sqlx::Error>` keeps its signature and behaviour (lookup + `record_signal(.., &Ping::success())`), so existing tests stay untouched.
 - Produces (routes/router):
-  - `pub const MAX_PING_BODY_BYTES: usize = 1024 * 1024;` `pub const PINGS_PER_SECOND: f64 = 1.0;` `pub const PING_BURST: f64 = 10.0;` in `routes::heartbeats`.
-  - `pub fn public_router(ping_slots: Arc<Semaphore>, ping_limits: Arc<TokenBuckets>) -> Router<AppState>`; routes `/api/v1/heartbeat/{token}` and `/api/v1/heartbeat/{token}/{signal}` (GET and POST each), layer `DefaultBodyLimit::max(MAX_PING_BODY_BYTES)`.
+  - `pub const MAX_PING_BODY_BYTES: usize = 1024 * 1024;` `pub const PINGS_PER_SECOND: f64 = 1.0;` `pub const PING_BURST: f64 = 10.0;` `pub const MAX_PING_BODIES_IN_FLIGHT: usize = 16;` `pub const PING_BODY_TIMEOUT: Duration = Duration::from_secs(10);` in `routes::heartbeats`.
+  - `pub fn public_router(ping_slots: Arc<Semaphore>, ping_limits: Arc<TokenBuckets>) -> Router<AppState>`; routes `/api/v1/heartbeat/{token}` and `/api/v1/heartbeat/{token}/{signal}` (GET and POST each). The handlers take the raw `axum::extract::Request` as their last extractor and read the body themselves (see Step 5), so no `Bytes`/`DefaultBodyLimit` extractor ever buffers a body before the token is checked.
+  - `logs::rate_limit::TokenBuckets::{len(&self) -> usize, prune_full(&self, now: Instant)}` (drop buckets whose refilled tokens reach `burst`).
   - `router::build_public_router_with_ping_limits(state, ping_slots: Arc<Semaphore>, ping_limits: Arc<TokenBuckets>) -> Router` (tests); the existing builders pass `default_ping_limits()` = `TokenBuckets::new(PINGS_PER_SECOND, PING_BURST)`.
 
 - [ ] **Step 1: Write the failing unit tests** in `src/uptime/heartbeat.rs` `mod tests`:
@@ -215,15 +238,17 @@ async fn a_fail_ping_takes_the_heartbeat_down_at_once_and_a_success_ping_recover
     let (status, _, body) = ping_with(&public, &format!("/api/v1/heartbeat/{token}/fail"), vec![]).await;
     assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
     assert_eq!(heartbeat_state(&pool, id).await, ("down".to_string(), true));
+    // incidents_of: (status, title, cause), oldest first.
     let incidents = incidents_of(&pool, id).await;
     assert_eq!(incidents.len(), 1);
-    assert_eq!(incidents[0].1, "open");
+    assert_eq!(incidents[0].0, "open");
+    assert_eq!(incidents[0].1, "Nightly backup reported a failure");
     assert_eq!(incidents[0].2.as_deref(), Some("Heartbeat reported failure"));
 
     let (status, _, _) = ping_with(&public, &format!("/api/v1/heartbeat/{token}/0"), vec![]).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(heartbeat_state(&pool, id).await.0, "up");
-    assert_eq!(incidents_of(&pool, id).await[0].1, "resolved");
+    assert_eq!(incidents_of(&pool, id).await[0].0, "resolved");
     let mail = settled_mail(&recipient, 2).await;
     assert_eq!(mail[0].0, "[Nami] Nightly backup is DOWN");
     assert!(mail[0].1.contains("Cause: Heartbeat reported failure\n"), "{}", mail[0].1);
@@ -266,7 +291,25 @@ async fn fail_pings_during_maintenance_or_pause_change_nothing_but_last_ping_at(
 async fn ping_bodies_over_one_mebibyte_are_413_and_change_nothing(pool: sqlx::PgPool) {
     // POST /api/v1/heartbeat/{token}/fail with vec![b'x'; MAX_PING_BODY_BYTES + 1]
     //   -> 413, body == {"error":"ping body too large (max 1 MiB)"}, heartbeat still pending.
+    // The same oversized body sent chunked (Body::from_stream of two 600 KiB chunks, no
+    //   Content-Length) -> 413, heartbeat still pending.
     // exactly MAX_PING_BODY_BYTES -> 200.
+}
+
+#[sqlx::test]
+async fn no_body_is_read_for_an_unknown_token(pool: sqlx::PgPool) {
+    // POST /api/v1/heartbeat/{64 x 'e'}/fail with a body stream that panics if polled
+    //   (or a 2 MiB Content-Length) -> 404 {"error":"not found"}: the token is judged first.
+    // With every ping slot held (build_public_router_with_ping_slots + a held Semaphore),
+    //   an unknown well-formed token is 503, not 404: the lookup still needs a slot.
+}
+
+#[sqlx::test]
+async fn one_body_per_heartbeat_is_read_at_a_time(pool: sqlx::PgPool) {
+    // Start a POST whose body never finishes (a channel-backed Body kept open) on token A,
+    // then POST /fail on A again -> 429; a POST on token B -> 200 (other heartbeats unaffected).
+    // With tokio::time::pause(), advancing past PING_BODY_TIMEOUT makes the first request 408
+    //   {"error":"ping body not received in time"} and leaves the heartbeat unchanged.
 }
 
 #[sqlx::test]
@@ -293,6 +336,10 @@ async fn more_than_the_burst_of_pings_per_heartbeat_is_429(pool: sqlx::PgPool) {
     assert_eq!(ping_with(&public, &format!("/api/v1/heartbeat/{}", "e".repeat(64)), vec![]).await.0, StatusCode::NOT_FOUND);
 }
 ```
+
+Existing tests that ping one token more than 10 times within a second through `common::test_public_app` would now hit the rate limit: grep `tests/heartbeats.rs` for loops over `ping_raw`/`ping` and give any such test a router built with `build_public_router_with_ping_limits(.., Arc::new(TokenBuckets::new(1000.0, 1000.0)))` (behaviour under test unchanged).
+
+Unit test in `logs/rate_limit.rs`: `pruning_drops_only_full_buckets` (a drained bucket survives `prune_full`, a refilled one is removed, and `try_acquire` on a removed key behaves like a fresh full bucket).
 
 Extend `no_token_ever_reaches_a_log_line`: after the existing calls, also `POST {ping}/fail` with body `b"backup failed: disk full"`, `POST {ping}/3`, `POST {ping}/0`, `POST /api/v1/heartbeat/{unknown}/fail` — the same final assertion (no token in any line) must hold. Extend `ping_replies_are_never_cacheable` to the `/fail`, `/1`, 400 and 429 replies.
 
@@ -336,21 +383,22 @@ pub async fn record_signal(pool: &PgPool, token: &str, ping: &Ping) -> Result<Op
 
 - [ ] **Step 5: Implement the routes**
 
-In `routes::heartbeats`: `#[derive(Clone)] struct PingLimits(Arc<TokenBuckets>);` added as an `Extension` beside `PingSlots`. Both handlers delegate to one function:
+In `routes::heartbeats`: `#[derive(Clone)] struct PingGuards { .. }` (one `Extension` replacing `PingSlots`, built in `public_router`). Both handlers delegate to one function:
 
 ```rust
-async fn handle_ping(state: AppState, slots: Arc<Semaphore>, limits: Arc<TokenBuckets>,
-                     token: String, signal: Option<String>,
-                     body: Result<Bytes, BytesRejection>) -> Result<Response, AppError>
+async fn handle_ping(state: AppState, guards: PingGuards, token: String, signal: Option<String>,
+                     request: Request) -> Result<Response, AppError>
+// PingGuards { slots: Arc<Semaphore>, limits: Arc<TokenBuckets>,
+//              bodies_per_heartbeat: Arc<InFlight>, body_slots: Arc<Semaphore> }
 ```
 
-Order (each step returns before the next): `is_well_formed_token` else 404 → `signal.map(parse_signal)`: `Some(None)` → `AppError::Validation("the last path segment must be fail or an exit code")` → `body` rejection with status 413 → `(413, Json({"error":"ping body too large (max 1 MiB)"}))`, any other rejection → 400 → `lookup_token` (`None` → 404) → `limits.try_acquire(id)` else `(429, [(RETRY_AFTER, "1")], Json({"error":"too many requests"}))` → `slots.try_acquire()` else `busy()` → `record_signal(.., &Ping { kind, exit_code, output: String::new() })` (`None` → 404) → spawn `alerts::notify_transition` for a transition (as today) → `Json({"ok": true})`. The body is read but not stored yet (NAMI-UP-21 stores it). Path extraction keeps the `Result<Path<_>, PathRejection>` pattern (a rejection is a 404). The 429 and 413 replies go through the existing `no_store` layer.
+with `body: axum::body::Body` and the request headers taken from the `Request` extractor. Order (each step returns before the next; see the "Path order on pings" ruling): `is_well_formed_token` else 404 → `signal.map(parse_signal)`: `Some(None)` → `AppError::Validation("the last path segment must be fail or an exit code")` → a declared `Content-Length` above `MAX_PING_BODY_BYTES` → `(413, Json({"error":"ping body too large (max 1 MiB)"}))` → `slots.try_acquire()` else `busy()`, then `lookup_token` (`None` → 404), slot dropped → `limits.try_acquire(id)` else `too_many()` = `(429, [(RETRY_AFTER, "1")], Json({"error":"too many requests"}))`; when the map is over 10 000 entries call `limits.prune_full(Instant::now())` first → unless `body.size_hint().exact() == Some(0)`: `bodies_per_heartbeat.try_enter(id)` else `too_many()`, `body_slots.try_acquire()` else `busy()`, then `tokio::time::timeout(PING_BODY_TIMEOUT, axum::body::to_bytes(body, MAX_PING_BODY_BYTES))` — timeout → 408 `{"error":"ping body not received in time"}`, an error whose source chain holds `http_body_util::LengthLimitError` → the 413 above, any other error → 400 `{"error":"ping body could not be read"}`; guards dropped → `slots.try_acquire()` else `busy()` → `record_signal(.., &Ping { kind, exit_code, output: String::new() })` (`None` → 404), slot dropped → spawn `alerts::notify_transition` for a transition (as today) → `Json({"ok": true})`. `bodies_per_heartbeat: InFlight::new(1)` and `body_slots: Semaphore::new(MAX_PING_BODIES_IN_FLIGHT)` live beside `PingSlots` as extensions built in `public_router`. The body is read but not stored yet (NAMI-UP-21 stores it). Path extraction keeps the `Result<Path<_>, PathRejection>` pattern (a rejection is a 404). The 408, 413 and 429 replies go through the existing `no_store` layer.
 
 In `router.rs`: `fn default_ping_limits() -> Arc<TokenBuckets>`; `build_public_router_with_limits` gains a `ping_limits` parameter; add `pub fn build_public_router_with_ping_limits(state, ping_slots, ping_limits) -> Router`.
 
 - [ ] **Step 6: Run the tests to verify they pass**
 
-Run: `cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test --lib uptime::heartbeat && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test --test heartbeats`
+Run: `cd nami-engine && cargo test --lib -- uptime::heartbeat logs::rate_limit && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test --test heartbeats`
 Expected: PASS (the whole `heartbeats` binary, old tests included).
 
 - [ ] **Step 7: Full engine suite, then commit**
@@ -358,7 +406,7 @@ Expected: PASS (the whole `heartbeats` binary, old tests included).
 Run: `cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test` → all binaries green; `cargo clippy --all-targets -- -D warnings` clean.
 
 ```bash
-git add nami-engine/src/uptime/heartbeat.rs nami-engine/src/routes/heartbeats.rs nami-engine/src/router.rs nami-engine/tests/heartbeats.rs
+git add nami-engine/src/uptime/heartbeat.rs nami-engine/src/routes/heartbeats.rs nami-engine/src/router.rs nami-engine/src/logs/rate_limit.rs nami-engine/tests/heartbeats.rs
 git commit -m "feat(engine): heartbeat /fail and exit-code pings with per-heartbeat rate limit (NAMI-UP-20)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -541,7 +589,7 @@ Expected: FAIL (missing `sanitize_output`, `details`, table).
 
 `sanitize_output`: `String::from_utf8_lossy(body)`, drop every char with `c.is_control() && c != '\n' && c != '\t'` (C0, DEL, C1) and the bidi set (`'\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'`), then if the result is longer than `MAX_OUTPUT_BYTES` bytes cut at the last char boundary ≤ the cap and append `TRUNCATED_MARKER`. (Filter first, then cut: stripped bytes never count.)
 
-`handle_ping` passes `output: sanitize_output(&body)` in the `Ping`. `record_signal`: when the failure branch opened an incident and `!ping.output.is_empty()`, `incident::attach_details(&mut tx, incident_id, &ping.output)` and put `details: Some(output.clone())` on the transition; `Recorded` gains `received_at: now`. After the reply data is ready and before returning, the handler inserts the ClickHouse row:
+`handle_ping` passes `output: sanitize_output(&body)` in the `Ping` (sanitized after the guards of NAMI-UP-20 are dropped, before the record slot is taken). `record_signal`: when the failure branch opened an incident and `!ping.output.is_empty()`, `incident::attach_details(&mut tx, incident_id, &ping.output)` and put `details: Some(output.clone())` on the transition; `Recorded` gains `received_at: now`. After the reply data is ready and before returning, the handler inserts the ClickHouse row — after the record slot has been dropped, so a slow ClickHouse (up to the 2 s timeout) never holds a ping slot:
 
 ```rust
 let row = HeartbeatPingRow { heartbeat_id: r.heartbeat_id, project_id: r.project_id,
@@ -653,7 +701,7 @@ Branch `feat/NAMI-UP-23-advanced-request-options`, worktree `.worktrees/NAMI-UP-
 
 **Files:**
 - Create: `nami-engine/migrations/0024_monitor_advanced_request.sql`, `nami-engine/tests/monitor_advanced_options.rs`
-- Modify: `nami-engine/src/models/monitor.rs` (`Monitor`, its `Debug`, `MonitorView::new`, `for_reader`, `MonitorConfig` + `From<&Monitor>` + `changes_check_of`, `CreateMonitorRequest` + `into_config`, `PatchMonitorRequest` + `apply_to`, `validate`, `clear_unused_fields`, `clear_request_config`, `write_config`), `nami-engine/src/models/monitor_request.rs`
+- Modify: `nami-engine/src/models/monitor.rs` (`Monitor`, its `Debug`, `MonitorView::new`, `for_reader`, `MonitorConfig` + `From<&Monitor>` + `changes_check_of`, `CreateMonitorRequest` + `into_config`, `PatchMonitorRequest` + `apply_to`, `validate`, `clear_unused_fields`, `clear_request_config`, `write_config`, `update_in_project` — the proxy-origin rule), `nami-engine/src/models/monitor_request.rs`
 - Test: `nami-engine/tests/monitor_advanced_options.rs`, unit tests in both model files, `nami-engine/tests/migrations.rs`
 
 **Interfaces:**
@@ -690,6 +738,9 @@ fn proxy_urls_must_be_http_or_https_host_and_port_without_credentials() {
     assert_eq!(validate_proxy_url(" http://proxy.internal:3128 ").unwrap(), "http://proxy.internal:3128");
     assert_eq!(validate_proxy_url("https://10.0.0.5:8443/").unwrap(), "https://10.0.0.5:8443/");
     assert_eq!(validate_proxy_url("http://[fd00::1]:3128").unwrap(), "http://[fd00::1]:3128");
+    // Url::port() hides a port equal to the scheme's default: an explicit :80 / :443 is still a port.
+    assert_eq!(validate_proxy_url("http://proxy:80").unwrap(), "http://proxy:80");
+    assert_eq!(validate_proxy_url("https://proxy:443").unwrap(), "https://proxy:443");
     let credentials = "proxy_url must not contain credentials; use proxy_username and proxy_password";
     assert_eq!(validate_proxy_url("http://user:pass@proxy:3128").unwrap_err(), credentials);
     assert_eq!(validate_proxy_url("http://user@proxy:3128").unwrap_err(), credentials);
@@ -743,7 +794,8 @@ async fn the_proxy_password_is_stored_sealed_and_never_returned(pool: sqlx::PgPo
     //   "proxy_password" except has_proxy_password; body.to_string() does not contain "s3cr3t-proxy-pw".
     // row: select proxy_password_enc -> Some(bytes), bytes do not contain the plaintext,
     //   open_proxy_password(test_cipher(), id, &bytes) == "s3cr3t-proxy-pw".
-    // GET as member and as viewer: never the plaintext; viewer sees proxy_username "***".
+    // GET as member and as viewer: never the plaintext; viewer sees proxy_username "***" (and
+    //   `redacted: true` once fix-wave item 7 has landed), proxy_url unchanged (redact_url no-op).
 }
 
 #[sqlx::test]
@@ -753,6 +805,23 @@ async fn patch_keeps_omitted_proxy_password_replaces_given_and_null_clears(pool:
     // PATCH {"proxy_password": "new"} -> enc != A and opens to "new".
     // PATCH {"proxy_password": null} -> enc null, has_proxy_password false, username kept.
     // PATCH {"proxy_url": null} -> url, username and password all null.
+}
+
+#[sqlx::test]
+async fn changing_the_proxy_requires_every_secret_again(pool: sqlx::PgPool) {
+    // Proxy-origin rule (see rulings; fix-wave item 1 applied to the proxy). Owner creates an
+    // http monitor with a header X-Api-Key, basic auth and a proxy http://127.0.0.1:3128 with a
+    // proxy password. As a member:
+    // PATCH {"proxy_url": "http://127.0.0.1:3129"} -> 400 "changing the proxy requires entering the
+    //   header values and passwords again, or clearing them"; the row is unchanged byte for byte.
+    // PATCH {"proxy_url": "https://127.0.0.1:3128"} (scheme change) -> same 400.
+    // Same PATCH replacing the proxy password but keeping the headers -> 400.
+    // Replacing (or clearing) headers, basic-auth password and proxy password in one PATCH -> 200.
+    // A monitor with headers and NO proxy: PATCH {"proxy_url": "http://127.0.0.1:3128"} keeping the
+    //   headers -> 400 (adding a proxy counts); PATCH {"proxy_url": null} on a proxied monitor -> 200.
+    // Changing only the target URL's origin keeps the proxy password (the fix-wave rule still asks
+    //   for the header values / basic-auth password, not for the proxy password).
+    // No response body ever contains a header value or a password.
 }
 
 #[sqlx::test]
@@ -777,11 +846,13 @@ Expected: FAIL.
 
 - [ ] **Step 5: Implement**
 
-- `validate_proxy_url`: reject control/whitespace before trimming (like `validate_http`), trim, ≤ 2048 bytes, `reqwest::Url::parse`, scheme `http`|`https` else the scheme message (a parse failure gets the same message), `url_has_credentials` → credentials message, `port()` must be `Some` (explicit; `port_or_known_default` is not enough) else port message, `path() == "/" && query().is_none() && fragment().is_none()` else the "nothing after it" message; return the trimmed input as typed.
+- `validate_proxy_url`: reject control/whitespace before trimming (like `validate_http`), trim, ≤ 2048 bytes, `reqwest::Url::parse`, scheme `http`|`https` else the scheme message (a parse failure gets the same message), `url_has_credentials` → credentials message, an explicit port in the text — `port()` is `Some`, or the authority after `://` ends in `:<digits>` (`Url::port()` returns `None` for `:80` on http and `:443` on https) — else port message, `path() == "/" && query().is_none() && fragment().is_none()` else the "nothing after it" message; return the trimmed input as typed.
 - `validate_proxy(c: &mut MonitorConfig) -> Result<(), String>` in `monitor.rs`, called from `validate_request_config` (http/keyword only): normalizes empty strings to `None`; applies the rules of Step 2 in the order: url → username (`validate_username`-like with `proxy_username` in messages) → password (`PasswordChange::Replace` needs username; length) → removing url clears username/password → removing username clears password → `ip_version != "any"` with a url → error.
 - `validate`: check `ip_version` against `IP_VERSIONS` before the type match; `clear_unused_fields` resets `ip_version` to `"any"` outside `IP_VERSION_TYPES`; `clear_request_config` also clears `remember_cookies`, `proxy_url`, `proxy_username`, and `proxy_password` to `Clear` unless `Keep { present: false }`.
-- `write_config`: append `ip_version = $34, remember_cookies = $35, proxy_url = $36, proxy_username = $37, proxy_password_enc = case when $38 then proxy_password_enc else $39 end` (keep flag + sealed bytes via `seal_proxy_password`, same pattern as the basic-auth password).
-- `for_reader`: viewer gets `proxy_username` → `***`.
+- `write_config`: append `ip_version = $N+1, remember_cookies = $N+2, proxy_url = $N+3, proxy_username = $N+4, proxy_password_enc = case when $N+5 then proxy_password_enc else $N+6 end`, `$N` being the statement's current last placeholder (`$33` at `6e78618` → `$34..$39`; `$34` once fix-wave item 10 binds `project_id` → `$35..$40`), with the binds in the same order (keep flag + sealed bytes via `seal_proxy_password`, same pattern as the basic-auth password).
+- `update_in_project`: after merge + validate and next to the fix wave's URL-origin check (or, if it has not landed, as its own function `proxy_change_needs_secrets(current: &Monitor, config: &MonitorConfig) -> Result<(), String>`): the proxy origin of `config.proxy_url` vs `current.proxy_url` (`Url::origin()`; `None` → `Some` counts as a change, `Some` → `None` does not); on a change, any of `request_headers` = `Keep` with names, `auth_password` = `Keep { present: true }`, `proxy_password` = `Keep { present: true }` → `AppError::Validation` with the ruling's message.
+- `for_reader`: viewer gets `proxy_username` → `***` and `proxy_url` through `redact_url`.
+- `Debug for Monitor`: `proxy_password_enc` like the other sealed columns (`<sealed>` / `None`), `proxy_username` as `<set>` / `None` (fix-wave item 10's convention), `ip_version`, `remember_cookies`, `proxy_url` in the clear. Extend `debug_leaves_the_sealed_columns_out`.
 - `MonitorView::new`: `has_proxy_password = monitor.proxy_password_enc.is_some()`.
 
 - [ ] **Step 6: Run to verify pass** — full engine suite green (other test binaries that build `Monitor { .. }` use `..Monitor::default()`; fix any literal the compiler names).
@@ -812,6 +883,8 @@ Branch `feat/NAMI-UP-24-checker-advanced-options`, worktree `.worktrees/NAMI-UP-
   - `pub(crate) async fn resolve_target(host: &str, port: u16, ip: IpVersion) -> Result<Vec<SocketAddr>, String>`: `lookup_host` (error → `describe_io_error`) → `keep_family` (error → its text) → `allowed_addresses` (error → `DESTINATION_NOT_ALLOWED`). Used by `probe_tcp`, `tls::connect`, and (with its own "could not resolve {host}" wording kept) `ping::resolve`.
   - `GuardedResolver { ip_version: IpVersion }` applies `keep_family` before `allowed_addresses`.
   - `HttpClients::select(&self, follow_redirects: bool, verify_ssl: bool, carries_secrets: bool, ip_version: IpVersion) -> &reqwest::Client`; `CLIENT_COUNT = 18`.
+  - `fn carries_secrets(monitor: &Monitor, url: &str, headers: &[RequestHeader], method: &reqwest::Method) -> bool` — the one place the "carries credentials" decision is made (today's inline expression in `build_request`, plus fix-wave item 2's body rule when it has landed); both the shared cache and the per-check clients take their `RedirectMode` from it.
+  - `fn literal_of_other_family(url: &reqwest::Url, ip: IpVersion) -> bool` — an IP-literal host of the family `ip` excludes. reqwest never hands an IP literal to the resolver, so `GuardedResolver` alone cannot enforce `ip_version` for `http://[::1]/`; `probe_http` checks the monitor URL with it (→ down with `NoAddressOfFamily`'s text) and `follow_policy(same_origin_only, ip_version)` refuses such a redirect hop with a `NoAddressOfFamily` error.
   - No new error constant: a proxy password that cannot be opened reuses `CONFIG_DECRYPT_ERROR`, and nothing is sent.
   - `tls::connect(config, host, port, ip_version: IpVersion)`.
 
@@ -870,6 +943,10 @@ fn the_client_cache_has_a_slot_per_redirect_mode_tls_setting_and_ip_version() {
     }
     assert_eq!(clients.built(), 18);
 }
+// The existing slot tests (`there_is_a_slot_for_every_mode_with_and_without_verification`,
+// `a_client_is_built_when_a_check_first_needs_it`, `every_combination_of_settings_gets_its_own_client_and_keeps_it`,
+// `nothing_is_followed_so_secrets_need_no_client_of_their_own_then`, `clones_share_the_clients_that_were_built`)
+// call `select` with three arguments: pass `IpVersion::Any` and keep their assertions.
 
 /// reqwest must resolve the proxy host through the client's resolver, or the
 /// guard against link-local proxies would be bypassed by a name.
@@ -1021,8 +1098,8 @@ Expected: FAIL (compile errors on `IpVersion` params, `with_proxy`).
 - [ ] **Step 6: Implement**
 
 - `ClientOptions { redirects: RedirectMode, verify_ssl: bool, ip_version: IpVersion, proxy: Option<reqwest::Proxy>, cookies: bool }`; `build_client(&ClientOptions) -> reqwest::Client` keeps every existing builder call in the same order (`.no_proxy()` first, then `.proxy(p)` only when `Some`), `.dns_resolver(GuardedResolver { ip_version })`, and `.cookie_provider(Arc::new(reqwest::cookie::Jar::default()))` when `cookies`. The cache calls it with `proxy: None, cookies: false`.
-- `build_request`: after opening headers and the basic-auth password, if `monitor.proxy_url` is `Some`: parse it; `names_forbidden_address(&proxy)` → `Err(DESTINATION_NOT_ALLOWED)`; open the proxy password (error → `CONFIG_DECRYPT_ERROR`); `reqwest::Proxy::all(url)` with `.basic_auth(user, pass)` when a username is set. If a proxy or `remember_cookies` is set → `build_client(&ClientOptions { …, proxy, cookies: monitor.remember_cookies })` owned by the request (return the client with the builder, e.g. `Result<(Option<reqwest::Client>, reqwest::RequestBuilder), String>`, so the per-check client lives as long as the request); otherwise `ctx.http.select(.., monitor.ip_version())`.
-- `probe_http`: when the monitor has a proxy, a response with status 407 → `Observation::down(Some(407), …, "proxy authentication failed (HTTP 407)")`; send errors go through `describe_proxied_error(&e)`:
+- `build_request` becomes `async` (it may resolve the target, below): after opening headers and the basic-auth password, if `monitor.proxy_url` is `Some`: parse it; `names_forbidden_address(&proxy)` → `Err(DESTINATION_NOT_ALLOWED)`; open the proxy password (error → `CONFIG_DECRYPT_ERROR`); resolve the **target** host locally with `resolve_target(host, port_or_known_default, IpVersion::Any)` — `Err(DESTINATION_NOT_ALLOWED)` → return it (nothing sent), any other error (the name does not resolve here) → carry on, the proxy resolves it; `reqwest::Proxy::all(url)` with `.basic_auth(user, pass)` when a username is set. If a proxy or `remember_cookies` is set → `build_client(&ClientOptions { redirects: mode_from(carries_secrets(..)), …, proxy, cookies: monitor.remember_cookies })`; otherwise `ctx.http.select(.., monitor.ip_version())`. `reqwest::Client::request` clones the client into the `RequestBuilder` (a `Client` is an `Arc`), so the per-check client lives exactly as long as the request: the signature can stay `Result<reqwest::RequestBuilder, String>`.
+- `probe_http`: before `build_request`, `literal_of_other_family(&parsed, monitor.ip_version())` → down with `no IPv4 address` / `no IPv6 address` (the http case of `an_ipv6_only_target_with_ipv4_is_down_without_fallback` depends on it). When the monitor has a proxy, a response with status 407 → `Observation::down(Some(407), …, "proxy authentication failed (HTTP 407)")`, checked **before** the expected-status range (a custom range may include 407); send errors go through `describe_proxied_error(&e)`:
 
 ```rust
 /// A send error of a check that went through a proxy: which side failed.
@@ -1044,7 +1121,9 @@ fn describe_proxied_error(error: &reqwest::Error) -> String {
   (`chain_message_with_prefix` walks `source()` and returns the remainder of the first `to_string()` that starts with the prefix.)
 - `describe_request_error`: first `if let Some(e) = find_cause::<NoAddressOfFamily>(error) { return e.to_string(); }` (generic `find_cause` beside `caused_by`).
 - `probe_tcp` → `resolve_target(host, port, monitor.ip_version())`; `tls::connect(.., ip_version)` → `resolve_target`; `expiry::probe_ssl` passes `monitor.ip_version()`, `mail::probe` passes `IpVersion::Any`; `ping::probe` → `resolve(host, monitor.ip_version())` applying `keep_family` (literals included) before `allowed_addresses`, error text from `NoAddressOfFamily`.
-- Update the doc comments of `HttpClients` and `build_client` (the "Proxy settings … are ignored" bullet now reads: environment proxies are ignored; a monitor's own proxy is used only for that monitor's checks, on a client built for that one check).
+- Update the doc comments of `HttpClients` and `build_client` (the "Proxy settings … are ignored" bullet now reads: environment proxies are ignored; a monitor's own proxy is used only for that monitor's checks, on a client built for that one check; a proxied target name is pre-resolved locally and refused when it only names forbidden addresses, and the proxy's own resolution is an accepted residual risk).
+- The cookie jar is reqwest's `Jar` (domain-scoped per RFC 6265, no public-suffix list): within one check a cookie is only sent to hosts its `Domain` matches; it dies with the per-check client. reqwest strips `Cookie` from a cross-origin hop's copied headers and the jar re-adds only what matches the new host. Nothing is persisted.
+- Per-check clients rebuild TLS state on every check of a proxied or cookie-keeping monitor (no session resumption, roots loaded per build). Accepted; measure in the final review if many such monitors exist.
 
 - [ ] **Step 7: Run to verify pass**
 
@@ -1240,8 +1319,16 @@ fn uptimerobot_headers_match_case_insensitively_and_unknown_columns_are_ignored(
     assert_eq!(parse(ImportFormat::Uptimerobot, "Name,Something\nx,y\n", &ImportDefaults::default()),
                Err(ParseError::Malformed("CSV header must name the columns Friendly Name, URL/IP and Type".into())));
     assert!(matches!(parse(ImportFormat::Uptimerobot, "", &ImportDefaults::default()), Err(ParseError::Malformed(_))));
-    // An unterminated quote is a malformed document, not a panic.
-    assert!(matches!(parse(ImportFormat::Uptimerobot, "Friendly Name,URL/IP,Type\n\"a,https://a.test,1\n", &ImportDefaults::default()), Err(ParseError::Malformed(_))));
+    // An unterminated quote never panics and never yields a monitor. (The csv crate is lenient: it
+    // reads the rest of the input as one field instead of failing, so either outcome is accepted.)
+    match parse(ImportFormat::Uptimerobot, "Friendly Name,URL/IP,Type\n\"a,https://a.test,1\n", &ImportDefaults::default()) {
+        Err(ParseError::Malformed(_)) => {}
+        Ok(entries) => assert!(entries.iter().all(|e| e.body.is_err()), "{entries:?}"),
+        Err(other) => panic!("{other:?}"),
+    }
+    // A row without a target cell (short row, flexible reader) is a per-entry error, not a panic.
+    assert_eq!(bodies(ImportFormat::Uptimerobot, "Friendly Name,URL/IP,Type\nA\n")[0].1,
+               Err("row has no URL/IP".to_string()));
 }
 ```
 
@@ -1255,11 +1342,11 @@ Expected: FAIL (module missing).
 - `urls::parse`: `content.lines().enumerate()`; skip `trim().is_empty()` and `trim_start().starts_with('#')`; count kept lines first and return `TooManyEntries(n)` when `n > MAX_ENTRIES`; for each: `reqwest::Url::parse(trimmed)` with scheme http/https and a host, else `Err("line is not a valid http(s) URL")`; body `{check_type: "http", name: host_str, url: trimmed}` (the URL text as typed, so validation judges the same string).
 - `kuma::parse`: `serde_json::from_str::<Value>` → on error `Malformed(format!("content is not valid JSON (line {}, column {})", e.line(), e.column()))`; `monitorList` must be an array (else the "no monitorList" message); length > 500 → `TooManyEntries`; per entry (`line = index + 1`), with a `fn str_field(&Map, &str) -> Option<&str>` helper that never echoes values in errors:
   - not an object → "entry is not a JSON object"; no non-empty `name` → "entry has no name"; `upsideDown == true` → upside-down error; type mapping: `http`, `keyword` (needs `keyword`), `port` → `tcp`, `ping`, `dns` (record type must be in `DNS_RECORD_TYPES`, else `Uptime Kuma DNS record type "X" is not supported`), any other → the "type … is not supported" error.
-  - http/keyword: `url`, `http_method` = uppercase `method` (default GET), `body` when a non-empty string, `headers` (string parsed as an object of strings → `[{name, value}]`, sorted by name; anything else the headers error), basic auth only when `authMethod` is null/""/"basic" and `basic_auth_user` non-empty (other `authMethod` with credentials → the authMethod error), `accepted_statuscodes[0]` as `"a-b"` or `"a"` → `expected_status_min/max` (unparseable → per-entry error `accepted_statuscodes "X" is not a status range`), `ignoreTls` → `verify_ssl = !ignoreTls`, `maxredirects == 0` → `follow_redirects = false` (else true), `invertKeyword` → `keyword_mode: not_contains`.
+  - http/keyword: `url`, `http_method` = uppercase `method` (default GET), `body` when a non-empty string, `headers` (string parsed as an object of strings → `[{name, value}]`, sorted by name; anything else the headers error), `authMethod` other than null/""/"basic" → the authMethod error (credentials or not), basic auth when `basic_auth_user` is non-empty, `accepted_statuscodes[0]` as `"a-b"` or `"a"` → `expected_status_min/max` (unparseable → per-entry error `accepted_statuscodes "X" is not a status range`), `ignoreTls` → `verify_ssl = !ignoreTls`, `maxredirects == 0` → `follow_redirects = false` (else true), `invertKeyword` → `keyword_mode: not_contains`.
   - all: `interval_seconds = max(30, interval)` (absent → omitted, defaults apply), `confirmation_threshold = min(10, maxretries + 1)` (absent → omitted), `timeout_seconds` when `timeout` is a number: `clamp(round(timeout), 1, min(60, interval - 1))`, `paused = !active` (`active` bool or 0/1; absent → `false`).
   - tcp/ping/dns: `host` from `hostname`; tcp `port`; dns `dns_nameserver = "{server}:{port}"` when `dns_resolve_server` is set (`port` default 53).
-  - Read nothing else from the document.
-- `uptimerobot::parse`: `csv::ReaderBuilder::new().flexible(true).from_reader(content.as_bytes())`; header aliases (lowercased, trimmed): name ← `friendly name`|`name`; target ← `url/ip`|`url`|`ip`|`host`; type ← `type`|`monitor type`; keyword type ← `keyword type`; keyword ← `keyword value`|`keyword`; port ← `port`; interval ← `interval`|`monitoring interval`. Name/target/type required else the header message. Count records before mapping (>500 → `TooManyEntries`). `line = record.position().line()`. Type: `http(s)`|`http`|`https`|`1` → http (target as `url`), `keyword`|`2` → keyword (`keyword type` `not exists`|`2` → `not_contains`, else `contains`), `ping`|`3` → ping (target as `host`), `port`|`4` → tcp (target as `host`, `port` required → per-entry error `port is required for Port monitors`); other → the type error quoting the cell through `printable(cell, 40)`. Interval cell → `max(30, n)` when it parses as an integer. A csv error → `Malformed(format!("CSV could not be read: {e}"))` (csv errors carry positions, not cell contents).
+  - Read nothing else from the document. (`serde_json` refuses nesting deeper than 128 levels with an error instead of overflowing the stack, and the 2 MiB body cap bounds the `Value` tree to a few tens of MiB: no extra guard needed.)
+- `uptimerobot::parse`: `csv::ReaderBuilder::new().flexible(true).from_reader(content.as_bytes())`; header aliases (lowercased, trimmed): name ← `friendly name`|`name`; target ← `url/ip`|`url`|`ip`|`host`; type ← `type`|`monitor type`; keyword type ← `keyword type`; keyword ← `keyword value`|`keyword`; port ← `port`; interval ← `interval`|`monitoring interval`. Name/target/type required else the header message; a record whose name, target or type cell is missing or empty → per-entry error `row has no Friendly Name` / `row has no URL/IP` / `row has no Type`. Count records before mapping (>500 → `TooManyEntries`). `line = record.position().line()`. Type: `http(s)`|`http`|`https`|`1` → http (target as `url`), `keyword`|`2` → keyword (`keyword type` `not exists`|`2` → `not_contains`, else `contains`), `ping`|`3` → ping (target as `host`), `port`|`4` → tcp (target as `host`, `port` required → per-entry error `port is required for Port monitors`); other → the type error quoting the cell through `printable(cell, 40)`. Interval cell → `max(30, n)` when it parses as an integer. A csv error → `Malformed(format!("CSV could not be read: {e}"))` (csv errors carry positions, not cell contents).
 
 - [ ] **Step 6: Run to verify pass** — `cargo test --test monitor_import` green; `cargo clippy --all-targets -- -D warnings`.
 
@@ -1285,10 +1372,11 @@ Branch `feat/NAMI-UP-26-monitor-import`, worktree `.worktrees/NAMI-UP-26/`.
 - Produces:
   - `#[derive(Deserialize)] pub struct ImportRequest { pub format: ImportFormat, pub content: String, #[serde(default)] pub defaults: ImportDefaults, #[serde(default)] pub dry_run: bool, #[serde(default = "default_true")] pub skip_existing: bool }`
   - `#[derive(Debug, Serialize, PartialEq)] #[serde(rename_all = "lowercase")] pub enum EntryStatus { Created, Skipped, Error }`
-  - `#[derive(Debug, Serialize)] pub struct ImportResultRow { pub line: usize, pub status: EntryStatus, #[serde(skip_serializing_if = "Option::is_none")] pub name: Option<String>, … target, monitor_id: Option<Uuid>, error: Option<String> }`
+  - `#[derive(Debug, Serialize)] pub struct ImportResultRow { pub line: usize, pub status: EntryStatus, pub name: Option<String>, pub target: Option<String>, pub monitor_id: Option<Uuid>, pub error: Option<String> }` — **every** `Option` field carries `#[serde(skip_serializing_if = "Option::is_none")]` (the error-row test compares the whole object).
   - `#[derive(Debug, Serialize)] pub struct ImportReport { pub dry_run: bool, pub created: usize, pub skipped: usize, pub errors: usize, pub results: Vec<ImportResultRow> }`
   - `pub async fn run_import(pool: &PgPool, cipher: &Cipher, project_id: Uuid, request: ImportRequest) -> Result<ImportReport, AppError>`
   - `pub fn existing_key(c: &MonitorConfig) -> String` (the skip key from the rulings).
+  - `pub const IMPORT_LOCK_CLASS: i32` (a fixed advisory-lock class id, documented next to it) for the one-import-per-project lock.
   - Route `POST /projects/{id}/monitors/import` with `DefaultBodyLimit::max(MAX_IMPORT_BODY_BYTES)` on that route only.
 
 - [ ] **Step 1: Write the failing API tests** (append to `tests/monitor_import.rs`, `mod common;` at the top):
@@ -1364,7 +1452,17 @@ async fn every_entry_is_validated_like_a_single_create(pool: sqlx::PgPool) {
 async fn import_limits_are_enforced_before_anything_is_created(pool: sqlx::PgPool) {
     // 501 URLs -> 400 {"error": "at most 500 entries per import, got 501"}, count 0.
     // content of 2 MiB + 1 byte (body over the route limit) -> 413, count 0.
-    // malformed Kuma JSON -> 400 with the parser message; unknown format "pingdom" -> 400 (axum rejection), count 0.
+    // malformed Kuma JSON -> 400 with the parser message; unknown format "pingdom" -> 422 (axum's
+    //   Json data-error rejection, not 400), count 0.
+}
+
+#[sqlx::test]
+async fn a_second_import_while_one_runs_is_409(pool: sqlx::PgPool) {
+    // Hold the project's import lock from the test (begin a transaction on `pool`, run the same
+    // `select pg_try_advisory_xact_lock(<IMPORT_LOCK_CLASS>, hashtext(<project>::text))`), then import as a
+    // member -> 409 {"error": "another import is running in this project; try again when it finishes"},
+    // count 0. A dry run at the same time -> 200 (dry runs take no lock). Roll the test transaction back
+    // -> the import succeeds.
 }
 
 #[sqlx::test]
@@ -1396,6 +1494,16 @@ pub async fn run_import(pool: &PgPool, cipher: &Cipher, project_id: Uuid, reques
     }
     let entries = parse(request.format, &request.content, &request.defaults)
         .map_err(|e| AppError::Validation(e.to_string()))?;
+    // One import at a time per project (ruling): held until `_lock` is dropped (rolled back).
+    let _lock = if request.dry_run { None } else {
+        let mut lock = pool.begin().await?;
+        let taken: bool = sqlx::query_scalar("select pg_try_advisory_xact_lock($1, hashtext($2::text))")
+            .bind(IMPORT_LOCK_CLASS).bind(project_id).fetch_one(&mut *lock).await?;
+        if !taken {
+            return Err(AppError::Conflict("another import is running in this project; try again when it finishes".into()));
+        }
+        Some(lock)
+    };
     let mut seen: HashSet<String> = if request.skip_existing {
         monitor::list_for_project(pool, project_id).await?.iter()
             .map(|m| existing_key(&MonitorConfig::from(m))).collect()
@@ -1509,10 +1617,12 @@ fn weekly_spans_agree_with_covers_every_five_minutes_for_two_years() {
     ] {
         let w = weekly(days, start, end, zone);
         let (from, to) = (utc(2026, 1, 1, 0, 0, 0), utc(2028, 1, 1, 0, 0, 0));
-        let spans = w.spans(from, to);
-        let mut at = from;
+        // Merged first so one forward cursor suffices: ~210k samples per case stay fast in debug builds.
+        let spans = crate::uptime::availability::union(w.spans(from, to));
+        let (mut at, mut next) = (from, 0);
         while at < to {
-            let in_span = spans.iter().any(|sp| sp.start <= at && at < sp.end);
+            while next < spans.len() && spans[next].end <= at { next += 1; }
+            let in_span = next < spans.len() && spans[next].start <= at;
             assert_eq!(in_span, w.covers(at), "{zone} {start}-{end} at {at}");
             at += TimeDelta::minutes(5);
         }
@@ -1556,7 +1666,7 @@ async fn availability_checks_ranges_access_and_project(pool: sqlx::PgPool) {
 
 - [ ] **Step 3: Run to verify failure**
 
-Run: `cd nami-engine && cargo test --lib uptime::availability models::maintenance && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test --test availability`
+Run: `cd nami-engine && cargo test --lib -- uptime::availability models::maintenance && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test --test availability` (cargo takes one test-name filter before `--`; several go after it)
 Expected: FAIL.
 
 - [ ] **Step 4: Implement**
@@ -1603,6 +1713,7 @@ Branch `feat/NAMI-UP-28-checks-export`, worktree `.worktrees/NAMI-UP-28/`.
   - `store::checks_between(ch, project_id, monitor_id, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<UptimeCheckRow>, ClickHouseError>` (ascending, `LIMIT 20000`).
   - `export::{MAX_EXPORT_DAYS: i64 = 180, HEADER: &str = "checked_at,status,status_code,response_time_ms,error\r\n", neutralize(cell: &str) -> Cow<str>, csv_line(row: &UptimeCheckRow) -> String, check_range(from, to) -> Result<(), String>}`.
   - Route `GET /projects/{id}/monitors/{monitor_id}/checks/export?from&to` (viewer) → `text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="checks-{monitor_id}.csv"`, `Cache-Control: no-store`.
+  - `export::{MAX_EXPORTS_IN_FLIGHT: usize = 4, CHUNK_BYTES: usize = 64 * 1024}`; the slots are one process-wide `Arc<Semaphore>` (a `static` `LazyLock`, or an `Extension` layered in `routes::monitors::router()`), an owned permit moved into the producer task.
 
 - [ ] **Step 1: Write the failing unit tests** (`export.rs`):
 
@@ -1668,7 +1779,7 @@ Expected: FAIL.
 
 - `neutralize`: `Cow::Owned(format!("'{cell}"))` when the first char is one of `=`, `+`, `-`, `@`, `\t`, `\r`; else borrowed.
 - `csv_line`: `csv::WriterBuilder::new().terminator(csv::Terminator::CRLF).quote_style(csv::QuoteStyle::Necessary).from_writer(vec![])`, write the five cells (`checked_at` as `%Y-%m-%dT%H:%M:%S%.3fZ`, status lowercase, empty for `None`), each through `neutralize`, flush, `String::from_utf8`.
-- Handler: role `viewer` → `export::check_range` (400) → `find_in_project` (404) → query the first UTC-day slice `[from, min(from + 1 day, to))` with `checks_between` (error → `AppError::ClickHouse`, the JSON 500) → spawn a task that sends `HEADER`, the first slice's lines, then each further slice, over `tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(8)`; a ClickHouse error mid-stream logs (`monitor_id`, no SQL) and sends `Err(io::Error::other("export aborted"))`, which aborts the body → `Body::from_stream(ReceiverStream::new(rx))` with the three headers.
+- Handler: role `viewer` → `export::check_range` (400) → `find_in_project` (404) → `try_acquire_owned` an export slot, else 503 `{"error":"busy, retry shortly"}` with `Retry-After: 5` → query the first UTC-day slice `[from, min(from + 1 day, to))` with `checks_between` (error → `AppError::ClickHouse`, the JSON 500) → spawn a task (holding the permit) that sends `HEADER`, then the lines of the first slice and of each further slice, batched into `Bytes` of about `CHUNK_BYTES`, over `tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(2)`; it returns at the first failed `send` (the client is gone: no further ClickHouse queries); a ClickHouse error mid-stream logs (`monitor_id`, no SQL) and sends `Err(io::Error::other("export aborted"))`, which aborts the body → `Body::from_stream(ReceiverStream::new(rx))` with the three headers. Every slice query goes through `query_rows` (read-only, `max_execution_time`).
 
 - [ ] **Step 5: Run to verify pass** — full suite green.
 
@@ -1690,7 +1801,7 @@ Branch `feat/NAMI-UP-29-ui-heartbeats`, worktree `.worktrees/NAMI-UP-29/`.
 
 **Interfaces:**
 - Consumes: engine `GET .../heartbeats/{id}/pings?limit=50`, `GET /projects/{id}/monitor-groups`, `group_id` on heartbeats, `Incident.details`.
-- Produces (`lib/uptime.ts`): `Heartbeat.group_id: string | null`; `Incident.details: string | null`; `export type HeartbeatPing = { heartbeat_id: string; project_id: string; received_at: string; kind: 'success' | 'fail'; exit_code: number | null; output: string }`; `export function failUrl(url: string): string` (`${url}/fail`); `export function exitCodeCommand(url: string): string` returning exactly `'out=$(your-job 2>&1); curl -fsS -m 10 --data-binary "$out" ' + shellQuote(url) + '/$?'` (the assignment's status is the job's, so `$?` is its exit code). `heartbeatPayloadFromForm(form: FormData, mode: FormMode = 'create'): FormResult` gains `group_id` (create: omitted when blank; edit: `null` when blank).
+- Produces (`lib/uptime.ts`): `Heartbeat.group_id: string | null`; `Incident.details: string | null`; `export type HeartbeatPing = { heartbeat_id: string; project_id: string; received_at: string; kind: 'success' | 'fail'; exit_code: number | null; output: string }`; `export function failUrl(url: string): string` (`${url}/fail`); `export function exitCodeCommand(url: string): string` returning exactly the text `out=$(your-job 2>&1); code=$?; printf '%s' "$out" | curl -fsS -m 10 --data-binary @- ` followed by `shellQuote(url)` and `/$code` (the assignment's status is the job's, so `$?` right after it is the exit code; the output goes on stdin so output starting with `@` is never read as a file name — see the ruling). `heartbeatPayloadFromForm(form: FormData, mode: FormMode = 'create'): FormResult` gains `group_id` (create: omitted when blank; edit: `null` when blank).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1700,7 +1811,11 @@ Branch `feat/NAMI-UP-29-ui-heartbeats`, worktree `.worktrees/NAMI-UP-29/`.
 it('builds the fail URL and an exit-code command that reports output', () => {
 	const url = 'https://engine.example.com/api/v1/heartbeat/' + 'a'.repeat(64);
 	expect(failUrl(url)).toBe(url + '/fail');
-	expect(exitCodeCommand(url)).toBe(`out=$(your-job 2>&1); curl -fsS -m 10 --data-binary "$out" '${url}'/$?`);
+	expect(exitCodeCommand(url)).toBe(
+		`out=$(your-job 2>&1); code=$?; printf '%s' "$out" | curl -fsS -m 10 --data-binary @- '${url}'/$code`
+	);
+	// Never `--data-binary "$out"`: output starting with @ would make curl upload a local file.
+	expect(exitCodeCommand(url)).not.toContain('--data-binary "$out"');
 });
 it('groups heartbeats like monitors', () => {
 	// groupMonitors([{group_id: 'g1'}, {group_id: null}], [group g1]) -> [{group: g1, ...}, {group: null, ...}]
@@ -1723,7 +1838,7 @@ it('shows recent pings with their output as text, never as markup', () => {
 	expect(body).toContain('exit code 2');
 });
 it('shows /fail and exit-code examples to members only', () => {
-	// member: body contains PING + '/fail' and 'curl -fsS -m 10 --data-binary'; viewer (token null): neither.
+	// member: body contains PING + '/fail' and 'curl -fsS -m 10 --data-binary @-'; viewer (token null): neither.
 });
 ```
 
@@ -1767,7 +1882,7 @@ Branch `feat/NAMI-UP-30-ui-advanced-options`, worktree `.worktrees/NAMI-UP-30/`.
 - Modify: `nami-ui/src/lib/uptime.ts` (+ test), `nami-ui/src/lib/server/monitor-form.ts` (+ test), `nami-ui/src/lib/components/MonitorForm.svelte`, `nami-ui/src/lib/components/monitor-form-render.test.ts`, `nami-ui/src/lib/components/form-inputs.test.ts` (if it enumerates components), `src/routes/(app)/projects/[id=uuid]/monitors/[monitorId=uuid]/+page.svelte` (show the settings read-only)
 
 **Interfaces:**
-- Produces: `Monitor` type gains `ip_version: 'any' | 'ipv4' | 'ipv6'`, `remember_cookies: boolean`, `proxy_url: string | null`, `proxy_username: string | null`, `has_proxy_password: boolean`; `export const IP_VERSION_TYPES: CheckType[] = ['http', 'keyword', 'tcp', 'ping', 'ssl_expiry']`; `hasMaskedValues` also true when `proxy_username === '***'` (its `Pick` gains `proxy_username`). `monitorPayloadFromForm`: `ip_version` sent for `IP_VERSION_TYPES` (`formText || 'any'`); for http/keyword `remember_cookies = form.has('remember_cookies')`, `optional('proxy_url', …)`, `optional('proxy_username', …)`, and the proxy password with `proxy_password_action` keep/replace/clear exactly like `password_action` (create: replace when filled).
+- Produces: `Monitor` type gains `ip_version: 'any' | 'ipv4' | 'ipv6'`, `remember_cookies: boolean`, `proxy_url: string | null`, `proxy_username: string | null`, `has_proxy_password: boolean`; `export const IP_VERSION_TYPES: CheckType[] = ['http', 'keyword', 'tcp', 'ping', 'ssl_expiry']`. Masking: if fix-wave item 7 has landed, the engine's `redacted` flag already marks a viewer's monitor and nothing changes here; only if it has not, `hasMaskedValues` also returns true when `proxy_username === '***'` (its `Pick` gains `proxy_username`) and the fix wave removes that with the rest of the `***` sniffing. Proxy-origin rule (fix-wave item 1 extended, see rulings): on edit, when the proxy URL's origin differs from the stored one (or a proxy is added) and the monitor has stored header values, a basic-auth password or a proxy password, the form forces each of `headers_action` / `password_action` / `proxy_password_action` off `keep` (client-side hint, same mechanism as the fix wave's URL-origin hint), and the engine's 400 message is shown if it gets through. `monitorPayloadFromForm`: `ip_version` sent for `IP_VERSION_TYPES` (`formText || 'any'`); for http/keyword `remember_cookies = form.has('remember_cookies')`, `optional('proxy_url', …)`, `optional('proxy_username', …)`, and the proxy password with `proxy_password_action` keep/replace/clear exactly like `password_action` (create: replace when filled).
 
 - [ ] **Step 1: Write the failing tests** (`monitor-form.test.ts`):
 
@@ -1792,7 +1907,7 @@ it('sends proxy settings with keep, replace and clear for the password', () => {
 
 (`payload` = a local helper that builds `FormData` and returns `monitorPayloadFromForm(...).payload`, or the whole result for the error case — follow the file's existing helper.)
 
-`monitor-form-render.test.ts`: the Advanced `<details>` contains `name="ip_version"` for tcp, none for dns; proxy inputs only for http/keyword; edit mode with `has_proxy_password: true` renders the keep/replace/clear radios and never a value in `name="proxy_password"`. `uptime.test.ts`: `hasMaskedValues({ url: 'https://a', request_body: null, auth_username: null, proxy_username: '***' })` is true.
+`monitor-form-render.test.ts`: the Advanced `<details>` contains `name="ip_version"` for tcp, none for dns; proxy inputs only for http/keyword; edit mode with `has_proxy_password: true` renders the keep/replace/clear radios and never a value in `name="proxy_password"`. `monitor-form.test.ts`: an edit whose `proxy_url` origin differs from the stored one with `proxy_password_action: 'keep'` on a monitor with `has_proxy_password` → `{ ok: false, message: 'Changing the proxy requires entering the passwords and header values again, or clearing them' }` (pass the stored monitor the way the fix wave's URL-origin check does). `uptime.test.ts` (only without the `redacted` flag): `hasMaskedValues({ url: 'https://a', request_body: null, auth_username: null, proxy_username: '***' })` is true.
 
 - [ ] **Step 2: Run to verify failure** — `cd nami-ui && npm test -- monitor-form uptime` → FAIL.
 
@@ -1820,13 +1935,13 @@ Branch `feat/NAMI-UP-31-ui-import`, worktree `.worktrees/NAMI-UP-31/`.
 **Interfaces:**
 - Produces:
   - `export const MAX_IMPORT_BYTES = 2 * 1024 * 1024;` `export const IMPORT_FORMATS = ['urls', 'uptime_kuma', 'uptimerobot'] as const;`
-  - `export async function importPayloadFromForm(form: FormData, dryRun: boolean): Promise<FormResult>` — `format` must be one of `IMPORT_FORMATS` (else `Choose a format`); content from the `file` field when it is a non-empty `File` (`await file.text()`), else the `content` textarea; empty → `Paste the list or choose a file`; `new TextEncoder().encode(content).length > MAX_IMPORT_BYTES` → `The file is larger than 2 MiB`; `defaults` from `interval_seconds`, `timeout_seconds`, `confirmation_threshold`, `group_id` (whole numbers via `formWholeNumber`, blank omitted); `skip_existing: form.has('skip_existing')`; `dry_run`.
+  - `export async function importPayloadFromForm(form: FormData, dryRun: boolean): Promise<FormResult>` — `format` must be one of `IMPORT_FORMATS` (else `Choose a format`); content from the `file` field when it is a non-empty `File` (`file.size > MAX_IMPORT_BYTES` → `The file is larger than 2 MiB` **before** `await file.text()`, so an oversized upload is never decoded), else the `content` textarea; empty → `Paste the list or choose a file`; `new TextEncoder().encode(content).length > MAX_IMPORT_BYTES` → `The file is larger than 2 MiB`; finally the JSON body the engine will receive (`JSON.stringify(payload)`, encoded) over `MAX_IMPORT_BYTES` → `The import is larger than 2 MiB once encoded; split it` (escaping can push a 2 MiB file over the engine's 2 MiB body limit, which would otherwise surface as a bare 413); `defaults` from `interval_seconds`, `timeout_seconds`, `confirmation_threshold`, `group_id` (whole numbers via `formWholeNumber`, blank omitted); `skip_existing: form.has('skip_existing')`; `dry_run`.
   - Page actions `preview` (dry run) and `import`; both return `{ report, format, content }` so the textarea keeps its text (passed back through `form`, rendered with `defaultValue`), or `engineFailure(...)`.
   - `type ImportReport = { dry_run: boolean; created: number; skipped: number; errors: number; results: { line: number; status: 'created' | 'skipped' | 'error'; name?: string; target?: string; monitor_id?: string; error?: string }[] }` in `lib/uptime.ts`.
 
 - [ ] **Step 1: Write the failing tests**
 
-`import-form.test.ts`: each validation message above; a `File` wins over the textarea; defaults parsed (`interval_seconds: 'abc'` → `interval_seconds must be a whole number`); `skip_existing` unchecked → `false`.
+`import-form.test.ts`: each validation message above (including a 2 MiB `File` refused by its `size` without being read, and a content just under 2 MiB full of `"` refused for its encoded size); a `File` wins over the textarea; defaults parsed (`interval_seconds: 'abc'` → `interval_seconds must be a whole number`); `skip_existing` unchecked → `false`.
 
 `import.test.ts` (actions with `fakeEvent`):
 
@@ -1924,12 +2039,13 @@ git commit -m "feat(ui): availability card and check-history CSV export (NAMI-UP
 
 Not a numbered task: per CLAUDE.md every sub-project phase ends with a dedicated security review and fix wave. Branch `fix/NAMI-UP-phase3-final-review`, worktree `.worktrees/NAMI-UP-p3-review/`, from `origin/main` after NAMI-UP-32 merges. The reviewer reads the merged diff `6e78618..origin/main` for `nami-engine/` and `nami-ui/` and checks at least:
 
-- Public ping surface: token shape before any query; 404/400/413/429/503 ordering; no token in any log line (TRACE capture); bucket map bounded; `heartbeat_pings` insert cannot block or fail a ping; 1 MiB limit applies to chunked bodies too (send one without `Content-Length`).
+- Public ping surface: token shape before any query; 404/400/413/429/503/408 ordering per the ruling; no body read before the token lookup and rate limit; the token lookup still under a ping slot; no slot held while a body arrives or while ClickHouse is written; no token in any log line (TRACE capture); bucket map pruned; body memory bounded (16 × 1 MiB); `heartbeat_pings` insert cannot block or fail a ping; 1 MiB limit applies to chunked bodies too (send one without `Content-Length`).
 - Output: every path that shows `incidents.details` or ping output (UI pages, incident list, email, later Incident Management formatters) renders it as text; no `{@html}` anywhere in the diff.
 - Import: 2 MiB / 500 limits before any write; no serde error text that could quote a secret; Kuma `notificationList`/`proxyList` never read into a stored or returned value; each entry re-validated by the single-create path; foreign groups 404.
-- Proxy SSRF: `.no_proxy()` still first on every client; the proxy host resolved through `GuardedResolver` (the unit test from NAMI-UP-24 still passes against the locked reqwest version); IP-literal proxies and targets refused; proxy password only as ciphertext (AAD `monitors.proxy_password:{id}`), absent from responses, logs, alerts and `Debug`.
+- Proxy SSRF: `.no_proxy()` still first on every client; the proxy host resolved through `GuardedResolver` (the unit test from NAMI-UP-24 still passes against the locked reqwest version); IP-literal proxies and targets refused; proxied target names pre-resolved and refused when only forbidden addresses come back; proxy password only as ciphertext (AAD `monitors.proxy_password:{id}`), absent from responses, logs, alerts and `Debug`; the proxy-origin rule (no secret survives a proxy retarget) and the fix wave's URL-origin rule both hold; per-check clients use the shared `carries_secrets` decision (body rule included).
 - Cookie jar: never shared between checks or monitors (per-check client), never persisted.
-- CSV: formula neutralization on every cell; filename built from ids only; range caps; `no-store`.
+- CSV: formula neutralization on every cell; filename built from ids only; range caps; `no-store`; at most 4 exports at once; the producer stops when the client disconnects; the BFF passes the stream through without buffering.
+- Import: one import per project at a time (409); the BFF refuses oversized files by `size` before reading them.
 - SLA: range caps; DST/maintenance math cannot produce values outside 0-100; cross-project ids 404.
 - BFF: every new engine path built with `enginePath`; `[id=uuid]` matchers on the new routes; `no-store` where tokens or secrets are shown; import file size capped in the BFF.
 
