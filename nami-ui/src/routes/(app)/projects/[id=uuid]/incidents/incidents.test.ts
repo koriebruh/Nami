@@ -77,4 +77,18 @@ describe('incidents load', () => {
 		await load(event);
 		expect(calls().map((call) => call.path + call.search)).toEqual(['/projects/..%2Fauth%2Fme%3F/incidents?status=open']);
 	});
+
+	// Incident details carry job output: never cached, whatever the engine says.
+	it.each([
+		['a listing', { body: '[]' }, null],
+		['a caller the engine refuses', { status: 403, body: '{"error":"forbidden"}' }, { status: 403 }],
+		['an engine failure', { status: 500, body: '{"error":"internal error"}' }, { status: 500 }],
+		['a session that is gone', { status: 401, body: '{"error":"unauthorized"}' }, { status: 303 }]
+	] satisfies [string, Parameters<typeof fakeEvent>[0], { status: number } | null][])('forbids caching for %s', async (_name, engine, rejection) => {
+		const { event, setHeaders } = fakeEvent(engine);
+		if (rejection) await expect(load(event)).rejects.toMatchObject(rejection);
+		else await load(event);
+		expect(setHeaders).toHaveBeenCalledTimes(1);
+		expect(setHeaders).toHaveBeenCalledWith({ 'cache-control': 'private, no-store' });
+	});
 });

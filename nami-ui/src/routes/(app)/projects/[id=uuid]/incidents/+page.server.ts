@@ -9,6 +9,9 @@ import type { Incident } from '#lib/uptime';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {
+	// Incident details carry job output, which can hold secrets a job printed:
+	// never cached, like every other page that shows output.
+	event.setHeaders({ 'cache-control': 'private, no-store' });
 	// Anything but "resolved" shows open incidents: the engine only accepts
 	// open|resolved, so never forward the raw query value.
 	const status = event.url.searchParams.get('status') === 'resolved' ? 'resolved' : 'open';

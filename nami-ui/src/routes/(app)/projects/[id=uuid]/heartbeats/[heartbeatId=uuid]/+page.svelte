@@ -184,7 +184,7 @@
 						<CopyButton value={failEndpoint} />
 					</div>
 					<p class="pt-2 text-sm text-muted">
-						Or report the job's exit code (0 is a success, anything else a failure) with its output as the request body:
+						Or report the job's exit code (0 is a success, anything else a failure) with the end of its output (the last 10 KiB) as the request body:
 					</p>
 					<div role="group" aria-label="Exit code command" class="flex items-start gap-2">
 						<pre class="block flex-1 rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap text-ink-2 select-all">{exitCommand}</pre>
