@@ -1,11 +1,12 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { SvelteSet } from 'svelte/reactivity';
+	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import LogVolumeChart from '#lib/components/LogVolumeChart.svelte';
 	import {
 		engineParams,
+		entryHref,
 		explorerHref,
 		fieldAt,
 		FILTER_OPS,
@@ -234,9 +235,39 @@
 		go({ columns: [...data.state.columns, column] });
 	}
 
-	function toggleRow(id: string) {
-		if (expanded.has(id)) expanded.delete(id);
-		else expanded.add(id);
+	// List rows may be cut by the engine (long message, large fields): an
+	// expanded one loads the whole row once, by id and dt.
+	const fullRows = new SvelteMap<string, LogEntry>();
+	const fullErrors = new SvelteMap<string, string>();
+	const fullLoading = new SvelteSet<string>();
+
+	async function loadFull(row: LogEntry) {
+		if (fullRows.has(row.id) || fullLoading.has(row.id)) return;
+		fullLoading.add(row.id);
+		fullErrors.delete(row.id);
+		try {
+			const response = await fetch(entryHref(path, row));
+			if (response.status === 401) {
+				await goto('/login');
+				return;
+			}
+			const body = await response.json().catch(() => null);
+			if (response.ok && body) fullRows.set(row.id, body);
+			else fullErrors.set(row.id, body?.error ?? 'Could not load the whole entry.');
+		} catch {
+			fullErrors.set(row.id, 'Could not load the whole entry.');
+		} finally {
+			fullLoading.delete(row.id);
+		}
+	}
+
+	function toggleRow(row: LogEntry) {
+		if (expanded.has(row.id)) {
+			expanded.delete(row.id);
+			return;
+		}
+		expanded.add(row.id);
+		if (row.truncated) void loadFull(row);
 	}
 
 	const input =
@@ -471,7 +502,7 @@
 									<button
 										type="button"
 										aria-expanded={open}
-										onclick={() => toggleRow(row.id)}
+										onclick={() => toggleRow(row)}
 										class="block w-full truncate text-left font-mono text-xs text-neutral-200 hover:text-white"
 										>{row.message || '(no message)'}</button
 									>
@@ -481,18 +512,33 @@
 								{/each}
 							</tr>
 							{#if open}
+								{@const full = fullRows.get(row.id) ?? row}
 								<tr class="border-b border-[#262626] bg-[#0f0f0f]">
 									<td colspan={4 + data.state.columns.length} class="space-y-3 px-4 py-3">
-										<pre class="font-mono text-xs wrap-anywhere whitespace-pre-wrap text-neutral-200">{row.message}</pre>
+										{#if full.truncated}
+											<p class="text-xs text-amber-300" role="status">
+												{#if fullLoading.has(row.id)}
+													Shortened in the list — loading the whole entry…
+												{:else if fullErrors.has(row.id)}
+													Shortened in the list. {fullErrors.get(row.id)}
+													<button type="button" onclick={() => loadFull(row)} class="underline hover:text-amber-200"
+														>Retry</button
+													>
+												{:else}
+													Shortened in the list.
+												{/if}
+											</p>
+										{/if}
+										<pre class="max-h-96 overflow-auto font-mono text-xs wrap-anywhere whitespace-pre-wrap text-neutral-200">{full.message}</pre>
 										<pre
-											class="max-h-96 overflow-auto rounded-md border border-[#262626] bg-[#0a0a0a] p-3 font-mono text-xs text-neutral-300">{JSON.stringify(row.fields, null, 2)}</pre>
+											class="max-h-96 overflow-auto rounded-md border border-[#262626] bg-[#0a0a0a] p-3 font-mono text-xs text-neutral-300">{JSON.stringify(full.fields, null, 2)}</pre>
 										<dl class="grid gap-x-6 gap-y-1 text-xs text-neutral-500 sm:grid-cols-2">
 											<div>id <code class="text-neutral-400">{row.id}</code></div>
 											<div>pattern <code class="text-neutral-400">{row.pattern_hash}</code></div>
 											{#if row.trace_id}<div>trace <code class="text-neutral-400">{row.trace_id}</code></div>{/if}
 											{#if row.span_id}<div>span <code class="text-neutral-400">{row.span_id}</code></div>{/if}
 										</dl>
-										<CopyButton value={JSON.stringify(row, null, 2)} label="Copy JSON" />
+										<CopyButton value={JSON.stringify(full, null, 2)} label="Copy JSON" />
 									</td>
 								</tr>
 							{/if}

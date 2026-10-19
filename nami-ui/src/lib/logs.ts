@@ -166,7 +166,17 @@ export type LogEntry = {
 	trace_id: string;
 	span_id: string;
 	pattern_hash: string;
+	/**
+	 * The engine cut the message or left out large fields of this list row
+	 * (search page or live tail); `entryHref` loads the whole row.
+	 */
+	truncated?: boolean;
 };
+
+/** The BFF URL of one whole row, from the explorer at `explorerPath`. */
+export function entryHref(explorerPath: string, row: Pick<LogEntry, 'id' | 'dt'>): string {
+	return `${explorerPath}/entry/${encodeURIComponent(row.id)}?${new URLSearchParams({ dt: row.dt })}`;
+}
 
 export type HistogramBucket = {
 	start: string;
