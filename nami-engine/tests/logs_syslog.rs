@@ -717,3 +717,43 @@ async fn a_token_found_to_be_unknown_is_refused_at_intake(pool: sqlx::PgPool) {
     );
     ch.drop_database().await.unwrap();
 }
+
+/// Syslog builds rows with the step HTTP ingest uses and respects the
+/// encoded cap: a batch over `max_insert_bytes` is stored in several
+/// inserts, and a frame whose row alone is larger is dropped and counted.
+#[sqlx::test]
+async fn syslog_respects_the_encoded_insert_cap(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let handle = start_with(state, |c| {
+        c.batch_max_wait = Duration::from_millis(300);
+        c.max_insert_bytes = 3000;
+    })
+    .await;
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "edge").await;
+
+    let mut tcp = TcpStream::connect(handle.tcp_addr).await.unwrap();
+    let mut wire = String::new();
+    for n in 0..6 {
+        wire.push_str(&format!(
+            "{}\n",
+            frame(&token, &format!("small {n} {}", "x".repeat(300)))
+        ));
+    }
+    // Control characters: 4,000 bytes stored, about 24,000 encoded.
+    wire.push_str(&format!("{}\n", frame(&token, &"\u{1}".repeat(4000))));
+    tcp.write_all(wire.as_bytes()).await.unwrap();
+    let stats = stats_eventually(&handle, |s| s.accepted == 6 && s.too_large == 1).await;
+    assert_eq!(
+        (stats.accepted, stats.too_large, stats.store_failed),
+        (6, 1, 0),
+        "{stats:?}"
+    );
+    let rows = rows_eventually(&ch, project, 6).await;
+    assert_eq!(rows.len(), 6);
+    assert!(
+        rows.iter()
+            .all(|row| row["message"].as_str().unwrap().starts_with("small"))
+    );
+    ch.drop_database().await.unwrap();
+}

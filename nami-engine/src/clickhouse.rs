@@ -511,25 +511,10 @@ pub fn encode_rows_within<T: Serialize>(
     rows: &[T],
     max_bytes: usize,
 ) -> Result<String, ClickHouseError> {
-    struct Count(usize);
-
-    impl std::io::Write for Count {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 += bytes.len();
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
     let mut size = 0usize;
     for row in rows {
-        let mut count = Count(0);
-        serde_json::to_writer(&mut count, row).map_err(ClickHouseError::Encode)?;
         // The row and its newline.
-        size = size.saturating_add(count.0 + 1);
+        size = size.saturating_add(encoded_len(row)? + 1);
         if size > max_bytes {
             return Err(ClickHouseError::TooLarge { limit: max_bytes });
         }
@@ -545,6 +530,27 @@ pub fn encode_rows_within<T: Serialize>(
             "serde_json wrote bytes that are not UTF-8",
         ))
     })
+}
+
+/// How many bytes `row` takes in a `JSONEachRow` body (without its newline),
+/// measured by serializing it into a counter that keeps nothing.
+pub fn encoded_len<T: Serialize>(row: &T) -> Result<usize, ClickHouseError> {
+    struct Count(usize);
+
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, row).map_err(ClickHouseError::Encode)?;
+    Ok(count.0)
 }
 
 /// Makes a typed query-parameter value (`String`, `UUID`, `Int64`, ...) arrive

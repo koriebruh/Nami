@@ -25,7 +25,10 @@
 //!    quota (read once per source and batch, like HTTP's check before the
 //!    body), both counted in the usage tables like HTTP ingest;
 //! 4. normalization and row building on a blocking thread (`spawn_blocking`),
-//!    one ClickHouse insert, then usage is recorded.
+//!    with the step HTTP ingest uses (`store::RowBatch`, the same rows under
+//!    the same caps), then inserts of at most `max_insert_bytes` of encoded
+//!    body each (a frame whose row alone is larger is dropped and counted as
+//!    `too_large`), each followed by recording its usage.
 //!
 //! Resource bounds (nothing grows with what a peer sends):
 //! - at most [`MAX_TCP_CONNECTIONS`] TCP connections, and at most
@@ -120,6 +123,9 @@ pub struct SyslogConfig {
     pub queue_max_bytes: usize,
     pub events_per_second: f64,
     pub events_burst: f64,
+    /// The largest insert body the batcher sends (the encoded cap of HTTP
+    /// ingest, `ingest::MAX_ENCODED_BYTES`); a batch over it is split.
+    pub max_insert_bytes: usize,
 }
 
 impl SyslogConfig {
@@ -136,6 +142,7 @@ impl SyslogConfig {
             queue_max_bytes: QUEUE_MAX_BYTES,
             events_per_second: EVENTS_PER_SECOND,
             events_burst: EVENTS_BURST,
+            max_insert_bytes: super::ingest::MAX_ENCODED_BYTES,
         }
     }
 }
@@ -159,6 +166,9 @@ pub struct SyslogStats {
     pub overloaded: AtomicU64,
     /// Lost to a database or ClickHouse error.
     pub store_failed: AtomicU64,
+    /// Dropped because the row alone encodes to more than
+    /// `max_insert_bytes`.
+    pub too_large: AtomicU64,
     /// TCP connections closed at once because the limit was reached.
     pub refused_connections: AtomicU64,
 }
@@ -174,6 +184,7 @@ pub struct SyslogStatsSnapshot {
     pub rate_limited: u64,
     pub overloaded: u64,
     pub store_failed: u64,
+    pub too_large: u64,
     pub refused_connections: u64,
 }
 
@@ -189,6 +200,7 @@ impl SyslogStats {
             rate_limited: get(&self.rate_limited),
             overloaded: get(&self.overloaded),
             store_failed: get(&self.store_failed),
+            too_large: get(&self.too_large),
             refused_connections: get(&self.refused_connections),
         }
     }
@@ -234,6 +246,7 @@ pub async fn spawn(state: AppState, config: SyslogConfig) -> std::io::Result<Sys
         limiter: TokenBuckets::new(config.events_per_second, config.events_burst),
         max_rows: config.batch_max_rows,
         max_wait: config.batch_max_wait,
+        max_insert_bytes: config.max_insert_bytes,
     };
     tokio::spawn(batcher.run(rx));
     tokio::spawn(run_tcp(
@@ -600,6 +613,7 @@ struct Batcher {
     limiter: TokenBuckets,
     max_rows: usize,
     max_wait: Duration,
+    max_insert_bytes: usize,
 }
 
 impl Batcher {
@@ -694,25 +708,20 @@ impl Batcher {
         }
         let count = allowed.len() as u64;
         // Normalization and row building are CPU work: off the async runtime.
+        // No stored cap here: the queue's byte budget already bounds a batch.
         let built = tokio::task::spawn_blocking(move || {
-            let mut per_source: HashMap<Uuid, (u64, u64)> = HashMap::new();
+            let mut rows = store::RowBatch::with_capacity(allowed.len(), usize::MAX);
             let mut budget = Vec::with_capacity(allowed.len());
-            let rows: Vec<store::LogRow> = allowed
-                .into_iter()
-                .map(|(pending, source)| {
-                    budget.push(pending._bytes);
-                    let event = pending.message.into_event(pending.received_at);
-                    let row = store::build_row(event, &source);
-                    let counted = per_source.entry(source.id).or_default();
-                    counted.0 += 1;
-                    counted.1 += row.stored_bytes();
-                    row
-                })
-                .collect();
-            (rows, per_source, budget)
+            for (pending, source) in allowed {
+                budget.push(pending._bytes);
+                let event = pending.message.into_event(pending.received_at);
+                // Cannot fail: the batch has no stored cap.
+                let _ = rows.push(event, &source);
+            }
+            (Arc::new(rows), budget)
         })
         .await;
-        let (rows, per_source, _budget) = match built {
+        let (rows, _budget) = match built {
             Ok(built) => built,
             Err(error) => {
                 bump(&self.stats.store_failed, count);
@@ -720,19 +729,55 @@ impl Batcher {
                 return;
             }
         };
-        match store::insert_logs(&state.clickhouse, &rows).await {
-            Ok(()) => {
-                bump(&self.stats.accepted, rows.len() as u64);
-                for (source_id, (events, bytes)) in per_source {
-                    state
-                        .logs
-                        .usage
-                        .record_accepted(source_id, today, events, bytes);
-                }
-            }
+        let max_bytes = self.max_insert_bytes;
+        let (runs, oversized) = match store::chunk_rows(rows.rows(), max_bytes) {
+            Ok(split) => split,
             Err(error) => {
-                bump(&self.stats.store_failed, rows.len() as u64);
-                tracing::error!(%error, rows = rows.len(), "syslog: failed to store log rows");
+                bump(&self.stats.store_failed, count);
+                tracing::error!(%error, "syslog: could not encode log rows");
+                return;
+            }
+        };
+        if oversized > 0 {
+            bump(&self.stats.too_large, oversized as u64);
+            self.warnings
+                .warn(None, "a frame's row is larger than one insert may be");
+        }
+        // One insert body at a time, each encoded off the async runtime.
+        for run in runs {
+            let rows = Arc::clone(&rows);
+            let events = run.len() as u64;
+            let encoded = tokio::task::spawn_blocking(move || {
+                store::encode_run(&rows.rows()[run], max_bytes)
+            })
+            .await;
+            let encoded = match encoded {
+                Ok(Ok(encoded)) => encoded,
+                Ok(Err(error)) => {
+                    bump(&self.stats.store_failed, events);
+                    tracing::error!(%error, "syslog: could not encode log rows");
+                    continue;
+                }
+                Err(error) => {
+                    bump(&self.stats.store_failed, events);
+                    tracing::error!(%error, "syslog: encoding log rows failed");
+                    continue;
+                }
+            };
+            match store::insert_encoded_logs(&state.clickhouse, encoded.body).await {
+                Ok(()) => {
+                    bump(&self.stats.accepted, events);
+                    for (source_id, (events, bytes)) in encoded.per_source {
+                        state
+                            .logs
+                            .usage
+                            .record_accepted(source_id, today, events, bytes);
+                    }
+                }
+                Err(error) => {
+                    bump(&self.stats.store_failed, events);
+                    tracing::error!(%error, rows = events, "syslog: failed to store log rows");
+                }
             }
         }
     }

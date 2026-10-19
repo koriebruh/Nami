@@ -1,5 +1,7 @@
 //! Log rows in ClickHouse (`logs`, see `clickhouse::MIGRATIONS`).
 
+use std::{collections::HashMap, ops::Range};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -145,6 +147,151 @@ pub fn build_row_at(event: LogEvent, source: &IngestSource, now: DateTime<Utc>) 
     }
 }
 
+/// The rows of a batch of normalized events: the one step every ingest path
+/// (HTTP `ingest::build_batch`, the syslog batcher) turns events into rows
+/// with, so they all store the same rows under the same caps:
+///
+/// normalized event -> (pipeline stages, a later sub-project: they will run
+/// here, on the event) -> pattern and row ([`build_row`], which enforces the
+/// message, fields, level, id and `dt` rules whatever built the event) ->
+/// counted against `max_stored_bytes` -> encoded with a cap
+/// ([`RowBatch::encode`] for a whole request, [`chunk_rows`] and
+/// [`encode_run`] for frames that may be stored in several inserts).
+#[derive(Debug)]
+pub struct RowBatch {
+    rows: Vec<LogRow>,
+    stored: u64,
+    max_stored_bytes: usize,
+}
+
+/// What a run of rows counts for, per source: (events, stored bytes).
+pub type SourceCounts = HashMap<Uuid, (u64, u64)>;
+
+/// The rows would store more than the batch's `max_stored_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredTooLarge;
+
+/// Rows encoded for one insert, and what they count for.
+#[derive(Debug)]
+pub struct EncodedRows {
+    /// The `JSONEachRow` body ([`encode_logs`]).
+    pub body: String,
+    pub events: usize,
+    pub bytes: u64,
+    pub per_source: SourceCounts,
+}
+
+impl RowBatch {
+    pub fn new(max_stored_bytes: usize) -> RowBatch {
+        RowBatch::with_capacity(0, max_stored_bytes)
+    }
+
+    pub fn with_capacity(capacity: usize, max_stored_bytes: usize) -> RowBatch {
+        RowBatch {
+            rows: Vec::with_capacity(capacity),
+            stored: 0,
+            max_stored_bytes,
+        }
+    }
+
+    /// Adds the row for `event` from `source`; [`StoredTooLarge`] (and the row
+    /// is not kept) once the rows would store more than the batch's cap.
+    pub fn push(&mut self, event: LogEvent, source: &IngestSource) -> Result<(), StoredTooLarge> {
+        let row = build_row(event, source);
+        let stored = self.stored + row.stored_bytes();
+        if stored > self.max_stored_bytes as u64 {
+            return Err(StoredTooLarge);
+        }
+        self.stored = stored;
+        self.rows.push(row);
+        Ok(())
+    }
+
+    pub fn rows(&self) -> &[LogRow] {
+        &self.rows
+    }
+
+    pub fn into_rows(self) -> Vec<LogRow> {
+        self.rows
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// What the rows count against usage and quotas ([`LogRow::stored_bytes`]).
+    pub fn stored_bytes(&self) -> u64 {
+        self.stored
+    }
+
+    /// Every row in one insert body, refused with
+    /// [`ClickHouseError::TooLarge`] over `max_bytes` (a request is stored
+    /// whole or not at all).
+    pub fn encode(&self, max_bytes: usize) -> Result<EncodedRows, ClickHouseError> {
+        encode_run(&self.rows, max_bytes)
+    }
+}
+
+/// `rows` (a run of [`chunk_rows`], or a whole batch) encoded for one
+/// insert, refused with [`ClickHouseError::TooLarge`] over `max_bytes`, with
+/// what they count for per source.
+pub fn encode_run(rows: &[LogRow], max_bytes: usize) -> Result<EncodedRows, ClickHouseError> {
+    let body = encode_logs(rows, max_bytes)?;
+    let mut per_source = SourceCounts::new();
+    let mut bytes = 0;
+    for row in rows {
+        let counted = per_source.entry(row.source_id).or_default();
+        counted.0 += 1;
+        counted.1 += row.stored_bytes();
+        bytes += row.stored_bytes();
+    }
+    Ok(EncodedRows {
+        body,
+        events: rows.len(),
+        bytes,
+        per_source,
+    })
+}
+
+/// `rows` split into consecutive runs whose insert body (each row and its
+/// newline) is at most `max_bytes`, and how many rows were left out because
+/// one alone is larger than that.
+pub fn chunk_rows(
+    rows: &[LogRow],
+    max_bytes: usize,
+) -> Result<(Vec<Range<usize>>, usize), ClickHouseError> {
+    let mut runs = Vec::new();
+    let mut oversized = 0;
+    let mut start = 0;
+    let mut size = 0usize;
+    for (index, row) in rows.iter().enumerate() {
+        let len = crate::clickhouse::encoded_len(row)? + 1;
+        if len > max_bytes {
+            if start < index {
+                runs.push(start..index);
+            }
+            oversized += 1;
+            start = index + 1;
+            size = 0;
+            continue;
+        }
+        if size + len > max_bytes {
+            runs.push(start..index);
+            start = index;
+            size = 0;
+        }
+        size += len;
+    }
+    if start < rows.len() {
+        runs.push(start..rows.len());
+    }
+    Ok((runs, oversized))
+}
+
 pub async fn insert_logs(ch: &ClickHouse, rows: &[LogRow]) -> Result<(), ClickHouseError> {
     ch.insert_rows_with(LOGS_TABLE, rows, &INSERT_SETTINGS)
         .await
@@ -202,6 +349,65 @@ mod tests {
             String::new(),
             String::new(),
         )
+    }
+
+    fn row_of_size(source: &IngestSource, message_len: usize) -> LogRow {
+        let mut event = event_at(now());
+        event.message = "m".repeat(message_len);
+        build_row_at(event, source, now())
+    }
+
+    #[test]
+    fn rows_are_chunked_by_encoded_size_and_oversized_ones_left_out() {
+        let source = source(14);
+        let rows: Vec<LogRow> = [100, 100, 100, 5000, 100]
+            .iter()
+            .map(|len| row_of_size(&source, *len))
+            .collect();
+        let one = crate::clickhouse::encoded_len(&rows[0]).unwrap() + 1;
+        let (runs, oversized) = chunk_rows(&rows, 2 * one).unwrap();
+        assert_eq!(runs, vec![0..2, 2..3, 4..5]);
+        assert_eq!(oversized, 1);
+        let (runs, oversized) = chunk_rows(&rows, usize::MAX).unwrap();
+        assert_eq!((runs, oversized), (vec![0..5], 0));
+        assert_eq!(chunk_rows(&[], 10).unwrap(), (vec![], 0));
+    }
+
+    #[test]
+    fn a_row_batch_caps_what_it_stores_and_encodes() {
+        let source = source(14);
+        let mut batch = RowBatch::new(250);
+        let event = |len: usize| LogEvent {
+            message: "m".repeat(len),
+            ..event_at(now())
+        };
+        batch.push(event(100), &source).unwrap();
+        batch.push(event(100), &source).unwrap();
+        assert_eq!(batch.push(event(100), &source), Err(StoredTooLarge));
+        assert_eq!(batch.len(), 2);
+        let stored = batch.stored_bytes();
+        assert_eq!(
+            stored,
+            batch.rows().iter().map(LogRow::stored_bytes).sum::<u64>()
+        );
+
+        let whole = batch.encode(usize::MAX).unwrap();
+        assert_eq!((whole.events, whole.bytes), (2, stored));
+        assert_eq!(whole.per_source[&source.id], (2, stored));
+        assert_eq!(whole.body.lines().count(), 2);
+        assert!(matches!(
+            batch.encode(10),
+            Err(ClickHouseError::TooLarge { .. })
+        ));
+
+        let one = crate::clickhouse::encoded_len(&batch.rows()[0]).unwrap() + 1;
+        let (runs, oversized) = chunk_rows(batch.rows(), one + 5).unwrap();
+        assert_eq!((runs.len(), oversized), (2, 0));
+        for run in runs {
+            let chunk = encode_run(&batch.rows()[run], one + 5).unwrap();
+            assert_eq!(chunk.events, 1);
+            assert!(chunk.body.len() <= one + 5);
+        }
     }
 
     #[test]

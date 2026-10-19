@@ -496,9 +496,8 @@ pub fn build_batch(
     source: &IngestSource,
     received_at: DateTime<Utc>,
 ) -> Result<Batch, IngestError> {
-    let rows = build_rows(body, encoding, source, received_at)?;
-    let bytes = rows.iter().map(LogRow::stored_bytes).sum();
-    let encoded = match store::encode_logs(&rows, MAX_ENCODED_BYTES) {
+    let rows = row_batch(body, encoding, source, received_at, MAX_ENCODED_BYTES)?;
+    let encoded = match rows.encode(MAX_ENCODED_BYTES) {
         Ok(encoded) => encoded,
         Err(ClickHouseError::TooLarge { .. }) => return Err(stored_too_large()),
         Err(error) => {
@@ -507,9 +506,9 @@ pub fn build_batch(
         }
     };
     Ok(Batch {
-        body: encoded,
-        events: rows.len(),
-        bytes,
+        body: encoded.body,
+        events: encoded.events,
+        bytes: encoded.bytes,
     })
 }
 
@@ -533,20 +532,29 @@ pub fn build_rows_within(
     received_at: DateTime<Utc>,
     max_stored_bytes: usize,
 ) -> Result<Vec<LogRow>, IngestError> {
+    Ok(row_batch(body, encoding, source, received_at, max_stored_bytes)?.into_rows())
+}
+
+/// Decodes `body` and turns its events into rows with the shared step
+/// ([`store::RowBatch`]), refused with a 413 as soon as they store more than
+/// `max_stored_bytes`.
+fn row_batch(
+    body: Bytes,
+    encoding: BodyEncoding,
+    source: &IngestSource,
+    received_at: DateTime<Utc>,
+    max_stored_bytes: usize,
+) -> Result<store::RowBatch, IngestError> {
     let events = decode_events(body, encoding)?;
-    let mut rows = Vec::with_capacity(events.len());
-    let mut stored = 0u64;
+    let mut batch = store::RowBatch::with_capacity(events.len(), max_stored_bytes);
     // Each event is dropped as its row is made: the values it held go as the
     // rows grow.
     for object in events {
-        let row = store::build_row(normalize::from_json(object, received_at), source);
-        stored += row.stored_bytes();
-        if stored > max_stored_bytes as u64 {
-            return Err(stored_too_large());
-        }
-        rows.push(row);
+        batch
+            .push(normalize::from_json(object, received_at), source)
+            .map_err(|store::StoredTooLarge| stored_too_large())?;
     }
-    Ok(rows)
+    Ok(batch)
 }
 
 /// Decompresses (when gzip) and parses a body into event objects.
