@@ -20,7 +20,7 @@ use super::{
     },
     tls,
 };
-use crate::models::monitor::Monitor;
+use crate::models::monitor::{IpVersion, Monitor};
 
 /// A greeting is one line; never keep more than this of it.
 const MAX_GREETING_BYTES: usize = 512;
@@ -36,7 +36,7 @@ pub(crate) async fn probe(ctx: &CheckContext, monitor: &Monitor, started: Instan
         return Observation::down(None, None, "monitor has no valid port".to_string());
     };
     let greeting = if monitor.use_tls {
-        match tls::connect(ctx.tls.clone(), host, port).await {
+        match tls::connect(ctx.tls.clone(), host, port, IpVersion::Any).await {
             Ok(mut stream) => read_greeting(&mut stream).await,
             Err(message) => return Observation::down(None, None, message),
         }

@@ -66,7 +66,7 @@ Also out of scope (ruled 2026-10-13):
 - [x] Heartbeat groups (shared with monitor groups)
 - [ ] Monitor bulk import: URL list (<= 500, per-line results), Uptime
       Kuma JSON, UptimeRobot CSV
-- [ ] Advanced request options: IP version (any/IPv4/IPv6), remember
+- [x] Advanced request options: IP version (any/IPv4/IPv6), remember
       cookies within a check, HTTP(S) proxy with encrypted credentials
 - [x] Availability (SLA) report for a monitor over an arbitrary range;
       check-history CSV export

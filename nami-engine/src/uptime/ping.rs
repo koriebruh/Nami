@@ -11,8 +11,8 @@ use std::{
 
 use surge_ping::{Client, Config, ICMP, PingIdentifier, PingSequence, SurgeError};
 
-use super::checker::{Observation, allowed_addresses};
-use crate::models::monitor::Monitor;
+use super::checker::{Observation, allowed_addresses, keep_family};
+use crate::models::monitor::{IpVersion, Monitor};
 
 /// The classic 56 data bytes of `ping`.
 const PAYLOAD: [u8; 56] = [0; 56];
@@ -21,7 +21,7 @@ pub(crate) async fn probe(monitor: &Monitor, timeout: Duration) -> Observation {
     let Some(host) = monitor.host.as_deref() else {
         return Observation::down(None, None, "monitor has no host".to_string());
     };
-    let ip = match resolve(host).await {
+    let ip = match resolve(host, monitor.ip_version()).await {
         Ok(ip) => ip,
         Err(message) => return Observation::down(None, None, message),
     };
@@ -59,8 +59,10 @@ pub(crate) async fn probe(monitor: &Monitor, timeout: Duration) -> Observation {
 /// to, however the name is spelled (`2852039166` resolves to the metadata
 /// address); when nothing else is left the result is the generic refusal. The
 /// address that is judged is the one that is pinged: the name is resolved once.
-/// IPv4 is preferred.
-async fn resolve(host: &str) -> Result<IpAddr, String> {
+/// With `ip_version` only addresses of that family are kept, a literal's
+/// included (see `checker::keep_family`), with no fallback; with `Any`, IPv4
+/// is preferred.
+async fn resolve(host: &str, ip_version: IpVersion) -> Result<IpAddr, String> {
     let resolved: Vec<SocketAddr> = match host.parse::<IpAddr>() {
         Ok(ip) => vec![SocketAddr::new(ip, 0)],
         Err(_) => tokio::net::lookup_host((host, 0))
@@ -68,7 +70,8 @@ async fn resolve(host: &str) -> Result<IpAddr, String> {
             .map_err(|e| format!("could not resolve {host}: {e}"))?
             .collect(),
     };
-    let allowed = allowed_addresses(resolved).map_err(|refused| refused.to_string())?;
+    let of_family = keep_family(resolved, ip_version).map_err(|e| e.to_string())?;
+    let allowed = allowed_addresses(of_family).map_err(|refused| refused.to_string())?;
     allowed
         .iter()
         .map(SocketAddr::ip)

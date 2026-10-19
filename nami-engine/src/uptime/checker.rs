@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     crypto::{Cipher, SecretString},
     models::{
-        monitor::{Monitor, url_has_credentials},
+        monitor::{IpVersion, Monitor, url_has_credentials},
         monitor_request::{
-            BODY_METHODS, HTTP_METHODS, RESERVED_HEADERS, open_headers, open_password,
+            BODY_METHODS, HTTP_METHODS, RESERVED_HEADERS, RequestHeader, open_headers,
+            open_password, open_proxy_password,
         },
     },
     state::AppState,
@@ -66,6 +67,73 @@ impl fmt::Display for DestinationNotAllowed {
 }
 
 impl std::error::Error for DestinationNotAllowed {}
+
+/// Why a check with an `ip_version` did not connect: its target resolves (or
+/// is written as a literal) only to addresses of the other family. There is no
+/// fallback to the other family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoAddressOfFamily(pub IpVersion);
+
+impl std::error::Error for NoAddressOfFamily {}
+
+impl fmt::Display for NoAddressOfFamily {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            IpVersion::V6 => f.write_str("no IPv6 address"),
+            // `Any` never fails (see `keep_family`); it reads as IPv4 here only
+            // so that the match is total.
+            IpVersion::V4 | IpVersion::Any => f.write_str("no IPv4 address"),
+        }
+    }
+}
+
+/// The addresses among `resolved` of the family `ip` asks for. `Any` keeps
+/// everything; nothing resolved stays an empty list (which fails later as any
+/// unresolvable name does); addresses that were resolved but none of the
+/// family is [`NoAddressOfFamily`]. Applied before [`allowed_addresses`].
+pub(crate) fn keep_family(
+    resolved: impl IntoIterator<Item = SocketAddr>,
+    ip: IpVersion,
+) -> Result<Vec<SocketAddr>, NoAddressOfFamily> {
+    let resolved: Vec<SocketAddr> = resolved.into_iter().collect();
+    let wanted = |address: &SocketAddr| match ip {
+        IpVersion::Any => true,
+        IpVersion::V4 => address.is_ipv4(),
+        IpVersion::V6 => address.is_ipv6(),
+    };
+    if resolved.is_empty() || resolved.iter().any(wanted) {
+        Ok(resolved.into_iter().filter(wanted).collect())
+    } else {
+        Err(NoAddressOfFamily(ip))
+    }
+}
+
+/// Resolves `host` (a name or an IP literal) for a check that connects itself
+/// (tcp, the TLS checks): the system resolver, then [`keep_family`], then
+/// [`allowed_addresses`]. The error is ready for check history.
+pub(crate) async fn resolve_target(
+    host: &str,
+    port: u16,
+    ip: IpVersion,
+) -> Result<Vec<SocketAddr>, String> {
+    // A (host, port) tuple, not a "host:port" string, so IPv6 literals work.
+    let resolved = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| describe_io_error(&e))?;
+    let of_family = keep_family(resolved, ip).map_err(|e| e.to_string())?;
+    allowed_addresses(of_family).map_err(|_| DESTINATION_NOT_ALLOWED.to_string())
+}
+
+/// Whether `url`'s host is an IP literal of the family `ip` excludes. reqwest
+/// never hands a literal to the resolver, so [`GuardedResolver`] cannot apply
+/// `ip_version` to it: [`probe_http`] checks the monitor's URL with this, and
+/// [`follow_policy`] every redirect hop.
+fn literal_of_other_family(url: &reqwest::Url, ip: IpVersion) -> bool {
+    matches!(
+        (url.host(), ip),
+        (Some(url::Host::Ipv4(_)), IpVersion::V6) | (Some(url::Host::Ipv6(_)), IpVersion::V4)
+    )
+}
 
 /// Addresses no check may contact, whatever the monitor says:
 ///
@@ -153,15 +221,23 @@ pub(crate) fn names_forbidden_address(url: &reqwest::Url) -> bool {
 /// (the system resolver, off the async threads) and drops every address a
 /// check may not contact, failing with [`DestinationNotAllowed`] when none is
 /// left. Every connection the client opens resolves its host here, the target
-/// of each redirect included.
-struct GuardedResolver;
+/// of each redirect included, and a monitor's proxy (reqwest resolves the
+/// proxy host through the client's resolver; pinned by
+/// `the_proxy_host_is_resolved_by_the_clients_resolver`). Addresses of the
+/// family `ip_version` excludes are dropped first (see [`keep_family`]), with
+/// no fallback.
+struct GuardedResolver {
+    ip_version: IpVersion,
+}
 
 impl reqwest::dns::Resolve for GuardedResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let host = name.as_str().to_string();
+        let ip_version = self.ip_version;
         Box::pin(async move {
             let resolved = tokio::net::lookup_host((host.as_str(), 0)).await?;
-            let allowed = allowed_addresses(resolved)?;
+            let of_family = keep_family(resolved, ip_version)?;
+            let allowed = allowed_addresses(of_family)?;
             Ok(Box::new(allowed.into_iter()) as reqwest::dns::Addrs)
         })
     }
@@ -261,7 +337,7 @@ impl CheckContext {
 }
 
 /// How a client treats a redirect.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RedirectMode {
     /// No redirect is followed: the 3xx response is the result.
     None,
@@ -272,14 +348,29 @@ enum RedirectMode {
     SameOrigin,
 }
 
+impl RedirectMode {
+    /// The one decision of how a check's client treats redirects, for the
+    /// shared clients ([`HttpClients::select`]) and the per-check ones alike:
+    /// a request that carries secrets (see [`carries_secrets`]) only follows
+    /// redirects on its own origin.
+    fn for_request(follow_redirects: bool, carries_secrets: bool) -> RedirectMode {
+        match (follow_redirects, carries_secrets) {
+            (false, _) => RedirectMode::None,
+            (true, false) => RedirectMode::Follow,
+            (true, true) => RedirectMode::SameOrigin,
+        }
+    }
+}
+
 /// The clients [`HttpClients`] keeps: every [`RedirectMode`] with and without
-/// certificate verification.
-const CLIENT_COUNT: usize = 3 * 2;
+/// certificate verification, for each [`IpVersion`].
+const CLIENT_COUNT: usize = 3 * 2 * 3;
 
 /// One reqwest client per combination of the per-monitor transport settings:
-/// how redirects are handled (see [`RedirectMode`]) and whether certificates
-/// are verified. All of them come out of [`build_client`], so every one is
-/// built the same way, and hardened the same way:
+/// how redirects are handled (see [`RedirectMode`]), whether certificates
+/// are verified and which address family is used (see [`IpVersion`]). All of
+/// them come out of [`build_client`], so every one is built the same way, and
+/// hardened the same way:
 ///
 /// - Idle connections are never kept, so every check opens a fresh connection:
 ///   a pooled keep-alive socket would hide a server that stopped accepting new
@@ -288,7 +379,9 @@ const CLIENT_COUNT: usize = 3 * 2;
 /// - Proxy settings from the environment (`HTTP_PROXY`, `HTTPS_PROXY`,
 ///   `ALL_PROXY`) or the operating system are ignored: a check must reach the
 ///   monitored address itself, not whatever a proxy in the engine's
-///   environment makes of it, and tcp checks never use a proxy.
+///   environment makes of it, and tcp checks never use a proxy. A monitor's
+///   own proxy is used only for that monitor's checks, on a client built for
+///   that one check (see [`build_request`]), never on one of these.
 /// - No connection goes to an address [`is_forbidden_destination`] refuses:
 ///   names resolve through [`GuardedResolver`], and a redirect to an IP
 ///   literal is refused by the redirect policy (the monitor's own URL is
@@ -298,11 +391,12 @@ const CLIENT_COUNT: usize = 3 * 2;
 ///
 /// A client is built when a check first needs it, not up front: building one
 /// can mean parsing the system's root certificates, and a pass rarely uses more
-/// than one or two of the six. Clones share what has been built.
+/// than one or two of the eighteen. Clones share what has been built.
 #[derive(Clone)]
 pub struct HttpClients {
-    /// Indexed by `mode * 2 + (verify_ssl ? 0 : 1)`, `mode` being the
-    /// [`RedirectMode`]'s position in its declaration.
+    /// Indexed by `(ip * 3 + mode) * 2 + (verify_ssl ? 0 : 1)`, `mode` and
+    /// `ip` being the [`RedirectMode`]'s and the [`IpVersion`]'s position in
+    /// their declarations.
     clients: Arc<[OnceLock<reqwest::Client>; CLIENT_COUNT]>,
 }
 
@@ -343,14 +437,24 @@ impl HttpClients {
         follow_redirects: bool,
         verify_ssl: bool,
         carries_secrets: bool,
+        ip_version: IpVersion,
     ) -> &reqwest::Client {
-        let mode = match (follow_redirects, carries_secrets) {
-            (false, _) => RedirectMode::None,
-            (true, false) => RedirectMode::Follow,
-            (true, true) => RedirectMode::SameOrigin,
+        let mode = RedirectMode::for_request(follow_redirects, carries_secrets);
+        let ip = match ip_version {
+            IpVersion::Any => 0,
+            IpVersion::V4 => 1,
+            IpVersion::V6 => 2,
         };
-        self.clients[mode as usize * 2 + usize::from(!verify_ssl)]
-            .get_or_init(|| build_client(mode, verify_ssl))
+        self.clients[(ip * 3 + mode as usize) * 2 + usize::from(!verify_ssl)].get_or_init(|| {
+            build_client(ClientOptions {
+                redirects: mode,
+                verify_ssl,
+                ip_version,
+                proxy: None,
+                cookies: false,
+            })
+            .expect("failed to build an uptime HTTP client")
+        })
     }
 
     /// How many clients exist so far.
@@ -363,33 +467,181 @@ impl HttpClients {
     }
 }
 
-/// The one place a check's HTTP client is built (see [`HttpClients`]).
-fn build_client(redirects: RedirectMode, verify_ssl: bool) -> reqwest::Client {
-    let policy = match redirects {
+/// Everything [`build_client`] needs to know about one client.
+struct ClientOptions {
+    redirects: RedirectMode,
+    verify_ssl: bool,
+    ip_version: IpVersion,
+    /// A monitor's own proxy, for a client built for one check of that
+    /// monitor (never for a shared one).
+    proxy: Option<MonitorProxy>,
+    /// A cookie jar of the client's own, for a client built for one check.
+    cookies: bool,
+}
+
+/// A monitor's proxy as a client uses it.
+struct MonitorProxy {
+    proxy: reqwest::Proxy,
+    /// The proxy URL's host, set for an `https://` proxy only: the name its
+    /// certificate must be valid for (see [`ProxyOnlyVerifier`]).
+    tls_host: Option<String>,
+}
+
+/// The one place a check's HTTP client is built, shared (see [`HttpClients`])
+/// or for one check (see [`build_request`]).
+///
+/// `.no_proxy()` comes first on every client, so the environment's and the
+/// operating system's proxies are never used; a monitor's own proxy is added
+/// after it, explicitly. The proxy host resolves through the same
+/// [`GuardedResolver`] as every target.
+///
+/// TLS to an `https://` proxy is always verified: `verify_ssl` is about the
+/// target only. reqwest uses one TLS configuration for the proxy and the
+/// target, so when the two differ (a proxy over TLS and `verify_ssl = false`)
+/// the client gets a configuration of its own whose verifier checks the
+/// proxy's certificate and accepts any other (see [`ProxyOnlyVerifier`]).
+fn build_client(options: ClientOptions) -> Result<reqwest::Client, String> {
+    let policy = match options.redirects {
         RedirectMode::None => reqwest::redirect::Policy::none(),
-        RedirectMode::Follow => follow_policy(false),
-        RedirectMode::SameOrigin => follow_policy(true),
+        RedirectMode::Follow => follow_policy(false, options.ip_version),
+        RedirectMode::SameOrigin => follow_policy(true, options.ip_version),
     };
-    reqwest::Client::builder()
-        .no_proxy()
-        .dns_resolver(GuardedResolver)
+    let mut builder = reqwest::Client::builder().no_proxy();
+    let mut proxy_tls_host = None;
+    if let Some(MonitorProxy { proxy, tls_host }) = options.proxy {
+        builder = builder.proxy(proxy);
+        proxy_tls_host = tls_host;
+    }
+    builder = builder
+        .dns_resolver(GuardedResolver {
+            ip_version: options.ip_version,
+        })
         .redirect(policy)
         .referer(false)
-        .danger_accept_invalid_certs(!verify_ssl)
+        .danger_accept_invalid_certs(!options.verify_ssl)
         .pool_max_idle_per_host(0)
-        .user_agent(concat!("Nami-Uptime/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("Nami-Uptime/", env!("CARGO_PKG_VERSION")));
+    if let (Some(host), false) = (proxy_tls_host, options.verify_ssl) {
+        builder = builder.tls_backend_preconfigured(proxy_only_verified_tls(&host)?);
+    }
+    if options.cookies {
+        builder = builder.cookie_provider(Arc::new(reqwest::cookie::Jar::default()));
+    }
+    builder
         .build()
-        .expect("failed to build an uptime HTTP client")
+        .map_err(|e| format!("could not build the HTTP client: {}", root_cause(&e)))
+}
+
+/// The TLS configuration of a client whose `https://` proxy at `proxy_host`
+/// must be verified while its targets are not (`verify_ssl = false`).
+///
+/// The protocol versions, the provider, ALPN and SNI are the ones reqwest
+/// would choose itself. A target whose host name is the proxy's own is
+/// verified too: the verifier only sees the name.
+fn proxy_only_verified_tls(proxy_host: &str) -> Result<rustls::ClientConfig, String> {
+    let provider = super::tls::provider();
+    let strict = rustls_platform_verifier::Verifier::new(provider.clone())
+        .map_err(|e| format!("could not load the system's TLS roots: {e}"))?;
+    let verifier = ProxyOnlyVerifier::new(proxy_host, Arc::new(strict), &provider)?;
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("invalid TLS settings: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+/// Verifies the certificate of exactly one server name, the proxy's, with
+/// `strict` (the system's verifier, what reqwest uses), and accepts every
+/// other name's certificate unverified, as `verify_ssl = false` asks for the
+/// target. Handshake signatures are always checked.
+#[derive(Debug)]
+struct ProxyOnlyVerifier {
+    proxy: rustls::pki_types::ServerName<'static>,
+    strict: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    algorithms: rustls::crypto::WebPkiSupportedAlgorithms,
+}
+
+impl ProxyOnlyVerifier {
+    fn new(
+        proxy_host: &str,
+        strict: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+        provider: &rustls::crypto::CryptoProvider,
+    ) -> Result<ProxyOnlyVerifier, String> {
+        let host = proxy_host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(proxy_host);
+        let proxy = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|_| "the proxy host is not a valid TLS server name".to_string())?;
+        Ok(ProxyOnlyVerifier {
+            proxy,
+            strict,
+            algorithms: provider.signature_verification_algorithms,
+        })
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for ProxyOnlyVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if *server_name == self.proxy {
+            self.strict.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            )
+        } else {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.algorithms.supported_schemes()
+    }
 }
 
 /// Follows up to [`MAX_REDIRECTS`] redirects, refusing every hop to an address
-/// no check may contact (see [`is_forbidden_destination`]), and, with
-/// `same_origin_only`, every hop that leaves the monitored origin.
-fn follow_policy(same_origin_only: bool) -> reqwest::redirect::Policy {
+/// no check may contact (see [`is_forbidden_destination`]), every hop to an IP
+/// literal of the family `ip_version` excludes (see
+/// [`literal_of_other_family`]), and, with `same_origin_only`, every hop that
+/// leaves the monitored origin.
+fn follow_policy(same_origin_only: bool, ip_version: IpVersion) -> reqwest::redirect::Policy {
     let limit = reqwest::redirect::Policy::limited(MAX_REDIRECTS);
     reqwest::redirect::Policy::custom(move |attempt| {
         if names_forbidden_address(attempt.url()) {
             return attempt.error(DestinationNotAllowed);
+        }
+        if literal_of_other_family(attempt.url(), ip_version) {
+            return attempt.error(NoAddressOfFamily(ip_version));
         }
         let leaves = same_origin_only
             .then(|| leaves_origin(attempt.previous(), attempt.url()))
@@ -605,23 +857,49 @@ async fn probe_http(ctx: &CheckContext, monitor: &Monitor) -> Observation {
     };
     // The URL's own host, if it is an IP literal: a name is judged when it
     // resolves (see `GuardedResolver`), a redirect by the redirect policy.
-    if reqwest::Url::parse(url).is_ok_and(|parsed| names_forbidden_address(&parsed)) {
+    let parsed = reqwest::Url::parse(url).ok();
+    if parsed.as_ref().is_some_and(names_forbidden_address) {
         return Observation::down(None, None, DESTINATION_NOT_ALLOWED.to_string());
+    }
+    // A literal never reaches the resolver, so `ip_version` is applied to it
+    // here (and to every redirect hop by the redirect policy).
+    let ip_version = monitor.ip_version();
+    if parsed
+        .as_ref()
+        .is_some_and(|parsed| literal_of_other_family(parsed, ip_version))
+    {
+        return Observation::down(None, None, NoAddressOfFamily(ip_version).to_string());
     }
     // Last before sending: the secrets are opened only for a request that
     // will be sent.
-    let request = match build_request(ctx, monitor, url, keyword.is_some()) {
+    let request = match build_request(ctx, monitor, url, keyword.is_some()).await {
         Ok(request) => request,
         Err(message) => return Observation::down(None, None, message),
     };
+    let proxied = monitor.proxy_url.is_some();
     // The response time starts here: the request may just have built its
     // client (see `HttpClients`), which has nothing to do with the target.
     let started = Instant::now();
     let mut response = match request.send().await {
         Ok(response) => response,
+        Err(e) if proxied => {
+            let target_is_https = parsed.as_ref().is_some_and(|u| u.scheme() == "https");
+            return Observation::down(None, None, describe_proxied_error(&e, target_is_https));
+        }
         Err(e) => return Observation::down(None, None, describe_request_error(&e)),
     };
     let code = response.status().as_u16();
+    // A 407 behind a proxy is the proxy refusing its credentials (an http
+    // target goes through the proxy as a plain request, so the refusal comes
+    // back as a response). Checked before the expected range, which may
+    // include 407.
+    if proxied && code == 407 {
+        return Observation::down(
+            Some(code),
+            Some(elapsed_ms(started)),
+            PROXY_AUTH_FAILED.to_string(),
+        );
+    }
     let in_range =
         (monitor.expected_status_min..=monitor.expected_status_max).contains(&i32::from(code));
     if !in_range {
@@ -658,8 +936,31 @@ async fn probe_http(ctx: &CheckContext, monitor: &Monitor) -> Observation {
     }
 }
 
+/// The down reason of a check whose proxy answered 407.
+const PROXY_AUTH_FAILED: &str = "proxy authentication failed (HTTP 407)";
+
+/// Whether a request carries secrets of any kind, which keeps it on its origin
+/// (see [`HttpClients::select`]): custom headers, basic auth, the credentials
+/// in the URL itself, which reqwest sends as an `Authorization` header, and a
+/// request body, which a 307 or 308 sends again to wherever it points. The one
+/// place this is decided: the shared clients and the per-check ones both take
+/// their [`RedirectMode`] from it.
+fn carries_secrets(
+    monitor: &Monitor,
+    url: &str,
+    headers: &[RequestHeader],
+    method: &reqwest::Method,
+) -> bool {
+    let sends_body = BODY_METHODS.contains(&method.as_str());
+    !headers.is_empty()
+        || monitor.auth_username.is_some()
+        || (sends_body && monitor.request_body.is_some())
+        || reqwest::Url::parse(url).is_ok_and(|parsed| url_has_credentials(&parsed))
+}
+
 /// The request one check sends: the monitor's method, custom headers, basic
-/// auth and body, on the client matching its redirect and TLS settings.
+/// auth and body, on the client matching its redirect, TLS and IP version
+/// settings.
 ///
 /// The secrets are opened here, for this check alone, and never logged or
 /// echoed: every failure becomes one of two fixed messages. The request has no
@@ -669,7 +970,21 @@ async fn probe_http(ctx: &CheckContext, monitor: &Monitor) -> Observation {
 /// stored HEAD is sent as GET for them, because a HEAD response has none. The
 /// request body only goes out with a method that may carry one, whatever is
 /// stored.
-fn build_request(
+///
+/// A monitor with a proxy or `remember_cookies` gets a client of its own for
+/// this one check (see [`build_client`]), so a proxy and a cookie jar are
+/// never shared between monitors or checks: the client lives in the returned
+/// request (a `Client` is reference counted) and is dropped with it, and the
+/// jar with it. The jar is reqwest's: a cookie goes only to hosts its domain
+/// matches (RFC 6265, without a public-suffix list), and reqwest strips
+/// `Cookie` from a cross-origin hop's copied headers before the jar adds what
+/// matches the new host. Nothing is persisted. Such clients rebuild their TLS
+/// state on every check (no session resumption, roots loaded per build).
+///
+/// A proxied request is also checked here before anything is sent: the proxy
+/// URL must not name a forbidden address, its password must open, and the
+/// target name is resolved locally first (see [`check_proxied_target`]).
+async fn build_request(
     ctx: &CheckContext,
     monitor: &Monitor,
     url: &str,
@@ -708,21 +1023,32 @@ fn build_request(
         value.set_sensitive(true);
         header_map.append(name, value);
     }
-    // Credentials of any kind keep the request on its origin (see
-    // `HttpClients::select`): custom headers, basic auth, the ones in the URL
-    // itself, which reqwest sends as an `Authorization` header, and a request
-    // body, which a 307 or 308 sends again to wherever it points.
     let sends_body = BODY_METHODS.contains(&method.as_str());
-    let carries_secrets = !headers.is_empty()
-        || monitor.auth_username.is_some()
-        || (sends_body && monitor.request_body.is_some())
-        || reqwest::Url::parse(url).is_ok_and(|parsed| url_has_credentials(&parsed));
-    let client = ctx.http.select(
-        monitor.follow_redirects,
-        monitor.verify_ssl,
-        carries_secrets,
-    );
-    let mut request = client.request(method, url).headers(header_map);
+    let carries_secrets = carries_secrets(monitor, url, &headers, &method);
+    let proxy = match &monitor.proxy_url {
+        Some(proxy_url) => Some(monitor_proxy(ctx, monitor, proxy_url, url).await?),
+        None => None,
+    };
+    let request = if proxy.is_some() || monitor.remember_cookies {
+        build_client(ClientOptions {
+            redirects: RedirectMode::for_request(monitor.follow_redirects, carries_secrets),
+            verify_ssl: monitor.verify_ssl,
+            ip_version: monitor.ip_version(),
+            proxy,
+            cookies: monitor.remember_cookies,
+        })?
+        .request(method, url)
+    } else {
+        ctx.http
+            .select(
+                monitor.follow_redirects,
+                monitor.verify_ssl,
+                carries_secrets,
+                monitor.ip_version(),
+            )
+            .request(method, url)
+    };
+    let mut request = request.headers(header_map);
     if let Some(username) = &monitor.auth_username {
         request = request.basic_auth(username, password.as_ref().map(SecretString::expose));
     }
@@ -731,6 +1057,69 @@ fn build_request(
         _ => {}
     }
     Ok(request)
+}
+
+/// The proxy of one check of `monitor`, after every check that must pass
+/// before anything is sent: the proxy URL parses and names no forbidden
+/// address (a name is judged when the client resolves it, see
+/// [`GuardedResolver`]), the proxy password opens (else
+/// [`CONFIG_DECRYPT_ERROR`]), and the target passes [`check_proxied_target`].
+async fn monitor_proxy(
+    ctx: &CheckContext,
+    monitor: &Monitor,
+    proxy_url: &str,
+    target: &str,
+) -> Result<MonitorProxy, String> {
+    let parsed =
+        reqwest::Url::parse(proxy_url).map_err(|_| "invalid proxy configuration".to_string())?;
+    if names_forbidden_address(&parsed) {
+        return Err(DESTINATION_NOT_ALLOWED.to_string());
+    }
+    let password = match &monitor.proxy_password_enc {
+        Some(sealed) => Some(
+            open_proxy_password(&ctx.cipher, monitor.id, sealed)
+                .map_err(|_| CONFIG_DECRYPT_ERROR.to_string())?,
+        ),
+        None => None,
+    };
+    check_proxied_target(target).await?;
+    let mut proxy = reqwest::Proxy::all(parsed.as_str())
+        .map_err(|_| "invalid proxy configuration".to_string())?;
+    if let Some(username) = &monitor.proxy_username {
+        proxy = proxy.basic_auth(username, password.as_ref().map_or("", SecretString::expose));
+    }
+    let tls_host = (parsed.scheme() == "https")
+        .then(|| parsed.host_str().map(str::to_string))
+        .flatten();
+    Ok(MonitorProxy { proxy, tls_host })
+}
+
+/// A proxy resolves the target's name itself, but never blindly: the name is
+/// resolved locally first, and when it resolves here and every address is
+/// forbidden, nothing is sent ([`DESTINATION_NOT_ALLOWED`]). This keeps a proxy
+/// running next to the engine (`127.0.0.1:3128`) from being used to reach the
+/// engine host's metadata service by name. A name that does not resolve here
+/// (one only the proxy knows) goes ahead.
+///
+/// Residual risks, accepted: the proxy may resolve the name differently from
+/// the engine, and the names of redirect hops behind a proxy are resolved by
+/// the proxy only (the redirect policy still refuses forbidden IP literals,
+/// see [`follow_policy`]; it cannot resolve names).
+async fn check_proxied_target(target: &str) -> Result<(), String> {
+    let Ok(parsed) = reqwest::Url::parse(target) else {
+        return Ok(());
+    };
+    let host = match parsed.host() {
+        Some(url::Host::Domain(name)) => name.to_string(),
+        Some(url::Host::Ipv4(ip)) => ip.to_string(),
+        Some(url::Host::Ipv6(ip)) => ip.to_string(),
+        None => return Ok(()),
+    };
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    match resolve_target(&host, port, IpVersion::Any).await {
+        Err(message) if message == DESTINATION_NOT_ALLOWED => Err(message),
+        _ => Ok(()),
+    }
 }
 
 /// The method a check sends: the stored one, as long as it is one a monitor
@@ -771,13 +1160,9 @@ async fn probe_tcp(monitor: &Monitor, started: Instant) -> Observation {
     let Ok(port) = u16::try_from(port) else {
         return Observation::down(None, None, format!("invalid port {port}"));
     };
-    // A (host, port) tuple, not a "host:port" string, so IPv6 literals work.
-    let resolved = match tokio::net::lookup_host((host, port)).await {
-        Ok(resolved) => resolved,
-        Err(e) => return Observation::down(None, None, describe_io_error(&e)),
-    };
-    let Ok(allowed) = allowed_addresses(resolved) else {
-        return Observation::down(None, None, DESTINATION_NOT_ALLOWED.to_string());
+    let allowed = match resolve_target(host, port, monitor.ip_version()).await {
+        Ok(allowed) => allowed,
+        Err(message) => return Observation::down(None, None, message),
     };
     // Tried in turn, like a connect to the name itself.
     match tokio::net::TcpStream::connect(&allowed[..]).await {
@@ -787,6 +1172,9 @@ async fn probe_tcp(monitor: &Monitor, started: Instant) -> Observation {
 }
 
 pub(crate) fn describe_request_error(error: &reqwest::Error) -> String {
+    if let Some(e) = find_cause::<NoAddressOfFamily>(error) {
+        return e.to_string();
+    }
     if caused_by::<DestinationNotAllowed>(error) {
         return DESTINATION_NOT_ALLOWED.to_string();
     }
@@ -802,6 +1190,46 @@ pub(crate) fn describe_request_error(error: &reqwest::Error) -> String {
     } else {
         format!("request failed: {}", root_cause(error))
     }
+}
+
+/// A send error of a check that went through a proxy: which side failed.
+///
+/// An https target is tunnelled with `CONNECT`, and hyper-util's tunnel errors
+/// display as `tunnel error: <reason>`; every failure to reach the proxy is
+/// wrapped in one of them. An http target goes to the proxy as a plain request,
+/// so every connection error is the proxy's. Everything else (the target's TLS
+/// inside the tunnel, a refused redirect, the response) is the target's.
+fn describe_proxied_error(error: &reqwest::Error, target_is_https: bool) -> String {
+    if caused_by::<DestinationNotAllowed>(error) {
+        return DESTINATION_NOT_ALLOWED.to_string();
+    }
+    match chain_message_with_prefix(error, "tunnel error: ") {
+        Some(reason) if reason == "proxy authorization required" => PROXY_AUTH_FAILED.to_string(),
+        Some(reason) if reason == "failed to create underlying connection" => {
+            format!("proxy connection failed: {}", root_cause(error))
+        }
+        Some(reason) => format!("proxy tunnel failed: {reason}"),
+        None if error.is_connect() && !target_is_https => {
+            format!("proxy connection failed: {}", root_cause(error))
+        }
+        None => describe_request_error(error),
+    }
+}
+
+/// The rest of the first message in `error`'s `source()` chain that starts
+/// with `prefix`.
+fn chain_message_with_prefix(
+    error: &(dyn std::error::Error + 'static),
+    prefix: &str,
+) -> Option<String> {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if let Some(rest) = err.to_string().strip_prefix(prefix) {
+            return Some(rest.to_string());
+        }
+        current = err.source();
+    }
+    None
 }
 
 pub(crate) fn describe_io_error(error: &std::io::Error) -> String {
@@ -845,6 +1273,20 @@ fn caused_by<E: std::error::Error + 'static>(error: &(dyn std::error::Error + 's
         current = err.source();
     }
     false
+}
+
+/// The first `E` in `error`'s `source()` chain.
+fn find_cause<'a, E: std::error::Error + 'static>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a E> {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if let Some(found) = err.downcast_ref::<E>() {
+            return Some(found);
+        }
+        current = err.source();
+    }
+    None
 }
 
 /// The innermost error's message, e.g. "failed to lookup address
@@ -1286,7 +1728,10 @@ mod tests {
     fn there_is_a_slot_for_every_mode_with_and_without_verification() {
         assert_eq!(RedirectMode::None as usize, 0);
         assert_eq!(RedirectMode::Follow as usize, 1);
-        assert_eq!(RedirectMode::SameOrigin as usize * 2 + 1, CLIENT_COUNT - 1);
+        assert_eq!(
+            (2 * 3 + RedirectMode::SameOrigin as usize) * 2 + 1,
+            CLIENT_COUNT - 1
+        );
     }
 
     /// `(follow_redirects, verify_ssl, carries_secrets)`, one per client.
@@ -1305,14 +1750,14 @@ mod tests {
     fn a_client_is_built_when_a_check_first_needs_it() {
         let clients = HttpClients::new();
         assert_eq!(clients.built(), 0);
-        clients.select(true, true, false);
+        clients.select(true, true, false, IpVersion::Any);
         assert_eq!(clients.built(), 1);
-        clients.select(true, true, false);
+        clients.select(true, true, false, IpVersion::Any);
         assert_eq!(clients.built(), 1, "a second check reuses it");
-        clients.select(false, false, true);
+        clients.select(false, false, true, IpVersion::Any);
         assert_eq!(clients.built(), 2);
         for (follow, verify, secrets) in ALL_CLIENTS {
-            clients.select(follow, verify, secrets);
+            clients.select(follow, verify, secrets, IpVersion::Any);
         }
         assert_eq!(clients.built(), 6);
     }
@@ -1322,7 +1767,9 @@ mod tests {
         let clients = HttpClients::new();
         let chosen: Vec<&reqwest::Client> = ALL_CLIENTS
             .iter()
-            .map(|&(follow, verify, secrets)| clients.select(follow, verify, secrets))
+            .map(|&(follow, verify, secrets)| {
+                clients.select(follow, verify, secrets, IpVersion::Any)
+            })
             .collect();
         for (position, one) in chosen.iter().enumerate() {
             for other in &chosen[position + 1..] {
@@ -1331,7 +1778,7 @@ mod tests {
         }
         for (&(follow, verify, secrets), first) in ALL_CLIENTS.iter().zip(&chosen) {
             assert!(std::ptr::eq(
-                clients.select(follow, verify, secrets),
+                clients.select(follow, verify, secrets, IpVersion::Any),
                 *first
             ));
         }
@@ -1342,8 +1789,8 @@ mod tests {
         let clients = HttpClients::new();
         for verify in [true, false] {
             assert!(std::ptr::eq(
-                clients.select(false, verify, true),
-                clients.select(false, verify, false)
+                clients.select(false, verify, true, IpVersion::Any),
+                clients.select(false, verify, false, IpVersion::Any)
             ));
         }
         assert_eq!(clients.built(), 2);
@@ -1353,12 +1800,363 @@ mod tests {
     fn clones_share_the_clients_that_were_built() {
         let clients = HttpClients::new();
         let clone = clients.clone();
-        let built_by_the_clone = clone.select(true, false, false);
+        let built_by_the_clone = clone.select(true, false, false, IpVersion::Any);
         assert_eq!(clients.built(), 1);
         assert!(std::ptr::eq(
-            clients.select(true, false, false),
+            clients.select(true, false, false, IpVersion::Any),
             built_by_the_clone
         ));
+    }
+
+    fn address(text: &str) -> SocketAddr {
+        SocketAddr::new(ip(text), 80)
+    }
+
+    #[test]
+    fn keep_family_filters_without_fallback() {
+        let v4 = address("192.0.2.1");
+        let v6 = address("2001:db8::1");
+        assert_eq!(keep_family([v4, v6], IpVersion::Any), Ok(vec![v4, v6]));
+        assert_eq!(keep_family([v4, v6], IpVersion::V4), Ok(vec![v4]));
+        assert_eq!(keep_family([v4, v6], IpVersion::V6), Ok(vec![v6]));
+        assert_eq!(
+            keep_family([v6], IpVersion::V4),
+            Err(NoAddressOfFamily(IpVersion::V4))
+        );
+        assert_eq!(
+            keep_family([v4], IpVersion::V6),
+            Err(NoAddressOfFamily(IpVersion::V6))
+        );
+        assert_eq!(keep_family([], IpVersion::V4), Ok(vec![]));
+        assert_eq!(
+            NoAddressOfFamily(IpVersion::V4).to_string(),
+            "no IPv4 address"
+        );
+        assert_eq!(
+            NoAddressOfFamily(IpVersion::V6).to_string(),
+            "no IPv6 address"
+        );
+    }
+
+    #[test]
+    fn a_literal_of_the_excluded_family_is_recognised() {
+        for (text, ip, other) in [
+            ("http://127.0.0.1/", IpVersion::V6, true),
+            ("http://127.0.0.1/", IpVersion::V4, false),
+            ("http://[::1]/", IpVersion::V4, true),
+            ("http://[::ffff:127.0.0.1]/", IpVersion::V4, true),
+            ("http://[::1]/", IpVersion::V6, false),
+            ("http://localhost/", IpVersion::V4, false),
+            ("http://localhost/", IpVersion::V6, false),
+            ("http://127.0.0.1/", IpVersion::Any, false),
+            ("http://[::1]/", IpVersion::Any, false),
+        ] {
+            assert_eq!(
+                literal_of_other_family(&url(text), ip),
+                other,
+                "{text} {ip:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_target_applies_the_family_then_the_guard() {
+        assert_eq!(
+            resolve_target("::1", 9, IpVersion::V4).await,
+            Err("no IPv4 address".to_string())
+        );
+        assert_eq!(
+            resolve_target("127.0.0.1", 9, IpVersion::V6).await,
+            Err("no IPv6 address".to_string())
+        );
+        assert_eq!(
+            resolve_target("169.254.169.254", 80, IpVersion::V4).await,
+            Err(DESTINATION_NOT_ALLOWED.to_string())
+        );
+        assert_eq!(
+            resolve_target("127.0.0.1", 9, IpVersion::Any).await,
+            Ok(vec![address("127.0.0.1")]
+                .into_iter()
+                .map(|a| SocketAddr::new(a.ip(), 9))
+                .collect())
+        );
+    }
+
+    /// The proxied target is resolved locally first: a name that resolves
+    /// here only to forbidden addresses is refused; one that does not
+    /// resolve here (only the proxy knows it) goes ahead.
+    #[tokio::test]
+    async fn a_proxied_target_is_refused_only_when_it_resolves_here_to_forbidden_addresses() {
+        // `probe_http` refuses forbidden literals earlier; the resolver path is
+        // the same for names.
+        for refused in [
+            "http://169.254.169.254/latest/",
+            "http://[fe80::1]:8080/",
+            "https://100.100.100.200/",
+        ] {
+            assert_eq!(
+                check_proxied_target(refused).await,
+                Err(DESTINATION_NOT_ALLOWED.to_string()),
+                "{refused}"
+            );
+        }
+        for allowed in [
+            "http://target.test/",
+            "http://localhost:9/",
+            "https://[::1]/",
+            "http://10.0.0.1/",
+        ] {
+            assert_eq!(check_proxied_target(allowed).await, Ok(()), "{allowed}");
+        }
+    }
+
+    #[test]
+    fn the_client_cache_has_a_slot_per_redirect_mode_tls_setting_and_ip_version() {
+        let clients = HttpClients::new();
+        for ip in [IpVersion::Any, IpVersion::V4, IpVersion::V6] {
+            for (follow, secrets) in [(false, false), (true, false), (true, true)] {
+                for verify in [true, false] {
+                    let a: *const reqwest::Client = clients.select(follow, verify, secrets, ip);
+                    let b: *const reqwest::Client = clients.select(follow, verify, secrets, ip);
+                    assert_eq!(a, b);
+                }
+            }
+        }
+        assert_eq!(clients.built(), 18);
+    }
+
+    #[test]
+    fn the_redirect_mode_is_decided_in_one_place() {
+        assert_eq!(RedirectMode::for_request(false, false), RedirectMode::None);
+        assert_eq!(RedirectMode::for_request(false, true), RedirectMode::None);
+        assert_eq!(RedirectMode::for_request(true, false), RedirectMode::Follow);
+        assert_eq!(
+            RedirectMode::for_request(true, true),
+            RedirectMode::SameOrigin
+        );
+    }
+
+    #[test]
+    fn a_request_carries_secrets_with_headers_auth_a_body_or_url_credentials() {
+        let get = reqwest::Method::GET;
+        let post = reqwest::Method::POST;
+        let plain = Monitor::default();
+        let header = RequestHeader {
+            name: "X-Api-Key".into(),
+            value: SecretString::new("k"),
+        };
+        assert!(!carries_secrets(&plain, "http://a.test/", &[], &get));
+        assert!(carries_secrets(&plain, "http://a.test/", &[header], &get));
+        let auth = Monitor {
+            auth_username: Some("u".into()),
+            ..Monitor::default()
+        };
+        assert!(carries_secrets(&auth, "http://a.test/", &[], &get));
+        let body = Monitor {
+            request_body: Some("{}".into()),
+            ..Monitor::default()
+        };
+        assert!(carries_secrets(&body, "http://a.test/", &[], &post));
+        assert!(
+            !carries_secrets(&body, "http://a.test/", &[], &get),
+            "no body on GET"
+        );
+        assert!(carries_secrets(&plain, "http://u:p@a.test/", &[], &get));
+        // A proxy or a cookie jar is not a target secret.
+        let proxied = Monitor {
+            proxy_url: Some("http://127.0.0.1:3128".into()),
+            proxy_username: Some("u".into()),
+            remember_cookies: true,
+            ..Monitor::default()
+        };
+        assert!(!carries_secrets(&proxied, "http://a.test/", &[], &get));
+    }
+
+    /// reqwest must resolve the proxy host through the client's resolver, or the
+    /// guard against link-local proxies would be bypassed by a name.
+    #[tokio::test]
+    async fn the_proxy_host_is_resolved_by_the_clients_resolver() {
+        use std::sync::Mutex;
+        #[derive(Clone, Default)]
+        struct Recording(Arc<Mutex<Vec<String>>>);
+        impl reqwest::dns::Resolve for Recording {
+            fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+                self.0.lock().unwrap().push(name.as_str().to_string());
+                Box::pin(async {
+                    Err::<reqwest::dns::Addrs, _>(Box::new(DestinationNotAllowed) as _)
+                })
+            }
+        }
+        for target in ["http://target.test/", "https://target.test/"] {
+            let seen = Recording::default();
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .proxy(reqwest::Proxy::all("http://proxy.test:3128").unwrap())
+                .dns_resolver(seen.clone())
+                .build()
+                .unwrap();
+            let error = client.get(target).send().await.unwrap_err();
+            assert!(caused_by::<DestinationNotAllowed>(&error), "{error:?}");
+            assert_eq!(
+                *seen.0.lock().unwrap(),
+                vec!["proxy.test".to_string()],
+                "only the proxy is resolved, never the target ({target})"
+            );
+        }
+    }
+
+    /// The same through `build_client`: a proxied client resolves a proxy
+    /// name through `GuardedResolver` (family filter included). IP literals
+    /// never reach a resolver; `monitor_proxy` refuses forbidden ones with
+    /// `names_forbidden_address`.
+    #[tokio::test]
+    async fn a_proxied_client_resolves_its_proxy_name_through_the_guard() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buffer = [0u8; 4096];
+                let _ = stream.read(&mut buffer).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+        let client = |ip_version| {
+            build_client(ClientOptions {
+                redirects: RedirectMode::None,
+                verify_ssl: true,
+                ip_version,
+                proxy: Some(MonitorProxy {
+                    proxy: reqwest::Proxy::all(format!("http://localhost:{port}")).unwrap(),
+                    tls_host: None,
+                }),
+                cookies: false,
+            })
+            .unwrap()
+        };
+        let response = client(IpVersion::V4)
+            .get("http://target.test/")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        // localhost has no IPv6 address the listener is on (or none at all).
+        let error = client(IpVersion::V6)
+            .get("http://target.test/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            describe_proxied_error(&error, false).starts_with("proxy connection failed"),
+            "{error:?}"
+        );
+    }
+
+    fn self_signed_localhost() -> (
+        rustls::pki_types::CertificateDer<'static>,
+        rustls::RootCertStore,
+    ) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = certified.cert.der().clone();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert.clone()).unwrap();
+        (cert, roots)
+    }
+
+    /// With `verify_ssl = false` behind an https proxy, only the proxy's
+    /// certificate is verified.
+    #[test]
+    fn the_proxy_only_verifier_verifies_the_proxy_and_nothing_else() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+        let provider = super::super::tls::provider();
+        let (cert, roots) = self_signed_localhost();
+        // A verifier that trusts the certificate, and one that does not.
+        let trusting = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let (_, other_roots) = self_signed_localhost();
+        let distrusting = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(other_roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let now = UnixTime::now();
+        let name = |text: &str| ServerName::try_from(text.to_string()).unwrap();
+
+        let verifier = ProxyOnlyVerifier::new("localhost", distrusting, &provider).unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &name("localhost"), &[], now)
+                .is_err(),
+            "the proxy's certificate is verified"
+        );
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &name("target.test"), &[], now)
+                .is_ok(),
+            "the target's is not"
+        );
+        let verifier = ProxyOnlyVerifier::new("localhost", trusting, &provider).unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &name("localhost"), &[], now)
+                .is_ok()
+        );
+        // IP literal proxies, bracketed as a URL writes them.
+        let (_, roots) = self_signed_localhost();
+        let strict = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let verifier = ProxyOnlyVerifier::new("[::1]", strict.clone(), &provider).unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &name("::1"), &[], now)
+                .is_err()
+        );
+        let verifier = ProxyOnlyVerifier::new("127.0.0.1", strict, &provider).unwrap();
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &name("127.0.0.1"), &[], now)
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_server_cert(&cert, &[], &name("localhost"), &[], now)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_https_proxy_with_verify_ssl_off_gets_its_own_tls_configuration() {
+        let config = proxy_only_verified_tls("proxy.test").unwrap();
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        // reqwest accepts it (the rustls versions agree).
+        for verify_ssl in [true, false] {
+            build_client(ClientOptions {
+                redirects: RedirectMode::Follow,
+                verify_ssl,
+                ip_version: IpVersion::Any,
+                proxy: Some(MonitorProxy {
+                    proxy: reqwest::Proxy::all("https://proxy.test:3129").unwrap(),
+                    tls_host: Some("proxy.test".to_string()),
+                }),
+                cookies: true,
+            })
+            .unwrap();
+        }
     }
 
     #[test]

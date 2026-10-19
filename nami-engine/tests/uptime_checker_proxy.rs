@@ -5,7 +5,7 @@
 //! exists, and no other test builds a client while the variables are set.
 mod common;
 
-use common::{check_context, unsaved_monitor, with_headers};
+use common::{check_context, proxy::FakeProxy, unsaved_monitor, with_headers, with_proxy};
 use nami_engine::{
     models::monitor::Monitor,
     uptime::checker::{CheckStatus, perform_check},
@@ -110,5 +110,54 @@ fn proxy_environment_variables_never_reroute_checks() {
             let error = outcome.error.expect("a failed check carries an error");
             assert!(error.starts_with("connection failed: "), "{label}: {error}");
         }
+
+        // Per-check clients (a cookie jar) go around the variables too.
+        let jar = Monitor {
+            remember_cookies: true,
+            ..http_monitor(http.clone())
+        };
+        let outcome = perform_check(&ctx, &jar).await;
+        assert_eq!(outcome.status, CheckStatus::Up, "jar: {:?}", outcome.error);
+
+        // A monitor's own proxy wins over the variables, which stay ignored:
+        // the check goes to the explicit proxy, not the dead one.
+        let explicit =
+            FakeProxy::start("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await;
+        for (label, monitor) in [
+            (
+                "plain",
+                http_monitor("http://target.test/via-proxy".to_string()),
+            ),
+            (
+                "with a jar and secrets",
+                with_headers(
+                    Monitor {
+                        remember_cookies: true,
+                        ..http_monitor("http://target.test/via-proxy".to_string())
+                    },
+                    &[("X-Api-Key", "proxy-test-key")],
+                ),
+            ),
+        ] {
+            let monitor = with_proxy(
+                monitor,
+                &format!("http://127.0.0.1:{}", explicit.port),
+                Some(("nami", "pr0xy")),
+            );
+            let outcome = perform_check(&ctx, &monitor).await;
+            assert_eq!(
+                outcome.status,
+                CheckStatus::Up,
+                "{label}: {:?}",
+                outcome.error
+            );
+        }
+        let seen = explicit.requests();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen.iter()
+                .all(|r| r.request_line == "GET http://target.test/via-proxy HTTP/1.1")
+        );
     });
 }

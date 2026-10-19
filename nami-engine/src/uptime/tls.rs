@@ -7,7 +7,8 @@ use rustls::{CertificateError, RootCertStore, pki_types::ServerName};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
-use super::checker::{DESTINATION_NOT_ALLOWED, allowed_addresses, describe_io_error};
+use super::checker::{describe_io_error, resolve_target};
+use crate::models::monitor::IpVersion;
 
 /// rustls is built with both the ring and aws-lc-rs providers in this
 /// workspace (reqwest 0.12, pulled in by oauth2, brings ring), so configs
@@ -37,25 +38,23 @@ pub fn webpki_client_config() -> Arc<rustls::ClientConfig> {
     client_config(roots)
 }
 
-/// Resolves `host`, connects to one of the addresses a check may contact (see
-/// [`allowed_addresses`]: link-local and cloud-metadata addresses are refused,
-/// whatever the name resolves to) and completes a TLS handshake with `host`
+/// Resolves `host`, connects to one of the addresses of the family
+/// `ip_version` asks for that a check may contact (see
+/// `checker::resolve_target`: link-local and cloud-metadata addresses are
+/// refused, whatever the name resolves to) and completes a TLS handshake with `host`
 /// as SNI and verification name. The error is ready for check history. No
 /// deadline of its own: the caller's covers DNS, connect and handshake.
 pub(crate) async fn connect(
     config: Arc<rustls::ClientConfig>,
     host: &str,
     port: u16,
+    ip_version: IpVersion,
 ) -> Result<TlsStream<TcpStream>, String> {
     // A fully qualified name ("example.com.") is not a valid SNI name.
     let name = host.strip_suffix('.').unwrap_or(host);
     let server_name = ServerName::try_from(name.to_string())
         .map_err(|_| format!("{name} is not a valid TLS server name"))?;
-    // A (host, port) tuple, not a "host:port" string, so IPv6 literals work.
-    let resolved = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| describe_io_error(&e))?;
-    let allowed = allowed_addresses(resolved).map_err(|_| DESTINATION_NOT_ALLOWED.to_string())?;
+    let allowed = resolve_target(host, port, ip_version).await?;
     // Tried in turn, like a connect to the name itself.
     let tcp = TcpStream::connect(&allowed[..])
         .await

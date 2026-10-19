@@ -505,6 +505,34 @@ async fn invalid_proxy_settings_are_400_and_write_nothing(pool: sqlx::PgPool) {
     }
 }
 
+/// Removing the proxy while sending a new proxy password in the same PATCH
+/// is a password without a username: 400, and nothing changes (the URL, the
+/// username and the stored password all stay).
+#[sqlx::test]
+async fn removing_the_proxy_with_a_new_proxy_password_is_400_and_changes_nothing(
+    pool: sqlx::PgPool,
+) {
+    let s = setup(&pool).await;
+    let id = s.proxied().await;
+    let before = row(&pool, id).await;
+    for body in [
+        json!({ "proxy_url": null, "proxy_password": "x" }),
+        json!({ "proxy_url": "", "proxy_password": "x" }),
+    ] {
+        let (status, response) = s.patch(&s.member, id, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        assert_eq!(
+            response["error"], "proxy_password requires proxy_username",
+            "{body}"
+        );
+        assert_no_secret(&response);
+        assert_eq!(row(&pool, id).await, before, "{body}: row unchanged");
+    }
+    let (_, view) = s.get(&s.member, id).await;
+    assert_eq!(view["proxy_url"], "http://proxy.internal:3128");
+    assert_eq!(view["has_proxy_password"], true);
+}
+
 #[sqlx::test]
 async fn viewers_cannot_set_a_proxy(pool: sqlx::PgPool) {
     let s = setup(&pool).await;
