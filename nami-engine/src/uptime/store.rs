@@ -154,6 +154,43 @@ pub async fn recent_checks(
     .await
 }
 
+/// Most rows [`checks_between`] returns in one query. At the 30 s minimum
+/// interval one day holds 2880 checks; a caller that gets exactly this many
+/// rows continues after the last one (see `uptime::export`).
+pub const CHECKS_BETWEEN_LIMIT: u32 = 20_000;
+
+/// The monitor's checks with `from <= checked_at < to`, oldest first, at most
+/// [`CHECKS_BETWEEN_LIMIT`] of them. `error` is cut to the checker's
+/// `MAX_ERROR_CHARS` here too, so one result stays far below the client's
+/// response cap (`clickhouse::MAX_RESPONSE_BYTES`) whatever a row holds.
+pub async fn checks_between(
+    ch: &ClickHouse,
+    project_id: Uuid,
+    monitor_id: Uuid,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+) -> Result<Vec<UptimeCheckRow>, ClickHouseError> {
+    ch.query_rows(
+        "SELECT monitor_id, project_id, checked_at, status, status_code, response_time_ms,
+                leftUTF8(error, {max_error:UInt32}) AS error
+         FROM uptime_checks
+         WHERE project_id = {project_id:UUID} AND monitor_id = {monitor_id:UUID}
+           AND checked_at >= fromUnixTimestamp64Milli({from_ms:Int64}, 'UTC')
+           AND checked_at < fromUnixTimestamp64Milli({to_ms:Int64}, 'UTC')
+         ORDER BY checked_at ASC
+         LIMIT {limit:UInt32}",
+        &[
+            ("project_id", project_id.to_string()),
+            ("monitor_id", monitor_id.to_string()),
+            ("max_error", super::checker::MAX_ERROR_CHARS.to_string()),
+            ("from_ms", from.timestamp_millis().to_string()),
+            ("to_ms", to.timestamp_millis().to_string()),
+            ("limit", CHECKS_BETWEEN_LIMIT.to_string()),
+        ],
+    )
+    .await
+}
+
 /// Uptime over 24 h / 7 d / 30 d, 24 h average response time, and a 24 h
 /// series of [`SERIES_BUCKETS`] half-hour buckets ending with the bucket
 /// that contains `now`. Buckets without checks are present with nulls, so a

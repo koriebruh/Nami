@@ -66,6 +66,10 @@ pub fn router() -> Router<AppState> {
             "/projects/{id}/monitors/{monitor_id}/availability",
             get(get_availability),
         )
+        .route(
+            "/projects/{id}/monitors/{monitor_id}/checks/export",
+            crate::uptime::export::route(),
+        )
 }
 
 /// `monitor` as a [`MonitorView`] for `reader`, with `in_maintenance` looked
