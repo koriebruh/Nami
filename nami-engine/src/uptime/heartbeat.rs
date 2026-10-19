@@ -29,6 +29,28 @@ pub const SUCCESS_OUTPUT_MAX: usize = 1024;
 /// Appended to output that was cut at its cap.
 pub const TRUNCATED_MARKER: &str = "\n\u{2026}[truncated]";
 
+/// Stored in place of the output of a ping whose body found no reading place
+/// free (the ping itself, its kind and exit code, is recorded all the same).
+pub const OUTPUT_BUSY_MARKER: &str = "[output not stored: server busy]";
+/// Stored in place of the output of a ping whose body did not arrive in time.
+pub const OUTPUT_LATE_MARKER: &str = "[output not received in time]";
+/// Stored in place of the output of a ping whose body broke off.
+pub const OUTPUT_UNREADABLE_MARKER: &str = "[output not received: the body could not be read]";
+/// Stored in place of the output of a ping past its heartbeat's hourly output
+/// budget.
+pub const OUTPUT_BUDGET_MARKER: &str = "[output not stored: output budget used]";
+
+/// Whether `output` is one of the fixed markers stored in place of output.
+pub fn is_output_marker(output: &str) -> bool {
+    [
+        OUTPUT_BUSY_MARKER,
+        OUTPUT_LATE_MARKER,
+        OUTPUT_UNREADABLE_MARKER,
+        OUTPUT_BUDGET_MARKER,
+    ]
+    .contains(&output)
+}
+
 /// Turns a ping body into storable text with the failure cap
 /// ([`MAX_OUTPUT_BYTES`]); see [`sanitize_output_capped`].
 pub fn sanitize_output(body: &[u8]) -> String {
@@ -129,14 +151,14 @@ pub fn failure_cause(exit_code: Option<i32>) -> String {
     }
 }
 
-/// The id of the heartbeat that holds `token`, in one plain indexed lookup
-/// (no transaction, no lock). Text that cannot be a token is `None` without a
-/// query.
-pub async fn lookup_token(pool: &PgPool, token: &str) -> Result<Option<Uuid>, sqlx::Error> {
+/// The id and project id of the heartbeat that holds `token`, in one plain
+/// indexed lookup (no transaction, no lock). Text that cannot be a token is
+/// `None` without a query.
+pub async fn lookup_token(pool: &PgPool, token: &str) -> Result<Option<(Uuid, Uuid)>, sqlx::Error> {
     if !is_well_formed_token(token) {
         return Ok(None);
     }
-    sqlx::query_scalar("select id from heartbeats where token = $1")
+    sqlx::query_as("select id, project_id from heartbeats where token = $1")
         .bind(token)
         .fetch_optional(pool)
         .await
@@ -162,8 +184,11 @@ pub struct Recorded {
 /// A success ping marks the heartbeat up and resolves its incident if it was
 /// down. A failure ping on a pending or up heartbeat marks it down at once and
 /// opens an incident (title `{name} reported a failure`, cause
-/// [`failure_cause`]); on a heartbeat already down it only moves
-/// `last_ping_at` (the open incident keeps the cause that opened it).
+/// [`failure_cause`]), or reopens the last one if it was resolved less than
+/// `incident::HEARTBEAT_REOPEN_WINDOW_SECS` ago (a flapping job keeps one
+/// incident; the alert emails are bounded by `alert_throttle`); on a
+/// heartbeat already down it only moves `last_ping_at` (the open incident
+/// keeps the cause that opened it).
 ///
 /// Paused heartbeats, and heartbeats a project-wide maintenance window covers
 /// (judged at the transaction's `now()`, the instant `last_ping_at` records),
@@ -643,7 +668,10 @@ mod tests {
             }
         }
         // "ASCII smuggling": tag characters spelling hidden text vanish whole.
-        let hidden: String = "ignore".chars().map(|c| char::from_u32(0xE0000 + c as u32).unwrap()).collect();
+        let hidden: String = "ignore"
+            .chars()
+            .map(|c| char::from_u32(0xE0000 + c as u32).unwrap())
+            .collect();
         assert_eq!(sanitize_output(format!("ok{hidden}").as_bytes()), "ok");
     }
 
