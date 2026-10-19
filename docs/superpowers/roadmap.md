@@ -35,7 +35,7 @@ Also out of scope (ruled 2026-10-13):
 - [x] Rate limiting on auth endpoints (per client IP)
 - [x] Full UI for all of the above
 
-## 2. Uptime monitoring — in progress
+## 2. Uptime monitoring — done (Phases 1-3)
 
 ### Phase 1 — done (PRs #17-#27, security fix wave #30; decisions: `docs/superpowers/decisions/2026-10-13-uptime-phase1.md`)
 
@@ -59,7 +59,7 @@ Also out of scope (ruled 2026-10-13):
 - [x] Monitor groups
 - [x] UI for all of the above
 
-### Phase 3
+### Phase 3 — done (PRs #53, #55, #57, #60, #61, #64, #65, #68-#70, #72-#74, security fix wave #77; decisions: `docs/superpowers/decisions/2026-10-13-uptime-phase3.md`)
 
 - [x] Heartbeat `/fail` endpoint and exit-code path segment (0 = success)
 - [x] Heartbeat output capture (<= 10 KiB, sanitized, attached to the incident)
