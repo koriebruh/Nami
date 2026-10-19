@@ -1,0 +1,7 @@
+Friendly Name,URL/IP,Type,Keyword Type,Keyword Value,Port,Interval
+Website,https://example.com/,HTTP(s),,,,300
+Login page,https://example.com/login,Keyword,not exists,Error,,60
+"Mail, primary",mail.example.com,Port,,,25,120
+Router,192.0.2.1,Ping,,,,10
+Heartbeat job,https://heartbeat.uptimerobot.com/x,Heartbeat,,,,300
+=HYPERLINK("http://evil.test"),https://example.net/,HTTP(s),,,,300

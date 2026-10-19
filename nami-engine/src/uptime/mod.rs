@@ -9,6 +9,7 @@ pub mod checker;
 pub mod dns;
 pub mod expiry;
 pub mod heartbeat;
+pub mod import;
 pub mod mail;
 pub mod ping;
 pub mod pings;
