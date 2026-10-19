@@ -903,25 +903,25 @@ async fn host_based_monitors_skip_by_lowercased_host_and_port(pool: sqlx::PgPool
 }
 
 #[test]
-fn the_skip_key_is_the_url_or_the_lowercased_host_and_port() {
+fn the_skip_key_is_the_check_type_and_the_url_or_lowercased_host_and_port() {
     let config = |body: Value| validated(&body).unwrap();
     assert_eq!(
         existing_key(&config(
             json!({"name": "a", "check_type": "http", "url": " https://A.test/x "})
         )),
-        "https://A.test/x"
+        "http https://A.test/x"
     );
     assert_eq!(
         existing_key(&config(
             json!({"name": "a", "check_type": "tcp", "host": "DB.test", "port": 5432})
         )),
-        "db.test:5432"
+        "tcp db.test:5432"
     );
     assert_eq!(
         existing_key(&config(
             json!({"name": "a", "check_type": "ping", "host": "GW.test"})
         )),
-        "gw.test"
+        "ping gw.test"
     );
 }
 
@@ -1461,4 +1461,58 @@ async fn one_failing_entry_never_rolls_back_the_others(pool: sqlx::PgPool) {
         "url must be at most 2048 bytes"
     );
     assert_eq!(monitor_count(&pool, project).await, 2);
+}
+
+#[sqlx::test]
+async fn the_check_type_is_part_of_the_skip_key(pool: sqlx::PgPool) {
+    // Controller ruling: (check_type, target). A ping and a dns monitor of the
+    // same host, or an http and a keyword monitor of the same URL, are not
+    // duplicates, within one input or against the project.
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let entries = json!([
+        { "name": "gw ping", "type": "ping", "hostname": "gw.example.com" },
+        { "name": "gw dns", "type": "dns", "hostname": "GW.example.com" },
+        { "name": "site", "type": "http", "url": "https://site.test/" },
+        { "name": "site kw", "type": "keyword", "url": "https://site.test/", "keyword": "ok" },
+        { "name": "gw ping again", "type": "ping", "hostname": "GW.example.com" },
+        { "name": "site kw again", "type": "keyword", "url": "https://site.test/", "keyword": "other" },
+    ]);
+    let statuses = |body: &Value| -> Vec<String> {
+        body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["status"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (status, body) = import(&app, project, &member, kuma(entries.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        statuses(&body),
+        [
+            "created", "created", "created", "created", "skipped", "skipped"
+        ]
+    );
+    assert_eq!(monitor_count(&pool, project).await, 4);
+
+    // Against the project: one existing monitor per type, the other type of
+    // the same target is still created.
+    let other = seed_project(&pool).await;
+    let (_, _, other_member) = user_with_role(&app, &pool, other, Some("member")).await;
+    let first = json!([
+        { "name": "gw ping", "type": "ping", "hostname": "gw.example.com" },
+        { "name": "site", "type": "http", "url": "https://site.test/" },
+    ]);
+    let (_, body) = import(&app, other, &other_member, kuma(first)).await;
+    assert_eq!(statuses(&body), ["created", "created"]);
+    let (_, body) = import(&app, other, &other_member, kuma(entries)).await;
+    assert_eq!(
+        statuses(&body),
+        [
+            "skipped", "created", "skipped", "created", "skipped", "skipped"
+        ]
+    );
+    assert_eq!(monitor_count(&pool, other).await, 4);
 }

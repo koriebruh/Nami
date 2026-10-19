@@ -258,17 +258,22 @@ const UNSTORABLE_ENTRY: &str = "entry could not be stored";
 const ALREADY_MONITORED: &str = "already monitored";
 const BUSY: &str = "another import is running in this project; try again when it finishes";
 
-/// The `skip_existing` key: the validated URL for http/keyword, otherwise the
-/// lowercased host plus `:port` when the type has a port.
+/// The `skip_existing` key: the check type and the normalized target, so a
+/// ping and a dns monitor of one host, or an http and a keyword monitor of one
+/// URL, are not duplicates (controller ruling). The target is the validated
+/// URL for http/keyword, otherwise the lowercased host plus `:port` when the
+/// type has a port. A space separates the two: neither a check type nor a
+/// validated URL or host contains one.
 pub fn existing_key(c: &MonitorConfig) -> String {
-    match (&c.url, &c.host) {
+    let target = match (&c.url, &c.host) {
         (Some(url), _) if matches!(c.check_type.as_str(), "http" | "keyword") => url.clone(),
         (_, Some(host)) => match c.port {
             Some(port) => format!("{}:{port}", host.to_lowercase()),
             None => host.to_lowercase(),
         },
         _ => String::new(),
-    }
+    };
+    format!("{} {target}", c.check_type)
 }
 
 /// What a result row shows of a validated monitor's target.
