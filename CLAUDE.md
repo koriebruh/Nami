@@ -48,6 +48,7 @@ scratch and has been deleted.
 
 Current sub-project: **Uptime monitoring**
 - Spec: `docs/superpowers/specs/2026-10-13-uptime-monitoring-design.md`
+- Phase 2 done: plan `docs/superpowers/plans/2026-10-13-uptime-phase2.md`
 
 Task IDs per sub-project: `NAMI-UP-<n>` (uptime), `NAMI-LOG-<n>` (logs),
 `NAMI-INC-<n>` (incident/on-call), `NAMI-SP-<n>` (status page),
