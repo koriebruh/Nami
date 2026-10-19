@@ -10,7 +10,21 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-13-incident-management-design.md`, including its "Parity additions (2026-10-13)". Roadmap: `docs/superpowers/roadmap.md` §4 (the definition of done).
 
-**When to start:** after every Logs Part 2 task (NAMI-LOG-9 .. NAMI-LOG-18, plan `docs/superpowers/plans/2026-10-13-log-management-part2.md`, PR #52) is merged to `main`. This plan assumes that end state. In particular, NAMI-LOG-14's migration `0044_create_log_alerts.sql` exists: `log_alerts`, `incidents.log_alert_id` (FK, cascade) and the index `incidents_one_open_per_log_alert ... where status = 'open'`. The plan also assumes `models::incident::{open_for_log_alert, resolve_for_log_alert}`, `uptime::alerts::Subject::LogAlert`, `logs::alerts::apply_evaluation` returning `Option<Transition>`, and log-alert emails sent through `alerts::notify_transition`. Review fixes that land in the meantime may shift a line, a name or a test count. Implementers adapt such drift minimally (same behaviour, same tests) and note it in the PR. They never redesign around it.
+**When to start:** after **both** of these are merged to `main`:
+
+1. Every Logs Part 2 task (NAMI-LOG-9 .. NAMI-LOG-18, plan `docs/superpowers/plans/2026-10-13-log-management-part2.md`, PR #52) and its final fix wave. This plan assumes that end state. In particular:
+   - NAMI-LOG-14's migration `0044_create_log_alerts.sql` exists: `log_alerts`, `incidents.log_alert_id` (FK, cascade) and the index `incidents_one_open_per_log_alert ... where status = 'open'`.
+   - `models::incident::{open_for_log_alert, resolve_for_log_alert}`, `uptime::alerts::Subject::LogAlert`, `logs::alerts::{claim_due_alerts, apply_evaluation}` (`apply_evaluation` returns `Option<Transition>`), and log-alert emails sent through `alerts::notify_transition`.
+   - The R-P2-27 seam: `logs::alerts::{open_alert_incident, resolve_alert_incident}` are the only callers of the two `*_for_log_alert` functions. `resolve_alert_incident(.., notify: false)` is what `models::log_alert::update` calls when an alerting alert is disabled. Task 10 swaps the seam (R17).
+2. Every Uptime Phase 3 task (NAMI-UP-20 .. NAMI-UP-32, plan `docs/superpowers/plans/2026-10-13-uptime-phase3.md`) and its final fix wave. NAMI-UP-20 is merged (`5da08a9`). The rest is running while this plan is reviewed. This plan consumes:
+   - NAMI-UP-20: `uptime::heartbeat::{Ping, PingKind, record_signal, failure_cause}`. A failure ping opens an incident titled `{name} reported a failure`.
+   - NAMI-UP-21: migration `0022_incident_details.sql` (`incidents.details text`, ≤ 10 KiB + marker), `models::incident::attach_details`, `IncidentListItem.details`, `alerts::Transition.details`, `uptime::heartbeat::sanitize_output`, and the integration test `heartbeat_pings.rs::the_output_of_the_ping_that_opens_the_incident_is_attached_to_it`, which asserts that the DOWN email contains `Output:\n> …\n` lines.
+   - NAMI-UP-29: the incidents page renders `details` in a `<details><summary>Job output</summary><pre>…</pre></details>` block (text only).
+   - NAMI-UP-27: `availability::for_monitor` / `for_heartbeat` (Part 2's SLA report only).
+
+   Tasks that touch these shapes say so under **Interfaces → Consumes**. If Uptime Phase 3 is not finished when Part 1 is due, Tasks 1, 3, 6 and 7 can start once NAMI-UP-21 is merged, but Task 2 (list `details`), Task 4 (email `Output:` block), Task 10 (the UP-21 email test) and Task 12 (the UP-29 page) cannot.
+
+Review fixes that land in the meantime may shift a line, a name or a test count. Implementers adapt such drift minimally (same behaviour, same tests) and note it in the PR. They never redesign around it.
 
 **Part 2 follows** (a separate plan, NAMI-INC-16 onward). It covers:
 - severity management (CRUD + settings UI);
@@ -20,8 +34,9 @@
 - Slack interactivity (signed Acknowledge/Resolve buttons);
 - GitHub/Linear/Jira tickets;
 - reporting (MTTA/MTTR, breakdowns, CSV) and the SLA report (needs Uptime Phase 3's availability function);
-- shift reminder emails, the per-user ICS feed and "take over shift";
-- heartbeat output (`details`, Uptime Phase 3) on the incident page.
+- shift reminder emails, the per-user ICS feed and "take over shift".
+
+Heartbeat output (`incidents.details`, Uptime Phase 3) is **not** deferred. Part 1 keeps it everywhere it already shows: the list item, the email `Output:` block and the incidents page. It is also added to the detail page (R26).
 
 Part 1 leaves room for these:
 - `IncidentSource` gets `Integration { integration_id, dedup_key }` and `ReportForm` variants, each with its own conflict target.
@@ -32,9 +47,9 @@ Part 1 leaves room for these:
 
 Postgres migrations 0060-0099 are reserved for Incidents (ruling in `docs/superpowers/decisions/2026-10-13-uptime-phase1.md`). None of these numbers was in use on 2026-10-19 (`main` ends at 0041; Logs Part 2 adds 0042-0044). Part 1 uses 0060-0066. Part 2 continues at 0067.
 
-**Verification status (2026-10-19):** written against `main` at `95940ee` plus the Logs Part 2 plan's stated end state. Unlike the Logs Part 1 and Uptime Phase 2 plans, the code here has **not** been applied to a scratch copy. Tests are given in full. Code that decides something is given in full: migrations, SQL, the escalation planner, rotation math, escaping, token signing and URL rules. Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body (the Logs Part 2 convention). Run every step. A test that fails for a reason the plan did not predict is a plan bug: fix it minimally and say so in the PR.
+**Verification status (2026-10-19):** written against `main` at `95940ee` plus the Logs Part 2 plan's stated end state. A review on 2026-10-19 checked every signature against `origin/main` at `5da08a9` (NAMI-UP-20 merged) and against the planned shapes of Uptime Phase 3 NAMI-UP-21 and Logs Part 2 NAMI-LOG-14. It fixed the drift it found, for example the members list endpoint, `state_with_clickhouse(&pool)`, the monitor page's `?monitor_id=` list call, `mod common` in `tests/migrations.rs`, the tests that pin the old SMTP path, and `AppError` having no 410 variant. Unlike the Logs Part 1 and Uptime Phase 2 plans, the code here has **not** been applied to a scratch copy. Tests are given in full. Code that decides something is given in full: migrations, SQL, the escalation planner, rotation math, escaping, token signing and URL rules. Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body (the Logs Part 2 convention). Run every step. A test that fails for a reason the plan did not predict is a plan bug: fix it minimally and say so in the PR.
 
-**Execution:** per CLAUDE.md. Use one worktree per task under `.worktrees/NAMI-INC-<n>/`, branched from the latest `origin/main`, with the branch named under each task heading. Commit with Conventional Commits, then run the task review, open the PR, and auto-merge on a clean review (pre-authorized for sub-projects 2-11). Tasks are sequential (each consumes the interfaces of the ones before it). Two exceptions: T4 depends only on T1, and T6 depends on nothing in this plan. Engine tests need `docker compose up -d postgres clickhouse mailpit` (never restart running containers).
+**Execution:** per CLAUDE.md. Use one worktree per task under `.worktrees/NAMI-INC-<n>/`, branched from the latest `origin/main`, with the branch named under each task heading. Commit with Conventional Commits, then run the task review, open the PR, and auto-merge on a clean review (pre-authorized for sub-projects 2-11). Tasks are sequential (each consumes the interfaces of the ones before it). Two exceptions: T4 depends only on T3 (the `hmac` dependency and nothing else), and T6 depends on nothing in this plan. Engine tests need `docker compose up -d postgres clickhouse mailpit` (never restart running containers).
 
 The **engine command** is used throughout:
 
@@ -42,6 +57,13 @@ The **engine command** is used throughout:
 cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami CARGO_PROFILE_DEV_DEBUG=0 \
   CARGO_TARGET_DIR=/Users/mitengineer/development/nami/.worktrees/.cargo-target cargo test <args>
 ```
+
+**Test filters.** `cargo test` takes at most one positional filter, and that filter applies to *every* selected target. So:
+- Several `--test <binary>` flags in one command, with no filter, are fine.
+- Unit tests by module go in a command of their own: `--lib -- <filter> <filter>`. Libtest takes several filters after `--`.
+- Never combine `--test x` with a `--lib` filter in one command. The filter would also apply to binary `x` and silently skip its tests.
+
+Every "Run:" line below follows this rule. "engine command A, then B" means two invocations.
 
 The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
 
@@ -88,7 +110,14 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - they lead to a nami-ui confirmation page (`/incidents/action?token=…`) that POSTs, and a GET never mutates;
   - the token is HMAC-SHA256 over `(incident_id, action, user_id, exp)` with a key derived from `NAMI_ENCRYPTION_KEY` and expires after 24 h;
   - the POST needs no session and records the token's user as the actor.
-- Outbound requests: every chat/webhook send goes through `outbound::client()`. That client uses `.no_proxy()`, a `GuardedResolver` (refuses link-local `169.254.0.0/16`/`fe80::/10`, `fd00:ec2::254`, `0.0.0.0/8`, `::` and their mapped/NAT64 forms, the same policy as monitors) and no redirects. IP literals are checked before the request. Error text is cleaned (`clean_error`) and stripped of the URL (`reqwest::Error::without_url`).
+- Outbound requests (R9):
+  - Every chat/webhook send goes through one of two process-wide clients in `outbound`. Both use `.no_proxy()`, `redirect(Policy::none())`, `referer(false)`, `pool_max_idle_per_host(0)` (each request resolves again, so a DNS rebind is judged at connect time by the resolver, which returns the only addresses reqwest may connect to) and a 10 s timeout.
+  - `outbound::client()` uses the monitors' `GuardedResolver`. It refuses link-local `169.254.0.0/16`/`fe80::/10`, `fd00:ec2::254`, `0.0.0.0/8`, `::` and their mapped/NAT64 forms, and allows private and loopback addresses. It serves only **project `webhook` channels** (admin-made, self-hosted receivers) and the Telegram API base (operator config).
+  - `outbound::public_client()` uses `PublicOnlyResolver`. It refuses everything `GuardedResolver` refuses, plus loopback, RFC 1918, CGNAT `100.64.0.0/10`, `198.18.0.0/15`, ULA `fc00::/7`, multicast, broadcast and documentation ranges. It serves every **personal** channel (any logged-in user creates them, viewers included) and every Slack/Discord/Teams channel.
+  - IP literals are checked against the same policy before the request (`check_url`).
+  - Error text is a fixed vocabulary (`describe_error`), built from `reqwest::Error::without_url()`, and never contains a URL, body, address or token.
+- Secrets in memory: no type that holds a channel secret, a signing secret or an HMAC key derives `Debug`. Each gets a manual `Debug` that prints only ids and kinds: `ChannelConfig`, `OpenedChannel`, `ChannelPatch`, and the create/patch request bodies of `routes::channels`. Keys and opened secrets are held in `zeroize::Zeroizing`. Never pass them to `tracing` fields or `#[instrument]` (use `skip_all`).
+- Every new POST/PUT/PATCH route is added to the route list of `tests/json_bodies.rs::every_state_changing_route_refuses_bodies_that_are_not_json`, in the task that adds the route. Every new table is added to `tests/migrations.rs::all_tables_exist`.
 - nami-ui:
   - every engine call goes through `callEngine`, and every path through `enginePath`;
   - route params use `[...=uuid]` matchers;
@@ -105,6 +134,8 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
 - **A flapping source, or many incidents opening at once, must not flood a channel.** Example: a monitor that goes down and up every minute, or 50 monitors behind one dead switch. Deliveries to one channel are capped per minute (the excess waits, it is not dropped), each incident is capped in total, and a repeat pass never starts sooner than 5 minutes after the previous one → Task 5 (`a_channel_never_receives_more_than_its_per_minute_cap`) and Task 9 (`the_per_incident_delivery_cap_stops_a_storm`, `repeats_wait_at_least_the_minimum_gap`).
 - **An acknowledgement that races an escalation tick must win.** Example: a step-2 notification that is already queued when someone acknowledges. That notification must not go out, and no later step may run → Task 9 (`an_acknowledge_cancels_queued_step_notifications`).
 - **Nobody on call must never mean nobody notified, silently.** Example: a schedule target outside its working hours, or a schedule with no participants. That pass falls through to the fallback policy. Without a fallback, the timeline records `escalation_exhausted` with the reason, so the gap is visible on the incident → Task 9 (`a_pass_that_notifies_nobody_moves_to_the_fallback_once`, `without_a_fallback_an_empty_pass_is_recorded_as_exhausted`).
+- **A user who can only make personal channels must not reach internal services through Nami.** Example: a global viewer with no project creates a personal webhook to `http://127.0.0.1:5432/` or to a name that resolves to `10.0.0.5`, then presses "send test". It is refused at create time (an IP literal) or at connect time (a name, `PublicOnlyResolver`), and the reply is "destination not allowed", never a status code from the internal service → Task 3 (`public_only_destinations_refuse_every_internal_address`, `personal_channels_belong_to_their_user_only`) and Task 5 (`the_strict_policy_refuses_internal_and_off_allowlist_destinations_at_send_time`).
+- **One crashed send must not wedge the queue.** Example: the engine dies mid-send on a delivery's 5th attempt. The next claim fails that row with `delivery interrupted` and drains the rest → Task 5 (`a_lease_that_expired_after_the_last_attempt_fails_the_row_instead_of_wedging_the_queue`).
 - **Someone removed from a project must stop getting its alerts, and their links must stop working.** This applies to schedule participants, user targets, personal channels and outstanding action links → Task 9 (`a_removed_member_is_not_notified_even_when_on_call`) and Task 11 (`a_token_of_a_user_no_longer_in_the_project_is_refused`).
 
 ## Decisions the spec leaves open (rulings)
@@ -116,7 +147,7 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - `0062_create_notification_deliveries.sql`.
   - `0063_create_on_call_schedules.sql`.
   - `0064_create_escalation_policies.sql`: policies, steps, targets, incident escalation columns, default policy.
-  - `0065_source_escalation_routing.sql`: `escalation_policy_id` and `severity_id` on monitors, heartbeats and log alerts.
+  - `0065_source_escalation_routing.sql`: `escalation_policy_id` and `severity_id` on monitors, heartbeats and log alerts, plus the R27 disarm of unresolved source incidents.
   - `0066_create_incident_action_token_uses.sql`.
 - **R3 Table names** (the spec leaves these to the plan): `escalation_policies`, `escalation_steps`, `escalation_step_targets`, `on_call_schedules`, `on_call_participants`, `on_call_overrides`, `notification_channels`, `notification_deliveries`, `incident_events`, `incident_severities`, `incident_action_token_uses`.
 - **R4 One unresolved incident per source.** Migration 0060 drops `incidents_one_open_per_monitor`, `incidents_one_open_per_heartbeat` and `incidents_one_open_per_log_alert` (all `where status = 'open'`). It recreates them as `..._one_unresolved_per_...` with `where status <> 'resolved'`, so an acknowledged incident still blocks a second one. `lifecycle::open` names the matching conflict target per source. Each target is a separate SQL literal, because a `match` on the variant picks the statement.
@@ -132,12 +163,14 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - A person may be notified again by a later step or pass. That is the point of escalating.
 - **R8 Personal channel kinds.** `webhook`, `slack`, `teams`, `telegram` and `discord` are allowed. A personal `email` channel is not: the implicit verified address covers it, and an unverified extra address would let anyone mail third parties through Nami. Project `email` channels (admin) take any address, for example a team list.
 - **R9 URL rules per kind.** These are checked at create/update and again before each send.
-  - webhook: `http` or `https`, no userinfo, host required. Private and loopback hosts are allowed (self-hosted receivers), with the same DNS guard as monitors.
-  - slack: `https://hooks.slack.com/` exactly.
-  - discord: `https://discord.com/api/webhooks/…`, also `discordapp.com`, `ptb.discord.com`, `canary.discord.com`.
-  - teams: any `https` host (Workflows URLs are tenant-specific).
-  - telegram: no URL. A bot token `^\d{1,20}:[A-Za-z0-9_-]{30,64}$` and a chat id `^-?\d{1,20}$` or `^@[A-Za-z0-9_]{5,32}$`, sent to `TELEGRAM_API_BASE_URL` (default `https://api.telegram.org`, like `RDAP_BASE_URL`).
-  - Integration tests insert channels through the model, which does not apply the host allowlist, so Slack/Discord/Teams payloads can be sent to wiremock.
+  - webhook: `http` or `https`, no userinfo, host required.
+    - A **project** webhook (admin) may point at private and loopback hosts (self-hosted receivers). It is sent with `outbound::client()`, the same DNS guard as monitors.
+    - A **personal** webhook must resolve to public addresses only. It is sent with `outbound::public_client()`. Personal channels can be made by any logged-in user, a global viewer with no project included. Without this rule, "send test" would hand such a user a POST to any internal service, and its status line ("HTTP 404" or "connection failed") would let them scan ports. The create/update check refuses a private or loopback IP literal with 400 `personal channels must point at a public address`. Names are judged by `PublicOnlyResolver` when the request connects.
+  - slack: `https://hooks.slack.com/` exactly. Public-only.
+  - discord: `https://discord.com/api/webhooks/…`, also `discordapp.com`, `ptb.discord.com`, `canary.discord.com`. Public-only.
+  - teams: any `https` host (Workflows URLs are tenant-specific). Public-only, for project channels too.
+  - telegram: no URL. A bot token `^\d{1,20}:[A-Za-z0-9_-]{30,64}$` and a chat id `^-?\d{1,20}$` or `^@[A-Za-z0-9_]{5,32}$`, sent to `TELEGRAM_API_BASE_URL` (default `https://api.telegram.org`, like `RDAP_BASE_URL`) with `outbound::client()`, because the base URL is operator config, possibly a local Bot API server.
+  - **Test seam.** `Config.outbound_policy: outbound::OutboundPolicy` is `Strict` in production. `Config::from_env` never reads it from the environment, so no deployment can turn it off. Only `Config::from_env_for_test` sets `Relaxed`. Under `Relaxed`, the send-time check keeps the scheme/userinfo/host-present rules and the monitors' forbidden-address set, but skips the per-kind host allowlists, the `https`-only rule and the public-only rule. That lets integration tests send Slack/Discord/Teams payloads and personal channels to wiremock on `127.0.0.1`. Create/update validation through the API is always strict, whatever the policy. Integration tests insert channels through the model (`common::insert_channel`), which skips validation. One test per rule sets `state.config.outbound_policy = Strict` and proves the send-time refusal (Task 5).
 - **R10 Secrets at rest.** `notification_channels.config_enc` is sealed under `notification_channels.config:{id}` and `signing_secret_enc` under `notification_channels.signing_secret:{id}` (ids generated in Rust before the insert). A non-secret `summary` column holds what the UI shows: the webhook URL's scheme and host, `hooks.slack.com`, `discord.com`, the Teams host, `Telegram chat <chat_id>`, or the email address. A channel whose secret no longer decrypts (key changed) fails each delivery with `channel configuration could not be decrypted (was NAMI_ENCRYPTION_KEY changed?)` and is never sent anywhere.
 - **R11 Errors recorded in the timeline.** Viewers can read the timeline, so it records only kinds and status codes: `HTTP 404`, `timeout`, `connection failed`, `destination not allowed`, `email not delivered`. It never records a response body, URL, address or token. The Telegram bot token is part of the request path, so `describe_error` always calls `without_url()`.
 - **R12 Retry policy.**
@@ -145,25 +178,38 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - Any other 4xx fails at once (the URL or token is wrong; retrying cannot help).
   - Backoff after failed attempt n is 30 s × 4^(n−1), capped at 1 h: 30 s, 2 min, 8 min, 32 min. After attempt 5 the delivery is `failed`.
   - A claimed delivery holds a 60 s lease. A crash between "sent" and recording it can resend once (at-least-once at the transport level). Webhooks carry `X-Nami-Delivery: <delivery id>` so receivers can drop that duplicate.
+  - **Poison rows.** The claim increments `attempts`. A row whose lease expired after its 5th attempt (the process crashed or panicked mid-send) is never reclaimed. The claim transaction first marks it `failed` with `delivery interrupted`. Otherwise `attempts + 1` would break the `attempts between 0 and 5` check, and that would fail the whole claim statement and wedge the queue for every incident.
 - **R13 Storm caps.**
   - At most 30 deliveries per channel per rolling minute, and at most 20 emails per user per minute. Excess deliveries are rescheduled 60 s later, not counted as an attempt and not dropped.
+  - The caps are enforced **at claim time, inside the claim transaction, under one transaction-level advisory lock**. The counts are "sent in the last minute" plus "currently leased" per bucket, and each candidate gets a rank within its bucket (Task 5 gives the SQL). The claim itself is serialised across every engine instance, and claimed rows count against the cap at once. So the cap is exact even with ten concurrent sends per drain and several instances. A per-row "count, then send" check would let every concurrent task see the same count. Over-cap candidates are deferred in the same statement, so a busy channel can never starve the others at the head of the queue.
   - At most 500 deliveries per incident, after which one `notification_failed` event says the cap was reached.
   - At most 100 recipients per step.
   - A repeat pass starts no sooner than 5 minutes after the previous pass ended (`MIN_REPEAT_GAP`).
   - One tick runs at most 20 consecutive zero-delay steps of one incident.
 - **R14 Escalation cursor.**
   - Columns: `escalation_policy_id`, `escalation_step` (0-based, the next step to run), `escalation_repeat`, `escalation_on_fallback`, `escalation_notified` (recipients notified in the current pass) and `next_escalation_at`.
-  - A step's run time is the previous step's *scheduled* time plus its delay, not "now", so a slow tick does not drift the policy.
+  - A step's run time `ran_at` is the previous step's *scheduled* time plus its delay, not "now", so a slow tick does not drift the policy. One exception: `ran_at = max(next_escalation_at, now − 60 s)`. A step overdue by more than a minute (the worker was down) runs once, now, and the policy's clock restarts from now. An outage therefore never replays every missed step and repeat as one burst.
+  - The step's **targets and condition are evaluated at the tick's `now`**, not at `ran_at`. After an outage, the person on call *now* is paged, and a "business hours" step is judged by the current time.
   - The decision after each step is the pure `escalation::plan::after_step` (Task 8).
   - Deleting the policy of a running incident ends its escalation with `escalation_exhausted` ("policy deleted").
 - **R15 Ack/resolve cancels queued step notifications.** A `triggered` delivery whose incident is no longer `open` when it is claimed becomes `cancelled`. `resolved` deliveries always go out.
-- **R16 Action links only in email.** Each email carries the recipient's own acknowledge and resolve links. Chat messages carry only the incident link, because a "personal" Slack webhook may post into a shared room. Tokens are `base64url(payload) "." base64url(mac)` with payload `v1|<incident>|<ack|resolve>|<user>|<exp unix>`. The MAC is HMAC-SHA256 under `cipher.derive_subkey("nami/incident-action/v1")`. Tokens are **single-use**: the first successful confirm stores SHA-256(token) in `incident_action_token_uses`, and a second confirm gets 410. The user must still be a project `member` or `admin` (or a global admin) when the link is used. The token never creates a session and grants nothing else. The engine endpoints take the token in a JSON body (never a URL), so it stays out of the engine's request logs. The nami-ui page sends `referrer-policy: no-referrer` and `cache-control: no-store`.
+- **R16 Action links only in email.** Each email carries the recipient's own acknowledge and resolve links. Chat messages carry only the incident link, because a "personal" Slack webhook may post into a shared room.
+  - Format: `base64url(payload) "." base64url(mac)`, payload `v1|<incident>|<ack|resolve>|<user>|<exp unix>|<nonce>`. The nonce is 9 random bytes, base64url (12 chars). Every link is distinct, so two emails sent in the same second never share one single-use key.
+  - The MAC is HMAC-SHA256 under `Zeroizing::new(cipher.derive_subkey("nami/incident-action/v1"))`. It is checked with `Mac::verify_slice` (constant time) before the payload is parsed.
+  - Tokens are **single-use**. The first successful confirm stores SHA-256(token) in `incident_action_token_uses`, and a second confirm gets 410.
+  - The confirm order inside one transaction is: verify, lock the incident row, check the role, refuse a token already used (410), apply the action (409 if it no longer applies; a fresh token is not consumed), then insert the use (`on conflict do nothing`; no row → roll back, 410). Two concurrent confirms are serialised by the row lock, and the primary key backs that up.
+  - The user must still be a project `member` or `admin` (or a global admin) when the link is used. A password change revokes every outstanding link. The token never creates a session and grants nothing else.
+  - The engine endpoints take the token in a JSON body (never a URL), so it stays out of the engine's request logs. They sit behind their own per-IP governor (burst 20, one token every 3 s), not the login one (burst 5, one a minute), because a responder may act on several links in a row.
+  - The nami-ui page sends `referrer-policy: no-referrer` and `cache-control: no-store`. Its `load` only inspects, so mail scanners and link previews that GET it change nothing. Its form action is protected by SvelteKit's built-in origin check (`csrf.checkOrigin`, on by default; never disable it). It links only to `/projects/{project_id}/incidents/{id}`, built from ids that pass `isUuid`, so it has no redirect parameter to abuse.
 - **R17 Routing.**
   - `alerts::notify_transition` keeps its signature, so the uptime worker, the heartbeat endpoint and Logs Part 2's alert worker do not change.
-  - Its body no longer emails anyone. It calls `incidents::worker::kick(state)`, which runs one escalation tick and one delivery drain at once. The `Notifications` set from the uptime worker stays the bounded vehicle for that.
+  - Its body no longer emails anyone. It calls `incidents::worker::kick(state)`, which runs one escalation tick and one delivery drain at once. The uptime worker's `Notifications` set bounds its own calls.
+  - The heartbeat ping handler (`routes/heartbeats.rs`) calls `notify_transition` from a bare `tokio::spawn` per transition. So `kick` bounds itself: a process-wide `static KICKS: tokio::sync::Semaphore = Semaphore::const_new(2)` permits at most two kicks at once, and the rest *wait* for a permit, so no work is lost. Every tick and drain is bounded (`ESCALATION_BATCH`, `DRAIN_BATCH`), and a kick that finds nothing due costs two indexed queries.
+  - `kick` does nothing when `config.incidents_worker_enabled` is false (R23).
   - The worker loop (every 2 s) is the durable backstop.
   - The source wrappers (`models::incident::open_for_monitor` and the others) keep their signatures and call `lifecycle::open` with the source's `escalation_policy_id`/`severity_id`.
-- **R18 Email subjects change** with routing (Task 10). A step notification is `[Nami] [<severity>] <title>`. A resolution is `[Nami] Resolved: <title>`. The existing worker, heartbeat, maintenance and log-alert tests that assert the old subjects (`… is DOWN`, `… is back UP`, `Log alert … triggered/resolved`) are updated in Task 10. Their counts stay the same (one email per member per transition).
+  - Log alerts keep the R-P2-27 seam. `logs::alerts::open_alert_incident` is unchanged: it calls the `open_for_log_alert` wrapper. In `resolve_alert_incident(.., notify)`, `notify: true` calls the `resolve_for_log_alert` wrapper (resolved notices go out). `notify: false` (an alerting alert being disabled) calls `lifecycle::resolve_source_silently(conn, &IncidentSource::LogAlert(id), at)`. That resolves and records the `resolved` event with metadata `{"silent": true}`, and queues nothing, which keeps Logs Part 2's "disable resolves without a notification" behaviour.
+- **R18 Email subjects change** with routing (Task 10). **Controller ruling (2026-10-19): accepted.** A step notification is `[Nami] [<severity>] <title>`. A resolution is `[Nami] Resolved: <title>`. The existing worker, heartbeat, maintenance and log-alert tests that assert the old subjects (`… is DOWN`, `… is back UP`, `Log alert … triggered/resolved`) are updated in Task 10. Their counts stay the same (one email per member per transition). A handful of `tests/uptime_worker.rs` tests pin the *mechanics* of the old SMTP path: sequential per-recipient sends, giving up after one timeout, its log lines. Task 10 lists them with the property each keeps.
 - **R19 Time windows** reuse `models::maintenance::Schedule::Weekly::covers` and `weekday_from_iso` (Phase 2, already DST-tested). `from == to` means a full 24 h, as for maintenance windows. Wall-clock semantics apply: a window inside a skipped hour does not happen that day, and one across a repeated hour lasts an hour longer.
 - **R20 Rotation math.**
   - `daily`/`weekly` shifts are calendar arithmetic in the schedule's zone. Shift k starts at local `(start_date + k days|weeks) handoff` and is converted with `local_to_utc`: a nonexistent time moves to the first valid minute after it, and an ambiguous one takes the earlier instant.
@@ -173,15 +219,21 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - `shifts(from, to)` evaluates `on_call_at` at every UTC minute boundary and at every override edge in the range, then merges runs of the same user. The range is at most 70 days, which covers the 14-day view and Part 2's ICS window.
 - **R21 Incident list.** `GET /projects/{id}/incidents` returns `{"incidents": [...], "next_cursor": string|null}`, newest first, `limit` 1-100 (default 50). It takes `status` (`open`, `acknowledged`, `resolved`, or `unresolved`; repeatable) and `source` (repeatable). The response shape changes from a bare array, and Task 2 updates the existing nami-ui loader in the same PR. Part 2 adds the remaining filters.
 - **R22 Postmortem rendering.** nami-ui renders postmortems with a small in-repo renderer (`#lib/markdown.ts`). It HTML-escapes everything first, then applies a fixed subset: headings, emphasis, inline code, fenced code, lists, paragraphs, and `http(s)` links with `rel="noopener noreferrer nofollow"`. No raw HTML passes, and there is no new dependency.
-- **R23 Worker switch.** The incidents worker runs where the uptime worker runs (`UPTIME_WORKER_ENABLED`). One flag keeps single-instance deployments simple. Every claim uses `skip locked`, so several instances are safe.
+- **R23 Worker switch. Controller ruling (2026-10-19):** the incidents worker has its own flag, `INCIDENTS_WORKER_ENABLED` (default `true`, parsed with `env_flag` like `UPTIME_WORKER_ENABLED`). It is `Config.incidents_worker_enabled` and is documented in `nami-engine/.env.example` (Task 5). It does not reuse `UPTIME_WORKER_ENABLED`. When it is false, `main` does not spawn `incidents::worker::run_forever`, and `kick` returns at once. Every claim uses `skip locked` (escalation) or a transaction-level advisory lock (deliveries), so several instances with the flag on are safe.
 - **R24 Not in Part 1** (Part 2 or later): everything listed under "Part 2 follows". SMS, phone and push are spec non-goals (they would need a paid provider), so this plan has none.
+- **R25 Overrides are admin-only in Part 1. Controller ruling (2026-10-19): accepted.** The spec's RBAC already lists overrides under admins. Members get "take over shift" (an override for themselves only) in Part 2.
+- **R26 Heartbeat output stays visible.** Uptime Phase 3 stores a heartbeat failure's output in `incidents.details`. The incident list item and the detail keep `details` (Task 2). The email keeps the `Output:` block, each line prefixed `> ` (Task 4). The incidents page keeps NAMI-UP-29's `<details>` block, and the detail page gets the same block (Task 12). Chat messages and the webhook body do not carry it: the spec fixes the webhook body, and chat stays short.
+- **R27 Deploying between tasks.** `main` stays deployable after every merge.
+  - The incidents worker is spawned from `main.rs` only in Task 10, when routing switches. Before that, nothing in production queues deliveries ("send test" is synchronous). So Tasks 5-9 can never page someone alongside the old email path.
+  - From Task 8 on, `lifecycle::open` arms escalation for monitor, heartbeat and log-alert incidents too. Those incidents were emailed by the old path, so migration `0065` (Task 10) disarms every unresolved incident of those sources (`next_escalation_at = null`, `escalation_legacy = true`), as R6 does at `0064`. Manual incidents created before Task 10 were never notified by anyone, so they stay armed.
+- **R28 Project members and roles for the UI.** The engine has no members list today (`/projects/{id}/members` takes POST only), and the project layout returns no role. Task 7 adds `GET /projects/{id}/members` (viewer) → `[{user_id, email, project_role}]`, by email. Schedule participants, override users and policy user targets are chosen from it. The UI does not hide admin forms by role: every page shows its forms and surfaces the engine's 403 as the form message, as the incident list does (Task 12). That needs no role endpoint, and the engine stays the only authority.
 
 ## File Structure
 
 ```
 nami-engine/
   Cargo.toml (+ Cargo.lock)            T3 hmac 0.13.0 (direct)
-  .env.example                         T5 TELEGRAM_API_BASE_URL
+  .env.example                         T5 TELEGRAM_API_BASE_URL, INCIDENTS_WORKER_ENABLED
   migrations/
     0060_incident_lifecycle.sql        T1
     0061_create_notification_channels.sql T3
@@ -192,10 +244,13 @@ nami-engine/
     0066_create_incident_action_token_uses.sql T11
   src/
     lib.rs                             T1 mod incidents; T3 mod outbound; T6 mod oncall, mod timewindow
-    config.rs                          T5 telegram_api_base_url
-    main.rs                            T5 spawn incidents::worker::run_forever
-    router.rs, routes/mod.rs           T2, T3, T7, T8, T11 merge routers
-    outbound.rs                        T3 guarded client, URL rules, describe_error
+    config.rs                          T3 outbound_policy (Strict; Relaxed only in from_env_for_test);
+                                       T5 telegram_api_base_url, incidents_worker_enabled
+    main.rs                            T10 spawn incidents::worker::run_forever under INCIDENTS_WORKER_ENABLED (R27)
+    error.rs                           T11 AppError::Gone(String) → 410
+    router.rs, routes/mod.rs           T2, T3, T7, T8, T11 merge routers (T11: own governor)
+    outbound.rs                        T3 client(), public_client(), PublicOnlyResolver, OutboundPolicy,
+                                       URL rules, describe_error
     timewindow.rs                      T6 TimeWindow (wraps maintenance::Schedule::Weekly)
     incidents/
       mod.rs                           T1 module list
@@ -221,13 +276,14 @@ nami-engine/
       severities.rs                    T2
       channels.rs                      T3 project + personal channels; T5 test send
       schedules.rs                     T7
+      projects.rs                      T7 GET /projects/{id}/members (R28)
       escalation_policies.rs           T8
       incident_actions.rs              T11 inspect/confirm (no session)
     uptime/
-      checker.rs                       T3 GuardedResolver/clean_error moved to outbound.rs (re-used)
-      alerts.rs                        T10 notify_transition → incidents::worker::kick
-      worker.rs, heartbeat.rs          T10 pass policy/severity (through models::incident wrappers)
-    logs/alerts.rs                     T10 pass policy/severity
+      checker.rs                       T3 `GuardedResolver` and `caused_by` become pub(crate) (no move, no behaviour change)
+      alerts.rs                        T10 notify_transition → incidents::worker::kick; render removed
+      worker.rs, heartbeat.rs          unchanged: policy/severity come through the models::incident wrappers
+    logs/alerts.rs                     T10 resolve_alert_incident(notify: false) → lifecycle::resolve_source_silently (R17)
   tests/
     common/mod.rs                      T1 open_test_incident; T5 run_incident_ticks; T8 seed_policy helpers
     incident_lifecycle.rs              T1
@@ -239,9 +295,12 @@ nami-engine/
     escalation_engine.rs               T9
     incident_routing.rs                T10
     incident_actions.rs                T11
-    migrations.rs                      T1, T3, T5, T7, T8, T10, T11
+    migrations.rs                      T1 (+ `mod common;`), T3, T5, T7, T8, T10, T11
+    json_bodies.rs                     T2, T3, T5, T7, T8, T11 new state-changing routes
+    uptime_read_api.rs, heartbeats.rs  T2 list response shape {incidents, next_cursor}
     uptime_worker.rs, heartbeats.rs, maintenance_windows.rs, recovery_threshold.rs,
-    uptime_worker_timing.rs, checker_http_config.rs, log_alerts.rs  T10 subject assertions (R18)
+    uptime_worker_timing.rs, checker_http_config.rs, log_alerts.rs,
+    heartbeat_pings.rs (NAMI-UP-21)    T10 subject assertions (R18) and the old-SMTP-mechanics tests
 
 nami-ui/src/
   lib/incidents.ts (+ .test.ts)        T2 types; T12 status/source/severity helpers, timeline labels
@@ -254,7 +313,8 @@ nami-ui/src/
   routes/(app)/projects/[id=uuid]/
     +layout.svelte                     T14 "Escalation", T15 "On-call" tabs
     +page.svelte, +page.server.ts      T15 "On call now" card
-    incidents/+page.*                  T2 loader shape; T12 list, tabs, new incident
+    incidents/+page.*                  T2 loader shape; T12 list, tabs, new incident (keeps UP-29 details, LOG-18 link)
+    monitors/[monitorId=uuid]/+page.server.ts  T2 reads `.incidents` of the new list shape
     incidents/[incidentId=uuid]/+page.* T12 detail, timeline, actions, comments, postmortem
     settings/notifications/+page.*     T13 project channels
     escalation/+page.*, escalation/[policyId=uuid]/+page.*  T14
@@ -275,7 +335,7 @@ Branch `feat/NAMI-INC-1-incident-lifecycle`, worktree `.worktrees/NAMI-INC-1/`.
 - Test: `nami-engine/tests/incident_lifecycle.rs`. The existing `tests/incidents.rs` must stay green unchanged, except `status_is_limited_to_open_and_resolved`, which is renamed `status_is_limited_to_the_lifecycle_states` and also accepts `acknowledged`.
 
 **Interfaces:**
-- Consumes: `incidents` (0010/0011/0019/0044), `uptime::checker::is_unsafe_in_text`.
+- Consumes: `incidents` (0010/0011/0019, Uptime Phase 3's 0022 `details`, Logs Part 2's 0044 `log_alert_id`), `uptime::checker::is_unsafe_in_text`. `models::incident` already holds Logs Part 2's `*_for_log_alert` wrappers and NAMI-UP-21's `attach_details` and `IncidentListItem.details`. Keep `attach_details` unchanged: `record_signal` calls it right after `open_for_heartbeat`, in the same transaction.
 - Produces (`nami_engine::incidents::lifecycle`):
 
 ```rust
@@ -384,6 +444,22 @@ update incidents set source = case
     when heartbeat_id is not null then 'heartbeat'
     when log_alert_id is not null then 'log_alert'
     else 'manual' end;
+
+-- A row inserted without `source` (existing tests seed incidents in plain SQL
+-- with only monitor_id, for example) still gets the source its foreign key
+-- says, never the 'manual' default.
+create function incidents_derive_source() returns trigger language plpgsql as $$
+begin
+    new.source := case
+        when new.monitor_id is not null then 'monitor'
+        when new.heartbeat_id is not null then 'heartbeat'
+        when new.log_alert_id is not null then 'log_alert'
+        else new.source end;
+    return new;
+end
+$$;
+create trigger incidents_derive_source before insert on incidents
+    for each row execute function incidents_derive_source();
 update incidents i set severity_id = s.id
 from incident_severities s where s.project_id = i.project_id and s.is_default;
 -- Rows resolved before 0010 recorded a time cannot exist (the worker always
@@ -423,7 +499,7 @@ select id, 'resolved', resolved_at from incidents where status = 'resolved';
 
 - [ ] **Step 2: Write the failing migration test**
 
-Add to `nami-engine/tests/migrations.rs` (in the style of its existing table tests):
+Add to `nami-engine/tests/migrations.rs` (in the style of its existing table tests). That file has no `mod common;` on `5da08a9`: add `mod common;` at its top unless a Logs Part 2 or Uptime Phase 3 task already has. `common` carries `#![allow(dead_code)]`. Also add `"incident_severities"` and `"incident_events"` to `all_tables_exist`.
 
 ```rust
 #[sqlx::test]
@@ -472,6 +548,21 @@ async fn an_acknowledged_incident_still_blocks_a_second_one_for_its_monitor(pool
     .await
     .unwrap_err();
     assert_eq!(second.as_database_error().unwrap().code().as_deref(), Some("23505"));
+}
+
+#[sqlx::test]
+async fn a_plain_insert_takes_its_source_from_its_foreign_key(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let monitor = common::seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    let source: String = sqlx::query_scalar(
+        "insert into incidents (project_id, monitor_id, title) values ($1, $2, 'down') returning source",
+    )
+    .bind(project)
+    .bind(monitor)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(source, "monitor");
 }
 ```
 
@@ -750,7 +841,7 @@ pub async fn open_test_incident(pool: &sqlx::PgPool, project: Uuid, created_by: 
 
 - [ ] **Step 5: Run the tests**
 
-Run: engine command `--test incident_lifecycle --test incidents --test migrations --test uptime_worker --test heartbeats --test log_alerts`. Expected: PASS (the email-based tests are untouched by this task).
+Run: engine command `--test incident_lifecycle --test incidents --test migrations --test uptime_worker --test heartbeats --test heartbeat_pings --test log_alerts`. Expected: PASS (the email-based tests are untouched by this task).
 
 - [ ] **Step 6: Run the full engine suite and clippy**
 
@@ -774,7 +865,8 @@ Branch `feat/NAMI-INC-2-incident-api`, worktree `.worktrees/NAMI-INC-2/`.
 
 **Files:**
 - Create: `nami-engine/src/models/severity.rs`, `nami-engine/src/routes/severities.rs`
-- Modify: `nami-engine/src/models/incident.rs` (list with cursor, `IncidentDetail`, `IncidentEvent`), `nami-engine/src/routes/incidents.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-ui/src/lib/incidents.ts` (new: types), `nami-ui/src/lib/uptime.ts` (re-export `Incident` from `incidents.ts` for existing imports), `nami-ui/src/routes/(app)/projects/[id=uuid]/incidents/+page.server.ts` (+ its tests: read `.incidents` from the new shape)
+- Modify: `nami-engine/src/models/incident.rs` (list with cursor, `IncidentDetail`, `IncidentEvent`), `nami-engine/src/routes/incidents.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-ui/src/lib/incidents.ts` (new: types), `nami-ui/src/lib/uptime.ts` (re-export `Incident` from `incidents.ts` for existing imports), `nami-ui/src/routes/(app)/projects/[id=uuid]/incidents/+page.server.ts` (+ its tests: read `.incidents` from the new shape), `nami-ui/src/routes/(app)/projects/[id=uuid]/monitors/[monitorId=uuid]/+page.server.ts` (+ its test: it calls `/incidents?monitor_id=` today and reads a bare array)
+- Modify (existing engine tests on the old bare-array list): `tests/uptime_read_api.rs::incidents_are_newest_first_and_filterable` (read `body["incidents"]`; `?status=open` keeps meaning "status open"; `?monitor_id=` keeps working) and the list assertion in `tests/heartbeats.rs` (≈ line 440, `list[0]["heartbeat_id"]` → `list["incidents"][0]["heartbeat_id"]`). Add the five new write routes to `tests/json_bodies.rs`.
 - Test: `nami-engine/tests/incidents_api.rs`, the existing `incidents-page.test.ts` / `incidents.test.ts` updated
 
 **Interfaces:**
@@ -786,7 +878,7 @@ Branch `feat/NAMI-INC-2-incident-api`, worktree `.worktrees/NAMI-INC-2/`.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Severity { pub id: Uuid, pub name: String, pub rank: i32, pub is_default: bool }
 pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Severity>, sqlx::Error>; // by rank
-pub async fn belongs_to(conn: &mut PgConnection, project_id: Uuid, severity_id: Uuid) -> Result<bool, sqlx::Error>;
+pub async fn belongs_to<'e>(executor: impl PgExecutor<'e>, project_id: Uuid, severity_id: Uuid) -> Result<bool, sqlx::Error>;
 
 // models::incident
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -795,8 +887,11 @@ pub struct IncidentListItem { pub id: Uuid, pub project_id: Uuid, pub monitor_id
     pub source_name: Option<String>, pub title: String, pub cause: Option<String>, pub status: String,
     pub severity: Option<String>, pub severity_rank: Option<i32>, pub started_at: DateTime<Utc>,
     pub acknowledged_at: Option<DateTime<Utc>>, pub acknowledged_by_email: Option<String>,
-    pub resolved_at: Option<DateTime<Utc>> }
-pub struct ListFilter { pub statuses: Vec<String>, pub sources: Vec<String>, pub before: Option<(DateTime<Utc>, Uuid)>, pub limit: i64 }
+    pub resolved_at: Option<DateTime<Utc>>,
+    /// NAMI-UP-21's heartbeat output (R26); text, never markup.
+    pub details: Option<String> }
+pub struct ListFilter { pub statuses: Vec<String>, pub sources: Vec<String>, pub monitor_id: Option<Uuid>,
+    pub heartbeat_id: Option<Uuid>, pub log_alert_id: Option<Uuid>, pub before: Option<(DateTime<Utc>, Uuid)>, pub limit: i64 }
 pub async fn list(pool: &PgPool, project_id: Uuid, filter: &ListFilter) -> Result<Vec<IncidentListItem>, sqlx::Error>;
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct IncidentEvent { pub id: i64, pub kind: String, pub actor_id: Option<Uuid>, pub actor_email: Option<String>,
@@ -813,7 +908,7 @@ pub async fn detail(pool: &PgPool, project_id: Uuid, incident_id: Uuid) -> Resul
 | Method + path | Role | Body | Success | Errors |
 |---|---|---|---|---|
 | `GET /projects/{id}/severities` | viewer | — | `200 [Severity]` | |
-| `GET /projects/{id}/incidents?status=&source=&limit=&cursor=` | viewer | — | `200 {"incidents", "next_cursor"}` | 400 bad status/source/limit/cursor |
+| `GET /projects/{id}/incidents?status=&source=&monitor_id=&heartbeat_id=&log_alert_id=&limit=&cursor=` | viewer | — | `200 {"incidents", "next_cursor"}` | 400 bad status/source/limit/cursor/id |
 | `POST /projects/{id}/incidents` | member | `{title, description?, severity_id?}` | `201 IncidentDetail` | 400 caps, 404 foreign severity |
 | `GET /projects/{id}/incidents/{incident_id}` | viewer | — | `200 IncidentDetail` | 404 |
 | `POST .../acknowledge` | member | `{}` | `200 IncidentDetail` | 409 `incident is not open` |
@@ -823,7 +918,7 @@ pub async fn detail(pool: &PgPool, project_id: Uuid, incident_id: Uuid) -> Resul
 | `PUT .../postmortem` | member | `{postmortem: string or null}` | `200 IncidentDetail` | 400 > 102,400 bytes |
 | `PATCH /projects/{id}/incidents/{incident_id}` | member | `{severity_id}` | `200 IncidentDetail` | 404 foreign severity |
 
-The cursor is opaque: base64url of `<started_at RFC 3339 micros>|<id>`, and a malformed one is a 400. The list orders by `(started_at desc, id desc)` and fetches `limit + 1` rows to decide `next_cursor`. The SQL takes `status = any($2)` (empty array = all) and `source = any($3)`. `unresolved` expands to `open` + `acknowledged`. Every incident path checks `incidents.project_id = {id}` (404 otherwise). Request bodies are `#[serde(deny_unknown_fields)]`.
+The cursor is opaque: base64url of `<started_at RFC 3339 micros>|<id>`, and a malformed one is a 400. The list orders by `(started_at desc, id desc)` and fetches `limit + 1` rows to decide `next_cursor`. The SQL takes `(cardinality($2::text[]) = 0 or status = any($2))` and the same for `source`, plus `($n::uuid is null or monitor_id = $n)` for each of the three source ids. The monitor page's existing `?monitor_id=` call keeps working. `unresolved` expands to `open` + `acknowledged`. Every incident path checks `incidents.project_id = {id}` (404 otherwise). Request bodies are `#[serde(deny_unknown_fields)]`.
 
 Validation rules:
 - title: trimmed, 1-255 chars, no char with `is_unsafe_in_text`.
@@ -1031,17 +1126,17 @@ Run: engine command `--test incidents_api`. Expected: FAIL (routes missing).
 
 - [ ] **Step 3: Update the nami-ui loader**
 
-In `nami-ui/src/lib/incidents.ts`, define `Incident` (mirrors `IncidentListItem`), `IncidentDetail`, `IncidentEvent`, `Severity` and `IncidentPage = { incidents: Incident[]; next_cursor: string | null }`. The existing page's `+page.server.ts` keeps its open/resolved toggle and reads `(await response.json()).incidents`, with `status=unresolved` for the "open" tab. Update its two test files to the new response shape.
+In `nami-ui/src/lib/incidents.ts`, define `Incident` (mirrors `IncidentListItem`, including `details: string | null` and Logs Part 2's `log_alert_id`), `IncidentDetail`, `IncidentEvent`, `Severity` and `IncidentPage = { incidents: Incident[]; next_cursor: string | null }`. The existing page's `+page.server.ts` keeps its open/resolved toggle and reads `(await response.json()).incidents`, with `status=unresolved` for the "open" tab. Update its two test files to the new response shape. The monitor detail loader (`monitors/[monitorId=uuid]/+page.server.ts`) reads `.incidents` as well, and so does its test.
 
-Run: UI command with `src/routes/(app)/projects/[id=uuid]/incidents`. Expected: PASS, 0 errors / 0 warnings.
+Run: UI command with `src/routes/(app)/projects/[id=uuid]/incidents "src/routes/(app)/projects/[id=uuid]/monitors"`. Expected: PASS, 0 errors / 0 warnings.
 
-- [ ] **Step 4: Run** engine command `--test incidents_api --test incidents --test incident_lifecycle`, then the full engine suite and clippy. Expected: green.
+- [ ] **Step 4: Run** engine command `--test incidents_api --test incidents --test incident_lifecycle --test uptime_read_api --test heartbeats --test json_bodies`, then the full engine suite and clippy. Expected: green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nami-engine/src nami-engine/tests/incidents_api.rs nami-ui/src/lib/incidents.ts nami-ui/src/lib/uptime.ts \
-  "nami-ui/src/routes/(app)/projects/[id=uuid]/incidents"
+git add nami-engine/src nami-engine/tests nami-ui/src/lib/incidents.ts nami-ui/src/lib/uptime.ts \
+  "nami-ui/src/routes/(app)/projects/[id=uuid]/incidents" "nami-ui/src/routes/(app)/projects/[id=uuid]/monitors"
 git commit -m "feat(engine,ui): incident API with timeline, actions, comments and postmortems (NAMI-INC-2)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1053,24 +1148,44 @@ Branch `feat/NAMI-INC-3-notification-channels`, worktree `.worktrees/NAMI-INC-3/
 
 **Files:**
 - Create: `nami-engine/src/outbound.rs`, `nami-engine/migrations/0061_create_notification_channels.sql`, `nami-engine/src/models/channel.rs`, `nami-engine/src/routes/channels.rs`
-- Modify: `nami-engine/src/uptime/checker.rs` (move `GuardedResolver`, `names_forbidden_address`, `clean_error` into `outbound.rs` as `pub(crate)` items and import them back; behaviour unchanged), `nami-engine/src/lib.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/Cargo.toml` (`cargo add hmac@0.13.0`), `nami-engine/tests/migrations.rs`
+- Modify: `nami-engine/src/uptime/checker.rs` (make `GuardedResolver` and `caused_by` `pub(crate)`; nothing moves, behaviour unchanged; `names_forbidden_address` and `allowed_addresses` are already `pub(crate)`), `nami-engine/src/config.rs` (`outbound_policy`, R9), `nami-engine/src/lib.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/Cargo.toml` (`cargo add hmac@0.13.0`, already in the lock file through `hkdf 0.13`, same `digest 0.11` as `sha2 0.11`), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (project and personal channel POST/PATCH)
 - Test: `nami-engine/tests/notification_channels.rs` (+ unit tests in `outbound.rs` and `models/channel.rs`)
 
 **Interfaces:**
-- Consumes: `crypto::Cipher`, `uptime::checker::{is_forbidden_destination, allowed_addresses}`, `models::validate_name`, `rbac::{require_project_role, CurrentUser}`.
+- Consumes: `crypto::Cipher`, `uptime::checker::{is_forbidden_destination, allowed_addresses, names_forbidden_address, GuardedResolver, caused_by, DestinationNotAllowed}`, `models::validate_name`, `rbac::{require_project_role, CurrentUser}`.
 - Produces:
 
 ```rust
 // outbound
 pub const OUTBOUND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// No proxy, GuardedResolver, no redirects, no referer, 10 s total timeout, UA "Nami-Notify/<version>".
+/// No proxy, GuardedResolver (the monitors' policy), no redirects, no referer, no idle pool,
+/// 10 s total timeout, UA "Nami-Notify/<version>". Built once (`OnceLock`), cloned per call.
+/// Only for project webhooks and the Telegram API base (R9).
 pub fn client() -> reqwest::Client;
+/// The same, with `PublicOnlyResolver`. Every personal channel and every Slack/Discord/Teams send.
+pub fn public_client() -> reqwest::Client;
+/// `is_forbidden_destination(ip)` or loopback, RFC 1918, CGNAT 100.64/10, 198.18/15, ULA fc00::/7,
+/// multicast, broadcast, documentation (192.0.2/24, 198.51.100/24, 203.0.113/24, 2001:db8::/32),
+/// judged after unwrapping IPv4-mapped and NAT64 forms.
+pub fn is_non_public(ip: IpAddr) -> bool;
+/// Like checker::allowed_addresses with `is_non_public`: Err(DestinationNotAllowed) when every
+/// resolved address is refused.
+pub(crate) fn public_addresses(resolved: impl IntoIterator<Item = SocketAddr>) -> Result<Vec<SocketAddr>, DestinationNotAllowed>;
+pub(crate) struct PublicOnlyResolver;   // reqwest::dns::Resolve, as GuardedResolver with public_addresses
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundPolicy { Strict, Relaxed }   // Config.outbound_policy (R9)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach { MonitorPolicy, PublicOnly }  // which client and which literal check
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UrlRule { HttpOrHttps, Https, HttpsHosts(&'static [&'static str]), HttpsHostPrefix { host: &'static [&'static str], path_prefix: &'static str } }
 /// Parses and checks a destination: scheme, host present, no userinfo, the rule, and no
-/// forbidden IP literal (`names_forbidden_address`). The error is a user-facing message.
-pub fn check_url(raw: &str, rule: UrlRule) -> Result<reqwest::Url, String>;
+/// forbidden IP literal (`names_forbidden_address`, plus `is_non_public` for `Reach::PublicOnly`).
+/// Always strict: used by create/update validation. The error is a user-facing message.
+pub fn check_url(raw: &str, rule: UrlRule, reach: Reach) -> Result<reqwest::Url, String>;
+/// The send-time check: `check_url` under `Strict`; under `Relaxed` only HttpOrHttps +
+/// `names_forbidden_address` (R9 test seam).
+pub fn check_url_for_send(raw: &str, rule: UrlRule, reach: Reach, policy: OutboundPolicy) -> Result<reqwest::Url, String>;
 /// "timeout" | "connection failed" | "destination not allowed" | "HTTP <code>" | "request failed".
 /// Never contains the URL (uses `without_url`) or a response body.
 pub fn describe_error(error: &reqwest::Error) -> String;
@@ -1096,14 +1211,17 @@ pub enum ChannelConfig {
     Discord { webhook_url: String },
 }
 impl fmt::Debug for ChannelConfig { /* prints the kind only */ }
+pub enum Owner { Project(Uuid), User(Uuid) }
 impl ChannelConfig {
     pub fn kind(&self) -> &'static str;
-    /// R9 rules; the error is a 400 message.
-    pub fn validate(&self) -> Result<(), String>;
+    /// R9 rules for this owner (a personal webhook/any Slack/Discord/Teams is `Reach::PublicOnly`);
+    /// always strict. The error is a 400 message.
+    pub fn validate(&self, owner: &Owner) -> Result<(), String>;
+    /// The client and literal policy a send uses (R9).
+    pub fn reach(&self, owner: &Owner) -> Reach;
     /// R10 display string, never secret.
     pub fn summary(&self) -> String;
 }
-pub enum Owner { Project(Uuid), User(Uuid) }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Channel { pub id: Uuid, pub project_id: Option<Uuid>, pub user_id: Option<Uuid>, pub name: String,
@@ -1123,7 +1241,9 @@ pub async fn update(pool: &PgPool, cipher: &Cipher, owner: &Owner, id: Uuid, pat
 pub enum Deleted { Deleted, NotFound, InUse { policy: String } }
 pub async fn delete(pool: &PgPool, owner: &Owner, id: Uuid) -> Result<Deleted, sqlx::Error>;
 /// Everything a sender needs, opened. `Err(DecryptError)` when the key changed.
-pub struct OpenedChannel { pub id: Uuid, pub kind: String, pub name: String, pub config: ChannelConfig, pub signing_secret: Option<Vec<u8>> }
+/// No `Debug` derive: a manual impl prints id, kind and owner only.
+pub struct OpenedChannel { pub id: Uuid, pub kind: String, pub name: String, pub owner: Owner, pub enabled: bool,
+    pub config: ChannelConfig, pub signing_secret: Option<Zeroizing<Vec<u8>>> }
 pub async fn open_for_send(pool: &PgPool, cipher: &Cipher, id: Uuid) -> Result<Option<Result<OpenedChannel, DecryptError>>, sqlx::Error>;
 ```
 
@@ -1171,22 +1291,49 @@ Migration test `a_channel_belongs_to_exactly_one_owner`: an insert with both own
 In `outbound.rs` `mod tests`:
 
 ```rust
+use Reach::{MonitorPolicy, PublicOnly};
+
 #[test]
 fn urls_follow_their_rule() {
-    assert!(check_url("https://hooks.slack.com/services/T/B/x", SLACK).is_ok());
+    assert!(check_url("https://hooks.slack.com/services/T/B/x", SLACK, PublicOnly).is_ok());
     for bad in ["http://hooks.slack.com/services/x", "https://hooks.slack.com.evil.test/x",
                 "https://evil.test/hooks.slack.com/", "https://user:pw@hooks.slack.com/x"] {
-        assert!(check_url(bad, SLACK).is_err(), "{bad}");
+        assert!(check_url(bad, SLACK, PublicOnly).is_err(), "{bad}");
     }
-    assert!(check_url("https://discord.com/api/webhooks/1/abc", DISCORD).is_ok());
-    assert!(check_url("https://discordapp.com/api/webhooks/1/abc", DISCORD).is_ok());
-    assert!(check_url("https://discord.com/other/1/abc", DISCORD).is_err());
-    assert!(check_url("http://10.0.0.5:8080/hook", UrlRule::HttpOrHttps).is_ok(), "private receivers are allowed");
+    assert!(check_url("https://discord.com/api/webhooks/1/abc", DISCORD, PublicOnly).is_ok());
+    assert!(check_url("https://discordapp.com/api/webhooks/1/abc", DISCORD, PublicOnly).is_ok());
+    assert!(check_url("https://discord.com/other/1/abc", DISCORD, PublicOnly).is_err());
+    assert!(check_url("http://10.0.0.5:8080/hook", UrlRule::HttpOrHttps, MonitorPolicy).is_ok(),
+        "private receivers are allowed for project webhooks");
     for bad in ["ftp://x.test/", "http://169.254.169.254/latest", "http://[fe80::1]/", "http://0.0.0.0/",
                 "http://[::ffff:169.254.169.254]/", "javascript:alert(1)", "http:///nohost"] {
-        assert!(check_url(bad, UrlRule::HttpOrHttps).is_err(), "{bad}");
+        assert!(check_url(bad, UrlRule::HttpOrHttps, MonitorPolicy).is_err(), "{bad}");
     }
-    assert!(check_url("http://teams.example/x", UrlRule::Https).is_err());
+    assert!(check_url("http://teams.example/x", UrlRule::Https, PublicOnly).is_err());
+}
+
+#[test]
+fn public_only_destinations_refuse_every_internal_address() {
+    for bad in ["http://127.0.0.1/", "http://10.0.0.5/", "http://172.16.0.1/", "http://192.168.1.1/",
+                "http://100.64.0.1/", "http://[::1]/", "http://[fc00::1]/", "http://[fd12::1]/",
+                "http://[::ffff:10.0.0.1]/", "http://[64:ff9b::a00:1]/", "http://224.0.0.1/",
+                "http://255.255.255.255/", "http://2130706433/"] {
+        assert!(check_url(bad, UrlRule::HttpOrHttps, PublicOnly).is_err(), "{bad}");
+    }
+    assert!(check_url("https://203.0.114.10/x", UrlRule::HttpOrHttps, PublicOnly).is_ok());
+    let loopback = [std::net::SocketAddr::from(([127, 0, 0, 1], 0)), std::net::SocketAddr::from(([10, 1, 2, 3], 0))];
+    assert!(public_addresses(loopback).is_err(), "a name resolving only to internal addresses is refused at connect");
+    let mixed = [std::net::SocketAddr::from(([10, 1, 2, 3], 0)), std::net::SocketAddr::from(([93, 184, 216, 34], 0))];
+    assert_eq!(public_addresses(mixed).unwrap().len(), 1, "only the public address is ever connected to");
+}
+
+#[test]
+fn the_relaxed_send_check_exists_only_for_tests_and_still_refuses_metadata() {
+    let wiremock = "http://127.0.0.1:4567/services/x";
+    assert!(check_url_for_send(wiremock, SLACK, PublicOnly, OutboundPolicy::Strict).is_err());
+    assert!(check_url_for_send(wiremock, SLACK, PublicOnly, OutboundPolicy::Relaxed).is_ok());
+    assert!(check_url_for_send("http://169.254.169.254/", SLACK, PublicOnly, OutboundPolicy::Relaxed).is_err());
+    assert_eq!(crate::config::Config::from_env_for_test().outbound_policy, OutboundPolicy::Relaxed);
 }
 
 #[tokio::test]
@@ -1236,13 +1383,13 @@ In `models/channel.rs` `mod tests`:
 #[test]
 fn telegram_tokens_and_chat_ids_are_shaped() {
     let ok = ChannelConfig::Telegram { bot_token: format!("123456:{}", "A".repeat(35)), chat_id: "-1001234".into() };
-    assert!(ok.validate().is_ok());
+    assert!(ok.validate(&Owner::User(Uuid::nil())).is_ok());
     for (token, chat) in [("123456:short", "1"), ("abc:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "1"),
                           ("123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/../x", "1"),
                           ("123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "@ab"),
                           ("123456:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "1; drop")] {
         let c = ChannelConfig::Telegram { bot_token: token.into(), chat_id: chat.into() };
-        assert!(c.validate().is_err(), "{token} {chat}");
+        assert!(c.validate(&Owner::User(Uuid::nil())).is_err(), "{token} {chat}");
     }
 }
 
@@ -1387,6 +1534,25 @@ async fn personal_channels_belong_to_their_user_only(pool: sqlx::PgPool) {
     let (status, _) = call(&app, "POST", "/account/notification-channels", Some(&alice),
         Some(json!({"name": "mail", "kind": "email", "config": {"address": "a@b.test"}}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "no personal email channels (R8)");
+    for url in ["http://10.0.0.5:8080/in", "http://127.0.0.1:9/x", "https://[::1]/x"] {
+        let (status, body) = call(&app, "POST", "/account/notification-channels", Some(&alice),
+            Some(json!({"name": "internal", "kind": "webhook", "config": {"url": url}}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "personal webhooks are public-only (R9): {url} {body}");
+    }
+}
+
+#[sqlx::test]
+async fn a_global_viewer_without_projects_manages_only_personal_channels(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let email = common::unique_email("gviewer");
+    common::seed_user(&pool, &email, "viewer").await;
+    let viewer = common::login(&app, &email).await;
+    let (status, _) = call(&app, "GET", &format!("/projects/{project}/notification-channels"), Some(&viewer), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(&app, "POST", "/account/notification-channels", Some(&viewer),
+        Some(json!({"name": "hook", "kind": "webhook", "config": {"url": "https://hooks.example.org/in"}}))).await;
+    assert_eq!(status, StatusCode::CREATED, "any logged-in user owns personal channels");
 }
 
 #[sqlx::test]
@@ -1416,16 +1582,18 @@ async fn patch_keeps_omitted_config_and_replaces_given_config(pool: sqlx::PgPool
 }
 ```
 
-Run: engine command `--test notification_channels --lib outbound models::channel`. Expected: FAIL.
+Run: engine command `--test notification_channels`, then engine command `--lib -- outbound models::channel`. Expected: FAIL.
 
 - [ ] **Step 4: Implement** `outbound.rs`, `models/channel.rs` and `routes/channels.rs` as specified.
-- `outbound::client()`: `reqwest::Client::builder().no_proxy().dns_resolver(GuardedResolver).redirect(Policy::none()).referer(false).timeout(OUTBOUND_TIMEOUT).connect_timeout(CONNECT_TIMEOUT).pool_max_idle_per_host(0).user_agent(concat!("Nami-Notify/", env!("CARGO_PKG_VERSION")))`.
-- `describe_error` order: `is_timeout` → "timeout"; the error chain contains `DestinationNotAllowed` → "destination not allowed"; `is_connect` → "connection failed"; `status()` → `HTTP {code}`; else "request failed".
-- `ChannelConfig::validate` uses `check_url` (`SLACK`, `DISCORD`, `UrlRule::Https` for Teams, `UrlRule::HttpOrHttps` for webhooks). It also uses the Telegram regexes from R9, an email check via `lettre::Address::from_str`, and lengths (URL ≤ 2,048 bytes, address ≤ 254).
+- `outbound::client()`: a `static CLIENT: OnceLock<reqwest::Client>` holding `reqwest::Client::builder().no_proxy().dns_resolver(GuardedResolver).redirect(Policy::none()).referer(false).timeout(OUTBOUND_TIMEOUT).connect_timeout(CONNECT_TIMEOUT).pool_max_idle_per_host(0).user_agent(concat!("Nami-Notify/", env!("CARGO_PKG_VERSION")))`. `public_client()` is the same with `dns_resolver(PublicOnlyResolver)`. Both are built once, because building a client loads the TLS roots.
+- `PublicOnlyResolver::resolve` mirrors `GuardedResolver::resolve` with `public_addresses`. reqwest connects only to the addresses the resolver returns, and with no idle pool every request resolves again. That is the DNS-rebind defence: the address is judged where it is connected to, not at validation time.
+- `describe_error` order: `is_timeout` → "timeout"; the error chain contains `DestinationNotAllowed` (`checker::caused_by`) → "destination not allowed"; `is_connect` → "connection failed"; `status()` → `HTTP {code}`; else "request failed". It never formats the error itself (`%e` would print the URL, which holds the Telegram bot token and webhook keys).
+- `ChannelConfig::validate(owner)` uses `check_url` with `self.reach(owner)` (`SLACK`, `DISCORD`, `UrlRule::Https` for Teams, `UrlRule::HttpOrHttps` for webhooks). A personal webhook is `Reach::PublicOnly`, a project webhook `Reach::MonitorPolicy`, and Slack/Discord/Teams are always `PublicOnly`. It also uses the Telegram regexes from R9, an email check via `lettre::Address::from_str` (a bare address only, no display name), and lengths (URL ≤ 2,048 bytes, address ≤ 254).
 - Routes refuse a `kind` not in the list with 400 `unknown channel kind`.
-- Every config is serialised to JSON, then `cipher.encrypt(&config_context(id), ..)`.
+- Every config is serialised to JSON, then `cipher.encrypt(&config_context(id), ..)`. The request body structs (`CreateChannelRequest`, `PatchChannelRequest`) get manual `Debug` impls that print the kind only (Global Constraints).
+- `Config.outbound_policy`: `from_env_defaults_only` sets `Strict`. `from_env_for_test` returns `Config { outbound_policy: OutboundPolicy::Relaxed, ..Self::from_env_defaults_only() }`. No environment variable reads it.
 
-- [ ] **Step 5: Run** engine command `--test notification_channels --test migrations --test uptime_checker --test uptime_checker_proxy --test checker_http_config`, then the full suite and clippy. Expected: green (the checker tests prove the move changed nothing).
+- [ ] **Step 5: Run** engine command `--test notification_channels --test migrations --test json_bodies --test uptime_checker --test uptime_checker_proxy --test checker_http_config`, then engine command `--lib -- outbound models::channel uptime::checker`, then the full suite and clippy. Expected: green (the checker tests prove the visibility change altered nothing).
 
 - [ ] **Step 6: Commit**
 
@@ -1448,7 +1616,7 @@ Branch `feat/NAMI-INC-4-notification-format`, worktree `.worktrees/NAMI-INC-4/`.
 - Test: unit tests in `format.rs`
 
 **Interfaces:**
-- Consumes: `uptime::checker::is_unsafe_in_text`, `hmac 0.13`, `sha2`.
+- Consumes: `uptime::checker::is_unsafe_in_text`, `uptime::heartbeat::sanitize_output` (NAMI-UP-21), `hmac 0.13` (added in Task 3), `sha2`.
 - Produces (`nami_engine::incidents::format`):
 
 ```rust
@@ -1458,7 +1626,9 @@ impl NotifyEvent { pub fn webhook_name(self) -> &'static str }  // "incident.tri
 
 #[derive(Debug, Clone)]
 pub struct IncidentSummary { pub id: Uuid, pub title: String, pub cause: Option<String>, pub status: String,
-    pub source: String, pub severity: String, pub started_at: DateTime<Utc> }
+    pub source: String, pub severity: String, pub started_at: DateTime<Utc>,
+    /// `incidents.details` (heartbeat output, R26): email only.
+    pub details: Option<String> }
 #[derive(Debug, Clone)]
 pub struct ActionLinks { pub acknowledge: String, pub resolve: String }
 #[derive(Debug, Clone)]
@@ -1497,7 +1667,10 @@ Content rules:
   ```
 
   When `actions` is set, the body adds `Acknowledge: <url>` and `Resolve: <url>` lines after `View:`, with a blank line before them.
-- **Slack.** `{"text": <escaped headline>, "blocks": [section mrkdwn "*<escaped headline>*\n<escaped project> · <escaped severity> · <status>", section mrkdwn "<escaped cause>" (when any), section mrkdwn "<url|View incident>"]}`. `escape_slack` replaces `&`→`&amp;`, `<`→`&lt;`, `>`→`&gt;` (so `<!channel>`, `<@U…>` and `<http://x|y>` become inert). The only `<url|…>` is built from `incident_url`, which is ids only.
+  - **No forged lines.** Every cause line after the first is indented by two spaces (`Cause: a\n  b`). User text can then never start a line of its own, so a cause cannot fake a `View:`, `Acknowledge:` or `Resolve:` line pointing elsewhere.
+  - **Output block (R26).** When `details` is non-empty, `Output:\n` and then each line of `sanitize_output(details.as_bytes())` as `> {line}\n` follow the `Cause:` line, before the blank line and `View:`. The `> ` prefix is exactly NAMI-UP-21's, so its integration test's `Output:\n> …\n` assertion keeps holding.
+  - The body is `SinglePart::plain` (the existing `Mailer::send`), so markup is inert. The subject is one line, and lettre encodes it.
+- **Slack.** `{"text": <escaped headline>, "unfurl_links": false, "unfurl_media": false, "blocks": [section mrkdwn "*<escaped headline>*\n<escaped project> · <escaped severity> · <status>", section mrkdwn "<escaped cause>" (when any), section mrkdwn "<url|View incident>"]}`. `escape_slack` replaces `&`→`&amp;`, `<`→`&lt;`, `>`→`&gt;` (so `<!channel>`, `<!here>`, `<@U…>`, `<#C…>` and `<http://x|y>` become inert). The only `<url|…>` is built from `incident_url`, which is ids only, under the operator's `UI_BASE_URL`.
 - **Discord.** `{"content": "<escaped headline>\n<escaped project> · <severity> · <status>\n<escaped cause>\n<incident_url>", "allowed_mentions": {"parse": []}}`, cut to 2,000 chars. `escape_discord` puts a backslash before `\ * _ ~ ` ` | > # - [ ] ( ) @ :` and before `<`.
 - **Telegram.** `{"chat_id": .., "text": "<b>headline</b>\n...\n<a href=\"<incident_url>\">View incident</a>", "parse_mode": "HTML", "disable_web_page_preview": true}`. `escape_telegram` handles `&`, `<`, `>` (and `"` for the attribute). The text is cut to 4,096 chars before the link line is appended.
 - **Teams.** `{"type": "message", "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard", "version": "1.4", "body": [TextBlock headline (weight bolder, wrap), TextBlock "<project> · <severity> · <status>", TextBlock cause (wrap)], "actions": [{"type": "Action.OpenUrl", "title": "View incident", "url": incident_url}]}}]}`. `escape_teams` puts a backslash before each of `\ * _ [ ] ( ) ` # > - !` and replaces `&`, `<`, `>` with entities.
@@ -1513,7 +1686,7 @@ fn message(title: &str, cause: Option<&str>) -> Message {
         event: NotifyEvent::Triggered,
         incident: IncidentSummary { id: Uuid::nil(), title: title.into(), cause: cause.map(Into::into),
             status: "open".into(), source: "monitor".into(), severity: "critical".into(),
-            started_at: DateTime::from_timestamp(1_792_000_000, 0).unwrap() },
+            started_at: DateTime::from_timestamp(1_792_000_000, 0).unwrap(), details: None },
         project_id: Uuid::nil(), project_name: "Shop".into(),
         incident_url: format!("http://ui.test/projects/{0}/incidents/{0}", Uuid::nil()),
         actions: None,
@@ -1534,6 +1707,19 @@ fn email_subject_and_body_carry_severity_and_links_on_single_lines() {
     assert!(body.contains("\nAcknowledge: http://ui.test/incidents/action?token=a\nResolve: http://ui.test/incidents/action?token=r"), "{body}");
     let resolved = Message { event: NotifyEvent::Resolved, ..message("API", None) };
     assert_eq!(email(&resolved).0, "[Nami] Resolved: API");
+}
+
+#[test]
+fn a_cause_cannot_forge_a_link_line_and_job_output_is_quoted() {
+    let mut m = message("Nightly backup reported a failure", Some("boom\nAcknowledge: http://evil.test/x\r\nView: http://evil.test"));
+    m.incident.details = Some("<script>alert(1)</script>\nBcc: x@evil.test\n\u{1b}[31mdisk full".into());
+    let (_, body) = email(&m);
+    for line in body.lines() {
+        assert!(!line.starts_with("Acknowledge: http://evil") && !line.starts_with("View: http://evil"), "{body}");
+    }
+    assert!(body.contains("Cause: boom\n  Acknowledge: http://evil.test/x"), "{body}");
+    assert!(body.contains("Output:\n> <script>alert(1)</script>\n> Bcc: x@evil.test\n> [31mdisk full\n"), "{body}");
+    assert!(body.find("Output:").unwrap() < body.find("View: ").unwrap(), "{body}");
 }
 
 #[test]
@@ -1636,11 +1822,11 @@ Branch `feat/NAMI-INC-5-notification-deliveries`, worktree `.worktrees/NAMI-INC-
 
 **Files:**
 - Create: `nami-engine/migrations/0062_create_notification_deliveries.sql`, `nami-engine/src/incidents/send.rs`, `nami-engine/src/incidents/deliveries.rs`, `nami-engine/src/incidents/worker.rs`
-- Modify: `nami-engine/src/incidents/mod.rs`, `nami-engine/src/config.rs` (`telegram_api_base_url`, env `TELEGRAM_API_BASE_URL`, default `https://api.telegram.org`, must be an absolute http(s) URL with no path, query or userinfo), `nami-engine/.env.example`, `nami-engine/src/main.rs` (spawn `incidents::worker::run_forever` next to the uptime worker, under the same flag, R23), `nami-engine/src/routes/channels.rs` (the two `/test` routes), `nami-engine/tests/common/mod.rs` (`run_incident_ticks`, `insert_channel`), `nami-engine/tests/migrations.rs`
+- Modify: `nami-engine/src/incidents/mod.rs`, `nami-engine/src/config.rs` (`telegram_api_base_url`, env `TELEGRAM_API_BASE_URL`, default `https://api.telegram.org`, must be an absolute http(s) URL with no path, query or userinfo; and `incidents_worker_enabled`, env `INCIDENTS_WORKER_ENABLED`, `env_flag(.., true)`, R23), `nami-engine/.env.example` (both variables, documented like `UPTIME_WORKER_ENABLED` and `RDAP_BASE_URL`), `nami-engine/src/routes/channels.rs` (the two `/test` routes), `nami-engine/tests/common/mod.rs` (`run_incident_ticks`, `insert_channel`), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (the two `/test` routes). `main.rs` is **not** touched here: Task 10 spawns the worker (R27).
 - Test: `nami-engine/tests/notification_deliveries.rs`
 
 **Interfaces:**
-- Consumes: Task 3 `outbound::{client, describe_error}`, `models::channel::{open_for_send, OpenedChannel, ChannelConfig}`. Task 4 `format::*`. Task 1 `lifecycle::{record_event, EventKind}`. `email::Mailer::send`.
+- Consumes: Task 3 `outbound::{client, public_client, check_url_for_send, describe_error, OutboundPolicy}`, `models::channel::{open_for_send, OpenedChannel, ChannelConfig}`. Task 4 `format::*`. Task 1 `lifecycle::{record_event, EventKind}`. `email::Mailer::send` (`async fn send(&self, to: &str, subject: &str, body: String) -> Result<(), AppError>`; it logs the SMTP failure kind itself, never the address).
 - Produces:
 
 ```rust
@@ -1649,9 +1835,10 @@ Branch `feat/NAMI-INC-5-notification-deliveries`, worktree `.worktrees/NAMI-INC-
 pub struct SendError { pub message: String, pub retry: Retry }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retry { Never, After(Option<Duration>) }   // After(Some(d)) = Retry-After from a 429
-pub struct Senders { pub http: reqwest::Client, pub telegram_base: String }
-impl Senders { pub fn new(telegram_base: &str) -> Senders }  // http = outbound::client()
-/// One request (or one email). Re-validates the destination (R9) before sending.
+pub struct Senders { pub telegram_base: String, pub policy: OutboundPolicy }
+impl Senders { pub fn from_config(config: &Config) -> Senders }  // read per kick, so tests can change config
+/// One request (or one email). Re-validates the destination (R9, `check_url_for_send` with the
+/// channel's `reach` and `policy`) and picks `client()` or `public_client()` by `reach` before sending.
 pub async fn send_to_channel(s: &Senders, mailer: &Mailer, channel: &OpenedChannel, message: &format::Message,
     delivery_id: Uuid) -> Result<(), SendError>;
 pub async fn send_email(mailer: &Mailer, to: &str, message: &format::Message) -> Result<(), SendError>;
@@ -1679,8 +1866,11 @@ pub async fn drain(state: &AppState, senders: &Senders) -> Result<usize, AppErro
 
 // incidents::worker
 pub const TICK: Duration = Duration::from_secs(2);
+pub const MAX_CONCURRENT_KICKS: usize = 2;
 pub async fn run_forever(state: AppState);
 /// One drain now (Task 9 adds one escalation tick before it). Used by notify_transition (Task 10) and tests.
+/// Returns at once when `!state.config.incidents_worker_enabled`. Otherwise waits for one of the
+/// MAX_CONCURRENT_KICKS permits of a process-wide `static KICKS: Semaphore` (R17), then runs.
 pub async fn kick(state: &AppState);
 ```
 
@@ -1728,7 +1918,7 @@ create index notification_deliveries_email_sent_idx on notification_deliveries (
     where channel_id is null and status = 'sent';
 ```
 
-Migration test `a_target_gets_one_delivery_per_incident_round`: a second insert with the same `(incident_id, round, target_key)` fails with `23505`.
+Migration test `a_target_gets_one_delivery_per_incident_round`: a second insert with the same `(incident_id, round, target_key)` fails with `23505`. Add `"notification_deliveries"` (and Task 3's `"notification_channels"`) to `all_tables_exist`.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -1983,6 +2173,57 @@ async fn send_test_reports_the_outcome_and_is_rate_limited(pool: sqlx::PgPool) {
     let card: Value = serde_json::from_slice(&teams.received_requests().await.unwrap()[0].body).unwrap();
     assert_eq!(card["attachments"][0]["content"]["type"], "AdaptiveCard");
 }
+
+#[sqlx::test]
+async fn the_strict_policy_refuses_internal_and_off_allowlist_destinations_at_send_time(pool: sqlx::PgPool) {
+    let mut state = AppState::for_test(pool.clone());
+    state.config.outbound_policy = nami_engine::outbound::OutboundPolicy::Strict;
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (user, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let incident = open_test_incident(&pool, project, user).await;
+    let receiver = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&receiver).await;
+    // A personal webhook at 127.0.0.1 (public-only) and a Slack channel off hooks.slack.com: both refused.
+    let personal = insert_channel(&pool, None, Some(user), "mine", ChannelConfig::Webhook { url: receiver.uri() }).await;
+    let slack = insert_channel(&pool, Some(project), None, "room",
+        ChannelConfig::Slack { webhook_url: format!("{}/services/x", receiver.uri()) }).await;
+    // A project webhook may reach a private receiver (R9).
+    let project_hook = insert_channel(&pool, Some(project), None, "hook", ChannelConfig::Webhook { url: receiver.uri() }).await;
+    for (round, channel, owner) in [("p0r0s0", personal, Some(user)), ("p0r0s1", slack, None), ("p0r0s2", project_hook, None)] {
+        queue(&pool, incident, round, Target::Channel { channel_id: channel, user_id: owner }).await;
+    }
+    run_incident_ticks(&state).await;
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "select round, status, last_error from notification_deliveries where incident_id = $1 and round like 'p0r0s%' order by round")
+        .bind(incident).fetch_all(&pool).await.unwrap();
+    assert_eq!(rows, [
+        ("p0r0s0".into(), "failed".into(), Some("destination not allowed".into())),
+        ("p0r0s1".into(), "failed".into(), Some("destination not allowed".into())),
+        ("p0r0s2".into(), "sent".into(), None),
+    ]);
+    assert_eq!(receiver.received_requests().await.unwrap().len(), 1, "only the project webhook was contacted");
+}
+
+#[sqlx::test]
+async fn a_lease_that_expired_after_the_last_attempt_fails_the_row_instead_of_wedging_the_queue(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (user, email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let incident = open_test_incident(&pool, project, user).await;
+    // A crash mid-send of attempt 5 leaves this behind.
+    sqlx::query("insert into notification_deliveries (incident_id, event, round, target_key, user_id, status, attempts, locked_until)
+                 values ($1, 'triggered', 'stuck', 'email:x', $2, 'sending', 5, now() - interval '1 minute')")
+        .bind(incident).bind(user).execute(&pool).await.unwrap();
+    queue(&pool, incident, "p0r0s0", Target::Email { user_id: user }).await;
+    run_incident_ticks(&state).await;
+    let stuck: (String, Option<String>) = sqlx::query_as(
+        "select status, last_error from notification_deliveries where round = 'stuck'").fetch_one(&pool).await.unwrap();
+    assert_eq!(stuck, ("failed".into(), Some("delivery interrupted".into())));
+    assert_eq!(delivery(&pool, incident).await.0, "sent", "the rest of the queue still drains");
+    assert!(!settled_mail(&email, 1).await.is_empty());
+}
 ```
 
 `tests/common/mod.rs` gains:
@@ -1997,30 +2238,65 @@ pub async fn run_incident_ticks(state: &AppState) { nami_engine::incidents::work
 
 `insert_channel` needs a `created_by`. It uses `user`, or for project channels it seeds an admin through `seed_user`.
 
-Run: engine command `--test notification_deliveries --lib incidents::deliveries`. Expected: FAIL.
+Run: engine command `--test notification_deliveries`, then engine command `--lib incidents::deliveries`. Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
 `deliveries::drain`:
 
-1. Claim (one statement):
+1. Claim, in **one transaction** (R12, R13). Each step is one literal statement:
 
 ```sql
-update notification_deliveries d set status = 'sending', locked_until = now() + interval '60 seconds',
-    attempts = d.attempts + 1
-where d.id in (
-    select id from notification_deliveries
-    where (status = 'pending' and next_attempt_at <= now())
-       or (status = 'sending' and locked_until < now())
-    order by next_attempt_at
+-- (a) one claimer at a time, across every engine instance; released at commit
+select pg_advisory_xact_lock(hashtext('nami.notification_deliveries.claim'));
+
+-- (b) poison rows: a lease that expired after the last attempt (R12)
+update notification_deliveries set status = 'failed', locked_until = null, last_error = 'delivery interrupted'
+where status = 'sending' and locked_until < now() and attempts >= 5;
+
+-- (c) claim with the storm caps ($1 = DRAIN_BATCH, $2 = CHANNEL_PER_MINUTE, $3 = EMAIL_PER_USER_PER_MINUTE)
+with candidates as (
+    select id, channel_id, user_id, next_attempt_at,
+           case when channel_id is not null then 'c:' || channel_id::text else 'u:' || user_id::text end as bucket
+    from notification_deliveries
+    where ((status = 'pending' and next_attempt_at <= now())
+        or (status = 'sending' and locked_until < now()))
+      and attempts < 5
+    order by next_attempt_at, id
+    limit $1
     for update skip locked
-    limit $1)
+), recent as (
+    select case when channel_id is not null then 'c:' || channel_id::text else 'u:' || user_id::text end as bucket,
+           count(*) as used
+    from notification_deliveries
+    where ((status = 'sent' and sent_at > now() - interval '1 minute')
+        or (status = 'sending' and locked_until >= now()))
+      and (channel_id in (select channel_id from candidates where channel_id is not null)
+        or (channel_id is null and user_id in (select user_id from candidates where channel_id is null)))
+    group by 1
+), ranked as (
+    select c.id,
+           coalesce(r.used, 0) + row_number() over (partition by c.bucket order by c.next_attempt_at, c.id) as nth,
+           case when c.bucket like 'c:%' then $2::bigint else $3::bigint end as cap
+    from candidates c left join recent r on r.bucket = c.bucket
+), deferred as (
+    update notification_deliveries d
+    set status = 'pending', locked_until = null, next_attempt_at = now() + interval '60 seconds'
+    from ranked r where d.id = r.id and r.nth > r.cap
+    returning d.id
+)
+update notification_deliveries d
+set status = 'sending', locked_until = now() + interval '60 seconds', attempts = d.attempts + 1
+from ranked r
+where d.id = r.id and r.nth <= r.cap
 returning d.id, d.incident_id, d.event, d.round, d.user_id, d.channel_id, d.attempts
 ```
 
+   Commit. The lock serialises only the claim, which takes milliseconds. Sends happen after the commit, outside any transaction. Deferred rows keep their attempt count. `skip locked` stays, so a claimer never waits on a row another transaction is updating (a record step, for example).
+
 2. Per claimed row, in a task bounded by a `Semaphore(MAX_SENDS_IN_FLIGHT)`:
    a. **Cancel (R15).** If `event = 'triggered'` and the incident's status is not `open`: `status = 'cancelled'`, no event.
-   b. **Rate cap (R13).** Count the sends in the last minute for this channel (or for this user's email). At or above the cap: `status = 'pending', attempts = attempts - 1, next_attempt_at = now() + 60 s`, and stop.
+   b. *(The rate caps are already applied by the claim.)*
    c. **Membership.** If `user_id` is set and that user is no longer a member of the incident's project: `cancelled`.
    d. **Build the message.** Load the incident summary (title, cause, status, source, severity name, started_at) and the project name. `incident_url = {ui_base_url}/projects/{project}/incidents/{id}`. Event: `triggered` → `NotifyEvent::Triggered`, `resolved` → `Resolved`. `actions` stays `None` until Task 11.
    e. **Send.** Email target: the user's address if `email_verified_at` is set (otherwise `failed`, "no verified email"), via `send_email`. Channel target: `open_for_send`. A missing or disabled channel → `cancelled`; a `DecryptError` → `failed` with R10's message; otherwise `send_to_channel`.
@@ -2037,11 +2313,11 @@ returning d.id, d.incident_id, d.event, d.round, d.user_id, d.channel_id, d.atte
 - telegram: `{telegram_base}/bot{token}/sendMessage` with `format::telegram`.
 - email (project channel): `send_email` to the configured address.
 
-Before every request it re-runs the destination rules (`check_url` with the kind's rule). A refusal is `Retry::Never` with "destination not allowed". Responses: 2xx is success; 429 is `After(Retry-After capped at 1 h)`; 408 and 5xx are `After(None)`; any other 4xx is `Never`. Transport errors are `After(None)` with `describe_error`. Mailer errors are `After(None)` with "email not delivered". The response body is read only to drain it (at most 64 KiB) and is never stored.
+Before every request it re-runs the destination rules: `check_url_for_send` with the kind's rule, `channel.config.reach(&channel.owner)` and `senders.policy`. A refusal is `Retry::Never` with "destination not allowed". It then sends with `outbound::public_client()` for `Reach::PublicOnly` and `outbound::client()` for `Reach::MonitorPolicy` (project webhooks, the Telegram base). Responses: 2xx is success; 429 is `After(Retry-After capped at 1 h)`; 408 and 5xx are `After(None)`; any other 4xx is `Never`. Transport errors are `After(None)` with `describe_error`. Mailer errors are `After(None)` with "email not delivered". The response body is read only to drain it (at most 64 KiB) and is never stored.
 
-`worker::run_forever`: every `TICK` (missed ticks delayed), spawn one iteration in its own task (a panic is logged, never fatal) that calls `kick`. `kick` builds `Senders::new(&state.config.telegram_api_base_url)` (cheap; read per call so tests can point it at wiremock), calls `deliveries::drain` once, and logs errors with `tracing::error!` (no secrets).
+`worker::run_forever`: every `TICK` (missed ticks delayed), spawn one iteration in its own task (a panic is logged, never fatal) that calls `kick`. `kick` returns at once when `!state.config.incidents_worker_enabled`. Otherwise it takes a `KICKS` permit (`static KICKS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_KICKS)`), builds `Senders::from_config(&state.config)` (cheap; read per call so tests can point it at wiremock), calls `deliveries::drain` once, and logs errors with `tracing::error!` (no secrets: never a URL, address or reqwest error `Display`). A permit is held only for one bounded tick plus one bounded drain. `sqlx::test` databases are per test, so tests that run in parallel share the permits but never each other's rows.
 
-- [ ] **Step 4: Run** engine command `--test notification_deliveries --test notification_channels --test migrations --lib incidents`, then the full suite and clippy. Expected: green.
+- [ ] **Step 4: Run** engine command `--test notification_deliveries --test notification_channels --test migrations --test json_bodies`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
 
 - [ ] **Step 5: Commit**
 
@@ -2156,7 +2432,9 @@ pub fn shift_index(r: &Rotation, at: DateTime<Utc>) -> Option<i64> {
 3. Evaluate `on_call_at` at each point.
 4. Merge consecutive equal `(user, override)` values into shifts that end at the next differing point (or `to`). Drop `None` stretches.
 
-70 days are ~100k evaluations, fine for a request. The tests pin correctness, not speed.
+70 days are ~100k evaluations, fine for a request. The tests pin correctness, not speed. Two notes:
+- The list routes compute `on_call_now`/`until` for up to 50 schedules (≈ 20k evaluations each for 14 days). So routes call `shifts` inside `tokio::task::spawn_blocking`, never directly on the async runtime.
+- `TimeWindow.weekdays` are `u8`, and `maintenance::weekday_from_iso` takes an `i16`: convert with `i16::from(d)`. `ValidWindow` builds `Schedule::Weekly { days, start, end, timezone }`, the field names on `main`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2331,10 +2609,10 @@ fn shift_index_agrees_with_shift_start_for_a_year_of_daily_shifts_in_a_dst_zone(
 
 (America/Santiago changes its offset at local midnight, which is the hardest case for a 00:00 handoff: some days start at 01:00 local.)
 
-Run: engine command `--lib timewindow oncall`. Expected: FAIL to compile.
+Run: engine command `--lib -- timewindow oncall`. Expected: FAIL to compile.
 
 - [ ] **Step 2: Implement** both modules as specified.
-- [ ] **Step 3: Run** engine command `--lib timewindow oncall --lib models::maintenance`, then clippy. Expected: PASS.
+- [ ] **Step 3: Run** engine command `--lib -- timewindow oncall models::maintenance`, then clippy. Expected: PASS.
 - [ ] **Step 4: Commit**
 
 ```bash
@@ -2351,7 +2629,7 @@ Branch `feat/NAMI-INC-7-schedules-api`, worktree `.worktrees/NAMI-INC-7/`.
 
 **Files:**
 - Create: `nami-engine/migrations/0063_create_on_call_schedules.sql`, `nami-engine/src/models/schedule.rs`, `nami-engine/src/routes/schedules.rs`
-- Modify: `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/tests/migrations.rs`
+- Modify: `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/src/models/project.rs` + `nami-engine/src/routes/projects.rs` (the members list, R28), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (schedule POST/PUT, override POST)
 - Test: `nami-engine/tests/schedules_api.rs`
 
 **Interfaces:**
@@ -2359,6 +2637,13 @@ Branch `feat/NAMI-INC-7-schedules-api`, worktree `.worktrees/NAMI-INC-7/`.
 - Produces:
 
 ```rust
+// models::project (R28)
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct MemberView { pub user_id: Uuid, pub email: String, pub project_role: String }
+pub async fn list_members(pool: &PgPool, project_id: Uuid) -> Result<Vec<MemberView>, sqlx::Error>; // by email
+// routes::projects: add `.get(list_members)` to the existing
+// `.route("/projects/{id}/members", post(add_member))` line (one route, two methods), viewer.
+
 // models::schedule
 pub const MAX_SCHEDULES_PER_PROJECT: i64 = 50;
 pub const MAX_PARTICIPANTS: usize = 50;
@@ -2468,7 +2753,7 @@ create index on_call_overrides_schedule_idx on on_call_overrides (schedule_id, e
 
 A deleted user's participant row is removed by cascade, which shifts the later positions' meaning. `replace` always rewrites positions 0..n-1, so a gap only means the cycle skips that slot until the next save. `load_rotation` reads participants ordered by position, so a gap never yields a wrong user.
 
-Migration test `a_custom_rotation_needs_hours_and_others_must_not_have_them` (two failing inserts, `23514`).
+Migration test `a_custom_rotation_needs_hours_and_others_must_not_have_them` (two failing inserts, `23514`). Add the three tables to `all_tables_exist`.
 
 - [ ] **Step 2: Write the failing API tests**
 
@@ -2512,6 +2797,22 @@ async fn admins_manage_schedules_and_viewers_see_who_is_on_call(pool: sqlx::PgPo
     assert!(!shifts.as_array().unwrap().is_empty());
     let (status, board) = call(&app, "GET", &format!("/projects/{project}/on-call"), Some(&viewer), None).await;
     assert_eq!((status, board[0]["on_call_now"]["email"].as_str()), (StatusCode::OK, Some(alice_email.as_str())));
+}
+
+#[sqlx::test]
+async fn viewers_list_project_members_and_outsiders_get_403(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (alice, alice_email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (_, _, outsider) = user_with_role(&app, &pool, project, None).await;
+    let path = format!("/projects/{project}/members");
+    let (status, members) = call(&app, "GET", &path, Some(&viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{members}");
+    let entry = members.as_array().unwrap().iter().find(|m| m["user_id"] == json!(alice)).unwrap().clone();
+    assert_eq!(entry, json!({"user_id": alice, "email": alice_email, "project_role": "member"}));
+    let (status, _) = call(&app, "GET", &path, Some(&outsider), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[sqlx::test]
@@ -2597,10 +2898,10 @@ async fn shift_ranges_are_capped(pool: sqlx::PgPool) {
 fn urlencode(s: &str) -> String { url::form_urlencoded::byte_serialize(s.as_bytes()).collect() }
 ```
 
-Run: engine command `--test schedules_api --test migrations`. Expected: FAIL.
+Run: engine command `--test schedules_api --test migrations --test json_bodies`. Expected: FAIL.
 
-- [ ] **Step 3: Implement** the model and routes. Writes run in one transaction. Participants are rewritten as positions 0..n-1. `updated_at = now()` on replace. The `InUse` check is added in Task 8 (until then `delete` never returns it).
-- [ ] **Step 4: Run** engine command `--test schedules_api --test migrations`, then the full suite and clippy. Expected: green.
+- [ ] **Step 3: Implement** the model and routes. Shift computations run in `spawn_blocking` (Task 6 note). Writes run in one transaction. Participants are rewritten as positions 0..n-1. `updated_at = now()` on replace. The `InUse` check is added in Task 8 (until then `delete` never returns it).
+- [ ] **Step 4: Run** engine command `--test schedules_api --test migrations --test json_bodies`, then the full suite and clippy. Expected: green.
 - [ ] **Step 5: Commit**
 
 ```bash
@@ -2620,7 +2921,7 @@ Branch `feat/NAMI-INC-8-escalation-policies`, worktree `.worktrees/NAMI-INC-8/`.
   - `nami-engine/src/incidents/lifecycle.rs`: `OpenIncident.escalation_policy_id: Option<Uuid>`. `open`, `reopen`, `acknowledge` and `resolve` arm or disarm escalation. Every construction site in Task 1/2 code and tests sets the new field to `None`.
   - `nami-engine/src/models/channel.rs` and `nami-engine/src/models/schedule.rs`: `delete` returns `InUse` when a step targets the row.
   - `nami-engine/src/routes/incidents.rs`: manual create accepts `escalation_policy_id` (a foreign id → 404).
-  - `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/tests/common/mod.rs` (`policy_body`), `nami-engine/tests/migrations.rs`.
+  - `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/tests/common/mod.rs` (`policy_body`), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (policy POST/PUT, `/default`).
 - Test: `nami-engine/tests/escalation_policies_api.rs` (+ unit tests in `plan.rs`)
 
 **Interfaces:**
@@ -2677,7 +2978,7 @@ pub async fn get(pool: &PgPool, project_id: Uuid, id: Uuid) -> Result<Option<Pol
 pub async fn make_default(pool: &PgPool, project_id: Uuid, id: Uuid) -> Result<bool, sqlx::Error>;
 pub enum Deleted { Deleted, NotFound, IsDefault }
 pub async fn delete(pool: &PgPool, project_id: Uuid, id: Uuid) -> Result<Deleted, sqlx::Error>;
-pub async fn belongs_to(conn: &mut PgConnection, project_id: Uuid, policy_id: Uuid) -> Result<bool, sqlx::Error>;
+pub async fn belongs_to<'e>(executor: impl PgExecutor<'e>, project_id: Uuid, policy_id: Uuid) -> Result<bool, sqlx::Error>;
 ```
 
 - Routes:
@@ -2731,8 +3032,14 @@ create table escalation_step_targets (
     step_id uuid not null references escalation_steps(id) on delete cascade,
     kind text not null check (kind in ('user', 'schedule', 'all_members', 'project_channel')),
     user_id uuid references users(id) on delete cascade,
-    schedule_id uuid references on_call_schedules(id) on delete restrict,
-    channel_id uuid references notification_channels(id) on delete restrict,
+    -- NO ACTION (the default), not RESTRICT: both refuse removing a targeted
+    -- schedule or channel directly (23503), but NO ACTION is checked at the
+    -- end of the statement, so removing the whole project, which cascades to
+    -- the policies' targets and to the schedules/channels in one statement,
+    -- still works. RESTRICT is checked at once and could fail that cascade,
+    -- depending on the order the cascades run in.
+    schedule_id uuid references on_call_schedules(id),
+    channel_id uuid references notification_channels(id),
     check (
         (kind = 'user' and user_id is not null and schedule_id is null and channel_id is null) or
         (kind = 'schedule' and schedule_id is not null and user_id is null and channel_id is null) or
@@ -2787,6 +3094,8 @@ Migration tests:
 - `every_project_gets_a_default_policy_that_pages_all_members`: one policy, one step, delay 0, one `all_members` target.
 - `a_policy_cannot_fall_back_to_itself` (`23514`).
 - `a_targeted_schedule_cannot_be_deleted_from_sql` (`23503`).
+- `removing_a_project_removes_its_policies_schedules_and_channels`: a project whose policy targets one of its schedules and one of its project channels (inserted in SQL) is removed with a plain SQL delete of the `projects` row without error, and no row of the five tables is left for it.
+- Add the three new tables to `all_tables_exist`.
 
 - [ ] **Step 2: Write the failing planner tests** in `plan.rs` `mod tests`:
 
@@ -3069,7 +3378,7 @@ where i.id = $1
 
 Then write the model and routes as specified.
 
-- [ ] **Step 5: Run** engine command `--test escalation_policies_api --test incident_lifecycle --test incidents_api --test notification_channels --test schedules_api --test migrations --lib incidents`, then the full suite and clippy. Expected: green.
+- [ ] **Step 5: Run** engine command `--test escalation_policies_api --test incident_lifecycle --test incidents_api --test notification_channels --test schedules_api --test migrations --test json_bodies`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
 
 - [ ] **Step 6: Commit**
 
@@ -3107,14 +3416,21 @@ pub async fn recipients(conn: &mut PgConnection, project_id: Uuid, step_id: Uuid
 
 // incidents::lifecycle (changed)
 // resolve(): after the state change, enqueues one `resolved` delivery per target that has a
-// `sent` triggered delivery in the current generation (or, for `escalation_legacy` incidents,
-// one email per project member), round "resolved:g{generation}".
+// `sent` triggered delivery in the current generation (rounds `like 'g' || generation || 'p%'`;
+// the `p` keeps g1 from matching g10), or, for `escalation_legacy` incidents, one email per
+// project member, round "resolved:g{generation}".
+/// R17: resolves without queuing any notice; the `resolved` event carries {"silent": true}.
+/// Only Logs Part 2's disable path (`resolve_alert_incident(.., notify: false)`) uses it (Task 10).
+pub async fn resolve_source_silently(conn: &mut PgConnection, source: &IncidentSource, at: DateTime<Utc>)
+    -> Result<Option<Uuid>, sqlx::Error>;
 ```
 
 `tests/common/mod.rs` gains:
 
 ```rust
-/// Makes the incident's next escalation step due now.
+/// Makes the incident's next escalation step due now, only if one is scheduled:
+/// `update incidents set next_escalation_at = now() where id = $1 and next_escalation_at is not null`.
+/// (Unconditional, it would resurrect an exhausted escalation and break the "fallback runs once" test.)
 pub async fn make_escalation_due(pool: &sqlx::PgPool, incident: Uuid)
 /// Replaces the project's default policy (PUT) through the API as `admin`; returns its id.
 pub async fn set_policy(app: &Router, project: Uuid, admin: &HeaderValue, body: serde_json::Value) -> Uuid
@@ -3125,9 +3441,9 @@ pub async fn set_policy(app: &Router, project: Uuid, admin: &HeaderValue, body: 
 2. Load the incident's policy, its fallback and the `active` one (fallback when `escalation_on_fallback`).
    - A missing policy (deleted) → `next_escalation_at = null` + `escalation_exhausted` "escalation policy was deleted".
    - A cursor past the active policy's last step (the policy was shortened) runs as the end of the pass with 0 newly notified.
-3. Run the step scheduled at `ran_at = next_escalation_at`:
-   - **Condition false.** If the step has a condition that does not cover `ran_at`, record a `step_skipped` event (`"Step <n> skipped: outside <weekdays> <from>-<to> <timezone>"`) with 0 newly notified.
-   - **Recipients.** Otherwise call `recipients(project, step, ran_at)`. Then cap at `MAX_DELIVERIES_PER_INCIDENT - existing` (when the cap is hit, add one `notification_failed` event "notification cap reached (500 per incident)", once per incident, detected by `metadata->>'cap' = 'true'`).
+3. Run the step scheduled at `ran_at = max(next_escalation_at, now − 60 s)` (R14). `now` is read once per incident with `select now()` inside the transaction.
+   - **Condition false.** If the step has a condition that does not cover `now`, record a `step_skipped` event (`"Step <n> skipped: outside <weekdays> <from>-<to> <timezone>"`) with 0 newly notified.
+   - **Recipients.** Otherwise call `recipients(project, step, now)`, so the person on call now is paged (R14). Then cap at `MAX_DELIVERIES_PER_INCIDENT - existing` (when the cap is hit, add one `notification_failed` event "notification cap reached (500 per incident)", once per incident, detected by `metadata->>'cap' = 'true'`).
    - **Enqueue.** `enqueue` with `event = Triggered`, `round = round(generation, cursor)`. The newly notified count is the inserted row count.
    - **Event.** Record `escalated` with `"Step <n> of <policy name>: <k> recipient(s)"` and metadata `{"step", "repeat", "fallback", "recipients": k}`.
 4. `after_step(active, fallback, cursor, ran_at, newly)`:
@@ -3446,12 +3762,32 @@ async fn racing_ticks_notify_each_target_once(pool: sqlx::PgPool) {
         .bind(&id).fetch_one(&pool).await.unwrap();
     assert_eq!(rows, 2, "two members, one delivery each");
 }
+
+#[sqlx::test]
+async fn an_outage_never_replays_missed_steps_as_a_burst(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (_, email, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    set_policy(&app, project, &admin, json!({"name": "Default", "repeat_count": 10,
+        "steps": [one_step(0, json!([{"type": "all_members"}]))]})).await;
+    let id = open(&app, project, &member).await;
+    // The worker was down for three hours: the first step is long overdue.
+    sqlx::query("update incidents set next_escalation_at = now() - interval '3 hours' where id = $1::uuid")
+        .bind(&id).execute(&pool).await.unwrap();
+    run_incident_ticks(&state).await;
+    assert_eq!(settled_mail(&email, 1).await.len(), 1, "one pass now, not one per missed repeat");
+    let wait: f64 = sqlx::query_scalar("select extract(epoch from next_escalation_at - now())::float8 from incidents where id = $1::uuid")
+        .bind(&id).fetch_one(&pool).await.unwrap();
+    assert!((180.0..=301.0).contains(&wait), "the next repeat is ~5 min from now, got {wait}s");
+}
 ```
 
 Run: engine command `--test escalation_engine`. Expected: FAIL.
 
-- [ ] **Step 2: Implement** `run.rs`, the `resolve` hook and `kick` as specified above.
-- [ ] **Step 3: Run** engine command `--test escalation_engine --test notification_deliveries --test incidents_api --test incident_lifecycle --lib incidents`, then the full suite and clippy. Expected: green.
+- [ ] **Step 2: Implement** `run.rs`, the `resolve` hook, `resolve_source_silently` and `kick` as specified above. `kick` takes its `KICKS` permit (Task 5), then runs `escalation::run::tick` and then `deliveries::drain`, logging each error separately: a failed tick never skips the drain. Add a lifecycle test in `tests/incident_lifecycle.rs`: `a_silent_resolution_queues_nothing`. A monitor incident whose step already sent one email, resolved with `resolve_source_silently`, has no `resolved:g0` delivery, and its last event is `resolved` with metadata `{"silent": true}`.
+- [ ] **Step 3: Run** engine command `--test escalation_engine --test notification_deliveries --test incidents_api --test incident_lifecycle`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
 - [ ] **Step 4: Commit**
 
 ```bash
@@ -3469,18 +3805,21 @@ Branch `feat/NAMI-INC-10-incident-routing`, worktree `.worktrees/NAMI-INC-10/`.
 - Create: `nami-engine/migrations/0065_source_escalation_routing.sql`
 - Modify:
   - `nami-engine/src/models/incident.rs`: the six wrappers read the source's `escalation_policy_id`/`severity_id` and pass them to `lifecycle::open`.
-  - `nami-engine/src/uptime/alerts.rs`: `notify_transition` calls `incidents::worker::kick`; `render` and its tests are removed; `sanitize_cause` stays.
+  - `nami-engine/src/uptime/alerts.rs`: `notify_transition` calls `incidents::worker::kick`. `render` and its unit tests are removed, including Logs Part 2's `log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert` and NAMI-UP-21's `heartbeat_output_is_quoted_line_by_line_between_since_and_details` / `details_are_sanitized_again_when_rendered`. Their properties live in `incidents::format`'s tests (Task 4). `sanitize_cause`, `Transition` (with UP-21's `details`) and `Subject` stay: the worker's `log_dropped` and the call sites use them.
+  - `nami-engine/src/logs/alerts.rs`: the R-P2-27 seam. `resolve_alert_incident(.., notify: false)` calls `lifecycle::resolve_source_silently` instead of the wrapper (R17). `open_alert_incident` and the `notify: true` path are unchanged.
+  - `nami-engine/src/main.rs`: spawn `incidents::worker::run_forever(state.clone())` when `state.config.incidents_worker_enabled`, next to the uptime worker block, with the same two log lines (`"incidents worker started"` / `"incidents worker disabled (INCIDENTS_WORKER_ENABLED=false)"`). R23, R27.
   - `nami-engine/src/models/{monitor,heartbeat,log_alert}.rs` and their routes: the two new optional fields in create/patch bodies and views.
-  - The existing tests that assert alert subjects (R18): `tests/uptime_worker.rs`, `tests/heartbeats.rs`, `tests/maintenance_windows.rs`, `tests/recovery_threshold.rs`, `tests/uptime_worker_timing.rs`, `tests/checker_http_config.rs`, `tests/log_alerts.rs`.
+  - The existing tests that assert alert subjects (R18): `tests/uptime_worker.rs`, `tests/heartbeats.rs`, `tests/maintenance_windows.rs`, `tests/recovery_threshold.rs`, `tests/uptime_worker_timing.rs`, `tests/checker_http_config.rs`, `tests/log_alerts.rs`, `tests/heartbeat_pings.rs` (NAMI-UP-21).
+  - The `tests/uptime_worker.rs` tests that pin the old SMTP path's mechanics (Step 4 lists them).
   - `nami-engine/tests/migrations.rs`.
 - Test: `nami-engine/tests/incident_routing.rs`
 
 **Interfaces:**
-- Consumes: Tasks 1-9. Logs Part 2: `log_alerts`, `logs::alerts::{claim_due_alerts, apply_evaluation}`.
+- Consumes: Tasks 1-9. Logs Part 2: `log_alerts`, `logs::alerts::{claim_due_alerts, apply_evaluation, resolve_alert_incident}`. Uptime Phase 3: `incidents.details` and `attach_details` (unchanged; `format::email` renders it, Task 4).
 - Produces:
   - `Monitor`/`MonitorView`, `Heartbeat`/`HeartbeatView` and `LogAlert` gain `escalation_policy_id: Option<Uuid>` and `severity_id: Option<Uuid>`.
   - Create bodies accept them as optional fields. Patch bodies accept them as `Option<Option<Uuid>>` (`null` clears, so the project default applies; deserialized with `models::nullable`, like `group_id`).
-  - An id from another project is rejected exactly the way a foreign `group_id` is today (same status and message style, checked with `escalation_policy::belongs_to` / `severity::belongs_to` inside the write transaction).
+  - An id from another project is rejected exactly the way a foreign `group_id` is today in `routes/monitors.rs::create_monitor`: `404` from a `belongs_to(&state.db, project_id, id)` check before the write, plus the existing `23503 → 404` mapping for a row deleted in between. Use `escalation_policy::belongs_to` / `severity::belongs_to`, both generic over `impl PgExecutor` like `monitor_group::belongs_to`. A policy or severity can never move between projects, so the check cannot go stale.
   - `alerts::notify_transition(state, transition)` keeps its signature. Its body is now `crate::incidents::worker::kick(state).await`, because the incident and its deliveries were already written in the source's transaction.
 
 - [ ] **Step 1: Write the migration**
@@ -3500,9 +3839,18 @@ alter table heartbeats
 alter table log_alerts
     add column escalation_policy_id uuid references escalation_policies(id) on delete set null,
     add column severity_id uuid references incident_severities(id) on delete set null;
+
+-- R27: incidents of these sources that are still unresolved were opened while
+-- the old email path was live and were emailed by it (from NAMI-INC-8 on,
+-- lifecycle::open had armed their escalation too). Disarm them so this deploy
+-- never pages for them a second time; "legacy" makes their resolution
+-- notify every member, as the old path would have. Manual incidents were
+-- never notified by anyone and keep their escalation.
+update incidents set next_escalation_at = null, escalation_legacy = true
+where status <> 'resolved' and source in ('monitor', 'heartbeat', 'log_alert');
 ```
 
-Migration test `deleting_a_policy_clears_it_on_monitors`.
+Migration test `deleting_a_policy_clears_it_on_monitors`. The R27 `update` touches only rows that exist when it runs, and a `sqlx::test` database runs every migration before the test body, so no test can seed rows ahead of it. The task review checks the statement against R27 instead, and the PR says so.
 
 - [ ] **Step 2: Write the failing routing tests**
 
@@ -3528,7 +3876,7 @@ async fn severity(pool: &sqlx::PgPool, project: Uuid, name: &str) -> Uuid {
 
 #[sqlx::test]
 async fn a_monitor_pages_through_its_own_policy_with_its_severity(pool: sqlx::PgPool) {
-    let (state, _ch) = state_with_clickhouse(pool.clone()).await;
+    let (state, ch) = state_with_clickhouse(&pool).await;
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
@@ -3564,7 +3912,7 @@ async fn a_monitor_pages_through_its_own_policy_with_its_severity(pool: sqlx::Pg
 
 #[sqlx::test]
 async fn an_acknowledged_monitor_incident_blocks_a_second_one_until_it_recovers(pool: sqlx::PgPool) {
-    let (state, _ch) = state_with_clickhouse(pool.clone()).await;
+    let (state, ch) = state_with_clickhouse(&pool).await;
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
@@ -3585,7 +3933,7 @@ async fn an_acknowledged_monitor_incident_blocks_a_second_one_until_it_recovers(
 
 #[sqlx::test]
 async fn a_missed_heartbeat_pages_the_default_policy(pool: sqlx::PgPool) {
-    let (state, _ch) = state_with_clickhouse(pool.clone()).await;
+    let (state, ch) = state_with_clickhouse(&pool).await;
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, email, member) = user_with_role(&app, &pool, project, Some("member")).await;
@@ -3601,7 +3949,7 @@ async fn a_missed_heartbeat_pages_the_default_policy(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn a_log_alert_opens_its_incident_on_its_policy_and_severity(pool: sqlx::PgPool) {
-    let (state, _ch) = state_with_clickhouse(pool.clone()).await;
+    let (state, ch) = state_with_clickhouse(&pool).await;
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
@@ -3639,9 +3987,9 @@ async fn foreign_policies_and_severities_are_refused_on_sources(pool: sqlx::PgPo
 }
 ```
 
-`state_with_clickhouse`, `make_due` and the heartbeat create body follow the existing helpers and API in `tests/common/mod.rs` and `tests/heartbeats.rs`. Where a field name differs (for example `grace_seconds`), use the existing one.
+`state_with_clickhouse(&pool)` takes a reference and returns `(AppState, ClickHouse)` bound to a fresh per-test database. Each test above that calls it ends with `ch.drop_database().await.unwrap();` (the convention in `tests/uptime_worker.rs`). `make_due` and the heartbeat create body follow the existing helpers and API in `tests/common/mod.rs` and `tests/heartbeats.rs`. Where a field name differs (for example `grace_seconds`), use the existing one.
 
-Run: engine command `--test incident_routing --test migrations`. Expected: FAIL.
+Run: engine command `--test incident_routing --test migrations`. Expected: FAIL. (After Step 3, also run `--test log_alerts --test heartbeat_pings --test uptime_worker --test heartbeats` and expect only the Step 4 failures.)
 
 - [ ] **Step 3: Implement**
 
@@ -3656,17 +4004,32 @@ pub async fn notify_transition(state: &AppState, _transition: &Transition) {
 }
 ```
 
-Delete `render` and its unit tests. The escaping they covered (CR/LF in names never reaching a subject) is covered by `incidents::format` (`email_subject_and_body_carry_severity_and_links_on_single_lines`). Fix the uses of `render` that the compiler reports. Logs Part 2's `log_alert_emails_say_triggered_and_resolved...` test goes with it.
+Delete `render` and its unit tests. The escaping they covered (CR/LF in names never reaching a subject) is covered by `incidents::format` (`email_subject_and_body_carry_severity_and_links_on_single_lines`). The heartbeat output quoting is covered by `a_cause_cannot_forge_a_link_line_and_job_output_is_quoted`. Fix the uses of `render` that the compiler reports. Logs Part 2's `log_alert_emails_say_triggered_and_resolved...` test and NAMI-UP-21's two `render` tests go with it.
 
-- [ ] **Step 4: Update the existing subject assertions (R18)**
+The log-alert seam (R17): in `logs::alerts::resolve_alert_incident`, `notify: false` calls `lifecycle::resolve_source_silently(conn, &IncidentSource::LogAlert(alert_id), at)` and returns `None`. Logs Part 2's disable test (the alert disabled while alerting resolves its incident and sends nothing) must keep passing unchanged.
 
-Run the full engine suite. The failures to expect are only subject strings and, where a test counted on one email per member per transition, nothing else. Rewrite each subject to the new form:
+- [ ] **Step 4: Update the existing assertions (R18)**
+
+Run the full engine suite. Expect two kinds of failure.
+
+**(a) Subject strings.** Rewrite each subject to the new form. Counts stay the same: one email per member per transition, because the default policy pages `all_members` once, and a resolution notifies each of them once.
 - `"[Nami] X is DOWN"` → `"[Nami] [high] X is down"`
 - `"[Nami] X is back UP"` → `"[Nami] Resolved: X is down"`
-- heartbeats: `"[Nami] [high] X missed its heartbeat"` / `"[Nami] Resolved: X missed its heartbeat"`
+- heartbeats (sweep): `"[Nami] [high] X missed its heartbeat"` / `"[Nami] Resolved: X missed its heartbeat"`
+- heartbeats (failure ping, NAMI-UP-20): `"[Nami] [high] X reported a failure"` / `"[Nami] Resolved: X reported a failure"`
 - log alerts: `"[Nami] [high] Log alert: X"` / `"[Nami] Resolved: Log alert: X"`
+- `a_name_written_around_the_api_cannot_inject_headers_or_recipients`: unsafe characters now become spaces instead of being dropped, so the subject is `format!("[Nami] [high] API  Bcc: {victim}  Cc: {victim} is down")`. Its recipient/header assertions stay as they are.
 
-Body assertions that looked for `Cause: …` keep working (the format keeps that line). Any other failure is a behaviour change: stop and fix the code, not the test.
+Body assertions that looked for `Cause: …` keep working (the format keeps that line). NAMI-UP-21's `Output:\n> …\n` assertion keeps working (Task 4).
+
+**(b) Tests that pin the old SMTP path's mechanics** (`tests/uptime_worker.rs`). The old path sent one email after another from the alert task and gave up after one timeout. The new path queues deliveries, sends up to `MAX_SENDS_IN_FLIGHT` at once and retries per R12. Rewrite exactly these tests to keep the property named here. Do not weaken anything else.
+- `a_hung_smtp_server_does_not_hold_up_the_checks`: keep the property "two passes finish in < 5 s while SMTP never answers, and the monitor ends up". Drop the `notifications.reap() == 2` count: the second kick may find nothing to send.
+- `alerts_to_a_hung_smtp_server_are_given_up_on_after_the_timeout`: keep "`run_due_checks` ends (well under 20 s) although SMTP is hung". The two recipients' sends now run concurrently: assert `elapsed >= 700 ms` (one mailer timeout) instead of `>= 1,300 ms`. Both deliveries end `pending` with `attempts = 1` and `last_error = 'email not delivered'`.
+- `a_failed_alert_is_logged_once_and_without_the_recipients_address`: keep "no log line contains the recipient's address" and "the mailer logs the cause (`failed to send email`) once". Replace the `alert email not delivered to every recipient` summary assertion with: the delivery is `pending` with `attempts = 1`, and there is exactly one `notification_failed` event whose message is `Email: <recipient>: email not delivered` (R11 allows the user's own address in their own event).
+- `a_pass_sends_all_its_alerts_from_one_task` and `alerts_are_dropped_and_logged_when_too_many_batches_are_still_sending` test the `Notifications` set, which is unchanged. They keep passing as they are. In the second one, the refused batch means no kick runs, so the armed incident sends nothing until the worker loop, which tests do not run. `settled_mail(&recipient, 0)` still sees no email.
+- `an_alert_does_not_wait_for_the_rest_of_its_pass`: unchanged apart from the subject (`"[Nami] [high] Refused API is down"`).
+
+Any other failure is a behaviour change: stop and fix the code, not the test.
 
 - [ ] **Step 5: Run** the full engine suite and clippy. Expected: green.
 - [ ] **Step 6: Commit**
@@ -3688,7 +4051,8 @@ Branch `feat/NAMI-INC-11-action-links`, worktree `.worktrees/NAMI-INC-11/`.
 - Modify:
   - `nami-engine/src/incidents/deliveries.rs`: implicit-email deliveries of `triggered` events carry `ActionLinks` for that user when they are a `member`/`admin` of the project or a global admin.
   - `nami-engine/src/incidents/worker.rs`: prune token uses older than 2 days, once an hour.
-  - `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs` (merge behind `rate_limited_with_governor`), `nami-engine/tests/migrations.rs`.
+  - `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`: merge behind a governor of its own, `rate_limited_actions(router)`, the same shape as `rate_limited_with_governor` with `SmartIpKeyExtractor`, `.per_second(3).burst_size(20)` (R16; `per_second(n)` is the replenish interval in seconds). `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (both routes, without a session).
+  - `nami-engine/src/error.rs`: `AppError::Gone(String)` → `410 {"error": msg}`. There is no 410 variant on `main`.
 - Test: `nami-engine/tests/incident_actions.rs` (+ unit tests in `action_token.rs`), `action.test.ts`
 
 **Interfaces:**
@@ -3705,6 +4069,7 @@ pub enum Action { Acknowledge, Resolve }   // "ack" | "resolve" in the payload
 pub struct Claims { pub incident_id: Uuid, pub action: Action, pub user_id: Uuid, pub expires_at: DateTime<Utc> }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Invalid { Malformed, BadSignature, Expired }
+/// Adds a fresh 9-byte random nonce to the payload (R16); `Claims` does not carry it.
 pub fn sign(cipher: &Cipher, claims: &Claims) -> String;
 pub fn verify(cipher: &Cipher, token: &str, now: DateTime<Utc>) -> Result<Claims, Invalid>;
 pub fn hash(token: &str) -> [u8; 32];   // SHA-256, the single-use key
@@ -3721,13 +4086,16 @@ pub fn links(cipher: &Cipher, ui_base_url: &str, incident_id: Uuid, user_id: Uui
     - `410 {"error": "this link was already used"}`.
     - `409 {"error": "the incident is already <status>"}` when the action no longer applies. This does **not** consume the token.
 
-`confirm` runs in one transaction:
-1. Verify the token.
-2. Load and lock the incident.
-3. Check the role.
-4. `insert into incident_action_token_uses (token_hash, incident_id, expires_at) values (...) on conflict do nothing returning token_hash`. No row → 410.
-5. Run `lifecycle::acknowledge`/`resolve` with the token's user. `false` → roll back (409).
-6. Commit and `kick` the worker (a resolve queues notices).
+`confirm` runs in one transaction, in this order (R16):
+1. Verify the token (no database work for a bad one).
+2. Load and lock the incident (`select ... for update`). Unknown → 400 as above. The user's `password_changed_at` check also happens here.
+3. Check the role. A user who is no longer a `member`/`admin` and not a global admin → 403.
+4. `select exists(select 1 from incident_action_token_uses where token_hash = $1)` → 410 `this link was already used`. A used link always says "used", even though its action no longer applies either.
+5. Run `lifecycle::acknowledge`/`resolve` with the token's user. `false` → roll back, 409 (a fresh token is not consumed).
+6. `insert into incident_action_token_uses (token_hash, incident_id, expires_at) values (...) on conflict do nothing returning token_hash`. No row → roll back, 410. The state change in step 5 is undone with it.
+7. Commit and `kick` the worker (a resolve queues notices).
+
+Concurrent confirms of one token serialise on the row lock of step 2. The second one sees the stored use (410) and never acts twice. The primary key of step 6 backs this up should a future change drop the lock. `inspect` runs steps 1-3 and never writes. The key is `Zeroizing::new(cipher.derive_subkey(SUBKEY_INFO))`, derived per call and wiped on drop.
 
 - [ ] **Step 1: Migration**
 
@@ -3893,7 +4261,9 @@ async fn a_token_is_bound_to_its_incident_and_action(pool: sqlx::PgPool) {
     let statuses: Vec<String> = sqlx::query_scalar("select status from incidents where id = any($1) order by id = $2 desc")
         .bind(vec![id, other]).bind(id).fetch_all(&pool).await.unwrap();
     assert_eq!(statuses, ["acknowledged", "open"], "only its own incident changed");
+    // A second, distinct link for the same action (the nonce makes every token distinct, R16).
     let late_ack = token(&state, id, alice, Action::Acknowledge);
+    assert_ne!(late_ack, ack);
     let (status, _) = call(&app, "POST", "/incident-actions/confirm", None, Some(json!({"token": late_ack}))).await;
     assert_eq!(status, StatusCode::CONFLICT, "already acknowledged");
     let (status, _) = call(&app, "POST", "/incident-actions/confirm", None, Some(json!({"token": late_ack}))).await;
@@ -3933,9 +4303,9 @@ async fn a_get_never_acknowledges(pool: sqlx::PgPool) {
 - the project, incident title, severity and status;
 - one button ("Acknowledge incident" / "Resolve incident") in a `<form method="POST" action="?/confirm">` with a hidden `token` input;
 - the result or problem message;
-- a link to the incident page (`/projects/{project_id}/incidents/{id}`), which needs a login.
+- a link to the incident page (`/projects/{project_id}/incidents/{id}`), which needs a login. It is rendered only when both ids pass `isUuid` (`#lib/uuid`). The page takes no redirect or return-to parameter.
 
-The page renders text only through Svelte expressions (escaped).
+The page renders text only through Svelte expressions (escaped). The `confirm` action relies on SvelteKit's origin check for form actions (`kit.csrf.checkOrigin`, default on; the review checks `svelte.config.js` does not disable it). The page lives outside `(app)`, so `(app)/+layout.server.ts` never redirects it to the login page, and no `engineFailure` login redirect applies: a 401 cannot happen on these sessionless routes.
 
 `action.test.ts`:
 
@@ -3973,7 +4343,7 @@ describe('incident action page', () => {
 });
 ```
 
-- [ ] **Step 5: Run** engine command `--test incident_actions --test notification_deliveries --test migrations --lib incidents::action_token`, the full engine suite and clippy, then the UI command with `src/routes/incidents/action`. Expected: green.
+- [ ] **Step 5: Run** engine command `--test incident_actions --test notification_deliveries --test migrations --test json_bodies`, then engine command `--lib incidents::action_token`, the full engine suite and clippy, then the UI command with `src/routes/incidents/action`. Expected: green.
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -3990,7 +4360,7 @@ Branch `feat/NAMI-INC-12-ui-incidents`, worktree `.worktrees/NAMI-INC-12/`.
 
 **Files:**
 - Create: `nami-ui/src/lib/markdown.ts` (+ `markdown.test.ts`), `nami-ui/src/lib/components/SeverityBadge.svelte`, `nami-ui/src/routes/(app)/projects/[id=uuid]/incidents/[incidentId=uuid]/+page.server.ts`, `+page.svelte`, `incident-detail.test.ts`
-- Modify: `nami-ui/src/lib/incidents.ts` (+ `incidents.test.ts`), `nami-ui/src/routes/(app)/projects/[id=uuid]/incidents/+page.server.ts`, `+page.svelte`, and its two tests. Keep Logs Part 2's log-alert link on list rows.
+- Modify: `nami-ui/src/lib/incidents.ts` (+ `incidents.test.ts`), `nami-ui/src/routes/(app)/projects/[id=uuid]/incidents/+page.server.ts`, `+page.svelte`, and its two tests. Keep Logs Part 2's log-alert link on list rows (NAMI-LOG-18) and NAMI-UP-29's `<details><summary>Job output</summary><pre>…</pre></details>` block (R26), with their existing test cases.
 - Test: the files above
 
 **Interfaces:**
@@ -4024,7 +4394,8 @@ Page behaviour:
   - Timeline, oldest first: event label, actor email, time (UTC), and message. Messages render as text (Svelte escapes); comments keep line breaks with `white-space: pre-wrap`.
   - Comment form (action `comment`).
   - Postmortem: rendered with `{@html renderMarkdown(postmortem)}`, the only `{@html}` in the feature, plus an edit form (textarea with `defaultValue`, action `postmortem`).
-  - Cause shown in a `<pre>` (escaped).
+  - Cause shown in a `<pre>` (escaped). When `details` is set, the same `Job output` `<details>` block as the list (R26), text only.
+  - The incident list's "New incident" policy select loads `GET /projects/{id}/escalation-policies`. Policy and severity ids from forms pass `isUuid` before `enginePath`.
   - Load sets `cache-control: private, no-store`.
 
 - [ ] **Step 1: Failing tests**
@@ -4182,7 +4553,7 @@ Pages:
 - After a webhook create, the action result carries `signingSecret` once. It is shown in a copy box with "Shown once. Store it now." and never placed in a URL or a redirect.
 - Both loads set `cache-control: private, no-store`.
 - Channel ids from forms pass `isUuid` before reaching `enginePath`.
-- The project page shows the forms only to admins (`data.role` from the project layout). Viewers see the list.
+- The project page shows the forms to everyone, and the engine's 403 for a non-admin surfaces as the form message (R28: the project layout has no role, and the engine stays the only authority). The page says "Only project admins can change project channels." above the forms.
 
 - [ ] **Step 1: Failing tests**
 
@@ -4284,7 +4655,7 @@ Form field names:
 - A step with no target → "Step <i+1> needs at least one target".
 
 The editor page keeps steps in `$state` (add, remove, move up/down) and renders the inputs with `defaultValue`/`defaultChecked`. Its select options come from the load:
-- members: `GET /projects/{id}` members, or the members endpoint the settings page already uses;
+- members: `GET /projects/{id}/members` (Task 7, R28: `[{user_id, email, project_role}]`);
 - schedules: `GET /projects/{id}/schedules`;
 - project channels: `GET /projects/{id}/notification-channels`;
 - policies: for the fallback, excluding itself.
@@ -4340,7 +4711,7 @@ describe('policyPayloadFromForm', () => {
 ```
 
 `policy-editor.test.ts`:
-- the load fetches the policy, schedules, project channels, members and policies (5 calls, ids via `enginePath`);
+- the load fetches the policy, schedules, project channels, members (`/projects/<id>/members`) and policies (5 calls, ids via `enginePath`);
 - `save` PUTs the payload to `/projects/<id>/escalation-policies/<policyId>`;
 - a 400 from the engine (for example "fallback policy not found") is shown;
 - `default` posts `{}` to `.../default`;
@@ -4404,6 +4775,7 @@ Pages:
 - The list shows schedules with "on call now" and "until" in the schedule's zone (also UTC in a tooltip), and creation (admin).
 - The detail page holds the editor (admin), participants order (move up/down), restrictions, the next 14 days of shifts (`shiftRows`; overrides marked), overrides (list, add, two-step delete), and a schedule delete (two-step; a 409 "used by escalation policy" is shown).
 - Non-member participants are flagged "not a project member: never paged" (R7).
+- Participant and override-user choices come from `GET /projects/{id}/members` (Task 7, R28). Admin forms are shown to everyone and the engine's 403 surfaces as the form message.
 
 - [ ] **Step 1: Failing tests**
 
@@ -4449,7 +4821,7 @@ describe('shiftRows', () => {
 - an override in a skipped hour → the DST message.
 
 `schedule-detail.test.ts`:
-- the load makes 3 calls (schedule, shifts, overrides) plus members, `no-store` is not required (no secrets), and a 404 → 404;
+- the load makes 3 calls (schedule, shifts, overrides) plus members (`/projects/<id>/members`), `no-store` is not required (no secrets), and a 404 → 404;
 - `save` PUTs;
 - `addOverride` posts the UTC payload;
 - `deleteOverride` and `delete` need `confirm=yes`;
@@ -4489,21 +4861,25 @@ Do not tick:
 - "Severities … and incident metadata": management is Part 2.
 - "UI for all of the above": that waits for Part 2.
 
-Record the rulings above (R1-R24) and any execution-time changes in `docs/superpowers/decisions/2026-10-13-incident-management-part1.md`.
+Record the rulings above (R1-R28, including the controller rulings in R18, R23 and R25) and any execution-time changes in `docs/superpowers/decisions/2026-10-13-incident-management-part1.md`.
 
 ## Final review (whole Part 1)
 
 When NAMI-INC-1 .. NAMI-INC-15 are merged, run the sub-project's dedicated **security review + fix wave**, then a whole-Part-1 review, before Part 2 starts (CLAUDE.md: every sub-project ends with one; Part 2 ends with its own over the whole sub-project). The fix wave is one branch, `fix/NAMI-INC-part1-security`, with one PR. That PR lists each finding with severity, its fix and its test. It must check, with a test for every issue it finds:
 
 1. **SSRF.**
-   - Every send path (webhook, Slack, Discord, Teams, Telegram, project email, "send test") goes through `outbound::client()` and re-checks the destination before each request.
-   - No redirect is followed.
+   - Every send path (webhook, Slack, Discord, Teams, Telegram, project email, "send test") goes through `outbound::client()` or `outbound::public_client()` as R9 assigns them, and re-checks the destination before each request.
+   - Personal channels (any logged-in user, a global viewer included) can reach only public addresses, by IP literal and by name (`PublicOnlyResolver`). Test it with a name that resolves to `127.0.0.1` (for example `localhost`) as a personal webhook under `OutboundPolicy::Strict`.
+   - No redirect is followed. No proxy is used. The idle pool is off, so every request is resolved and judged again (DNS rebinding).
    - A name resolving to `169.254.169.254`, `fd00:ec2::254` or `0.0.0.0` is refused at DNS time.
    - Mapped and NAT64 forms are refused.
    - `TELEGRAM_API_BASE_URL` is config, not user input.
+   - `OutboundPolicy::Relaxed` is reachable only through `Config::from_env_for_test`: grep for every construction of `Relaxed`.
 2. **Secrets at rest and in transit.**
    - Channel configs and signing secrets are sealed under per-row contexts and never appear in responses, logs (INFO and below), the timeline, `Debug` output or error strings.
-   - Grep the engine for `webhook_url`, `bot_token` and `signing_secret` uses outside `models/channel.rs` and `incidents/send.rs`.
+   - Grep the engine for `webhook_url`, `bot_token` and `signing_secret` uses outside `models/channel.rs`, `routes/channels.rs` and `incidents/send.rs`.
+   - No type holding a secret derives `Debug` (Global Constraints), and no `tracing` call or `#[instrument]` records one.
+   - Webhook signatures are `HMAC-SHA256(secret, exact body bytes)`, verifiable by receivers. `X-Nami-Delivery` lets them drop at-least-once duplicates.
    - `describe_error` never includes a URL.
 3. **Escaping.** Re-run the injection inputs (mentions, markup, HTML, links, CR/LF, bidi controls, oversized text) through all six formatters and the nami-ui pages (titles, comments, causes, timeline messages, postmortem markdown).
 4. **Escalation safety.**
@@ -4519,8 +4895,11 @@ When NAMI-INC-1 .. NAMI-INC-15 are merged, run the sub-project's dedicated **sec
    - The confirm endpoint is POST-only and outside the session.
    - Tokens never appear in engine logs.
    - The nami-ui page sends `no-store`, `no-referrer` and `noindex`.
-   - Rate limiting applies per IP.
-8. **RBAC.** A table of every route × role (outsider, viewer, member, admin, global admin) matches the spec's RBAC section.
+   - Rate limiting applies per IP (the actions' own governor, R16).
+   - Two concurrent confirms of one token act once (the row lock), and a used token always answers 410.
+   - The nami-ui page keeps SvelteKit's form-action origin check, and its only link is built from UUID-checked ids (no open redirect).
+8. **RBAC.** A table of every route × role (outsider, viewer, member, admin, global admin) matches the spec's RBAC section. `tests/json_bodies.rs` lists every new state-changing route.
 9. **Failure behaviour.** A down SMTP server, ClickHouse or chat provider never blocks incident state changes, the uptime worker or the API. Deliveries retry per R12 and are visible in the timeline.
+10. **Queue robustness.** A row whose lease expired after its last attempt is failed, not reclaimed (poison rows, R12). Two drains in parallel (and two engine instances) never exceed the storm caps (the claim's advisory lock, R13). With `INCIDENTS_WORKER_ENABLED=false`, no tick or drain runs on that instance, `kick` included.
 
 No CI is configured on this repo yet. Every PR description states that, and lists the engine and UI commands run with their results.
