@@ -10,10 +10,18 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-13-status-pages-design.md`, including its "Parity additions (2026-10-13)". Roadmap: `docs/superpowers/roadmap.md` §5 (the definition of done).
 
-**When to start:** after **both** of these are merged to `main`, with their final fix waves:
+**When to start:** after **Incident Management Part 1** (NAMI-INC-1 .. NAMI-INC-15, plan `docs/superpowers/plans/2026-10-13-incident-management-part1.md`, PR #54) is merged to `main` with its final fix wave. That plan in turn needs Logs Part 2 (its 0044 `incidents.log_alert_id`), so Logs Part 2 is a transitive prerequisite. **Uptime Phase 3 NAMI-UP-27** (availability) is already merged (`9599bb8`, PR #61), so Task 4 has no open dependency.
 
-1. **Incident Management Part 1** (NAMI-INC-1 .. NAMI-INC-15, plan `docs/superpowers/plans/2026-10-13-incident-management-part1.md`, PR #54).
-2. **Uptime Phase 3 NAMI-UP-27** (availability). Task 4 cannot start without it. Tasks 1-3 can.
+Which tasks need unmerged INC work (everything else builds on `main` at `a1192a0` alone):
+
+| Task | Needs |
+|---|---|
+| T1, T2, T4, T5, T6, T7 | nothing unmerged |
+| T3 | NAMI-INC-3 (`hmac`) |
+| T7 | NAMI-INC-3 (`hmac`) |
+| T8 | NAMI-INC-1, NAMI-INC-9 (`resolve_source_with_reason`), NAMI-INC-10 |
+| T9, T10 | NAMI-INC-1 (`open_test_incident`), NAMI-INC-3, NAMI-INC-5 (queue, drain, `kick`, `run_incident_ticks`) |
+| T11, T12 | NAMI-INC-7 (`data.role`); T12 and T13 also NAMI-INC-12 (`renderMarkdown`) |
 
 ### Interfaces assumed from unmerged plans
 
@@ -21,14 +29,15 @@ Each line gives what this plan uses and the task that uses it. If the merged cod
 
 | From | Interface | Used by |
 |---|---|---|
-| NAMI-INC-1 | `incidents::lifecycle::{IncidentSource::{Monitor, Heartbeat, ..}, open, resolve, resolve_source}`, each taking `&mut PgConnection` inside the caller's transaction. `open` returns `Option<Uuid>`. `resolve`/`resolve_source` return whether/which incident was resolved. Incident statuses are `open`/`acknowledged`/`resolved`. | T8 |
+| NAMI-INC-1 | `incidents::lifecycle::{IncidentSource::{Monitor, Heartbeat, Manual { created_by }, ..}, OpenIncident { project_id, source, title, cause, severity_id, metadata, started_at }, open, resolve, resolve_source}`, each taking `&mut PgConnection` inside the caller's transaction. `open` returns `Option<Uuid>`, `resolve` returns `bool`, `resolve_source` returns `Option<Uuid>`. Incident statuses are `open`/`acknowledged`/`resolved`; 0060 adds `incidents.{source, severity_id, metadata, postmortem, ..}` with a trigger that derives `source` for plain-SQL inserts. `tests/common::open_test_incident(pool, project, created_by) -> Uuid`. | T8, T9 |
 | NAMI-INC-3 | `hmac 0.13` as a direct dependency. `outbound::is_non_public(ip)` (Part 2 webhooks only). | T3, T7, T9 |
-| NAMI-INC-5 | `notification_deliveries` (migration 0062) exactly as that plan writes it, the claim SQL in its Task 5 Step 3 (a)-(c), `deliveries::{drain, MAX_ATTEMPTS, backoff, LEASE}`, `incidents::worker::kick(&AppState)`, `Config.incidents_worker_enabled`. | T9, T10 |
+| NAMI-INC-5 | `notification_deliveries` (migration 0062) exactly as that plan writes it (`round` 1-32 chars, unnamed checks on `event` and on `(user_id, channel_id)`), the claim SQL in its Task 5 Step 3 (a)-(c), the per-row steps (2a)-(2f), `deliveries::{drain, enqueue, NewDelivery, DeliveryEvent, Target, MAX_ATTEMPTS, DRAIN_BATCH, backoff, LEASE}`, `send::{SendError { message, retry }, Retry::{Never, After}}`, `incidents::worker::kick(&AppState)`, `Config.incidents_worker_enabled`, `tests/common::run_incident_ticks(&AppState)`. | T9, T10 |
 | NAMI-INC-7 | `GET /projects/{id}` returns `role: "admin" \| "member" \| "viewer"`. The project layout passes it on as `data.role`. | T11, T12 |
+| NAMI-INC-9 | `lifecycle::resolve_source_with_reason(conn, source, at, reason)`. | T8 |
 | NAMI-INC-10 | `main.rs` spawns `incidents::worker::run_forever`. `alerts::notify_transition` calls `kick`. | T8, T10 |
-| NAMI-INC-11 | `AppError::Gone(String)` → 410. | T9, T10 |
 | NAMI-INC-12 | `nami-ui/src/lib/markdown.ts` `renderMarkdown(source: string): string` (escape first, fixed subset, `http(s)` links with `rel="noopener noreferrer nofollow"`). | T12, T13 |
-| NAMI-UP-27 | `models::maintenance::{Span, MaintenanceWindow::spans}`, `uptime::availability::{compute, union, subtract, seconds, Availability}`. | T4 |
+
+Merged on `main` (`9599bb8` and later), checked by this review: `models::maintenance::{Span, MaintenanceWindow::{spans, applies_to_monitor, applies_to_heartbeats}, list_for_project, active_windows, ActiveWindows::{covers_monitor, covers_heartbeats}}`, `uptime::availability::{compute, union, subtract, seconds, Availability}` (`Availability` has **no** `Default`; `subtract_sorted` and `incident_spans` are private and not used here). This plan no longer uses `AppError::Gone` (NAMI-INC-11): status routes answer their fixed bodies through one local helper (see Global Constraints).
 
 **Part 2 follows** (a separate plan, NAMI-SP-16 onward, migrations from 0105). It covers:
 - webhook subscribers: the public form when `allow_webhook_subscribers` is on, admin add, the `{"type":"verification","challenge":…}` handshake within 10 s, strict public-only outbound with DNS-rebinding-safe connects and no redirects, per-subscriber sealed HMAC secret shown once, `X-Nami-Signature`, auto-disable after 20 consecutive failures. They go through the same queue extension as Part 1's email rows (Task 9 leaves `webhook_subscriber_id` room for them);
@@ -41,11 +50,11 @@ Part 1 leaves room for these:
 - The DTO's `subscriptions.webhook` is always `false` in Part 1.
 - `status.json` already sends `Access-Control-Allow-Origin: *` and the exact shape the widget reads.
 
-**Migrations.** Postgres migrations 0100-0119 are reserved for status pages (ruling in `docs/superpowers/decisions/2026-10-13-uptime-phase1.md`: "Status 0100-0119"). On 2026-10-19 none of them was in use: `main` (`30d24d7`) ends at 0041. Logs Part 2 plans 0042-0044, Uptime Phase 3 0022-0039 and Incidents Part 1 0060-0066. No plan or branch names a 01xx file. Part 1 uses 0100-0104. Part 2 continues at 0105.
+**Migrations.** Postgres migrations 0100-0119 are reserved for status pages (ruling in `docs/superpowers/decisions/2026-10-13-uptime-phase1.md`: "Status 0100-0119"). On 2026-10-19 none of them was in use: `main` (`a1192a0`) ends at 0042 (LOG-10; UP-23 added 0024). Logs Part 2 plans 0042-0044, Uptime Phase 3 0022-0039 and Incidents Part 1 0060-0066. No plan or branch names a 01xx file. Part 1 uses 0100-0104. Part 2 continues at 0105.
 
-**Verification status (2026-10-19):** this plan was written against `main` at `30d24d7` plus the stated end state of the Incident Management Part 1 and Uptime Phase 3 plans. Its code has **not** been applied to a scratch copy. Tests are given in full where they pin a security property: leaks, tenant isolation, tokens, private access, escaping and rate limits. Code that decides something is given in full: migrations, SQL, token formats, the status and history rules, the queue extension and the DTO shape. Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body (the Incidents Part 1 convention). A test that fails for a reason the plan did not predict is a plan bug: fix it minimally and say so in the PR.
+**Verification status (2026-10-19):** this plan was written against `main` at `30d24d7` plus the stated end state of the Incident Management Part 1 and Uptime Phase 3 plans, then reviewed against `main` at `9599bb8`, rebased onto `a1192a0` (NAMI-UP-23 and NAMI-LOG-10 merged; UP-23 adds `monitors.{ip_version, remember_cookies, proxy_url, proxy_username, proxy_password_enc}`, now in the leak fixture) (signatures spot-checked: `availability.rs`, `maintenance.rs`, monitor/heartbeat/group models and migrations, `crypto.rs`, `config.rs`, `error.rs`, `email.rs`, `router.rs`, `serve.rs`, `tests/common`, `nami-ui` `engine.ts`/`fake-event.ts`/`params.ts`/`vite.config.ts`/`package.json`, `@sveltejs/kit` 3.0.1 types and the `@sveltejs/adapter-node@6.0.0` source). Its code has **not** been applied to a scratch copy. Tests are given in full where they pin a security property: leaks, tenant isolation, tokens, private access, escaping and rate limits. Code that decides something is given in full: migrations, SQL, token formats, the status and history rules, the queue extension and the DTO shape. Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body (the Incidents Part 1 convention). A test that fails for a reason the plan did not predict is a plan bug: fix it minimally and say so in the PR.
 
-**Execution:** per CLAUDE.md. Use one worktree per task under `.worktrees/NAMI-SP-<n>/`, branched from the latest `origin/main`, with the branch named under each task heading. Commit with Conventional Commits whose message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Then run the task review, open the PR (stating "No CI is configured on this repo yet" and the commands run), and auto-merge on a clean review (pre-authorized for sub-projects 2-11). Tasks are sequential except: T3 depends only on T1/T2; T11 depends on T2, T3 and T5 only; T15 depends on T13. Engine tests need `docker compose up -d postgres mailpit` (never restart running containers; ClickHouse is not used by this plan).
+**Execution:** per CLAUDE.md. Use one worktree per task under `.worktrees/NAMI-SP-<n>/`, branched from the latest `origin/main`, with the branch named under each task heading. Commit with Conventional Commits whose message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Then run the task review, open the PR (stating "No CI is configured on this repo yet" and the commands run), and auto-merge on a clean review (pre-authorized for sub-projects 2-11). Tasks are sequential except: T3 depends only on T1/T2; T11 depends on T2, T3 and T5 only. T15 renders from Task 13's helpers but runs **after** T14, because its last step ticks the roadmap's subscriber bullets. Engine tests need `docker compose up -d postgres mailpit` (never restart running containers; ClickHouse is not used by this plan).
 
 The **engine command** is used throughout:
 
@@ -94,6 +103,9 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - follow SvelteKit 3 conventions (`#lib`, `process.env` in server code, runes, `page` from `$app/state`, `defaultValue`/`defaultChecked`);
   - admin pages copy the existing dark theme classes.
 - Tests: Mailpit assertions filter by their own unique recipient and never delete messages.
+- Fixed public error bodies. `AppError` on `main` has no variant for a custom 401/410/429 message (`Unauthorized` says `unauthorized`, `RateLimited` says `too many requests`). Status routes therefore answer their fixed bodies through one helper in `routes::status_public`: `pub(crate) fn json_error(status: StatusCode, message: &'static str) -> Response` (`{"error": message}`). Every message is a `&'static str` literal, so no public error body ever echoes input. A 404 is always `json_error(NOT_FOUND, "not found")`, byte-identical to `AppError::NotFound`.
+- Test literals: an array that mixes string literals with `&format!(..)` or `&x.to_string()` does not compile (`expected &str, found &String`). Write `format!(..).as_str()` / `x.to_string().as_str()` instead (temporaries in a `for` iterator expression live for the whole loop).
+- `argon2` work on public routes (`verify_password` in unlock) runs in `tokio::task::spawn_blocking`, at most 4 at once per process (`static UNLOCK_SLOTS: Semaphore = Semaphore::const_new(4)`), so a burst of unlock attempts cannot stall the async workers. An `Err` from `verify_password` (a malformed stored hash) is treated as a wrong password, never as a 400.
 - Commits: Conventional Commits, message ending with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
 ## Review Focus
@@ -101,9 +113,32 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
 - **A custom-domain request must never reach the app or another page.** Example: `https://status.acme.test/login`, `/projects/…`, `/status/other-slug`, or `/status/_domain` sent to the app host. Each must be a 404 with no session cookie read or set → Task 13 (`a_custom_domain_reaches_only_its_own_page`, `the_domain_sentinel_is_refused_on_the_app_host`) and Task 6 (`an_unverified_or_foreign_domain_is_a_404`).
 - **A page view must stay cheap under a flood.** Example: 500 concurrent requests for one slug right after its cache entry expired. That must cost one snapshot build, and requests beyond the per-IP quota must get 429 → Task 6 (`concurrent_requests_build_the_snapshot_once`, `public_reads_are_rate_limited_per_client_address`).
 - **Day boundaries in the page's time zone must not drop or double an hour.** Example: a page in `Europe/Berlin` across the spring-forward and fall-back days, and an incident spanning midnight. Each local day is its own bar, 23 h and 25 h days included, and the total downtime of the 90 bars equals the incident's length → Task 4 (`days_follow_the_page_zone_across_dst`, `an_incident_across_midnight_is_split_between_its_days`).
+- **A cached snapshot must never reach a visitor without access.** Example: a public page is viewed (cache warm), then made private by another instance. The next request without a token must be a 404, and a stranger's `If-None-Match` with the right ETag must be a 404, not a 304 → Task 7 (`going_private_applies_at_once_even_with_a_warm_cache`, `a_private_page_never_answers_304_without_access`).
 - **A spoofed `X-Forwarded-For` must never widen private access.** Example: a visitor sends `X-Forwarded-For: 10.0.0.1` to nami-ui for a page that allowlists `10.0.0.0/8`. Also: the engine is called without a forwarded address, so its peer is nami-ui's own loopback, and the page allowlists `127.0.0.0/8` → Task 7 (`a_missing_forwarded_address_grants_no_ip_access`) and Task 13 (`the_bff_forwards_only_the_adapter_client_address`).
 - **Subscriber mail must not delay pages to on-call responders.** Example: a page with 10,000 subscribers posts an update while a monitor goes down. The on-call email must go out in the next drain → Task 9 (`incident_deliveries_are_claimed_before_status_page_mail`).
 - **A visitor must not learn whether an address is subscribed.** Example: posting the same address twice, a confirmed address, and a new address. Each must give the same status and body, and no second email inside the resend cap → Task 9 (`subscribe_answers_the_same_for_new_pending_and_confirmed_addresses`).
+
+## Controller rulings (2026-10-19)
+
+Recorded in the decisions log by the final review, verbatim:
+
+1. **Signed subscriber tokens replace "hashed at rest" (spec deviation).** Subscriber links are HMAC-SHA256 tokens under `cipher.derive_subkey("nami/status-subscriber/v1")` (a label of their own), each with a purpose tag (confirm / manage / unsubscribe), checked in constant time. Confirm tokens expire after **48 h**. Manage and unsubscribe tokens never expire, and are invalidated when the subscriber is deleted (their nonce lives on the subscriber row). The spec's "single-purpose and hashed at rest" becomes "single-purpose, signed, nothing usable stored" (R14).
+2. **Bar thresholds accepted:** 100 % operational, ≥ 99 % degraded, ≥ 95 % partial outage, below that major outage (R7).
+3. **Caps accepted:** 10,000 confirmed and 500 pending subscribers per page, 3 emails per address per page per day, 20 emailed (notified) updates per report (R8, R15).
+4. **Custom domains need DNS TXT verification before they are served (spec addition).** An unverified domain routes nowhere (R5).
+5. **Paused monitors and heartbeats show "no data" (grey), never operational** (R6). An active maintenance window still shows `maintenance` for a paused source, since the window is an explicit operator signal; neither is `operational`.
+
+## Plan review (2026-10-19), what changed
+
+The review of PR #62 against `main` at `9599bb8` fixed, among smaller things:
+- **Cache and access (R10, R12, T6, T7).** The access decision now uses the page row read fresh on every request, never the cached snapshot, so a visibility, password or allowlist change applies on every instance at once. Snapshots are keyed by `(page_id, version)`, where `version = status_pages.updated_at` and every write that changes the DTO bumps it, so invalidation is correct across instances. `If-None-Match` is evaluated only **after** access is granted (a private page never answers 304 to a visitor without access: that would be an existence and change oracle).
+- **adapter-node 6 facts (R4, T13).** There is no `ORIGIN` env var in adapter-node 6 (it is `kit.paths.origin`, which must stay unset). Without `PROTOCOL_HEADER` the protocol defaults to `https`. `ADDRESS_HEADER` unset means the socket peer, which behind a proxy is the proxy itself: an allowlist containing the proxy's network would then admit everyone. Deployment rules are spelled out. CSRF stays on (`csrf.trustedOrigins` never `'*'`; Kit 3 removed `checkOrigin`).
+- **Routing (R4, T13).** `/_nami/tls-ask` is exempt from the reroute (Caddy calls it on an internal host name, which the reroute would otherwise treat as a custom domain). `_domain` is refused whenever `APP_ORIGIN` is unset. Domain lookups use the lowercased hostname without a trailing dot. Security headers and `no-store` also apply to 404s on custom domains.
+- **Enumeration (R15).** A full page answers 429 for **every** address, so the cap cannot tell a known address from a new one.
+- **One-click unsubscribe (R16, T10).** Idempotent: a valid token whose subscriber is already gone answers 200. The governor no longer keys a mail provider's whole burst on one proxy peer, and the test router gets `with_fallback_connect_info`.
+- **Unlock (R12, R13).** argon2 off the async threads with a concurrency cap; a per-address bucket across pages (`unlock-ip`, 30 / 15 min).
+- **Drift fixes.** `Availability` has no `Default`; `Config::from_env` spreads `from_env_defaults_only`, so `TxtLookup` is set in both places; `bytes` is not a dependency (`axum::body::Bytes`); `Mailer::send` reports SMTP failures as `Validation` too, so the header test compares messages; `PAGE_COLUMNS` must be a `macro_rules!` for `concat!`; mixed-literal test arrays; `tokio::spawn(kick(..))` borrows; INC-9's `resolve_source_with_reason` gets the automatic-report hook too; the 0104 constraint swap asserts it dropped exactly two checks.
+- **Leak tests** now also seed heartbeat tokens, header names, basic-auth users, proxy URLs and users (UP-23), group names, incident `details` and `postmortem`, and an automatic-report email is checked for monitor names, targets and causes.
 
 ## Decisions the spec leaves open (rulings)
 
@@ -120,18 +155,24 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
 
   The one route on the public listener is RFC 8058 one-click unsubscribe (R16), because mail providers POST it cross-site as a form, which SvelteKit's origin check (kept on) refuses.
 - **R4 Host routing.**
-  - nami-ui gets `APP_ORIGIN` (for example `https://nami.example.com`). When it is unset, custom domains are off and every host is the app.
-  - `src/hooks.ts` `reroute` (server only; it returns `undefined` in the browser) maps every request whose `url.host` is not `APP_ORIGIN`'s host to `/status/_domain` + path. `_domain` can never be a slug (`_` is outside `[a-z0-9-]`).
-  - The `/status/[slug]` loads treat `_domain` as "look the page up by `url.host`". On the app host, `_domain` → 404.
-  - So on a custom domain `/login` becomes `/status/_domain/login` (no such route → 404), and `/status/x` becomes `/status/_domain/status/x` (404). Only the page's own routes exist.
+  - nami-ui gets `APP_ORIGIN` (for example `https://nami.example.com`). When it is unset (an empty value counts as unset), custom domains are off and every host is the app.
+  - `src/hooks.ts` `reroute` (server only; it returns `undefined` in the browser) maps every request whose `url.host` is not `APP_ORIGIN`'s host to `/status/_domain` + path. `_domain` can never be a slug (`_` is outside `[a-z0-9-]`). Two prefixes are never rerouted: `/_app/` (static assets) and `/_nami/` (the TLS `ask` endpoint below, which Caddy calls on an internal host name such as `nami-ui:3000`; it is harmless on any host).
+  - The `/status/[slug]` loads treat `_domain` as "look the page up by the request's hostname" (`url.hostname`, lowercased, one trailing `.` stripped, then the same hostname rule as `validate::custom_domain`). `_domain` → 404 on the app host, and always when `APP_ORIGIN` is unset (custom domains off).
+  - So on a custom domain `/login` becomes `/status/_domain/login` (no such route → 404), and `/status/x` becomes `/status/_domain/status/x` (404). Only the page's own routes exist. `/status/%5Fdomain` on the app host decodes to the slug `_domain` → 404.
   - A custom domain is served only after verification (R5). The app host itself (from `ui_base_url` in the engine, and `APP_ORIGIN` in nami-ui) can never be stored as a custom domain.
-  - nami-ui switches to `@sveltejs/adapter-node@6.0.0`, whose `getClientAddress()` honours `ADDRESS_HEADER`/`XFF_DEPTH` (spec). With custom domains, `ORIGIN` must stay unset and `HOST_HEADER`/`PROTOCOL_HEADER` must name headers the reverse proxy overwrites. Otherwise `url.host` is a constant (ORIGIN) and the CSRF origin check fails on custom domains. `.env.example` documents this.
-  - TLS for custom domains is the operator's job (spec non-goal: automatic TLS). nami-ui exposes `GET /_nami/tls-ask?domain=<host>` on the app host only: 200 for a verified custom domain, 404 otherwise. That is Caddy's on-demand TLS `ask` endpoint. The README documents the Caddy snippet and the manual alternative (one certificate per domain in any proxy).
+  - Forging the Host: a client that sends `Host: status.acme.test` straight to nami-ui gets exactly what visiting that domain gives it (a public page, or a 404 without access). It gains nothing, because access cookies are scoped by the browser to the real host, and the engine decides access.
+  - nami-ui switches to `@sveltejs/adapter-node@6.0.0` (peer `@sveltejs/kit ^3.0.0-next.0`; the repo has Kit 3.0.1). Checked against its `handler.js`:
+    - **Client address.** `getClientAddress()` is the socket peer unless `ADDRESS_HEADER` is set. Behind a reverse proxy the peer is the proxy, so every visitor would share one address (one rate-limit bucket), and an allowlist containing the proxy's network would admit everyone. Deployments behind a proxy **must** set `ADDRESS_HEADER=x-forwarded-for` and `XFF_DEPTH` = the number of proxies that append to it (1 for a single Caddy/nginx). adapter-node then reads the entry that many places from the right, which the client cannot forge. With `ADDRESS_HEADER` set and the header missing, `getClientAddress()` throws; `callPublicEngine` catches that and sends no address (no IP access, the `unknown` rate bucket).
+    - **Origin.** adapter-node 6 has no `ORIGIN` env var: the fixed origin is `kit.paths.origin` in the Kit config, which must stay **unset** (custom domains need the per-request host). The origin is then `PROTOCOL_HEADER` (default `https` when unset) + `HOST_HEADER` (when set) or `Host`. Recommended: the proxy forwards the original `Host` (Caddy does by default, nginx `proxy_set_header Host $host`) and `HOST_HEADER` stays unset. Set `HOST_HEADER=x-forwarded-host` only if the proxy overwrites that header on every request; otherwise a client could choose `url.host` (cache-poisoning risk behind a shared cache). Set `PROTOCOL_HEADER=x-forwarded-proto` (overwritten by the proxy) when the proxy may speak plain http to clients.
+    - **CSRF.** Kit 3 checks the `Origin` of form posts against `url.origin` and has no `checkOrigin` switch any more; `csrf.trustedOrigins` stays unset (never `'*'`). Custom-domain forms pass because `url.origin` is the custom domain.
+    - **Body size.** `BODY_SIZE_LIMIT` keeps its 512K default (every status form is tiny).
+    - `.env.example` and the README document all of this.
+  - TLS for custom domains is the operator's job (spec non-goal: automatic TLS). nami-ui exposes `GET /_nami/tls-ask?domain=<host>` (any host, never rerouted): 200 for a verified custom domain, 404 otherwise. That is Caddy's on-demand TLS `ask` endpoint. The README documents the Caddy snippet and the manual alternative (one certificate per domain in any proxy). Internal callers other than the ask endpoint (health checks) must send the `APP_ORIGIN` host, since every other host is treated as a custom domain.
 - **R5 Custom-domain verification.**
   - The admin adds a TXT record `_nami-verify.<domain>` with the value `nami-verify=<token>`.
   - `<token>` is the first 32 hex chars of HMAC-SHA256 under `cipher.derive_subkey("nami/status-domain/v1")` over `"{page_id}|{domain}"`. It is stateless and stable for the pair, and changes if either changes.
   - `POST …/custom-domain/verify` looks the record up and sets `custom_domain_verified_at`. Changing `custom_domain` clears it.
-  - The lookup goes through `Config.txt_lookup: TxtLookup`: `System` (hickory, system resolver, 5 s timeout) in `from_env`, and `Fixed(BTreeMap<String, Vec<String>>)` only in `from_env_for_test`. No deployment can switch it.
+  - The lookup goes through `Config.txt_lookup: TxtLookup`: `System` (hickory, system resolver, 5 s timeout) in `from_env`, and `Fixed(BTreeMap<String, Vec<String>>)` only in tests. No deployment can switch it. On `main`, `from_env` ends with `..Self::from_env_defaults_only()` and `from_env_for_test` *is* `from_env_defaults_only`, so: `from_env_defaults_only` sets `txt_lookup: TxtLookup::Fixed(BTreeMap::new())`, and `from_env` lists `txt_lookup: TxtLookup::System` explicitly before the spread. A unit test in `config.rs` pins both.
   - Verification proves DNS control, so a project admin cannot claim another team's hostname, and an unverified domain routes nowhere.
 - **R6 Component status.** Derived per component, then overridden:
 
@@ -143,32 +184,33 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   | `current_status = 'down'` | `major_outage` |
   | `current_status = 'pending'` | `no_data` |
 
+  - Controller ruling 5: paused → `no_data` (grey), never `operational`. Maintenance is checked first, so a paused source inside a window shows `maintenance`. History bars (R7) cannot know past pause intervals (nothing records them), so they reflect incidents and maintenance only.
   - Override: when one or more **active** reports affect the component, its status is the **worst** impact among those reports, even when that is better than the derived status (the spec's "overridable").
   - A report is active when its status is not `resolved`/`completed`. A `scheduled` maintenance report counts as active only while `starts_at <= now < ends_at`.
   - Severity order, worst first: `major_outage` > `partial_outage` > `degraded` > `maintenance` > `operational` > `no_data`. The overall banner is the worst component status; a page with no components is `no_data`.
 - **R7 90-day history.**
   - Bars cover the 90 local days ending today, in the page's `timezone`. Each day `[local midnight, next local midnight)`, converted with `earliest()` (a midnight inside a DST gap moves to the first valid instant), is clipped to `[component.created_at, now)`.
   - Per day: `availability::compute(day, incidents, maintenance)`. Incidents are those of the bound monitor/heartbeat. Maintenance is the project's windows that apply to it (`applies_to_monitor` / `applies_to_heartbeats`, `MaintenanceWindow::spans`).
-  - A clipped day that is empty → `no_data`, as is `uptime_pct = None`. Otherwise `100.0` → `operational`, `>= 99.0` → `degraded`, `>= 95.0` → `partial_outage`, else `major_outage`.
+  - A clipped day that is empty → `no_data`. A day whose `uptime_pct` is `None` because maintenance covered all of it (`maintenance_seconds == total_seconds > 0`) → `maintenance`; any other `None` → `no_data`. Otherwise (controller ruling 2) `100.0` → `operational`, `>= 99.0` → `degraded`, `>= 95.0` → `partial_outage`, else `major_outage`.
   - The tooltip shows the date, `uptime_pct` rounded to 2 decimals, downtime minutes, and the titles of **published reports** that affect the component and overlap the day. It never shows incident titles or causes (those carry monitor names and errors). `show_uptime_bars = false` → `bars: null`.
 - **R8 Reports.**
   - Title 1-255 chars, one line (`validate_label` semantics with 255). A message is 1 byte to 10 KiB of markdown.
-  - At most 100 affected components per report, at most 200 updates per report, at most 20 updates per report with `notify_subscribers = true` (the per-incident email cap; the 21st notified update → 400 `this report has reached 20 notified updates; post without notifying subscribers`).
+  - At most 100 affected components per report, at most 200 updates per report, at most 20 updates per report with `notify_subscribers = true` (the per-incident email cap, controller ruling 3; the 21st notified update → 400 `this report has reached 20 notified updates; post without notifying subscribers`).
   - Impacts are `degraded`, `partial_outage`, `major_outage`, `maintenance`. Maintenance reports require `starts_at < ends_at` (≤ 366 days apart).
   - Creating a report creates its first update (the initial message and status) in the same transaction. Posting an update sets the report's status (any status of the report's kind, in any order) and `updated_at`.
   - `published_at` = creation time (no drafts in Part 1). The public page lists active reports, upcoming maintenance (`scheduled`, `starts_at > now`), and history (reports created in the last 90 days, newest first, at most 50, each with at most 20 newest updates).
 - **R9 Automatic reports.** `lifecycle::open` (Monitor/Heartbeat sources only) calls `status_pages::automatic::on_incident_opened(conn, incident_id, &source, at)` in the same transaction.
   - For every page with `automatic_reports` that has a component bound to the source, it inserts a report: kind `incident`, status `investigating`, impact `major_outage` on each bound component of that page, `incident_id`, `automatic = true`.
   - Its title is `"{display names joined ', '} — service disruption"`, truncated to 255 chars with `…`. Its first update reads `We are investigating a disruption affecting {names}.` with `notify_subscribers = page.automatic_reports_notify`. The insert uses `on conflict (status_page_id, incident_id) where incident_id is not null do nothing`.
-  - `lifecycle::resolve` and `resolve_source` call `on_incident_resolved(conn, incident_id, at)`. It posts a `resolved` update `This incident has been resolved.` (notify per the same flag) to every report with that `incident_id`, `automatic = true` and a status other than `resolved`.
+  - Every resolve path calls `on_incident_resolved(conn, incident_id, at)`: `lifecycle::resolve`, `resolve_source`, and NAMI-INC-9's `resolve_source_with_reason`. Put the call in the one internal function they share if the merged code has one; otherwise in each of the three. It posts a `resolved` update `This incident has been resolved.` (notify per the same flag) to every report with that `incident_id`, `automatic = true` and a status other than `resolved`.
   - A member resolving the report by hand sets `automatic = false`, which ends automatic handling. An update to another status leaves it automatic.
   - Text uses component display names only.
 - **R10 Snapshot cache.** It is `status_pages::cache::SnapshotCache` in `AppState.status_pages`, in-process and per instance.
-  - Each entry holds the built `Snapshot` (DTO + `PageAccess` + ETag) for 30 s. A `tokio::sync::Mutex` per page id gives single flight: concurrent misses wait for one build.
+  - Every public request first reads the page row (`find_by_slug` / `find_by_verified_domain`, one indexed query). **Access (R12) is decided from that fresh row, never from a cached snapshot**, so a password, allowlist or visibility change applies at once on every instance. The snapshot holds only public DTO bytes.
+  - An entry is keyed by page id and holds `(version, built_at, Snapshot)`, where `version` is the row's `updated_at`. It is served while `built_at + 30 s > now` **and** its version equals the fresh row's `updated_at`; otherwise it is rebuilt. A `tokio::sync::Mutex` per page id gives single flight: concurrent misses wait for one build.
+  - Every write that changes what the DTO shows bumps `status_pages.updated_at = now()` in its own transaction: page PATCH (already does), section and component writes, report create/PATCH/delete, posted updates, and automatic reports (T8, inside the lifecycle transaction). So every instance sees a new version on its next request, and the in-process `invalidate(page_id)` after commit is only a fast path. Monitor and heartbeat state changes rely on the 30 s TTL (accepted).
   - At most 1,000 entries; inserting the 1,001st evicts the oldest.
-  - Every admin or report write to a page calls `invalidate(page_id)` after its commit. Automatic reports (inside the uptime worker's transaction) rely on the TTL.
-  - Across instances, staleness is at most 30 s (accepted).
-  - The ETag is `"` + the first 16 hex chars of SHA-256 of the DTO JSON + `"`.
+  - The ETag is `"` + the first 16 hex chars of SHA-256 of the DTO JSON + `"`. It is a hash of bytes the requester is about to receive, so it leaks nothing, and `If-None-Match` is compared **only after access is granted** (a private page answers a visitor without access 404, never 304).
 - **R11 Public DTO** (exact field set; nothing else is serialised):
 
 ```json
@@ -193,20 +235,22 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - Token: `v1.{page_id simple hex}.{exp unix}.{mac}`. `mac` is base64url (no padding) of HMAC-SHA256 under `Zeroizing::new(cipher.derive_subkey("nami/status-page-access/v1"))` over `"v1|{page_id}|{exp}|{access_epoch}"`. It is checked with `verify_slice` before trusting `exp`.
   - `access_epoch` is bumped whenever the password, the allowlist or the visibility changes, so every cookie issued before is revoked.
   - nami-ui stores the token in the cookie `nami_sp_access`: HttpOnly, `SameSite=Lax`, `Secure` when the request is https, `Max-Age` 30 days. Its `Path` is `/status/{slug}` on the app host and `/` on a custom domain. nami-ui sends it to the engine as `X-Nami-Page-Access`.
-  - The engine grants access when the token verifies for **this** page and epoch and is unexpired, **or** when the client address is inside `ip_allowlist`.
-  - The client address is the `X-Forwarded-For` header **only when it holds exactly one valid IP** (nami-ui sets exactly one). Missing, malformed or a list → no address, so no IP access. An IPv4-mapped IPv6 address is unwrapped first. The TCP peer is never used for access (it is nami-ui).
-  - Unlock (`POST …/unlock {password}`) answers 200 `{token, expires_at}`, or 401 `{"error":"wrong password"}` for a wrong password, a page with no password, a public page and an unknown slug alike. Unknown or passwordless pages run `verify_password` against a fixed dummy hash, so timing matches.
+  - The engine grants access when the token verifies for **this** page and epoch and is unexpired, **or** when the client address is inside `ip_allowlist`. Page id, epoch, visibility and allowlist come from the row read fresh for this request (R10).
+  - The client address is the `X-Forwarded-For` header **only when it holds exactly one valid IP** (nami-ui sets exactly one, from adapter-node's `getClientAddress()`, R4). Missing, malformed or a list → no address, so no IP access. An IPv4-mapped IPv6 address is unwrapped first. The TCP peer is never used for access (it is nami-ui). `X-Real-IP` and `Forwarded` are ignored. A visitor's own `X-Forwarded-For` never reaches the engine: `callPublicEngine` builds the outgoing headers from scratch.
+  - Unlock (`POST …/unlock {password}`) answers 200 `{token, expires_at}`, or 401 `{"error":"wrong password"}` for a wrong password, a page with no password, a public page and an unknown slug alike. Unknown or passwordless pages run `verify_password` against a fixed dummy hash, so timing matches. argon2 parameters are `Argon2::default()` as for user passwords (argon2id, m = 19 MiB, t = 2, p = 1); page passwords are 8-128 chars.
 - **R13 Rate limits.**
   - Reads (`GET /public/...`) go through a governor keyed by `SmartIpKeyExtractor` (the forwarded address): `per_millisecond(100)` (10/s), burst 30 → 429 JSON.
-  - Unlock: at most 10 hits per `(page, client address)` per 15 min, plus the same governor.
+  - Unlock: at most 10 hits per `(page, client address)` per 15 min (`unlock:{page id or 'none'}:{client_key}`), at most 30 per client address per 15 min across all pages (`unlock-ip:{client_key}`, so one address cannot spread guesses over many slugs), plus the same governor.
   - Subscribe: at most 5 per client address per hour (`subscribe-ip:{hash}`) and 100 per page per hour (`subscribe-page:{page}`).
   - Token endpoints (`/public/status-subscriptions/*`): a governor of burst 20, `per_second(3)` (one token every 3 s).
+  - The governors key on `SmartIpKeyExtractor`, which reads the first `X-Forwarded-For` entry nami-ui set (the same trusted address as the DB buckets; nami-ui never forwards a visitor's own header).
+  - RFC 8058 one-click (public listener, R16): `PeerIpKeyExtractor`, burst 100, `per_millisecond(20)`. The peer there may be a reverse proxy shared by every mail provider, so the limit is generous; the token's MAC is checked before any database work, so a flood of forged tokens costs one HMAC each.
   - Hits are counted in `status_page_rate_hits` (`rate_limit::hit`), atomically under `pg_advisory_xact_lock(hashtext(bucket))`. Client addresses are stored only as `hex(HMAC(subkey "nami/status-rate/v1", ip))[..32]`. A request without a client address uses the bucket key `unknown`, so it is limited, never exempt. Rows older than 1 day are deleted by the hit itself (`delete … where bucket = $1 and hit_at < now() - window`), and the delivery worker prunes the rest hourly.
-- **R14 Subscriber tokens.** Stateless, signed, single-purpose. Nothing usable is stored.
+- **R14 Subscriber tokens** (controller ruling 1). Stateless, signed, single-purpose. Nothing usable is stored. Confirm tokens expire after 48 h; manage and unsubscribe tokens never expire and die with the subscriber row (deleting it, or unsubscribing, makes every link of that subscriber invalid; a re-subscription is a new row with new nonces).
   - Format: `base64url(subscriber_id 16 bytes || purpose 1 byte || nonce 16 bytes || mac 32 bytes)`, where `mac` = HMAC-SHA256 under `derive_subkey("nami/status-subscriber/v1")` over the first 33 bytes.
   - Purposes: `1` confirm, `2` manage, `3` unsubscribe.
   - The nonce is `confirm_nonce` (random, rotated on every resend, cleared on confirm, so a confirm link is single-use and only the newest works) for purpose 1, and `token_nonce` (random at insert) for 2 and 3.
-  - Verify: decode, length check, MAC check (constant time), then load the row and compare the nonce (constant time). Confirm also checks `confirm_expires_at` (48 h).
+  - Verify: decode, length check (exactly 65 bytes, 87 base64url chars), MAC check (`Mac::verify_slice`, constant time), then load the row and compare the nonce with a constant-time comparison (a local `fn ct_eq(a: &[u8], b: &[u8]) -> bool` that XOR-folds equal-length slices; `subtle` is not a direct dependency). Confirm also checks `confirm_expires_at` (48 h).
   - The spec says tokens are "hashed at rest". This stores no token or hash at all: a DB dump alone yields nothing usable. That is needed because the queue builds the email after the request and so must be able to re-derive the link.
 - **R15 Enumeration resistance.**
   - `POST …/subscribe` answers `202 {"ok": true}` for every valid address: new, pending or already confirmed. The email itself is sent later by the queue, so timing does not differ either.
@@ -214,18 +258,19 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - Pending → components replaced, nonce rotated, confirmation re-sent.
   - Confirmed → an "already subscribed" email with the manage link.
   - Each address gets at most 3 such emails per page per 24 h (`confirmation_sends`, `confirmation_window_started_at`). Beyond that, nothing is sent, and the answer is still 202.
-  - Caps: 10,000 confirmed and 500 pending per page. A new address beyond either → 429 `this page is not accepting new subscriptions right now` (says nothing about the address).
+  - Caps (controller ruling 3): 10,000 confirmed and 500 pending per page. When either cap is reached, **every** subscribe to that page answers 429 `this page is not accepting new subscriptions right now`, whether the address is new, pending or confirmed. The cap is checked before the address is looked up, so it cannot be used to tell a known address from a new one.
   - Pending rows older than 48 h are deleted by the worker's hourly prune.
-  - Addresses are trimmed and lowercased, ≤ 254 chars, parse as `lettre::Address`, and contain no control chars.
+  - Addresses are trimmed and lowercased, ≤ 254 chars, parse as `lettre::Address`, have a domain with at least one `.` (lettre accepts `a@b`), and contain no control chars.
 - **R16 Subscriber emails.** Plain text.
   - Confirmation subject: `Confirm your subscription to {page title}`. Already-subscribed subject: `You are already subscribed to {page title}`.
   - Update subject: `[{page title}] {report title}` (maintenance: `[{page title}] Maintenance: {report title}`). Body: the status label, the update message (markdown source as text), the report link `{page url}#report-{id}`, then `Manage your subscription: {page url}/subscribe/manage?token=…` and `Unsubscribe: {page url}/unsubscribe?token=…`.
   - Subjects and titles go through `is_unsafe_in_text` → space.
-  - Headers: `List-Unsubscribe: <{public_engine_url}/api/v1/status-subscriptions/one-click/{unsubscribe token}>` and `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, via a new `Mailer::send_with_headers`.
+  - Headers: `List-Unsubscribe: <{public_engine_url}/api/v1/status-subscriptions/one-click/{unsubscribe token}>` and `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, via a new `Mailer::send_with_headers` (lettre 0.11.23 `HeaderName::new_from_ascii_str` + `HeaderValue::new` + `MessageBuilder::raw_header`; lettre itself RFC 2047-encodes any word holding CR or LF, and `send_with_headers` refuses such a value before that). lettre may fold a long header line, so tests unfold headers before comparing.
+  - One-click is idempotent (RFC 8058, mail providers retry): a token with a valid MAC answers `200 unsubscribed` whether or not the subscriber still exists; only a token whose MAC fails is 404. The same holds for `POST /public/status-subscriptions/unsubscribe`. A MAC-valid token proves Nami issued it, so the 200 tells an attacker nothing.
   - `Config.public_engine_url` (env `PUBLIC_ENGINE_URL`, default `http://localhost:8081`, same validation as nami-ui's) is the base.
 - **R17 Queue extension.** Migration 0104 makes `notification_deliveries.incident_id` nullable. It adds `status_page_id`, `subscriber_id`, `status_report_update_id` and `priority smallint` (0 = incidents, 1 = status pages), adds the events `sp_confirm`, `sp_subscribed`, `sp_update`, and replaces the due index with `(priority, next_attempt_at)`.
   - The claim orders candidates `by priority, next_attempt_at, id`. Status-page rows bucket as `'p:' || status_page_id` with the cap `STATUS_PAGE_PER_MINUTE = 600`.
-  - The drain sends incident rows exactly as before. Rows with `status_page_id` go to `status_pages::deliver::send(state, row)`. Those never write `incident_events`, and they are cancelled when the subscriber is gone or unconfirmed (`sp_update`).
+  - The drain sends incident rows exactly as before. Rows with `status_page_id` branch off **before** the Incidents plan's per-row step (2a) (they have no incident to check) and go to `status_pages::deliver::send(state, row)`. Those never write `incident_events`, and they are cancelled when the subscriber is gone or unconfirmed (`sp_update`). The claimed-row struct's `incident_id` becomes `Option<Uuid>`.
   - Dedupe: `unique (status_page_id, round, target_key) where status_page_id is not null`, with `round` = the update id in simple hex (32 chars) or `confirm-{n}`, and `target_key = 'sub:{subscriber_id}'`.
   - `INCIDENTS_WORKER_ENABLED=false` stops status-page mail on that instance too (one worker).
 - **R18 No uploads.** The spec makes logos `https` URLs (`logo_url`, `logo_dark_url`), so Part 1 has no upload endpoint, and the upload rules (magic bytes, size, `nosniff`, SVG) do not apply.
@@ -516,7 +561,7 @@ pub async fn seed_component(pool: &sqlx::PgPool, page: Uuid, display_name: &str,
     monitor: Option<Uuid>, heartbeat: Option<Uuid>) -> Uuid
 ```
 
-(`seed_heartbeat` stays as is if a helper with that name already exists after Uptime Phase 3; reuse it.)
+(`main` has no `seed_heartbeat` in `tests/common`. `tests/json_bodies.rs`, `tests/heartbeats.rs` and `tests/uptime_worker_timing.rs` each define a file-local `seed_heartbeat` with another signature; they import `common` items by name, never by glob, so the new `common::seed_heartbeat` does not clash. Leave those local helpers alone.)
 
 - [ ] **Step 2: Write the failing validator tests** (`validate.rs` `mod tests`)
 
@@ -548,7 +593,7 @@ fn nav_links_allow_https_and_mailto_only() {
 fn logos_are_https_only() {
     assert!(https_url("logo_url", "https://cdn.acme.test/logo.svg").is_ok());
     for bad in ["http://cdn.acme.test/l.png", "data:image/png;base64,AAAA", "javascript:x", "https://u:p@cdn.acme.test/l.png",
-                &format!("https://a.test/{}", "x".repeat(2048))] {
+                format!("https://a.test/{}", "x".repeat(2048)).as_str()] {
         assert_eq!(https_url("logo_url", bad), Err("logo_url must be an https:// URL of at most 2048 characters".into()), "{bad}");
     }
 }
@@ -586,7 +631,7 @@ fn cidrs_parse_canonically_and_match_both_families() {
 fn custom_domains_are_hostnames_other_than_the_app() {
     assert_eq!(custom_domain("Status.Acme.Test.", "nami.acme.test"), Ok("status.acme.test".into()));
     for bad in ["nami.acme.test", "NAMI.acme.test", "localhost", "acme", "203.0.113.7", "[::1]", "status.acme.test:8443",
-                "-bad.acme.test", "a..b.test", "https://status.acme.test", "status.acme.test/x", &format!("{}.test", "a".repeat(64))] {
+                "-bad.acme.test", "a..b.test", "https://status.acme.test", "status.acme.test/x", format!("{}.test", "a".repeat(64)).as_str()] {
         assert!(custom_domain(bad, "nami.acme.test").is_err(), "{bad}");
     }
 }
@@ -624,7 +669,7 @@ Branch `feat/NAMI-SP-2-status-page-admin-api`, worktree `.worktrees/NAMI-SP-2/`.
 
 ```rust
 // models::status_page
-#[derive(Debug, Clone, sqlx::FromRow)]          // Debug prints password_hash: implement Debug by hand, omitting it
+#[derive(Clone, sqlx::FromRow)]   // no derived Debug: it would print password_hash. `impl fmt::Debug` by hand, omitting it.
 pub struct StatusPage { pub id: Uuid, pub project_id: Uuid, pub slug: String, pub title: String,
     pub description: Option<String>, pub logo_url: Option<String>, pub logo_dark_url: Option<String>,
     pub accent_color: String, pub theme: String, pub nav_links: sqlx::types::Json<Vec<NavLink>>,
@@ -644,7 +689,11 @@ pub struct Component { pub id: Uuid, pub status_page_id: Uuid, pub section_id: U
     pub position: i32, pub show_uptime_bars: bool, pub created_at: DateTime<Utc>,
     /// Admin view only: the bound source's own name.
     pub source_name: String }
-pub const PAGE_COLUMNS: &str;   // the select list with `ip_allowlist::text[] as ip_allowlist`
+/// The select list with `ip_allowlist::text[] as ip_allowlist` (sqlx has no `cidr` decoding without the
+/// `ipnet` feature). A `macro_rules! page_columns` expanding to a string literal, used as
+/// `concat!("select ", page_columns!(), " from status_pages where …")`: a `const &str` cannot go into
+/// `concat!`, and SQL strings are never `format!`ed (same pattern as `maintenance::maybe_in_effect!`).
+macro_rules! page_columns { () => { "id, project_id, slug, …, ip_allowlist::text[] as ip_allowlist, …" } }
 pub async fn find_in_project(pool: &PgPool, project_id: Uuid, page_id: Uuid) -> Result<Option<StatusPage>, sqlx::Error>;
 pub async fn find_by_slug(pool: &PgPool, slug: &str) -> Result<Option<StatusPage>, sqlx::Error>;
 pub async fn find_by_verified_domain(pool: &PgPool, host: &str) -> Result<Option<StatusPage>, sqlx::Error>;
@@ -672,8 +721,10 @@ Routes (all under `/projects/{id}/status-pages`; R22 roles):
 Patch semantics, in one transaction with `select … for update` on the page:
 1. Validate every given field (Task 1); `password` through `validate::password` then `hash_password`.
 2. Merge onto the row. If the merged `visibility` is `public`: `password_hash = null`, `ip_allowlist = '{}'`. If `private` with neither → `400 a private page needs a password, an IP allowlist, or both`.
-3. `access_epoch = access_epoch + 1` when the password was given (set or cleared), the allowlist changed, or visibility changed.
+3. `access_epoch = access_epoch + 1` when the password was given (set or cleared), the allowlist changed (compared as a set with the stored one, not "was present in the body": the editor sends it on every save), or visibility changed.
 4. `updated_at = now()`. Unique violation on slug → `409 slug is taken`.
+
+Section and component writes also run `update status_pages set updated_at = now() where id = $1` in their transaction (R10).
 
 A section or component id that belongs to another page of the same project, or a page id of another project inside an accessible project path → 404. A `section_id`/`monitor_id`/`heartbeat_id`/`group_id` in a body that is not in this page/project → 400 `<field> not found in this project`. `monitor_id` and `heartbeat_id` both or neither → `400 set exactly one of monitor_id and heartbeat_id`. Rebinding a component's source is not offered (delete and re-add).
 
@@ -893,13 +944,15 @@ pub fn app_host(config: &Config) -> String;
 ```
 
 Routes:
-- `PATCH …/{page_id}` accepts `custom_domain` (string → `validate::custom_domain(raw, &app_host(&config))`, null clears). A change clears `custom_domain_verified_at`. Unique violation → `409 custom domain is taken by another page`.
+- `PATCH …/{page_id}` accepts `custom_domain` (string → `validate::custom_domain(raw, &app_host(&config))`, null clears). Only an actual change (normalised value differs from the stored one) clears `custom_domain_verified_at`; the editor sends the field on every save, and resending the same domain keeps it verified. Unique violation → `409 custom domain is taken by another page`.
 - `GET …/{page_id}` adds `custom_domain_verification: VerificationRecord | null` to `page`.
 - `POST …/{page_id}/custom-domain/verify` (admin, `{}`) → `200 {"verified": true}` and sets `custom_domain_verified_at = now()` when one TXT string equals `value`. Otherwise `400 {"error": "TXT record <name> with value <value> not found"}`. A lookup failure → `400 could not look up <name>`. No domain set → `400 set a custom domain first`.
 
 - `GET /public/status-domain-check/{host}` (no session; nami-ui's `/_nami/tls-ask` is its only caller, R4) → `204` when `host` is a verified custom domain of any page, public or private, otherwise `404`. It says nothing else about the page.
 
-`from_env` sets `TxtLookup::System`. `from_env_for_test` sets `TxtLookup::Fixed(BTreeMap::new())`. Neither reads an environment variable for it.
+`from_env` sets `TxtLookup::System` explicitly; `from_env_defaults_only` (which `from_env_for_test` is, and which `from_env` spreads last) sets `TxtLookup::Fixed(BTreeMap::new())`. Neither reads an environment variable for it. A `config.rs` unit test asserts `from_env_for_test().txt_lookup == Fixed(empty)`; `from_env` needs `DATABASE_URL` and the key, so its `System` value is pinned by reading the code in review.
+
+The domain-check route is added to `routes::status_pages::public_router()` in this task (no governor yet); Task 6 moves it behind the public status governor with the DTO routes.
 
 - [ ] **Step 1: Write the failing tests** (append to `tests/status_pages_api.rs`)
 
@@ -945,20 +998,21 @@ async fn a_custom_domain_routes_only_after_its_txt_record_is_verified(pool: sqlx
     assert_eq!(call(&app2, "GET", "/public/status-domain-check/status.acme.test", None, None).await.0, StatusCode::NO_CONTENT);
     assert_eq!(call(&app2, "GET", "/public/status-domain-check/other.acme.test", None, None).await.0, StatusCode::NOT_FOUND);
 
-    // Changing the domain clears verification.
+    // Resending the same domain (the editor does on every save) keeps it; changing it clears verification.
+    let (_, body) = call(&app2, "PATCH", &uri, Some(&admin2), Some(json!({ "custom_domain": "Status.Acme.Test.", "title": "x" }))).await;
+    assert_eq!(body["custom_domain_verified"].as_bool(), Some(true), "{body}");
     let (_, body) = call(&app2, "PATCH", &uri, Some(&admin2), Some(json!({ "custom_domain": "status2.acme.test" }))).await;
     assert_eq!(body["custom_domain_verified"].as_bool(), Some(false));
 }
 
-#[sqlx::test]
-async fn a_verified_token_is_bound_to_the_page_and_the_domain(pool: sqlx::PgPool) {
+#[test]
+fn a_verified_token_is_bound_to_the_page_and_the_domain() {
     let cipher = common::test_cipher();
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
     use nami_engine::status_pages::domain::verification_record as r;
     assert_eq!(r(&cipher, a, "s.acme.test"), r(&cipher, a, "s.acme.test"));
     assert_ne!(r(&cipher, a, "s.acme.test").value, r(&cipher, b, "s.acme.test").value);
     assert_ne!(r(&cipher, a, "s.acme.test").value, r(&cipher, a, "t.acme.test").value);
-    let _ = pool;
 }
 
 #[sqlx::test]
@@ -982,7 +1036,7 @@ Add the verify route to `json_bodies.rs`.
 
 Run: engine command `--test status_pages_api --test json_bodies`, then `--lib -- status_pages::domain`. Expected: FAIL.
 
-- [ ] **Step 2: Implement.** `verification_record`: `hex(HMAC-SHA256(Zeroizing(derive_subkey("nami/status-domain/v1")), "{page_id}|{domain}"))[..32]`. `lookup_txt(System, ..)` builds a `TokioResolver` from the system config with `timeout = 5 s`, `attempts = 1`, `ndots = 0`, queries `"{name}."` for TXT and joins each record's strings. A NXDOMAIN or no-records answer is `Ok(vec![])`. `Fixed` reads the map.
+- [ ] **Step 2: Implement.** `verification_record`: `hex(HMAC-SHA256(Zeroizing(derive_subkey("nami/status-domain/v1")), "{page_id}|{domain}"))[..32]`. `lookup_txt(System, ..)` reuses `uptime::dns`: make `build_resolver(nameserver, timeout)` and `readable(&RData)` `pub(crate)` (no behaviour change; the DNS monitor tests stay green) and call `build_resolver(None, Duration::from_secs(4))` (it adds 1 s, so 5 s in all; system config read once off the async threads, hosts file never, no cache). Query `"{name}."` for `RecordType::TXT`; `readable` already concatenates a record's strings. A NXDOMAIN or no-records error (`is_nx_domain()` / `is_no_records_found()`) is `Ok(vec![])`. `Fixed` reads the map.
 
 - [ ] **Step 3: Run** the commands again, the full suite and clippy. Expected: green.
 
@@ -1031,7 +1085,7 @@ pub struct Bar { pub date: NaiveDate, pub status: ComponentStatus, pub uptime_pc
 pub struct BarReport { pub id: Uuid, pub title: String }
 /// The 90 local days ending with `now`'s local date: [start, end) instants, oldest first.
 pub fn day_spans(tz: Tz, now: DateTime<Utc>) -> Vec<(NaiveDate, Span)>;
-pub fn status_for(availability: &Availability) -> ComponentStatus;    // R7 thresholds
+pub fn status_for(availability: &Availability) -> ComponentStatus;    // R7 thresholds; None + all maintenance → Maintenance
 /// Pure: one bar per day. `incidents`/`maintenance` unclipped; `reports` = (id, title, start, end-or-now).
 pub fn bars(tz: Tz, now: DateTime<Utc>, created_at: DateTime<Utc>, incidents: &[Span], maintenance: &[Span],
     reports: &[(Uuid, String, Span)]) -> Vec<Bar>;
@@ -1055,8 +1109,9 @@ fn derivation_follows_r6() {
     assert_eq!(s("down", false, false), ComponentStatus::MajorOutage);
     assert_eq!(s("pending", false, false), ComponentStatus::NoData);
     assert_eq!(s("up", true, false), ComponentStatus::NoData);
+    assert_eq!(s("down", true, false), ComponentStatus::NoData, "paused is grey, whatever the last state (ruling 5)");
     assert_eq!(s("down", false, true), ComponentStatus::Maintenance, "maintenance wins over down");
-    assert_eq!(s("down", true, true), ComponentStatus::Maintenance);
+    assert_eq!(s("down", true, true), ComponentStatus::Maintenance, "maintenance wins over paused");
 }
 
 #[test]
@@ -1130,16 +1185,18 @@ fn thresholds_and_report_titles() {
     let day = bars.iter().find(|b| b.date == NaiveDate::from_ymd_opt(2026, 10, 18).unwrap()).unwrap();
     assert_eq!(day.status, ComponentStatus::Degraded, "10 min = 99.3 %");
     assert_eq!(day.reports, vec![BarReport { id: r, title: "API slow".into() }]);
-    let a = |pct| crate::uptime::availability::Availability { uptime_pct: pct, ..Default::default() };
-    assert_eq!(status_for(&a(Some(100.0))), ComponentStatus::Operational);
-    assert_eq!(status_for(&a(Some(99.0))), ComponentStatus::Degraded);
-    assert_eq!(status_for(&a(Some(95.0))), ComponentStatus::PartialOutage);
-    assert_eq!(status_for(&a(Some(94.99))), ComponentStatus::MajorOutage);
-    assert_eq!(status_for(&a(None)), ComponentStatus::NoData);
+    // `Availability` has no `Default` on main: build it literally (do not add a derive to Uptime's type for a test).
+    let a = |pct: Option<f64>, maintenance_seconds: i64| crate::uptime::availability::Availability {
+        from: now, to: now, total_seconds: 86_400, maintenance_seconds, downtime_seconds: 0,
+        uptime_pct: pct, incidents: 0, longest_incident_seconds: 0 };
+    assert_eq!(status_for(&a(Some(100.0), 0)), ComponentStatus::Operational);
+    assert_eq!(status_for(&a(Some(99.0), 0)), ComponentStatus::Degraded);
+    assert_eq!(status_for(&a(Some(95.0), 0)), ComponentStatus::PartialOutage);
+    assert_eq!(status_for(&a(Some(94.99), 0)), ComponentStatus::MajorOutage);
+    assert_eq!(status_for(&a(None, 0)), ComponentStatus::NoData);
+    assert_eq!(status_for(&a(None, 86_400)), ComponentStatus::Maintenance, "a day wholly in maintenance");
 }
 ```
-
-(If `Availability` has no `Default`, build it literally in the test; do not add a derive to Uptime's type for a test.)
 
 `tests/status_history.rs`:
 
@@ -1190,7 +1247,7 @@ Run: engine command `--lib -- status_pages::status status_pages::history`, then 
 - [ ] **Step 2: Implement.**
   - `day_spans`: `today = now.with_timezone(&tz).date_naive()`. For `d` in `today - 89 ..= today`: `start = tz.from_local_datetime(&d.and_hms(0,0,0)).earliest()`, else step forward a minute at a time (at most 180 steps) until one exists. `end` is the next day's start.
   - `bars`: per day, `total = Span { start: max(day.start, created_at), end: min(day.end, now) }`. If `total.start >= total.end`: `no_data`, `uptime_pct: None`, minutes 0, but reports overlapping the day are still listed. Otherwise `a = compute(total, incidents, maintenance)`, `status = status_for(&a)`, `downtime_minutes = a.downtime_seconds / 60` (floor). Reports overlap when `start < day.end && end > day.start`.
-  - `load_inputs`: (1) `select c.id, c.monitor_id, c.heartbeat_id from status_page_components c where c.status_page_id = $1`; (2) one incidents query for all bound sources: `select monitor_id, heartbeat_id, started_at, resolved_at from incidents where project_id = $1 and (monitor_id = any($2) or heartbeat_id = any($3)) and (resolved_at is null or resolved_at > $4) and started_at < $5 order by started_at` with `$4 = now - 91 days`, `$5 = now`; (3) `maintenance::list_for_project` once, then `spans(now - 91 days, now)` per window, assigned per `applies_to_monitor` / `applies_to_heartbeats`.
+  - `load_inputs` returns an entry for **every** component of the page (empty vectors when nothing applies; the test indexes the map directly). (1) `select c.id, c.monitor_id, c.heartbeat_id from status_page_components c where c.status_page_id = $1`; (2) one incidents query for all bound sources: `select monitor_id, heartbeat_id, started_at, resolved_at from incidents where project_id = $1 and (monitor_id = any($2) or heartbeat_id = any($3)) and (resolved_at is null or resolved_at > $4) and started_at < $5 order by started_at` with `$4 = now - 91 days`, `$5 = now`; (3) `maintenance::list_for_project` once, then `spans(now - 91 days, now)` per window, assigned per `applies_to_monitor` / `applies_to_heartbeats`.
 
 - [ ] **Step 3: Run** both commands again, then `TZ=Pacific/Chatham` and `TZ=America/Santiago` for the `--lib` command (the code must not depend on the host zone). Then the full suite and clippy. Expected: green.
 
@@ -1466,10 +1523,9 @@ Branch `feat/NAMI-SP-6-public-snapshot`, worktree `.worktrees/NAMI-SP-6/`.
 #[derive(Debug, Clone, Serialize)] pub struct PublicAffected { pub id: Uuid, pub name: String, pub impact: ComponentStatus }
 #[derive(Debug, Clone, Serialize)] pub struct PublicUpdate { pub id: Uuid, pub status: String, pub message: String, pub created_at: DateTime<Utc> }
 #[derive(Debug, Clone, Serialize)] pub struct Subscriptions { pub email: bool, pub webhook: bool }
-/// What the access check needs; never serialised.
-#[derive(Clone)] pub struct PageAccess { pub page_id: Uuid, pub private: bool, pub access_epoch: i32,
-    pub allowlist: Vec<Cidr>, pub noindex: bool }   // Debug by hand (ids and flags only)
-pub struct Snapshot { pub json: bytes::Bytes, pub etag: String, pub access: PageAccess }
+/// Public bytes only. Access is never decided from a snapshot (R10): the route reads the page row fresh.
+/// `axum::body::Bytes` (the `bytes` crate is not a direct dependency).
+pub struct Snapshot { pub json: axum::body::Bytes, pub etag: String }
 pub fn page_url(config: &Config, page: &StatusPage) -> String;   // R11
 /// Builds from Postgres only (R10). Report lists per R8; at most 20 updates per report, newest first.
 pub async fn build(state: &AppState, page: &StatusPage, now: DateTime<Utc>) -> Result<Snapshot, sqlx::Error>;
@@ -1477,10 +1533,12 @@ pub async fn build(state: &AppState, page: &StatusPage, now: DateTime<Utc>) -> R
 // status_pages::cache
 pub const TTL: Duration = Duration::from_secs(30);
 pub const MAX_ENTRIES: usize = 1000;
-#[derive(Default)] pub struct SnapshotCache { /* Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<Option<(Instant, Arc<Snapshot>)>>>>>, builds: AtomicU64 */ }
+#[derive(Default)] pub struct SnapshotCache { /* std Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<Option<Entry>>>>>,
+    Entry { version: DateTime<Utc>, built_at: Instant, snapshot: Arc<Snapshot> }, builds: AtomicU64 */ }
 impl SnapshotCache {
-    /// Fresh entry → it; otherwise holds the page's lock while `build` runs, so concurrent misses build once.
-    pub async fn get_or_build<F, Fut>(&self, page_id: Uuid, build: F) -> Result<Arc<Snapshot>, sqlx::Error>
+    /// An entry with this `version` (the fresh row's `updated_at`) built less than TTL ago → it. Otherwise holds
+    /// the page's lock while `build` runs (re-checking after the lock is taken), so concurrent misses build once.
+    pub async fn get_or_build<F, Fut>(&self, page_id: Uuid, version: DateTime<Utc>, build: F) -> Result<Arc<Snapshot>, sqlx::Error>
         where F: FnOnce() -> Fut, Fut: Future<Output = Result<Snapshot, sqlx::Error>>;
     pub fn invalidate(&self, page_id: Uuid);
     /// Snapshots built since start (tests).
@@ -1493,10 +1551,13 @@ pub const READ_BURST: u32 = 30;
 pub fn router() -> Router<AppState>;   // GET /public/status-pages/{slug}, GET /public/status-domains/{host}
 ```
 
-Response rules (both GET routes):
-- Page not found, domain unverified, or private (Task 7 adds the access check; in this task a private page is always 404) → `404 {"error":"not found"}`.
-- 200 body = `snapshot.json` (`content-type: application/json`). Headers: `etag`; `cache-control: public, max-age=30` for public pages; `x-robots-tag: noindex` when `noindex`.
-- `If-None-Match` equal to the ETag → `304` with the same `etag` header and no body.
+Response rules (both GET routes), in this order:
+1. Read the page row fresh (`find_by_slug` / `find_by_verified_domain`). Not found, domain unverified, or private (Task 7 adds the access check against this fresh row; in this task a private page is always 404) → `json_error(404, "not found")`.
+2. Only then `get_or_build(page.id, page.updated_at, ..)`.
+3. `If-None-Match` equal to the ETag → `304` with the same `etag` header and no body. (Never before step 1: a private page without access must not answer 304.)
+4. 200 body = `snapshot.json` (`content-type: application/json`). Headers: `etag`; `cache-control: public, max-age=30` for public pages; `x-robots-tag: noindex` when the fresh row has `noindex`.
+
+This task also moves Task 3's `/public/status-domain-check/{host}` behind the same governor, and adds the R10 `updated_at` bump plus `state.status_pages.invalidate(page_id)` to every Task 2 and Task 5 write handler.
 - Reads go through a `GovernorLayer` (`SmartIpKeyExtractor`, `per_millisecond(100)`, `burst_size(30)`, error handler `AppError::RateLimited`). It applies only to the public status router (merged into `build_router` like `rate_limited_with_governor`).
 - The handler never reads the session.
 
@@ -1520,7 +1581,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 /// A page with every kind of secret behind it: what must never leak (R11, spec "Public DTO leak test").
-struct Fixture { project: Uuid, page: Uuid, monitor: Uuid, heartbeat: Uuid, incident: Uuid, member_email: String }
+struct Fixture { project: Uuid, page: Uuid, monitor: Uuid, heartbeat: Uuid, incident: Uuid, member_email: String,
+    project_slug: String, heartbeat_token: String }
 
 async fn fixture(pool: &sqlx::PgPool, app: &axum::Router) -> Fixture {
     let project = seed_project(pool).await;
@@ -1528,15 +1590,24 @@ async fn fixture(pool: &sqlx::PgPool, app: &axum::Router) -> Fixture {
     let page = common::seed_status_page(pool, project, "acme").await;
     let monitor = common::seed_http_monitor(pool, project, "db-primary-internal",
         "https://secret-internal.example:8443/health?token=hunter2", 1).await;
-    sqlx::query("update monitors set check_type = 'keyword', keyword = 'SECRETKW', current_status = 'down' where id = $1")
-        .bind(monitor).execute(pool).await.unwrap();
+    let group: Uuid = sqlx::query_scalar("insert into monitor_groups (project_id, name) values ($1, 'internal-payments-group') returning id")
+        .bind(project).fetch_one(pool).await.unwrap();
+    sqlx::query("update monitors set check_type = 'keyword', keyword = 'SECRETKW', current_status = 'down',
+                 auth_username = 'svc-basic-user', request_header_names = '{X-Internal-Token}', group_id = $2,
+                 proxy_url = 'http://proxy-internal.example:3128', proxy_username = 'svc-proxy-user' where id = $1")
+        .bind(monitor).bind(group).execute(pool).await.unwrap();
     let heartbeat = common::seed_heartbeat(pool, project, "nightly-backup-internal").await;
+    let heartbeat_token: String = sqlx::query_scalar("select token from heartbeats where id = $1")
+        .bind(heartbeat).fetch_one(pool).await.unwrap();
     common::seed_component(pool, page, "API", Some(monitor), None).await;
     common::seed_component(pool, page, "Backups", None, Some(heartbeat)).await;
-    let incident: Uuid = sqlx::query_scalar("insert into incidents (project_id, monitor_id, title, cause, status, started_at)
-        values ($1, $2, 'db-primary-internal is DOWN', 'connection refused to 10.0.0.5:5432', 'open', now() - interval '1 hour') returning id")
+    let incident: Uuid = sqlx::query_scalar("insert into incidents (project_id, monitor_id, title, cause, details, status, started_at)
+        values ($1, $2, 'db-primary-internal is DOWN', 'connection refused to 10.0.0.5:5432', 'SECRETDETAIL stack trace',
+                'open', now() - interval '1 hour') returning id")
         .bind(project).bind(monitor).fetch_one(pool).await.unwrap();
-    Fixture { project, page, monitor, heartbeat, incident, member_email }
+    sqlx::query("update incidents set postmortem = 'SECRETPM root cause' where id = $1").bind(incident).execute(pool).await.unwrap();
+    let project_slug: String = sqlx::query_scalar("select slug from projects where id = $1").bind(project).fetch_one(pool).await.unwrap();
+    Fixture { project, page, monitor, heartbeat, incident, member_email, project_slug, heartbeat_token }
 }
 
 async fn dto(app: &axum::Router, slug: &str) -> (StatusCode, axum::http::HeaderMap, Value) {
@@ -1554,6 +1625,8 @@ async fn the_public_dto_leaks_nothing_private(pool: sqlx::PgPool) {
     for secret in [f.project.to_string(), f.page.to_string(), f.monitor.to_string(), f.heartbeat.to_string(), f.incident.to_string(),
                    "secret-internal".into(), "hunter2".into(), "8443".into(), "SECRETKW".into(), "db-primary-internal".into(),
                    "nightly-backup-internal".into(), "10.0.0.5".into(), "connection refused".into(), f.member_email.clone(),
+                   "svc-basic-user".into(), "X-Internal-Token".into(), "internal-payments-group".into(), "SECRETDETAIL".into(),
+                   "SECRETPM".into(), f.project_slug.clone(), f.heartbeat_token.clone(), "proxy-internal".into(), "svc-proxy-user".into(),
                    "password".into(), "ip_allowlist".into(), "access_epoch".into(), "custom_domain".into()] {
         assert!(!text.contains(&secret), "leaked {secret}: {text}");
     }
@@ -1651,11 +1724,13 @@ async fn admin_writes_invalidate_the_snapshot_and_etags_match(pool: sqlx::PgPool
 async fn public_reads_are_rate_limited_per_client_address(pool: sqlx::PgPool) {
     let app = test_app(pool.clone());
     fixture(&pool, &app).await;
-    let mut last = StatusCode::OK;
-    for _ in 0..40 {
-        last = call_raw(&app, "GET", "/public/status-pages/acme", &[("x-forwarded-for", "192.0.2.1")], None).await.0;
+    // Burst 30, then one per 100 ms: 60 quick requests must hit the limit even on a slow debug build.
+    let mut limited = 0;
+    for _ in 0..60 {
+        if call_raw(&app, "GET", "/public/status-pages/acme", &[("x-forwarded-for", "192.0.2.1")], None).await.0
+            == StatusCode::TOO_MANY_REQUESTS { limited += 1; }
     }
-    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited > 0, "no 429 after 60 requests");
     assert_eq!(call_raw(&app, "GET", "/public/status-pages/acme", &[("x-forwarded-for", "192.0.2.2")], None).await.0, StatusCode::OK);
 }
 
@@ -1705,7 +1780,7 @@ Branch `feat/NAMI-SP-7-private-pages`, worktree `.worktrees/NAMI-SP-7/`.
 - Modify: `nami-engine/src/routes/status_public.rs` (access check, unlock), `nami-engine/tests/status_public.rs`, `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs`
 
 **Interfaces:**
-- Consumes: Task 1 `Cidr`, Task 6 `PageAccess` and routes, `auth::password::verify_password`, `crypto::Cipher::derive_subkey`, `hmac`.
+- Consumes: Task 1 `Cidr`, Task 6 routes (fresh-row lookup before the cache), `auth::password::verify_password`, `crypto::Cipher::derive_subkey`, `hmac`.
 - Produces:
 
 ```rust
@@ -1717,7 +1792,9 @@ pub fn client_ip(headers: &HeaderMap) -> Option<IpAddr>;
 pub fn sign(cipher: &Cipher, page_id: Uuid, access_epoch: i32, exp: i64) -> String;
 pub fn verify(cipher: &Cipher, token: &str, page_id: Uuid, access_epoch: i32, now: i64) -> bool;
 /// Public pages: always. Private: a valid token for this page/epoch, or `ip` inside the allowlist.
-pub fn granted(cipher: &Cipher, access: &PageAccess, token: Option<&str>, ip: Option<IpAddr>, now: DateTime<Utc>) -> bool;
+/// `page` is the row read fresh for this request (R10), never a cached snapshot; its `ip_allowlist`
+/// strings are parsed with `Cidr::parse` (a row that fails to parse grants nothing for that entry).
+pub fn granted(cipher: &Cipher, page: &StatusPage, token: Option<&str>, ip: Option<IpAddr>, now: DateTime<Utc>) -> bool;
 
 // status_pages::rate_limit
 /// Counts one hit in `bucket` and says whether it is within `max` per `window` (R13). Runs its own transaction.
@@ -1725,16 +1802,17 @@ pub async fn hit(pool: &PgPool, bucket: &str, max: i64, window: Duration) -> Res
 /// hex(HMAC(subkey "nami/status-rate/v1", ip))[..32], or "unknown".
 pub fn client_key(cipher: &Cipher, ip: Option<IpAddr>) -> String;
 pub const UNLOCK_MAX: i64 = 10;
+pub const UNLOCK_IP_MAX: i64 = 30;
 pub const UNLOCK_WINDOW: Duration = Duration::from_secs(15 * 60);
 ```
 
 Routes: `POST /public/status-pages/{slug}/unlock` and `POST /public/status-domains/{host}/unlock`, body `{password}` (≤ 128 chars, otherwise the same 401). Order:
 1. Resolve the page (no 404 here: unknown pages continue with the dummy hash).
-2. `hit(pool, "unlock:{page id or 'none'}:{client_key}", 10, 15 min)` → over → `429 {"error":"too many attempts, try again later"}`.
-3. Verify against `password_hash`, or against `DUMMY_HASH` (a `OnceLock<String>` hashed once at first use) when the page is unknown, public or has no password.
-4. Success → `200 {"token": sign(.., now + 30 d), "expires_at": …}`. Anything else → `401 {"error":"wrong password"}`.
+2. `hit(pool, "unlock:{page id or 'none'}:{client_key}", 10, 15 min)`, then `hit(pool, "unlock-ip:{client_key}", 30, 15 min)`; either over → `json_error(429, "too many attempts, try again later")`.
+3. Verify (in `spawn_blocking`, holding an `UNLOCK_SLOTS` permit, Global Constraints) against `password_hash`, or against `DUMMY_HASH` (a `OnceLock<String>` hashed once at first use) when the page is unknown, public or has no password. `Err` counts as a wrong password.
+4. Success → `200 {"token": sign(.., now + 30 d), "expires_at": …}`. Anything else → `json_error(401, "wrong password")`.
 
-The GET routes from Task 6 now read `X-Nami-Page-Access` and `client_ip(headers)`, and call `granted`. Not granted → the same 404. Granted private → `cache-control: private, no-store` and `x-robots-tag: noindex` (R25), whatever the toggle.
+The GET routes from Task 6 now read `X-Nami-Page-Access` and `client_ip(headers)`, and call `granted` with the **fresh row** (R10), before the cache and before `If-None-Match`. Not granted → the same 404. Granted private → `cache-control: private, no-store` and `x-robots-tag: noindex` (R25), whatever the toggle.
 
 - [ ] **Step 1: Write the migration**
 
@@ -1770,7 +1848,7 @@ fn tokens_are_bound_to_page_epoch_and_expiry() {
     let later = "9999999999".to_string();
     forged[2] = &later;
     assert!(!verify(&cipher, &forged.join("."), page, 3, 1_000), "a pushed-out expiry breaks the MAC");
-    for junk in ["", "v1", "v1...", "v2.x.y.z", &format!("{t}.extra")] { assert!(!verify(&cipher, junk, page, 3, 0), "{junk}"); }
+    for junk in ["", "v1", "v1...", "v2.x.y.z", format!("{t}.extra").as_str()] { assert!(!verify(&cipher, junk, page, 3, 0), "{junk}"); }
     let other_key = Cipher::new(b"another-test-key-of-32-bytes-xyz");
     assert!(!verify(&other_key, &t, page, 3, 1_000));
 }
@@ -1833,6 +1911,37 @@ async fn private_content_needs_a_token_for_this_page_and_epoch(pool: sqlx::PgPoo
 }
 
 #[sqlx::test]
+async fn a_private_page_never_answers_304_without_access(pool: sqlx::PgPool) {
+    // R10: If-None-Match is compared only after access. A 304 to a stranger would confirm the page exists
+    // and tell whether it changed.
+    let app = test_app(pool.clone());
+    private_page(&pool, "secret-e", Some("correct horse"), &[]).await;
+    let (_, body) = unlock(&app, "secret-e", "203.0.113.6", "correct horse").await;
+    let token = body["token"].as_str().unwrap().to_string();
+    let (status, headers, _) = call_raw(&app, "GET", "/public/status-pages/secret-e", &[("x-nami-page-access", &token)], None).await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = headers.get("etag").unwrap().to_str().unwrap().to_string();
+    let (status, _, _) = call_raw(&app, "GET", "/public/status-pages/secret-e", &[("if-none-match", &etag)], None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no token: 404 even with the right ETag");
+    let (status, _, _) = call_raw(&app, "GET", "/public/status-pages/secret-e",
+        &[("if-none-match", &etag), ("x-nami-page-access", &token)], None).await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+}
+
+#[sqlx::test]
+async fn going_private_applies_at_once_even_with_a_warm_cache(pool: sqlx::PgPool) {
+    // Access comes from the fresh row (R10), not from the cached snapshot.
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let page = common::seed_status_page(&pool, project, "turning").await;
+    assert_eq!(call_raw(&app, "GET", "/public/status-pages/turning", &[], None).await.0, StatusCode::OK);
+    // A write that bypasses the routes (another instance, say): no in-process invalidate ran.
+    sqlx::query("update status_pages set visibility = 'private', password_hash = 'x', updated_at = now() where id = $1")
+        .bind(page).execute(&pool).await.unwrap();
+    assert_eq!(call_raw(&app, "GET", "/public/status-pages/turning", &[], None).await.0, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test]
 async fn changing_the_password_revokes_issued_tokens(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = common::app(state.clone());
@@ -1862,6 +1971,16 @@ async fn unlock_is_limited_to_ten_attempts_per_address_and_page(pool: sqlx::PgPo
     assert_eq!(unlock(&app, "secret-b", "198.51.100.1", "correct horse").await.0, StatusCode::OK, "another page");
     let stored: Vec<String> = sqlx::query_scalar("select bucket from status_page_rate_hits").fetch_all(&pool).await.unwrap();
     assert!(stored.iter().all(|b| !b.contains("198.51.100")), "addresses are stored hashed: {stored:?}");
+}
+
+#[sqlx::test]
+async fn one_address_cannot_spread_guesses_over_many_pages(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    for i in 0..4 { private_page(&pool, format!("spread-{i}").as_str(), Some("correct horse"), &[]).await; }
+    let mut statuses = Vec::new();
+    for i in 0..4 { for _ in 0..8 { statuses.push(unlock(&app, format!("spread-{i}").as_str(), "198.51.100.9", "wrong").await.0); } }
+    assert_eq!(statuses.iter().filter(|s| **s == StatusCode::UNAUTHORIZED).count(), 30, "unlock-ip caps at 30 per 15 min");
+    assert!(statuses[30..].iter().all(|s| *s == StatusCode::TOO_MANY_REQUESTS));
 }
 
 #[sqlx::test]
@@ -1947,7 +2066,9 @@ pub fn title_for(names: &[String]) -> String;   // "A, B — service disruption"
 Hook placement in `lifecycle.rs`:
 - `open`: after the `opened` event, when `open` returns `Some(id)`, call `on_incident_opened`.
 - `resolve`: when it returns `true`, call `on_incident_resolved`.
-- `resolve_source`: when it returns `Some(id)`, call `on_incident_resolved`.
+- `resolve_source` and NAMI-INC-9's `resolve_source_with_reason`: when they resolve `Some(id)`, call `on_incident_resolved`. If the merged code routes all three through one internal function, put the single call there.
+
+Both hooks also run `update status_pages set updated_at = now() where id = any($1)` for the pages they touched (R10), so every instance serves the new report on its next request.
 
 `reopen` adds nothing: the page keeps its resolved report, and a new incident gets a new one.
 
@@ -2010,7 +2131,7 @@ async fn an_incident_on_a_bound_monitor_opens_one_report_per_opted_in_page(pool:
     let texts: Vec<String> = sqlx::query_scalar("select title || ' ' || u.message from status_reports r join status_report_updates u on u.report_id = r.id")
         .fetch_all(&pool).await.unwrap();
     for t in &texts {
-        for secret in ["db-primary-internal", "secret-internal", "10.0.0.5", "refused", &m.to_string(), &incident.to_string()] {
+        for secret in ["db-primary-internal", "secret-internal", "10.0.0.5", "refused", m.to_string().as_str(), incident.to_string().as_str()] {
             assert!(!t.contains(secret), "{secret} in {t}");
         }
     }
@@ -2076,6 +2197,8 @@ Run: engine command `--test status_automatic`. Expected: FAIL.
 
 - [ ] **Step 2: Implement** `automatic.rs` and the hooks. The existing `incident_lifecycle.rs`, `uptime_worker.rs` and `heartbeats.rs` tests must stay green unchanged (no page → no work: one indexed query per open/resolve).
 
+In Part 1 only log alerts call `resolve_source_with_reason`, and a log alert cannot be bound to a component, so no test drives that path. The task review checks that the call site is there.
+
 - [ ] **Step 3: Run** `--test status_automatic --test incident_lifecycle --test uptime_worker --test heartbeats`, the full suite and clippy. Expected: green.
 
 - [ ] **Step 4: Commit**
@@ -2097,7 +2220,7 @@ Branch `feat/NAMI-SP-9-email-subscribers`, worktree `.worktrees/NAMI-SP-9/`.
 - Modify: `nami-engine/src/incidents/deliveries.rs` (claim order, page bucket, dispatch), `nami-engine/src/incidents/worker.rs` (hourly prune), `nami-engine/src/routes/status_public.rs` (subscribe), `nami-engine/src/router.rs` (token router + governor), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs`
 
 **Interfaces:**
-- Consumes: NAMI-INC-5 queue and drain, Task 6 page resolution, Task 7 `access::granted`, `rate_limit::{hit, client_key}`, `email::Mailer::send`, `AppError::Gone`.
+- Consumes: NAMI-INC-5 queue and drain, Task 6 page resolution, Task 7 `access::granted`, `rate_limit::{hit, client_key}`, `email::Mailer::send`, `routes::status_public::json_error`.
 - Produces:
 
 ```rust
@@ -2123,20 +2246,22 @@ pub async fn confirm(conn: &mut PgConnection, cipher: &Cipher, token: &str) -> R
 
 // status_pages::deliver
 pub const STATUS_PAGE_PER_MINUTE: i64 = 600;
+/// `Failed` carries INC-5's struct: a Mailer error is `SendError { message: "email not delivered".into(),
+/// retry: Retry::After(None) }`, recorded with the Incidents plan's retry rules (its Task 5 Step 3 (2f)).
 pub enum Outcome { Sent, Cancelled, Failed(crate::incidents::send::SendError) }
 pub struct StatusPageRow { pub id: Uuid, pub event: String, pub round: String, pub status_page_id: Uuid,
     pub subscriber_id: Uuid, pub status_report_update_id: Option<Uuid>, pub attempts: i32 }
-/// Builds and sends one status-page email. Subscriber gone → Cancelled. Mailer error → Failed(After(None)).
+/// Builds and sends one status-page email. Subscriber gone → Cancelled. Mailer error → Failed (above).
 pub async fn send(state: &AppState, row: &StatusPageRow) -> Outcome;
 ```
 
 Routes:
 - `POST /public/status-pages/{slug}/subscribe` and `POST /public/status-domains/{host}/subscribe`, body `{email, components: [uuid] | null}`. Order:
-  1. Page plus access (no access → the Task 6 404).
+  1. Page plus access, from the fresh row (no access → the Task 6 404).
   2. `validate_email` → 400 with its message. A component not on the page → `400 component not found on this page`.
-  3. `hit("subscribe-ip:{client_key}", 5, 1 h)` and `hit("subscribe-page:{page}", 100, 1 h)` → `429 too many subscriptions, try again later`.
-  4. `subscribe`. `Queued`/`Suppressed` → `202 {"ok": true}`, then `tokio::spawn(incidents::worker::kick(state))`. `Full` → `429 this page is not accepting new subscriptions right now`.
-- `POST /public/status-subscriptions/confirm {token}` → `Confirmed` → `200 {"page": {"title", "url"}}`. `Expired` (MAC fine but nonce cleared, rotated or past `confirm_expires_at`) → `410 this link has expired or was already used; subscribe again`. `Invalid` → `404 {"error":"not found"}`.
+  3. `hit("subscribe-ip:{client_key}", 5, 1 h)` and `hit("subscribe-page:{page}", 100, 1 h)` → `json_error(429, "too many subscriptions, try again later")`.
+  4. `subscribe`. `Queued`/`Suppressed` → `202 {"ok": true}`, then `let s = state.clone(); tokio::spawn(async move { incidents::worker::kick(&s).await });` (`kick` borrows). `Full` → `json_error(429, "this page is not accepting new subscriptions right now")`.
+- `POST /public/status-subscriptions/confirm {token}` → `Confirmed` → `200 {"page": {"title", "url"}}`. `Expired` (MAC fine but nonce cleared, rotated or past `confirm_expires_at`) → `json_error(410, "this link has expired or was already used; subscribe again")` (no dependency on INC-11's `AppError::Gone`). `Invalid` (MAC fails, or the subscriber row is gone) → `json_error(404, "not found")`.
 - The token router has its own governor (`SmartIpKeyExtractor`, burst 20, `per_second(3)`).
 
 - [ ] **Step 1: Write the migrations**
@@ -2189,8 +2314,11 @@ alter table notification_deliveries
     add column priority smallint not null default 0 check (priority in (0, 1));
 
 -- 0062's unnamed checks on `event` and on (user_id, channel_id) are replaced by one rule per row kind.
+-- Matched by definition, not by the generated names (`notification_deliveries_event_check`,
+-- `notification_deliveries_check`/`_check1` depend on declaration order). Exactly two must go:
+-- anything else means 0062 drifted from its plan, and the migration stops instead of guessing.
 do $$
-declare c record;
+declare c record; dropped int := 0;
 begin
     for c in select conname from pg_constraint
              where conrelid = 'notification_deliveries'::regclass and contype = 'c'
@@ -2198,7 +2326,11 @@ begin
                  or pg_get_constraintdef(oid) like '%user_id IS NOT NULL%channel_id IS NOT NULL%')
     loop
         execute format('alter table notification_deliveries drop constraint %I', c.conname);
+        dropped := dropped + 1;
     end loop;
+    if dropped <> 2 then
+        raise exception 'expected to replace 2 checks on notification_deliveries, found %', dropped;
+    end if;
 end $$;
 
 alter table notification_deliveries add constraint notification_deliveries_row_kind check (
@@ -2271,7 +2403,7 @@ returning d.id, d.incident_id, d.event, d.round, d.user_id, d.channel_id, d.atte
           d.status_page_id, d.subscriber_id, d.status_report_update_id
 ```
 
-Dispatch per claimed row: `incident_id` set → the existing path, unchanged. Otherwise → `deliver::send`. Its `Outcome` is recorded with the same status/backoff rules (`Sent` → `sent`, `Cancelled` → `cancelled`, `Failed` → `R12`'s retry rules), without any `incident_events` row. The incidents worker's loop also runs, at most once per hour per process, `delete from status_page_subscribers where confirmed_at is null and created_at < now() - interval '48 hours'` and `delete from status_page_rate_hits where hit_at < now() - interval '1 day'`.
+Dispatch per claimed row: `incident_id` set → the existing path, unchanged. Otherwise → `deliver::send`. Its `Outcome` is recorded with the same status/backoff rules (`Sent` → `sent`, `Cancelled` → `cancelled`, `Failed` → the Incidents plan's retry rules (its R12; Task 5 Step 3 (2f))), without any `incident_events` row. The incidents worker's loop also runs, at most once per hour per process, `delete from status_page_subscribers where confirmed_at is null and created_at < now() - interval '48 hours'` and `delete from status_page_rate_hits where hit_at < now() - interval '1 day'`.
 
 - [ ] **Step 3: Write the failing tests** — `tests/status_subscribers.rs`:
 
@@ -2372,6 +2504,9 @@ async fn subscribe_is_rate_limited_per_address_and_capped_per_page(pool: sqlx::P
         .bind(page).execute(&pool).await.unwrap();
     let (status, body) = subscribe(&app, "acme", "203.0.113.51", json!({ "email": unique_email("full"), "components": null })).await;
     assert_eq!((status, body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("this page is not accepting new subscriptions right now")));
+    // A known (pending) address gets the very same answer: the cap is no enumeration oracle (R15).
+    let (status, body2) = subscribe(&app, "acme", "203.0.113.52", json!({ "email": "p1@pending.test", "components": null })).await;
+    assert_eq!((status, body2), (StatusCode::TOO_MANY_REQUESTS, body));
 }
 
 #[sqlx::test]
@@ -2384,7 +2519,7 @@ async fn components_must_be_on_the_page_and_private_pages_need_access(pool: sqlx
     let foreign = common::seed_component(&pool, other, "API", Some(m), None).await;
     let (status, _) = subscribe(&app, "acme", "203.0.113.60", json!({ "email": unique_email("c"), "components": [foreign] })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    for bad in ["not-an-email", "a@b", "x@y.test\r\nBcc: z@w.test", &format!("{}@x.test", "a".repeat(250))] {
+    for bad in ["not-an-email", "a@b", "x@y.test\r\nBcc: z@w.test", format!("{}@x.test", "a".repeat(250)).as_str()] {
         assert_eq!(subscribe(&app, "acme", "203.0.113.61", json!({ "email": bad, "components": null })).await.0, StatusCode::BAD_REQUEST, "{bad}");
     }
     sqlx::query("update status_pages set visibility = 'private', password_hash = 'x' where id = $1").bind(page).execute(&pool).await.unwrap();
@@ -2444,8 +2579,9 @@ Add the subscribe and confirm routes to `json_bodies.rs`.
 Run: engine command `--lib -- status_pages::tokens`, then engine command `--test status_subscribers --test migrations --test json_bodies --test notification_deliveries`. Expected: FAIL (`notification_deliveries` must stay green after the change).
 
 - [ ] **Step 4: Implement.** `subscribe` (one transaction, `pg_advisory_xact_lock(hashtext('subscribers:' || page_id))`):
+  0. Count confirmed and pending rows of the page. Either at its cap (10,000 / 500) → `Full`, **before** looking at the address (R15: the answer must not depend on whether the address is known).
   1. `select … for update` the `(page, email)` row.
-  2. None → count confirmed and pending. Over either cap → `Full`. Otherwise insert with `confirm_nonce = random`, `confirm_expires_at = now() + 48 h`, `token_nonce = random`, the component rows (`all_components = components.is_none()`), and enqueue `sp_confirm`.
+  2. None → insert with `confirm_nonce = random`, `confirm_expires_at = now() + 48 h`, `token_nonce = random`, the component rows (`all_components = components.is_none()`), and enqueue `sp_confirm`.
   3. Pending → rotate `confirm_nonce`, extend expiry, replace components, enqueue `sp_confirm` if under the send cap.
   4. Confirmed → enqueue `sp_subscribed` if under the send cap (components unchanged).
   5. The send cap: when `confirmation_window_started_at` is null or older than 24 h, reset `confirmation_sends = 0` and the window start to now. Then `confirmation_sends < 3` → increment it and `confirmation_sends_total`, and enqueue with `round = 'confirm-' || confirmation_sends_total`. Otherwise `Suppressed`.
@@ -2511,8 +2647,8 @@ Routes:
   - an Unsubscribe token → `200 {"purpose": "unsubscribe", "page": {…}, "email": "j***@…"}`;
   - anything else → 404. The masked address is the first character, `***`, then `@domain`.
 - `POST /public/status-subscriptions/manage {token, components: [uuid] | null}` (Manage only) → `200 {"ok": true}`. A component not on the page → 400.
-- `POST /public/status-subscriptions/unsubscribe {token}` (Manage or Unsubscribe) → deletes the subscriber (its queued rows cascade) → `200 {"ok": true}`. Unknown or invalid → 404.
-- Public listener: `POST /api/v1/status-subscriptions/one-click/{token}` (RFC 8058). It accepts any body up to 1 KiB of any content type, verifies an Unsubscribe token, deletes the subscriber, and answers `200 unsubscribed` (text/plain). An invalid token → 404. It sits behind a governor keyed by the TCP peer (`PeerIpKeyExtractor`, burst 20, `per_second(3)`).
+- `POST /public/status-subscriptions/unsubscribe {token}` (Manage or Unsubscribe) → deletes the subscriber (its queued rows cascade) → `200 {"ok": true}`. Idempotent (R16): a MAC-valid token whose subscriber is already gone also answers 200. A token whose MAC fails → 404.
+- Public listener: `POST /api/v1/status-subscriptions/one-click/{token}` (RFC 8058). It accepts any body up to 1 KiB of any content type (`DefaultBodyLimit::max(1024)`; the public router has no JSON guard), verifies an Unsubscribe token's MAC **before** touching the database, deletes the subscriber if it still exists, and answers `200 unsubscribed` (text/plain) either way (idempotent; mail providers retry). A token whose MAC fails or whose purpose is not Unsubscribe → 404. CSRF is not a concern here (no cookie; the token is the only credential). It sits behind a governor keyed by the TCP peer (R13: `PeerIpKeyExtractor`, burst 100, `per_millisecond(20)`). Production serves the public listener with `ConnectInfo` (`serve.rs`); tests wrap `common::public_app(state)` in `nami_engine::router::with_fallback_connect_info`, or the peer extractor fails.
 - Admin: `GET /projects/{id}/status-pages/{page_id}/subscribers` (admin) → `[{id, email, confirmed, all_components, components: [uuid], created_at}]`. `DELETE …/subscribers/{subscriber_id}` (admin) → 204. A member or viewer → 403.
 
 `deliver::send` for `sp_update`:
@@ -2568,7 +2704,8 @@ async fn an_update_reaches_confirmed_subscribers_of_affected_components_only(poo
 async fn emails_carry_one_click_unsubscribe_and_single_purpose_links(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = common::app(state.clone());
-    let public = common::public_app(state.clone());
+    // The one-click governor keys on the TCP peer: oneshot requests carry no ConnectInfo without this.
+    let public = nami_engine::router::with_fallback_connect_info(common::public_app(state.clone()));
     let project = seed_project(&pool).await;
     let (_, _, member) = common::user_with_role(&app, &pool, project, Some("member")).await;
     let page = common::seed_status_page(&pool, project, "acme").await;
@@ -2581,8 +2718,24 @@ async fn emails_carry_one_click_unsubscribe_and_single_purpose_links(pool: sqlx:
     let mail = stored_mail_for(&email).await.remove(0);
     assert!(mail.bcc.is_empty(), "no extra recipient");
     assert_eq!(mail.subject, "[Acme] <script>alert(1)</script> Bcc: x@evil.test", "plain text, one line");
-    assert!(mail.raw.contains("List-Unsubscribe: <http://localhost:8081/api/v1/status-subscriptions/one-click/"), "{}", mail.raw);
-    assert!(mail.raw.contains("List-Unsubscribe-Post: List-Unsubscribe=One-Click"));
+    // lettre may fold a long header line: read header values unfolded (RFC 5322 §2.2.3).
+    let header = |name: &str| -> Option<String> {
+        let mut lines = mail.raw.split("\n\n").next().unwrap().lines().peekable();
+        while let Some(line) = lines.next() {
+            if let Some(rest) = line.strip_prefix(&format!("{name}:")) {
+                let mut value = rest.trim().to_string();
+                while lines.peek().is_some_and(|l| l.starts_with([' ', '\t'])) {
+                    value.push_str(lines.next().unwrap().trim());
+                }
+                return Some(value);
+            }
+        }
+        None
+    };
+    let list_unsubscribe = header("List-Unsubscribe").unwrap_or_else(|| panic!("{}", mail.raw));
+    assert!(list_unsubscribe.starts_with("<http://localhost:8081/api/v1/status-subscriptions/one-click/") && list_unsubscribe.ends_with('>'),
+        "{list_unsubscribe}");
+    assert_eq!(header("List-Unsubscribe-Post").as_deref(), Some("List-Unsubscribe=One-Click"));
     let manage = link_token(&mail.text, "/subscribe/manage?token=");
     let unsubscribe = link_token(&mail.text, "/unsubscribe?token=");
     let one_click = |t: &str| { let public = public.clone(); let uri = format!("/api/v1/status-subscriptions/one-click/{t}");
@@ -2597,7 +2750,38 @@ async fn emails_carry_one_click_unsubscribe_and_single_purpose_links(pool: sqlx:
     assert_eq!(one_click(&unsubscribe).await, StatusCode::OK);
     let left: i64 = sqlx::query_scalar("select count(*) from status_page_subscribers where id = $1").bind(subscriber).fetch_one(&pool).await.unwrap();
     assert_eq!(left, 0);
-    assert_eq!(one_click(&unsubscribe).await, StatusCode::NOT_FOUND);
+    assert_eq!(one_click(&unsubscribe).await, StatusCode::OK, "idempotent: a provider's retry is still a success");
+    let mut forged = unsubscribe.clone().into_bytes();
+    let i = forged.len() - 2; forged[i] = if forged[i] == b'A' { b'B' } else { b'A' };   // inside the MAC, as in the confirm test
+    assert_eq!(one_click(&String::from_utf8(forged).unwrap()).await, StatusCode::NOT_FOUND, "a token whose MAC fails");
+    // The manage link of a deleted subscriber is dead too (ruling 1).
+    let (status, _, _) = call_raw(&app, "POST", "/public/status-subscriptions/inspect", &[], Some(json!({ "token": manage }))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test]
+async fn automatic_report_emails_carry_component_names_only(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let project = seed_project(&pool).await;
+    let page = common::seed_status_page(&pool, project, "acme").await;
+    sqlx::query("update status_pages set automatic_reports = true where id = $1").bind(page).execute(&pool).await.unwrap();
+    let m = common::seed_http_monitor(&pool, project, "db-primary-internal", "https://secret-internal.test:8443/h?k=hunter2", 1).await;
+    common::seed_component(&pool, page, "Database", Some(m), None).await;
+    let email = unique_email("auto");
+    confirmed(&pool, page, &email, None).await;
+    let mut tx = pool.begin().await.unwrap();
+    nami_engine::incidents::lifecycle::open(&mut tx, &nami_engine::incidents::lifecycle::OpenIncident {
+        project_id: project, source: nami_engine::incidents::lifecycle::IncidentSource::Monitor(m),
+        title: "db-primary-internal is DOWN", cause: Some("connection refused to 10.0.0.5"), severity_id: None,
+        metadata: None, started_at: chrono::Utc::now() }).await.unwrap().unwrap();
+    tx.commit().await.unwrap();
+    run_incident_ticks(&state).await;
+    let mail = settled_mail(&email, 1).await;
+    let text = format!("{} {}", mail[0].0, mail[0].1);
+    assert!(text.contains("Database"), "{text}");
+    for secret in ["db-primary-internal", "secret-internal", "hunter2", "8443", "10.0.0.5", "refused", m.to_string().as_str()] {
+        assert!(!text.contains(secret), "{secret} in {text}");
+    }
 }
 
 #[sqlx::test]
@@ -2642,15 +2826,15 @@ async fn only_admins_see_subscribers_and_the_dto_never_does(pool: sqlx::PgPool) 
 }
 ```
 
-`email.rs` unit test: `send_with_headers` refuses a value containing `\r` or `\n` with a Validation error and sends nothing (Mailer pointed at `127.0.0.1:9`, so a send attempt would show up as a timeout rather than a Validation error).
+`email.rs` unit test: `send_with_headers` refuses a value containing `\r` or `\n` and sends nothing. Note that on `main` `Mailer::send` reports SMTP failures as `AppError::Validation("could not send email")` too, so the test must compare the **message**: the refusal is `AppError::Validation("invalid email header")`, and with the Mailer pointed at `127.0.0.1:9` an attempted send would come back as `"could not send email"` instead. A second case sends a clean header to the same dead port and asserts `"could not send email"`, proving the two are told apart.
 
-Add `inspect`, `manage` and `unsubscribe` to `json_bodies.rs`. The one-click route is exempt by design and gets its own test `the_one_click_route_takes_a_form_body` (above).
+Add `inspect`, `manage` and `unsubscribe` to `json_bodies.rs`. The one-click route is exempt by design: `emails_carry_one_click_unsubscribe_and_single_purpose_links` (above) posts it as `application/x-www-form-urlencoded` on the public listener. Also add `the_one_click_route_takes_a_form_body` to `json_bodies.rs`, next to `pings_on_the_public_listener_take_any_body`: a form body with a junk token gets 404, not 415.
 
 Run: engine command `--test status_subscribers --test json_bodies --test status_automatic`, then engine command `--lib -- email`. Expected: FAIL.
 
 - [ ] **Step 2: Implement.**
   - `routes::status_reports` calls `enqueue_update` for the first update of a new report and for every posted update, inside the write's transaction, then `tokio::spawn(kick)` after commit.
-  - `automatic.rs` calls it after each insert/update (the uptime worker's `notify_transition` kick drains them).
+  - `automatic.rs` calls it after each insert/update (the uptime worker's `notify_transition` kick drains them). It runs inside the uptime worker's or heartbeat handler's transaction, so it is one `insert … select` (up to 10,000 rows for a full page), never a loop.
   - `public_engine_url` is validated in `from_env` like nami-ui's `publicEngineUrl` (absolute http(s), no credentials, query or fragment; trailing slashes trimmed). Document it in `.env.example` next to `UI_BASE_URL`.
 
 - [ ] **Step 3: Run** both commands again, the full suite and clippy. Expected: green.
@@ -2705,7 +2889,8 @@ export function parseSource(raw: string): Parsed<{ monitor_id: string } | { hear
 Editor (`/projects/{id}/status-pages/{pageId}`), every form shown only when `data.role === 'admin'` (R22). The engine stays the authority; a 403 shows as the form message.
 - **Settings:** title, slug, description, timezone, theme, accent colour (`<input type="color">` plus text), logo and dark logo URLs, four nav-link rows, `noindex`, automatic reports + "notify subscribers" for them. "Webhook subscribers" is shown disabled with "available soon" (Part 2).
 - **Visibility:** public/private, a password (write-only, placeholder "unchanged" when `has_password`, a "remove password" checkbox), an IP allowlist textarea (one CIDR per line). The note says: "Changing the password, allowlist or visibility signs everyone out of this page."
-- **Custom domain:** the domain, then the TXT record name/value to add and a "Verify" button (action `verifyDomain`). Status is verified or not. A help line points at the README's TLS section.
+- **Custom domain:** the domain, then the TXT record name/value to add and a "Verify" button (action `verifyDomain`). Status is verified or not. A help line points at the README's TLS section. Saving the settings form resends the current domain; the engine keeps the verification when the value is unchanged (Task 3).
+- **IP allowlist note:** "The allowlist matches the visitor address nami-ui sees. Behind a reverse proxy this needs ADDRESS_HEADER and XFF_DEPTH set (README), or every visitor looks like the proxy."
 - **Sections and components:** add/rename sections; up/down buttons (actions `moveSection`/`moveComponent` swap the `position` of two neighbours with two PATCHes); add a component (display name, description, source `<select>` grouped Monitors/Heartbeats showing source names, "show uptime bars"); "Import a group" (select of monitor groups) with the note "Component names will be the monitor and heartbeat names. They are public; rename them if needed."; two-step deletes (`confirm=yes`) for sections ("deletes its components"), components and the page.
 - **Links:** the public URL, `/feed.atom`, `/badge.svg` and `/status.json` (the last only for public pages).
 - The load sets `cache-control: private, no-store` (the page shows the TXT value and the allowlist).
@@ -2876,8 +3061,9 @@ git commit -m "feat(ui): status report composer, update timeline and subscriber 
 Branch `feat/NAMI-SP-13-ui-public-page`, worktree `.worktrees/NAMI-SP-13/`.
 
 **Files:**
-- Create: `nami-ui/src/hooks.ts`, `nami-ui/src/hooks.server.ts`, `nami-ui/src/lib/status-routing.ts` (+ `.test.ts`), `nami-ui/src/lib/server/status-public.ts` (+ `.test.ts`), `nami-ui/src/lib/components/UptimeBars.svelte`, `nami-ui/src/routes/status/[slug]/+page.server.ts`, `+page.svelte`, `+error.svelte`, `public-page.test.ts`, `nami-ui/src/routes/_nami/tls-ask/+server.ts` (+ `server.test.ts`)
-- Modify: `nami-ui/package.json` + lock (`npm install -D @sveltejs/adapter-node@6.0.0`, `npm uninstall @sveltejs/adapter-auto`), `nami-ui/vite.config.ts` (`import adapter from '@sveltejs/adapter-node'`), `nami-ui/src/lib/server/engine.ts` (`callPublicEngine`), `nami-ui/src/lib/server/engine.test.ts`, `nami-ui/src/lib/server/fake-event.ts` (options `headers`, `cookies` read by `cookies.get`; `calls()` also returns request `headers`), `nami-ui/.env.example`, `nami-ui/README.md`
+- Create: `nami-ui/src/hooks.ts`, `nami-ui/src/hooks.server.ts` (+ `hooks.server.test.ts`), `nami-ui/src/lib/status-routing.ts` (+ `.test.ts`), `nami-ui/src/lib/server/status-public.ts` (+ `.test.ts`), `nami-ui/src/lib/components/UptimeBars.svelte`, `nami-ui/src/routes/status/[slug]/+page.server.ts`, `+page.svelte`, `+error.svelte`, `public-page.test.ts`, `nami-ui/src/routes/_nami/tls-ask/+server.ts` (+ `server.test.ts`)
+- Modify: `nami-ui/package.json` + lock (`npm install -D @sveltejs/adapter-node@6.0.0`, `npm uninstall @sveltejs/adapter-auto`), `nami-ui/vite.config.ts` (`import adapter from '@sveltejs/adapter-node'`; there is no `svelte.config.js` in this repo, the Kit config lives in the `sveltekit({...})` plugin call; do **not** add `paths.origin` or `csrf.trustedOrigins`), `nami-ui/src/lib/server/engine.ts` (`callPublicEngine`), `nami-ui/src/lib/server/engine.test.ts`, `nami-ui/src/lib/server/fake-event.ts`, `nami-ui/.env.example`, `nami-ui/README.md`
+- `fake-event.ts` extension (backwards compatible; every existing suite must stay green): options `headers?: Record<string, string>` (set on the fake `request`, also for form posts) and `cookies?: Record<string, string>` (read by a new `cookies.get(name)`; `cookies.set` stays a `vi.fn()`); `calls()` entries gain `headers: Record<string, string>`, built from `new Headers(init.headers)` with lowercased names, so a `Headers` object and a plain object both work.
 
 **Interfaces:**
 - Consumes: Task 6 DTO and routes, Task 7 unlock, Task 3 domain check, NAMI-INC-12 `renderMarkdown`, Task 11 `STATUS_LABELS`, `statusClass`, `BANNER_TEXT`.
@@ -2886,20 +3072,27 @@ Branch `feat/NAMI-SP-13-ui-public-page`, worktree `.worktrees/NAMI-SP-13/`.
 ```ts
 // lib/status-routing.ts
 export const DOMAIN_SENTINEL = '_domain';
-/** R4. `appHost` null (APP_ORIGIN unset) → never reroutes. Paths under /_app/ are never rerouted (static assets). */
+/** R4. `appHost` null (APP_ORIGIN unset) → never reroutes. Paths under /_app/ (static assets) and /_nami/
+ *  (the TLS ask endpoint, called on internal host names) are never rerouted. Compares `url.host` (with port). */
 export function statusReroute(url: URL, appHost: string | null): string | undefined;
-// hooks.ts
-export const reroute: Reroute;   // server only: statusReroute(url, host of process.env.APP_ORIGIN); in the browser → undefined
+// hooks.ts (universal hooks: this file is also bundled for the browser)
+/** `typeof window !== 'undefined'` → undefined, checked first; then statusReroute(url, host of
+ *  globalThis.process?.env?.APP_ORIGIN). `process` does not exist in the browser, so it is never touched there. */
+export const reroute: Reroute;
 
 // lib/server/engine.ts
-/** Public status routes: no cookie forwarded, X-Forwarded-For = event.getClientAddress() only, `set-cookie` never relayed.
+/** Public status routes: headers built from scratch (no visitor header is copied, so no cookie, no visitor
+ *  X-Forwarded-For / X-Real-IP / Forwarded), X-Forwarded-For = event.getClientAddress() only (a throw, which
+ *  adapter-node does when ADDRESS_HEADER is set but absent, → no X-Forwarded-For), `set-cookie` never relayed.
  *  `access` (the nami_sp_access cookie value) goes out as X-Nami-Page-Access. */
 export async function callPublicEngine(event: RequestEvent, path: string, init?: RequestInit & { access?: string }): Promise<Response>;
 
 // lib/server/status-public.ts
 export type PageRef = { kind: 'slug'; slug: string } | { kind: 'domain'; host: string };
 export const ACCESS_COOKIE = 'nami_sp_access';
-/** `_domain` → the request host, only when it is not the app host; a slug must match ^[a-z0-9-]{3,63}$; else null. */
+/** A slug must match ^[a-z0-9-]{3,63}$. `_domain` → `{kind: 'domain', host}` with host = `url.hostname`
+ *  lowercased, one trailing "." stripped, matching the hostname rule; only when APP_ORIGIN is set and
+ *  `url.host` is not its host. Anything else → null. */
 export function pageRef(event: RequestEvent): PageRef | null;
 export function enginePrefix(ref: PageRef): string;             // enginePath`/public/status-pages/${slug}` | enginePath`/public/status-domains/${host}`
 export function basePath(ref: PageRef): string;                 // "/status/<slug>" | ""
@@ -2928,13 +3121,14 @@ Page behaviour (`/status/[slug]`, `export const csr = false`, `export const prer
   - Then active reports and upcoming maintenance, each update with `{@html renderMarkdown(message)}` and `id="report-{id}"` anchors, then history, then the subscribe form (Task 14), then the footer "Powered by Nami".
   - Dates are formatted with `Intl.DateTimeFormat('en-GB', { timeZone: page.timezone, … })`.
   - `<svelte:head>` gets `<meta name="robots" content="noindex">` when `noindex` or private.
-- `hooks.server.ts` `handle`: for any route id starting `/status/[slug]` it adds:
+- `hooks.server.ts` (new; `main` has none) `handle`: for every response whose route id starts `/status/[slug]`, **and** for every response on a custom-domain host (`APP_ORIGIN` set and `url.host` differs; this covers the 404s of unmatched paths, whose route id is null), it adds:
   - `content-security-policy: default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' https:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'`;
-  - `x-content-type-options: nosniff`, `referrer-policy: no-referrer`, `x-frame-options: DENY`.
+  - `x-content-type-options: nosniff`, `referrer-policy: no-referrer`, `x-frame-options: DENY`;
+  - on a status ≥ 400: `cache-control: no-store` (a shared cache must never keep the "locked or unknown" page, and it carries no `Last-Modified` for heuristic caching anyway).
 
-  Feed, badge and JSON override what they need (Task 15). `handle` passes everything else through unchanged.
-- `/_nami/tls-ask?domain=<host>`: only when `url.host` is the app host (otherwise 404, and on a custom domain the reroute already makes it unreachable). The host goes through a lowercase hostname regex, then `GET /public/status-domain-check/{host}` via `callPublicEngine`. Answers 200/404 with an empty body.
-- `.env.example` documents `APP_ORIGIN`, `ADDRESS_HEADER`/`XFF_DEPTH` (adapter-node; set them to the header the reverse proxy overwrites), `HOST_HEADER`/`PROTOCOL_HEADER` (needed for custom domains), and "do not set ORIGIN when custom domains are used" (R4). The README gets a "Custom domains and TLS" section: the TXT record, the Caddy `on_demand_tls { ask http://nami-ui:3000/_nami/tls-ask }` snippet, and the manual-certificate alternative.
+  Feed, badge and JSON override what they need (Task 15). `handle` passes everything else through unchanged. `/_nami/` responses are left alone.
+- `/_nami/tls-ask?domain=<host>`: served on any host (never rerouted, R4). The host goes through a lowercase hostname regex, then `GET /public/status-domain-check/{host}` via `callPublicEngine`. Answers 200/404 with an empty body. It reveals only whether a name is a verified custom domain, which public DNS already shows.
+- `.env.example` documents (R4): `APP_ORIGIN`; `ADDRESS_HEADER=x-forwarded-for` and `XFF_DEPTH=<proxies that append>` (required behind a proxy, or rate limits and IP allowlists see the proxy's address); `PROTOCOL_HEADER=x-forwarded-proto` (the protocol defaults to `https` when unset); `HOST_HEADER` left unset with the proxy forwarding the original `Host` (or `x-forwarded-host` only if the proxy always overwrites it); `BODY_SIZE_LIMIT` left at its default; and that adapter-node 6 has no `ORIGIN` variable and `kit.paths.origin` must stay unset for custom domains. The README gets a "Custom domains and TLS" section: the TXT record, the Caddy `on_demand_tls { ask http://nami-ui:3000/_nami/tls-ask }` snippet, a Caddy `reverse_proxy` block that sets `X-Forwarded-For`/`X-Forwarded-Proto` and keeps `Host`, the manual-certificate alternative, and "health checks must use the APP_ORIGIN host".
 
 - [ ] **Step 1: Failing tests**
 
@@ -2961,12 +3155,14 @@ describe('statusReroute', () => {
 
 	it('a custom domain reaches only its own page', () => {
 		// The app's routes and other pages become paths under the sentinel, where no route exists.
-		for (const p of ['/login', '/projects/c13bc10a-d17f-443b-8976-c6d9b54e2798', '/status/other-slug', '/_nami/tls-ask', '/logout'])
+		for (const p of ['/login', '/projects/c13bc10a-d17f-443b-8976-c6d9b54e2798', '/status/other-slug', '/status/_domain', '/logout'])
 			expect(r(`https://status.acme.test${p}`)).toBe(`/status/_domain${p}`);
 	});
 
-	it('serves static assets on every host', () => {
+	it('serves static assets and the TLS ask endpoint on every host', () => {
 		expect(r('https://status.acme.test/_app/immutable/assets/app.css')).toBeUndefined();
+		// Caddy calls the ask endpoint on an internal name such as nami-ui:3000.
+		expect(r('http://nami-ui:3000/_nami/tls-ask?domain=status.acme.test')).toBeUndefined();
 	});
 
 	it('compares hosts without case or a default port', () => {
@@ -2990,18 +3186,28 @@ describe('callPublicEngine', () => {
 		expect(call.headers['x-forwarded-for']).toBe('203.0.113.5');   // getClientAddress(), not the visitor's header
 		expect(call.headers['cookie']).toBeUndefined();
 		expect(call.headers['x-nami-page-access']).toBe('v1.tok');
+		expect(call.headers['x-real-ip']).toBeUndefined();
+		expect(call.headers['forwarded']).toBeUndefined();
 		expect(event.cookies.set).not.toHaveBeenCalled();
+	});
+
+	it('sends no address when adapter-node cannot determine one', async () => {
+		const { event, calls } = fakeEvent({ headers: { 'x-forwarded-for': '10.0.0.1', 'x-real-ip': '10.0.0.1' } });
+		event.getClientAddress = () => { throw new Error('Address header was specified with ADDRESS_HEADER=x-forwarded-for but is absent from request'); };
+		await callPublicEngine(event, '/public/status-pages/acme');
+		expect(calls()[0].headers['x-forwarded-for']).toBeUndefined();
+		expect(calls()[0].headers['x-real-ip']).toBeUndefined();
 	});
 });
 ```
 
-`status-public.test.ts`: `pageRef` returns `{kind: 'slug'}` for `acme`, null for `Acme`, `a`, `../x` and for `_domain` on the app host, and `{kind: 'domain', host: 'status.acme.test'}` for `_domain` on that host. `accessCookieOptions` has path `/status/acme` for a slug and `/` for a domain, `secure` true only on https, and maxAge `2592000`.
+`status-public.test.ts` (env through `vi.stubEnv('APP_ORIGIN', …)` with `afterEach(() => vi.unstubAllEnvs())`, never by assigning `process.env`): `pageRef` returns `{kind: 'slug'}` for `acme`, null for `Acme`, `a`, `../x`, for `_domain` on the app host and for `_domain` on any host when `APP_ORIGIN` is unset, and `{kind: 'domain', host: 'status.acme.test'}` for `_domain` on `https://Status.Acme.Test./` and on `https://status.acme.test:8443/` (hostname only, no port). `accessCookieOptions` has path `/status/acme` for a slug and `/` for a domain, `secure` true only on https, and maxAge `2592000`.
 
 `public-page.test.ts`:
 
 ```ts
 import { render } from 'svelte/server';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fakeEvent } from '#lib/server/fake-event';
 import { actions, load } from './+page.server';
 import Page from './+page.svelte';
@@ -3013,7 +3219,16 @@ const dto = (over: Record<string, unknown> = {}) => ({ page: { slug: 'acme', tit
 const ok = (body = dto(), headers: Record<string, string> = { etag: '"abc"', 'cache-control': 'public, max-age=30' }) =>
 	() => new Response(JSON.stringify(body), { headers });
 
+afterEach(() => vi.unstubAllEnvs());
+
 describe('public status page load', () => {
+	it('the domain sentinel is refused everywhere when custom domains are off', async () => {
+		vi.stubEnv('APP_ORIGIN', '');
+		const { event, calls } = fakeEvent({ params: { slug: '_domain' }, url: 'https://status.acme.test/status/_domain' });
+		await expect(load(event)).rejects.toMatchObject({ status: 404 });
+		expect(calls()).toEqual([]);
+	});
+
 	it('loads by slug and passes the cache headers on', async () => {
 		const { event, calls, setHeaders } = fakeEvent({ params: { slug: 'acme' }, url: 'https://nami.acme.test/status/acme', respond: ok() });
 		expect(await load(event)).toMatchObject({ dto: { page: { slug: 'acme' } }, base: '/status/acme' });
@@ -3022,14 +3237,14 @@ describe('public status page load', () => {
 	});
 
 	it('the domain sentinel is refused on the app host', async () => {
-		process.env.APP_ORIGIN = 'https://nami.acme.test';
+		vi.stubEnv('APP_ORIGIN', 'https://nami.acme.test');
 		const { event, calls } = fakeEvent({ params: { slug: '_domain' }, url: 'https://nami.acme.test/status/_domain' });
 		await expect(load(event)).rejects.toMatchObject({ status: 404 });
 		expect(calls()).toEqual([]);
 	});
 
 	it('a custom domain looks the page up by host', async () => {
-		process.env.APP_ORIGIN = 'https://nami.acme.test';
+		vi.stubEnv('APP_ORIGIN', 'https://nami.acme.test');
 		const { event, calls } = fakeEvent({ params: { slug: '_domain' }, url: 'https://status.acme.test/', respond: ok() });
 		expect(await load(event)).toMatchObject({ base: '' });
 		expect(calls()[0].path).toBe('/public/status-domains/status.acme.test');
@@ -3094,9 +3309,11 @@ describe('public page render', () => {
 });
 ```
 
-`tls-ask/server.test.ts`: on the app host a verified domain → 200 (engine 204), unknown → 404, an invalid `domain` (`a b`, `../x`, empty) → 404 without an engine call, and a request on a non-app host → 404 without an engine call.
+`tls-ask/server.test.ts`: a verified domain → 200 (engine 204), unknown → 404, an invalid `domain` (`a b`, `../x`, empty) → 404 without an engine call; a request on the internal host `http://nami-ui:3000` behaves the same as on the app host (Caddy's call).
 
-Run: UI command with `src/lib/status-routing.test.ts src/lib/server/status-public.test.ts src/lib/server/engine.test.ts src/routes/status src/routes/_nami`. Expected: FAIL.
+`hooks.server.test.ts`: `handle` adds the CSP, `nosniff`, `no-referrer` and `DENY` headers to a `/status/[slug]` response and to a 404 on a custom-domain host (route id null), adds `cache-control: no-store` to a status ≥ 400 there, and leaves an app route (`/projects/…`) and `/_nami/tls-ask` untouched.
+
+Run: UI command with `src/lib/status-routing.test.ts src/lib/server/status-public.test.ts src/lib/server/engine.test.ts src/hooks.server.test.ts src/routes/status src/routes/_nami`. Expected: FAIL.
 
 - [ ] **Step 2: Implement.** Install adapter-node and switch `vite.config.ts`. Run `npm run build` once to prove the adapter builds (`build/` stays gitignored).
 - [ ] **Step 3: Run** the UI command again, then the full `npx vitest run` (existing suites must stay green with the extended `fakeEvent`) and `npm run check`. Expected: PASS, 0 errors and 0 warnings.
@@ -3207,7 +3424,7 @@ git commit -m "feat(ui): status page subscribe, confirm, manage and unsubscribe 
 
 ### Task 15 (NAMI-SP-15): UI — Atom feed, SVG badge, public JSON status API
 
-Branch `feat/NAMI-SP-15-feed-badge-json`, worktree `.worktrees/NAMI-SP-15/`. Depends on Task 13 only.
+Branch `feat/NAMI-SP-15-feed-badge-json`, worktree `.worktrees/NAMI-SP-15/`. Uses Task 13's helpers; runs after Task 14 (its Step 4 ticks the subscriber bullets of the roadmap).
 
 **Files:**
 - Create: `nami-ui/src/routes/status/[slug]/feed.atom/+server.ts`, `badge.svg/+server.ts`, `status.json/+server.ts`, `nami-ui/src/routes/status/[slug]/machine.test.ts`
@@ -3244,7 +3461,7 @@ Route rules:
 | `badge.svg` | as the page | `content-type: image/svg+xml`, `cache-control: public, max-age=60` (private: `private, no-store`), `content-security-policy: default-src 'none'; style-src 'unsafe-inline'`, `nosniff`, `etag` |
 | `status.json` | **public pages only** (a private page → 404 even with a valid cookie, R25) | `content-type: application/json`, `access-control-allow-origin: *` (never `-allow-credentials`), `cache-control: public, max-age=30`, `x-robots-tag: noindex` when noindex, `etag`, `nosniff` |
 
-Each answers `If-None-Match` equal to its ETag with 304 and no body. For JSON the ETag is the engine's; for the feed it is the engine's with `-atom`; for the badge, `-badge`. Unknown or locked → 404 with `text/plain` "not found". JSON `OPTIONS` is not needed (a simple GET, no preflight).
+Each answers `If-None-Match` equal to its ETag with 304 and no body, compared only after `fetchPage` returned the DTO (access granted, R10); a locked page is a 404 whatever `If-None-Match` says. For JSON the ETag is the engine's; for the feed it is the engine's with `-atom`; for the badge, `-badge`. Unknown or locked → 404 with `text/plain` "not found". JSON `OPTIONS` is not needed (a simple GET, no preflight).
 
 - [ ] **Step 1: Failing tests**
 
@@ -3324,11 +3541,13 @@ Not a numbered task. Per CLAUDE.md every sub-project ends with a dedicated secur
    - Tokens are bound to page + `access_epoch` + expiry, MAC-checked before parsing, and the key is held in `Zeroizing`.
    - The cookie is HttpOnly, page-scoped and Secure on https.
    - `X-Forwarded-For` from a browser never reaches the engine (only `getClientAddress()`); a missing address grants nothing.
-   - Document the adapter-node `ADDRESS_HEADER`/`XFF_DEPTH` deployment requirement in the PR.
+   - Access is decided from the fresh row on every request; no path serves a cached snapshot, or a 304, before the access check.
+   - Document the adapter-node `ADDRESS_HEADER`/`XFF_DEPTH` deployment requirement in the PR, and confirm `vite.config.ts` sets neither `paths.origin` nor `csrf.trustedOrigins`.
 4. **Subscribers.**
    - Same answer for new, pending and confirmed addresses. 3 emails per address per day, 5/hour/IP, 100/hour/page, 10,000 confirmed and 500 pending per page, 20 notified updates per report.
    - Confirm only by POST, single use, 48 h. Tokens single-purpose (confirm ≠ manage ≠ unsubscribe).
-   - One-click unsubscribe per RFC 8058. No header injection through titles or addresses.
+   - One-click unsubscribe per RFC 8058, idempotent, MAC checked before any database work. No header injection through titles or addresses.
+   - A full page answers 429 for known and new addresses alike.
 5. **Queue.**
    - Incident rows keep every Incidents Part 1 behaviour (their tests are green and unchanged except the claim statement).
    - Status-page rows never write `incident_events`, never block incident rows (priority), respect the page cap, and cascade away with their subscriber, update or page.
@@ -3340,6 +3559,6 @@ Not a numbered task. Per CLAUDE.md every sub-project ends with a dedicated secur
 8. **CSP.** Public HTML runs no script (`csr = false`); the CSP header is present on every status route; logos load with `no-referrer`.
 9. **RBAC.** Route × role table (outsider, viewer, member, admin, global admin) matches R22. `tests/json_bodies.rs` lists every new state-changing route except the one-click route.
 
-Then the **fix wave** for every Important finding and the Minor ones marked fix-now, a scoped re-review, merge, and a decisions log `docs/superpowers/decisions/2026-10-13-status-pages-part1.md` recording R1 … R25 (same format as the earlier logs). Part 2 (NAMI-SP-16 onward) starts from that `main`.
+Then the **fix wave** for every Important finding and the Minor ones marked fix-now, a scoped re-review, merge, and a decisions log `docs/superpowers/decisions/2026-10-13-status-pages-part1.md` recording R1 … R25 and the five controller rulings of 2026-10-19 (same format as the earlier logs). Part 2 (NAMI-SP-16 onward) starts from that `main`.
 
 No CI is configured on this repo yet. Every PR description states that, and lists the engine and UI commands run with their results.
