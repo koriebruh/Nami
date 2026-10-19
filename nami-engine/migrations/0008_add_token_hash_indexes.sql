@@ -1,2 +1,0 @@
-create index idx_email_verification_tokens_token_hash on email_verification_tokens(token_hash);
-create index idx_password_reset_tokens_token_hash on password_reset_tokens(token_hash);

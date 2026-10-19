@@ -63,9 +63,12 @@ pub const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(155);
 /// `logs::query::search::READ_SETTINGS`).
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
-/// Idempotent DDL applied by [`ClickHouse::migrate`], in order. Table names
-/// are unqualified because every request carries the `database` setting.
+/// Idempotent DDL applied by [`ClickHouse::migrate`], in order, grouped by
+/// domain (each statement is independent of the others). Table names are
+/// unqualified because every request carries the `database` setting.
 const MIGRATIONS: [&str; 3] = [
+    // ---- Uptime domain ----
+    // Check results of every monitor.
     "CREATE TABLE IF NOT EXISTS uptime_checks (
     monitor_id UUID,
     project_id UUID,
@@ -77,6 +80,19 @@ const MIGRATIONS: [&str; 3] = [
 ) ENGINE = MergeTree
 ORDER BY (monitor_id, checked_at)
 TTL toDateTime(checked_at) + INTERVAL 180 DAY",
+    // Every heartbeat ping (see `uptime::heartbeat::pings`): kind, exit code and the
+    // sanitized output the job sent.
+    "CREATE TABLE IF NOT EXISTS heartbeat_pings (
+    heartbeat_id UUID,
+    project_id UUID,
+    received_at DateTime64(3, 'UTC'),
+    kind Enum8('success' = 1, 'fail' = 2),
+    exit_code Nullable(Int32),
+    output String
+) ENGINE = MergeTree
+ORDER BY (heartbeat_id, received_at)
+TTL toDateTime(received_at) + INTERVAL 180 DAY",
+    // ---- Logs domain ----
     // Log events (see `logs::ingest::store`). `retention_days` is copied from the
     // source onto each row at ingest, so the TTL is per row; `pattern_hash`
     // is derived by ClickHouse and never inserted.
@@ -101,18 +117,6 @@ TTL toDateTime(checked_at) + INTERVAL 180 DAY",
 PARTITION BY toYYYYMMDD(dt)
 ORDER BY (project_id, dt, id)
 TTL toDateTime(dt) + toIntervalDay(retention_days)",
-    // Every heartbeat ping (see `uptime::heartbeat::pings`): kind, exit code and the
-    // sanitized output the job sent.
-    "CREATE TABLE IF NOT EXISTS heartbeat_pings (
-    heartbeat_id UUID,
-    project_id UUID,
-    received_at DateTime64(3, 'UTC'),
-    kind Enum8('success' = 1, 'fail' = 2),
-    exit_code Nullable(Int32),
-    output String
-) ENGINE = MergeTree
-ORDER BY (heartbeat_id, received_at)
-TTL toDateTime(received_at) + INTERVAL 180 DAY",
 ];
 
 /// Settings a caller may never pass as extra settings: they are owned by
