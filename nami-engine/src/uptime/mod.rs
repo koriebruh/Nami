@@ -5,6 +5,7 @@
 //! the non-http checks (`tls`), and alert delivery
 //! (`alerts`).
 pub mod alerts;
+pub mod availability;
 pub mod checker;
 pub mod dns;
 pub mod expiry;

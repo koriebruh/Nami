@@ -28,9 +28,11 @@ use crate::{
         },
         maintenance, monitor_group,
     },
+    routes::monitors::RangeQuery,
     state::AppState,
     uptime::{
         alerts,
+        availability::{self, Availability},
         heartbeat::{
             MAX_OUTPUT_BYTES, Ping, PingKind, SUCCESS_OUTPUT_MAX, is_well_formed_token,
             lookup_token, parse_signal, record_signal, sanitize_output_capped,
@@ -58,6 +60,10 @@ pub fn router() -> Router<AppState> {
             post(rotate_heartbeat_token),
         )
         .route(
+            "/projects/{id}/heartbeats/{heartbeat_id}/availability",
+            get(get_availability),
+        )
+        .route(
             "/projects/{id}/heartbeats/{heartbeat_id}/pings",
             get(list_pings),
         )
@@ -77,6 +83,27 @@ const PING_LOG_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Deserialize)]
 struct PingsQuery {
     limit: Option<u32>,
+}
+
+async fn get_availability(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
+    Query(range): Query<RangeQuery>,
+) -> Result<Json<Availability>, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    availability::check_range(range.from, range.to).map_err(AppError::Validation)?;
+    availability::for_heartbeat(
+        &state.db,
+        project_id,
+        heartbeat_id,
+        range.from,
+        range.to,
+        Utc::now(),
+    )
+    .await?
+    .map(Json)
+    .ok_or(AppError::NotFound)
 }
 
 async fn list_pings(

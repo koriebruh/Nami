@@ -13,7 +13,10 @@
 
 use std::str::FromStr;
 
-use chrono::{DateTime, Datelike, NaiveTime, TimeDelta, Timelike, Utc, Weekday};
+use chrono::{
+    DateTime, Datelike, LocalResult, NaiveDateTime, NaiveTime, TimeDelta, TimeZone, Timelike, Utc,
+    Weekday,
+};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool};
@@ -68,7 +71,77 @@ pub enum Schedule {
     },
 }
 
+/// A half-open interval of time, `[start, end)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Span {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// The first instant whose wall-clock time in `tz` is at or after `local`:
+/// the earlier of two on a repeated hour (`prefer_latest = false`) or the
+/// later one (`true`), the end of the gap for a skipped one.
+fn instant_at_or_after(tz: Tz, local: NaiveDateTime, prefer_latest: bool) -> DateTime<Utc> {
+    let mut candidate = local;
+    // A DST gap is at most a few hours; stop after 180 minutes regardless.
+    for _ in 0..=180 {
+        match tz.from_local_datetime(&candidate) {
+            LocalResult::Single(t) => return t.with_timezone(&Utc),
+            LocalResult::Ambiguous(first, second) => {
+                return if prefer_latest { second } else { first }.with_timezone(&Utc);
+            }
+            LocalResult::None => candidate += TimeDelta::minutes(1),
+        }
+    }
+    local.and_utc()
+}
+
 impl Schedule {
+    /// The spans inside `[from, to)` during which the window is in effect,
+    /// sorted by start, clipped to the range, possibly overlapping (weekly
+    /// windows whose days wrap past midnight do not overlap each other, but
+    /// callers merge anyway). Follows the wall-clock semantics of
+    /// [`Schedule::covers`]; the one difference is a window that starts or
+    /// ends inside a repeated DST hour, where `covers` has a hole and this
+    /// reports one span from the earliest start to the latest end.
+    pub fn spans(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<Span> {
+        let clip = |start: DateTime<Utc>, end: DateTime<Utc>| {
+            let (start, end) = (start.max(from), end.min(to));
+            (start < end).then_some(Span { start, end })
+        };
+        match self {
+            Schedule::Once { starts_at, ends_at } => {
+                clip(*starts_at, *ends_at).into_iter().collect()
+            }
+            Schedule::Weekly {
+                days,
+                start,
+                end,
+                timezone,
+            } => {
+                if from >= to {
+                    return Vec::new();
+                }
+                let first = from.with_timezone(timezone).date_naive() - TimeDelta::days(1);
+                let last = to.with_timezone(timezone).date_naive();
+                let wraps = end <= start;
+                let mut spans = Vec::new();
+                let mut day = first;
+                while day <= last {
+                    if days.contains(&day.weekday()) {
+                        let end_day = if wraps { day + TimeDelta::days(1) } else { day };
+                        let s = instant_at_or_after(*timezone, day.and_time(*start), false);
+                        let e = instant_at_or_after(*timezone, end_day.and_time(*end), true);
+                        spans.extend(clip(s, e));
+                    }
+                    day += TimeDelta::days(1);
+                }
+                spans.sort_by_key(|span| span.start);
+                spans
+            }
+        }
+    }
+
     /// Whether the window is in effect at `at`.
     ///
     /// - One-off: `starts_at <= at < ends_at`.
@@ -138,6 +211,13 @@ impl MaintenanceWindow {
 
     pub fn covers(&self, at: DateTime<Utc>) -> bool {
         self.schedule().is_some_and(|schedule| schedule.covers(at))
+    }
+
+    /// [`Schedule::spans`]; empty for a row that is not a schedule.
+    pub fn spans(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<Span> {
+        self.schedule()
+            .map(|schedule| schedule.spans(from, to))
+            .unwrap_or_default()
     }
 
     /// Project-wide windows apply to every monitor; scoped ones to theirs.
@@ -1037,5 +1117,102 @@ mod tests {
         }
         .apply_to(patched);
         assert_eq!(cleared.monitor_id, None);
+    }
+
+    #[test]
+    fn one_off_spans_are_clipped_to_the_range() {
+        let w = Schedule::Once {
+            starts_at: utc(2026, 1, 1, 10, 0, 0),
+            ends_at: utc(2026, 1, 1, 12, 0, 0),
+        };
+        assert_eq!(
+            w.spans(utc(2026, 1, 1, 11, 0, 0), utc(2026, 1, 2, 0, 0, 0)),
+            vec![Span {
+                start: utc(2026, 1, 1, 11, 0, 0),
+                end: utc(2026, 1, 1, 12, 0, 0)
+            }]
+        );
+        assert!(
+            w.spans(utc(2026, 1, 2, 0, 0, 0), utc(2026, 1, 3, 0, 0, 0))
+                .is_empty()
+        );
+        // Touching the range edge from outside is empty.
+        assert!(
+            w.spans(utc(2026, 1, 1, 12, 0, 0), utc(2026, 1, 3, 0, 0, 0))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn weekly_spans_agree_with_covers_every_five_minutes_for_two_years() {
+        for (days, start, end, zone) in [
+            (&[1, 3, 5][..], "02:00", "04:00", "Europe/Berlin"),
+            // Wraps midnight into Monday.
+            (&[7][..], "23:00", "01:00", "America/New_York"),
+            // Sundays: crosses the March gap and the October repeated hour.
+            (&[7][..], "01:30", "03:30", "Europe/Berlin"),
+            // Full days.
+            (&[1, 2, 3, 4, 5, 6, 7][..], "00:00", "00:00", "Asia/Jakarta"),
+        ] {
+            let w = weekly(days, start, end, zone);
+            let (from, to) = (utc(2026, 1, 1, 0, 0, 0), utc(2028, 1, 1, 0, 0, 0));
+            // Merged first so one forward cursor suffices: ~210k samples per
+            // case stay fast in debug builds.
+            let spans = crate::uptime::availability::union(w.spans(from, to));
+            let (mut at, mut next) = (from, 0);
+            while at < to {
+                while next < spans.len() && spans[next].end <= at {
+                    next += 1;
+                }
+                let in_span = next < spans.len() && spans[next].start <= at;
+                assert_eq!(in_span, w.covers(at), "{zone} {start}-{end} at {at}");
+                at += TimeDelta::minutes(5);
+            }
+        }
+    }
+
+    #[test]
+    fn a_weekly_span_clips_to_a_range_that_starts_inside_it() {
+        // Sunday 23:00-01:00 New York; range starts Monday 00:30 local.
+        let w = weekly(&[7], "23:00", "01:00", "America/New_York");
+        let from = utc(2026, 1, 5, 5, 30, 0); // Mon 00:30 EST
+        let spans = w.spans(from, utc(2026, 1, 6, 0, 0, 0));
+        assert_eq!(
+            spans,
+            vec![Span {
+                start: from,
+                end: utc(2026, 1, 5, 6, 0, 0)
+            }]
+        );
+    }
+
+    #[test]
+    fn dst_edge_cases_of_weekly_spans() {
+        // Starts inside the March gap (02:30 does not exist on 2026-03-29):
+        // the window begins when the clock first shows 03:00, as `covers` does.
+        let gap = weekly(&[7], "02:30", "04:00", "Europe/Berlin");
+        let (from, to) = (utc(2026, 3, 29, 0, 0, 0), utc(2026, 3, 30, 0, 0, 0));
+        assert_eq!(
+            gap.spans(from, to),
+            vec![Span {
+                start: utc(2026, 3, 29, 1, 0, 0),
+                end: utc(2026, 3, 29, 2, 0, 0)
+            }]
+        );
+        assert!(!gap.covers(utc(2026, 3, 29, 0, 59, 59)));
+        assert!(gap.covers(utc(2026, 3, 29, 1, 0, 0)));
+        // Starts inside the October repeated hour: one span from the earliest
+        // start to the latest end; `covers` has a hole in between (documented
+        // over-count of at most one hour, once a year).
+        let repeated = weekly(&[7], "02:30", "04:00", "Europe/Berlin");
+        let (from, to) = (utc(2026, 10, 25, 0, 0, 0), utc(2026, 10, 26, 0, 0, 0));
+        assert_eq!(
+            repeated.spans(from, to),
+            vec![Span {
+                start: utc(2026, 10, 25, 0, 30, 0),
+                end: utc(2026, 10, 25, 3, 0, 0)
+            }]
+        );
+        assert!(!repeated.covers(utc(2026, 10, 25, 1, 0, 0)));
     }
 }

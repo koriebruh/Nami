@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     routing::get,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -19,7 +19,10 @@ use crate::{
         monitor_group,
     },
     state::AppState,
-    uptime::store::{self, MonitorStats, UptimeCheckRow},
+    uptime::{
+        availability::{self, Availability},
+        store::{self, MonitorStats, UptimeCheckRow},
+    },
 };
 
 /// How long the monitor list waits for ClickHouse's uptime answer. Past it the
@@ -59,6 +62,10 @@ pub fn router() -> Router<AppState> {
             get(list_checks),
         )
         .route("/projects/{id}/monitors/{monitor_id}/stats", get(get_stats))
+        .route(
+            "/projects/{id}/monitors/{monitor_id}/availability",
+            get(get_availability),
+        )
 }
 
 /// `monitor` as a [`MonitorView`] for `reader`, with `in_maintenance` looked
@@ -236,4 +243,32 @@ async fn get_stats(
     Ok(Json(
         store::monitor_stats(&state.clickhouse, project_id, monitor_id, Utc::now()).await?,
     ))
+}
+
+/// `?from=&to=` of the availability reports (RFC 3339).
+#[derive(Debug, Deserialize)]
+pub struct RangeQuery {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+
+async fn get_availability(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
+    Query(range): Query<RangeQuery>,
+) -> Result<Json<Availability>, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    availability::check_range(range.from, range.to).map_err(AppError::Validation)?;
+    availability::for_monitor(
+        &state.db,
+        project_id,
+        monitor_id,
+        range.from,
+        range.to,
+        Utc::now(),
+    )
+    .await?
+    .map(Json)
+    .ok_or(AppError::NotFound)
 }
