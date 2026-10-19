@@ -20,7 +20,8 @@ use nami_engine::{
     models::monitor::Monitor,
     state::AppState,
     uptime::{
-        alerts::{Transition, TransitionKind, notify_transition},
+        alert_throttle::ALERT_FLAP_WINDOW,
+        alerts::{Transition, TransitionKind, notify_transition, send_deferred},
         checker::{CheckOutcome, CheckStatus},
         store::{UptimeCheckRow, insert_checks},
         worker::{
@@ -1653,4 +1654,138 @@ async fn an_alert_does_not_wait_for_the_rest_of_its_pass(pool: sqlx::PgPool) {
         vec!["[Nami] Refused API is DOWN"]
     );
     pass.abort();
+}
+
+/// Flap control covers monitors too: a monitor that goes down and up four
+/// times in a row costs each member one DOWN + recovery pair; a monitor that
+/// then stays down is reported once the window is over.
+#[sqlx::test]
+async fn a_flapping_monitor_sends_one_pair_per_window_and_reports_staying_down_later(
+    pool: sqlx::PgPool,
+) {
+    let state = AppState::for_test(pool.clone());
+    let (project, recipient) = project_with_recipient(&pool).await;
+    let monitor = seed_http_monitor(&pool, project, "Flaky API", "http://127.0.0.1:9/", 1).await;
+    let snapshot = claimed_snapshot(&pool, monitor).await;
+    let mut second = 0;
+    for cycle in 0..4 {
+        for check in [failed_check(), passed_check()] {
+            second += 60;
+            let transition = apply_outcome(&pool, &snapshot, &at(check, second))
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("cycle {cycle}: a transition"));
+            notify_transition(&state, &transition).await;
+        }
+    }
+    let mail = settled_mail(&recipient, 2).await;
+    let subjects: Vec<&str> = mail.iter().map(|(subject, _)| subject.as_str()).collect();
+    assert_eq!(
+        subjects,
+        vec!["[Nami] Flaky API is DOWN", "[Nami] Flaky API is back UP"]
+    );
+
+    // Down once more, and it stays down: held back now, sent after the window.
+    let transition = apply_outcome(&pool, &snapshot, &at(failed_check(), second + 60))
+        .await
+        .unwrap()
+        .expect("down again");
+    notify_transition(&state, &transition).await;
+    let now = std::time::Instant::now();
+    assert_eq!(
+        send_deferred(&state, now).await,
+        0,
+        "the window is not over"
+    );
+    assert_eq!(send_deferred(&state, now + ALERT_FLAP_WINDOW).await, 1);
+    assert_eq!(
+        send_deferred(&state, now + ALERT_FLAP_WINDOW * 2).await,
+        0,
+        "sent once"
+    );
+    let mail = settled_mail(&recipient, 3).await;
+    assert_eq!(mail.len(), 3);
+    assert_eq!(mail[2].0, "[Nami] Flaky API is DOWN");
+}
+
+/// A monitor whose DOWN email the flap control is holding back: down, up,
+/// down again within the window.
+async fn monitor_with_held_down(state: &AppState, pool: &sqlx::PgPool, project: Uuid) -> Uuid {
+    let monitor = seed_http_monitor(pool, project, "Held API", "http://127.0.0.1:9/", 1).await;
+    let snapshot = claimed_snapshot(pool, monitor).await;
+    for (second, check) in [
+        (60, failed_check()),
+        (120, passed_check()),
+        (180, failed_check()),
+    ] {
+        let transition = apply_outcome(pool, &snapshot, &at(check, second))
+            .await
+            .unwrap()
+            .expect("a transition");
+        notify_transition(state, &transition).await;
+    }
+    monitor
+}
+
+/// A held-back DOWN is sent after the window only for a subject still down:
+/// not once it is paused, deleted, or inside a maintenance window (scoped to
+/// it or project-wide).
+#[sqlx::test]
+async fn a_held_down_is_dropped_for_paused_deleted_or_maintained_monitors(pool: sqlx::PgPool) {
+    let after_window = || std::time::Instant::now() + ALERT_FLAP_WINDOW;
+    let window = |project: Uuid, monitor: Option<Uuid>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "insert into maintenance_windows (project_id, monitor_id, title, kind, starts_at, ends_at)
+                 values ($1, $2, 'maintenance', 'once', now() - interval '5 minutes', now() + interval '1 hour')",
+            )
+            .bind(project)
+            .bind(monitor)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+
+    // Still down: sent.
+    let state = AppState::for_test(pool.clone());
+    let project = seed_project(&pool).await;
+    monitor_with_held_down(&state, &pool, project).await;
+    assert_eq!(send_deferred(&state, after_window()).await, 1);
+
+    let cases: [&str; 4] = [
+        "paused",
+        "deleted",
+        "scoped maintenance",
+        "project maintenance",
+    ];
+    for case in cases {
+        let state = AppState::for_test(pool.clone());
+        let project = seed_project(&pool).await;
+        let monitor = monitor_with_held_down(&state, &pool, project).await;
+        match case {
+            "paused" => {
+                sqlx::query("update monitors set paused = true where id = $1")
+                    .bind(monitor)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            "deleted" => {
+                sqlx::query("delete from monitors where id = $1")
+                    .bind(monitor)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            "scoped maintenance" => window(project, Some(monitor)).await,
+            _ => window(project, None).await,
+        }
+        assert_eq!(send_deferred(&state, after_window()).await, 0, "{case}");
+        assert!(
+            state.alert_throttle.due(after_window()).is_empty(),
+            "{case}: dropped"
+        );
+    }
 }

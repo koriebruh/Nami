@@ -9,14 +9,14 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{
-    is_invisible_or_bidi_char, monitor_group,
+    has_invisible_or_bidi, monitor_group,
     monitor_request::{
         self, BODY_METHODS, HTTP_METHODS, HeaderView, HeadersChange, MAX_BODY_BYTES,
         PasswordChange, RequestHeader, seal_headers, seal_password, seal_proxy_password,
     },
     nullable,
     target::{check_host_text, parse_nameserver, validate_host},
-    validate_name,
+    validate_name, with_unchanged_values,
 };
 use crate::{
     crypto::{Cipher, SecretString},
@@ -1361,7 +1361,7 @@ fn validate_expected_value(raw: Option<String>) -> Result<Option<String>, String
 }
 
 fn has_invisible_or_bidi_chars(text: &str) -> bool {
-    text.chars().any(is_invisible_or_bidi_char)
+    has_invisible_or_bidi(text)
 }
 
 pub async fn insert_monitor(
@@ -1549,8 +1549,22 @@ pub async fn update_in_project(
         return Ok(None);
     };
     let resumed = current.paused && patch.paused == Some(false);
-    let config =
-        validate(patch.apply_to(MonitorConfig::from(&current))).map_err(AppError::Validation)?;
+    let stored: Vec<String> = [
+        Some(&current.name),
+        current.url.as_ref(),
+        current.host.as_ref(),
+        current.auth_username.as_ref(),
+        current.proxy_url.as_ref(),
+        current.proxy_username.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .cloned()
+    .collect();
+    let config = with_unchanged_values(stored, || {
+        validate(patch.apply_to(MonitorConfig::from(&current)))
+    })
+    .map_err(AppError::Validation)?;
     secrets_stay_where_they_were(&current, &config).map_err(AppError::Validation)?;
     secrets_follow_the_proxy(&current, &config).map_err(AppError::Validation)?;
     if let Some(group_id) = config.group_id.filter(|g| Some(*g) != current.group_id) {

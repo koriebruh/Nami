@@ -1,6 +1,7 @@
 //! Pieces shared by the streamed file downloads (the uptime check export,
 //! `uptime::export`, and the log export, `logs::export`): the spreadsheet
-//! formula guard for CSV cells and a response body that can end with an
+//! formula guard and quoting for CSV cells, the per-project download slots
+//! and a response body that can end with an
 //! error instead of cleanly.
 
 use std::{
@@ -48,6 +49,20 @@ pub fn user_busy(max: usize) -> Response {
     )
 }
 
+/// 429: the project already runs `max` downloads of this kind. A per-project
+/// share keeps one tenant (however many accounts it has) from holding every
+/// slot of the instance; hold one of [`ProjectSlots`] for it.
+pub fn project_busy(max: usize) -> Response {
+    busy(
+        StatusCode::TOO_MANY_REQUESTS,
+        &format!("this project already has {max} exports running; retry when one finishes"),
+    )
+}
+
+/// Per-project download counts: the same counter as the per-user one,
+/// keyed by project id.
+pub type ProjectSlots = crate::logs::slots::UserSlots;
+
 /// 503: every download slot of the instance is taken.
 pub fn instance_busy() -> Response {
     busy(StatusCode::SERVICE_UNAVAILABLE, "busy, retry shortly")
@@ -60,6 +75,31 @@ pub fn neutralize(cell: &str) -> Cow<'_, str> {
         Some('=' | '+' | '-' | '@' | '\t' | '\r') => Cow::Owned(format!("'{cell}")),
         _ => Cow::Borrowed(cell),
     }
+}
+
+/// Appends one RFC 4180 field: formula-guarded first ([`neutralize`]), then
+/// always quoted (inner quotes doubled). Quoting every cell, not only those
+/// holding `"`, `,`, CR or LF, keeps a spreadsheet that splits CSV on `;`
+/// (Excel in de, fr, nl, ... locales) from cutting `x;=2+5` into a formula
+/// cell of its own: a quoted field is never split.
+pub fn push_csv_field(out: &mut String, value: &str) {
+    let value = neutralize(value);
+    out.push('"');
+    out.push_str(&value.replace('"', "\"\""));
+    out.push('"');
+}
+
+/// One CSV record of [`push_csv_field`] cells, CRLF-terminated.
+pub fn csv_record(fields: &[&str]) -> String {
+    let mut out = String::new();
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        push_csv_field(&mut out, field);
+    }
+    out.push_str("\r\n");
+    out
 }
 
 /// A download body fed by a producer task over a channel: the producer's

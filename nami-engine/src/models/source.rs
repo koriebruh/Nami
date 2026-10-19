@@ -17,7 +17,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::validate_name;
+use super::{validate_name, with_unchanged_values};
 use crate::{auth::token::hash_token, crypto::Cipher, error::AppError};
 
 pub const PLATFORMS: [&str; 5] = ["http", "syslog", "vector", "docker", "other"];
@@ -333,13 +333,15 @@ pub async fn update_in_project(
     let Some(current) = current else {
         return Ok(None);
     };
+    let stored = vec![current.name.clone()];
     let base = SourceConfig {
         name: current.name,
         platform: current.platform,
         retention_days: current.retention_days,
         daily_byte_quota: current.daily_byte_quota,
     };
-    let c = validate(patch.apply_to(base)).map_err(AppError::Validation)?;
+    let c = with_unchanged_values(stored, || validate(patch.apply_to(base)))
+        .map_err(AppError::Validation)?;
     let updated: Source = sqlx::query_as(
         "update sources
          set name = $3, platform = $4, retention_days = $5, daily_byte_quota = $6,

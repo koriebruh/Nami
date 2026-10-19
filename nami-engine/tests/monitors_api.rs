@@ -1223,3 +1223,57 @@ async fn a_viewer_sees_plain_urls_unchanged_and_a_lone_username_hidden(pool: sql
     .await;
     assert_eq!(token["url"], "https://***@example.com/x?");
 }
+
+/// Rows stored before the tag characters were refused stay editable: a PATCH
+/// that leaves the name (or the URL) alone pauses the monitor, one that sets
+/// a new name with a stray tag character is refused, and a subdivision flag
+/// is a fine name.
+#[sqlx::test]
+async fn a_stored_stray_tag_character_never_blocks_other_edits(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let monitor = seed_http_monitor(&pool, project, "legacy", "https://example.com/", 1).await;
+    sqlx::query(
+        "update monitors set name = 'legacy\u{E0041}', url = 'https://example.com/?q=\u{E0041}' where id = $1",
+    )
+    .bind(monitor)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let item = format!("/projects/{project}/monitors/{monitor}");
+
+    let (status, body) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "paused": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["paused"], true);
+    assert_eq!(body["name"], "legacy\u{E0041}");
+
+    let (status, body) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "name": "new\u{E0041}" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let england = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+    let (status, body) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "name": format!("{england} checkout") })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["name"], format!("{england} checkout"));
+}

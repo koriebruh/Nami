@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::{monitor_group, nullable, validate_name};
+use super::{monitor_group, nullable, validate_name, with_unchanged_values};
 use crate::error::AppError;
 
 /// The longest a heartbeat's period, or its grace, may be: 31 days.
@@ -321,6 +321,7 @@ pub async fn update_in_project(
     };
     let was_paused = current.paused;
     let previous_group = current.group_id;
+    let stored = vec![current.name.clone()];
     let base = HeartbeatConfig {
         name: current.name,
         period_seconds: current.period_seconds,
@@ -328,7 +329,8 @@ pub async fn update_in_project(
         paused: current.paused,
         group_id: current.group_id,
     };
-    let config = validate(patch.apply_to(base)).map_err(AppError::Validation)?;
+    let config = with_unchanged_values(stored, || validate(patch.apply_to(base)))
+        .map_err(AppError::Validation)?;
     if let Some(group_id) = config.group_id.filter(|g| Some(*g) != previous_group) {
         // A group of another project is a 404, like any foreign id.
         if !monitor_group::belongs_to(&mut *tx, project_id, group_id).await? {

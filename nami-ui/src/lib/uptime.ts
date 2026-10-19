@@ -223,10 +223,13 @@ export function failUrl(url: string): string {
 /**
  * A command that runs the job, then reports its exit code and output. The
  * output goes in on stdin (`@-`), never as `--data-binary "$out"`: output that
- * starts with `@` would make curl upload a local file of that name.
+ * starts with `@` would make curl upload a local file of that name. Only its
+ * last 10 KiB are sent (`tail -c`: errors come last, and the engine keeps at
+ * most 10 KiB), so the size is bounded, and curl retries like the plain ping
+ * command, so a failure report is not lost to a busy moment.
  */
 export function exitCodeCommand(url: string): string {
-	return `out=$(your-job 2>&1); code=$?; printf '%s' "$out" | curl -fsS -m 10 --data-binary @- ${shellQuote(url)}/$code`;
+	return `out=$(your-job 2>&1); code=$?; printf '%s' "$out" | tail -c 10240 | curl -fsS -m 10 --retry 3 --data-binary @- ${shellQuote(url)}/$code`;
 }
 
 /** Compact period: 86400 -> "1d", 5400 -> "1h 30m", 90 -> "1m 30s". */

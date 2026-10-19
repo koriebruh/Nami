@@ -234,8 +234,8 @@ async fn the_output_of_the_ping_that_opens_the_incident_is_attached_to_it(pool: 
         mail[0].text
     );
 
-    // Recovery resolves; a new failure with an empty body opens an incident
-    // without details.
+    // Recovery resolves; a new failure with an empty body soon after reopens
+    // the same incident (flap control) and clears its details.
     assert_eq!(
         ping(&public, &format!("{base}/0"), b"").await.0,
         StatusCode::OK
@@ -246,11 +246,10 @@ async fn the_output_of_the_ping_that_opens_the_incident_is_attached_to_it(pool: 
     );
     let (_, incidents) = call(&app, "GET", &list, Some(&member), None).await;
     let incidents = incidents.as_array().unwrap();
-    assert_eq!(incidents.len(), 2);
+    assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0]["status"], "open");
     assert_eq!(incidents[0]["details"], Value::Null);
-    assert_eq!(incidents[1]["status"], "resolved");
-    assert_eq!(incidents[1]["details"], output);
+    assert_eq!(incidents[0]["resolved_at"], Value::Null);
     ch.drop_database().await.unwrap();
 }
 

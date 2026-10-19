@@ -16,6 +16,7 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
+use tokio_stream::StreamExt;
 use uuid::Uuid;
 
 use crate::{
@@ -33,8 +34,10 @@ use crate::{
         alerts,
         availability::{self, Availability, RangeQuery},
         heartbeat::{
-            MAX_OUTPUT_BYTES, Ping, PingKind, SUCCESS_OUTPUT_MAX, is_well_formed_token,
-            lookup_token, parse_signal, record_signal, sanitize_output_capped,
+            MAX_OUTPUT_BYTES, OUTPUT_BUDGET_MARKER, OUTPUT_BUSY_MARKER, OUTPUT_LATE_MARKER,
+            OUTPUT_UNREADABLE_MARKER, Ping, PingKind, SUCCESS_OUTPUT_MAX, is_output_marker,
+            is_well_formed_token, lookup_token, parse_signal, record_signal,
+            sanitize_output_capped,
         },
         pings::{self, HeartbeatPingRow},
     },
@@ -124,16 +127,19 @@ async fn list_pings(
     ))
 }
 
-/// How many pings may be handled at once. The endpoint is public and needs no
-/// session, and every well-formed token costs database work: a ping that finds
-/// every place taken is answered at once with `503` and `Retry-After: 1`
-/// (cron jobs retry, e.g. `curl --retry 3`) instead of waiting for a pooled
-/// connection, so a flood of pings can never starve the API or the worker of
-/// the pool they share.
+/// How many pings may do database work at once. The endpoint is public and
+/// needs no session, and every well-formed token costs database work: a ping
+/// waits at most [`PING_SLOT_WAIT`] for a place (cron fleets ping at the same
+/// second, `:00`) and is then answered `503` with `Retry-After: 1`, so a flood
+/// of pings costs latency, never an unbounded queue, and can never starve the
+/// API or the worker of the pool they share.
 pub const MAX_PINGS_IN_FLIGHT: usize = 4;
+/// How long a ping waits for one of the [`MAX_PINGS_IN_FLIGHT`] places.
+pub const PING_SLOT_WAIT: Duration = Duration::from_secs(2);
 
-/// The largest ping body read (`curl --data-binary`, the job's output); a
-/// larger one is `413`, whether it declares its length or not.
+/// The largest ping body declared (`Content-Length`) that is accepted; a
+/// larger declared one is `413`. An undeclared (chunked) body is read up to
+/// this many bytes and the rest ignored.
 pub const MAX_PING_BODY_BYTES: usize = 1024 * 1024;
 /// The steady rate of pings one heartbeat may send, per second.
 pub const PINGS_PER_SECOND: f64 = 1.0;
@@ -141,24 +147,34 @@ pub const PINGS_PER_SECOND: f64 = 1.0;
 /// applies; beyond that, `429` with `Retry-After: 1`.
 pub const PING_BURST: f64 = 10.0;
 /// How many ping bodies are read at once across the endpoint (one per
-/// heartbeat at most); a body that finds every place taken is `503`.
+/// heartbeat and [`MAX_PING_BODIES_PER_PROJECT`] per project at most).
 pub const MAX_PING_BODIES_IN_FLIGHT: usize = 16;
-/// How long a ping body may take to arrive; a slower one is `408`.
+/// How many ping bodies of one project are read at once, so one tenant
+/// cannot hold every one of the [`MAX_PING_BODIES_IN_FLIGHT`] places.
+pub const MAX_PING_BODIES_PER_PROJECT: usize = 2;
+/// How long a ping body may take to arrive.
 pub const PING_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Output bytes one heartbeat may store per hour (refilled continuously, up
+/// to this much at once); past it, pings are stored with
+/// [`OUTPUT_BUDGET_MARKER`] in place of their output.
+pub const OUTPUT_BYTES_PER_HOUR: usize = 1024 * 1024;
 /// Past this many rate-limit buckets, the full ones (which behave like
 /// missing ones) are dropped before a ping takes a token.
 const PRUNE_BUCKETS_ABOVE: usize = 10_000;
 
 /// Everything that bounds the work pings cause: the database places (see
 /// [`MAX_PINGS_IN_FLIGHT`]), the per-heartbeat token buckets, one body read
-/// per heartbeat at a time and [`MAX_PING_BODIES_IN_FLIGHT`] body reads in
-/// all.
+/// per heartbeat at a time, [`MAX_PING_BODIES_PER_PROJECT`] per project and
+/// [`MAX_PING_BODIES_IN_FLIGHT`] in all, and the per-heartbeat output budget
+/// ([`OUTPUT_BYTES_PER_HOUR`]).
 #[derive(Clone)]
 struct PingGuards {
     slots: Arc<Semaphore>,
     limits: Arc<TokenBuckets>,
     bodies_per_heartbeat: Arc<InFlight>,
+    bodies_per_project: Arc<InFlight>,
     body_slots: Arc<Semaphore>,
+    output_budget: Arc<TokenBuckets>,
 }
 
 /// The public ping endpoint, served on the public listener only (see
@@ -177,7 +193,9 @@ pub fn public_router(
         slots: ping_slots,
         limits: ping_limits,
         bodies_per_heartbeat: Arc::new(InFlight::new(1)),
+        bodies_per_project: Arc::new(InFlight::new(MAX_PING_BODIES_PER_PROJECT)),
         body_slots: Arc::new(Semaphore::new(MAX_PING_BODIES_IN_FLIGHT)),
+        output_budget: Arc::new(output_budget()),
     };
     Router::new()
         .route("/api/v1/heartbeat/{token}", get(ping).post(ping))
@@ -349,10 +367,17 @@ async fn ping_signal(
 
 /// One ping, every step returning before the next (see the plan's "Path order
 /// on pings"): token shape (404) → suffix (400) → declared length (413) →
-/// token lookup under a database place (503, 404) → the heartbeat's rate
-/// limit (429) → the body, one per heartbeat and [`MAX_PING_BODIES_IN_FLIGHT`]
-/// in all, at most [`MAX_PING_BODY_BYTES`] within [`PING_BODY_TIMEOUT`]
-/// (429, 503, 413, 408) → the record under a database place again (503).
+/// token lookup under a database place (503 after [`PING_SLOT_WAIT`], 404) →
+/// the heartbeat's rate limit (429) → the body → the record under a database
+/// place again (503 after [`PING_SLOT_WAIT`]).
+///
+/// The path alone carries the signal (success, failure, exit code), so the
+/// body never decides whether a ping counts: a body that cannot be read (its
+/// heartbeat already has one being read, its project
+/// [`MAX_PING_BODIES_PER_PROJECT`], the endpoint [`MAX_PING_BODIES_IN_FLIGHT`];
+/// or it does not arrive within [`PING_BODY_TIMEOUT`], or breaks off) is
+/// dropped and the ping recorded with a fixed marker in place of its output.
+/// Only a declared length over [`MAX_PING_BODY_BYTES`] is refused (413).
 ///
 /// No body is read before its token is known and its rate limit passed, so
 /// nobody without a token can make the endpoint buffer anything, and no
@@ -378,17 +403,20 @@ async fn handle_ping(
         }
     };
     let (parts, body) = request.into_parts();
+    // The declared length: the header, or the body's exact size (hyper's
+    // incoming body takes it from `Content-Length`).
     let declared = parts
         .headers
         .get(header::CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok());
+        .and_then(|value| value.parse::<u64>().ok())
+        .or(body.size_hint().exact());
     if declared.is_some_and(|length| length > MAX_PING_BODY_BYTES as u64) {
         return Ok(body_too_large());
     }
 
-    let heartbeat_id = {
-        let Ok(_slot) = guards.slots.try_acquire() else {
+    let (heartbeat_id, project_id) = {
+        let Some(_slot) = ping_slot(&guards.slots).await else {
             return Ok(busy());
         };
         lookup_token(&state.db, &token)
@@ -396,8 +424,9 @@ async fn handle_ping(
             .ok_or(AppError::NotFound)?
     };
 
+    let now = Instant::now();
     if guards.limits.len() > PRUNE_BUCKETS_ABOVE {
-        guards.limits.prune_full(Instant::now());
+        guards.limits.prune_full(now);
     }
     if !guards.limits.try_acquire(heartbeat_id) {
         return Ok(too_many());
@@ -411,20 +440,20 @@ async fn handle_ping(
     };
     let mut output = String::new();
     if body.size_hint().exact() != Some(0) {
-        let Some(_reading) = guards.bodies_per_heartbeat.try_enter(heartbeat_id) else {
-            return Ok(too_many());
+        output = match read_output(&guards, heartbeat_id, project_id, body).await {
+            BodyRead::Read(bytes) => sanitize_output_capped(&bytes, output_cap),
+            BodyRead::Busy => OUTPUT_BUSY_MARKER.to_string(),
+            BodyRead::Late => OUTPUT_LATE_MARKER.to_string(),
+            BodyRead::Broken => OUTPUT_UNREADABLE_MARKER.to_string(),
         };
-        let Ok(_body_slot) = guards.body_slots.try_acquire() else {
-            return Ok(busy());
-        };
-        match read_body(body).await {
-            Ok(bytes) => output = sanitize_output_capped(&bytes, output_cap),
-            Err(reply) => return Ok(*reply),
+        if guards.output_budget.len() > PRUNE_BUCKETS_ABOVE {
+            guards.output_budget.prune_full(now);
         }
+        output = charge_output(&guards.output_budget, heartbeat_id, output, Instant::now());
     }
 
     let (ping, recorded) = {
-        let Ok(_slot) = guards.slots.try_acquire() else {
+        let Some(_slot) = ping_slot(&guards.slots).await else {
             return Ok(busy());
         };
         let ping = Ping {
@@ -470,42 +499,92 @@ async fn handle_ping(
     Ok(Json(json!({ "ok": true })).into_response())
 }
 
-/// Reads a ping body of at most [`MAX_PING_BODY_BYTES`] within
-/// [`PING_BODY_TIMEOUT`], or the reply that says why it was not.
-async fn read_body(body: Body) -> Result<axum::body::Bytes, Box<Response>> {
-    let read = tokio::time::timeout(
-        PING_BODY_TIMEOUT,
-        axum::body::to_bytes(body, MAX_PING_BODY_BYTES),
-    )
-    .await;
-    let reply = match read {
-        Ok(Ok(bytes)) => return Ok(bytes),
-        Err(_) => (
-            StatusCode::REQUEST_TIMEOUT,
-            Json(json!({ "error": "ping body not received in time" })),
-        )
-            .into_response(),
-        Ok(Err(error)) if is_length_limit(&error) => body_too_large(),
-        Ok(Err(_)) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "ping body could not be read" })),
-        )
-            .into_response(),
-    };
-    Err(Box::new(reply))
+/// `output` if the heartbeat's output budget (see [`OUTPUT_BYTES_PER_HOUR`])
+/// still holds its length, which is then taken from it; otherwise
+/// [`OUTPUT_BUDGET_MARKER`]. Empty output and the fixed markers cost nothing.
+fn charge_output(
+    budget: &TokenBuckets,
+    heartbeat_id: Uuid,
+    output: String,
+    now: Instant,
+) -> String {
+    if output.is_empty()
+        || is_output_marker(&output)
+        || budget.try_take_at(heartbeat_id, output.len() as f64, now)
+    {
+        output
+    } else {
+        OUTPUT_BUDGET_MARKER.to_string()
+    }
 }
 
-/// Whether a body error is the length cap of `to_bytes` (anywhere in its
-/// source chain).
-fn is_length_limit(error: &axum::Error) -> bool {
-    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
-    while let Some(error) = current {
-        if error.is::<http_body_util::LengthLimitError>() {
-            return true;
+/// The per-heartbeat output budget: [`OUTPUT_BYTES_PER_HOUR`], refilled
+/// continuously.
+fn output_budget() -> TokenBuckets {
+    TokenBuckets::new(
+        OUTPUT_BYTES_PER_HOUR as f64 / 3600.0,
+        OUTPUT_BYTES_PER_HOUR as f64,
+    )
+}
+
+/// One of the database places, waiting at most [`PING_SLOT_WAIT`] for it.
+async fn ping_slot(slots: &Semaphore) -> Option<tokio::sync::SemaphorePermit<'_>> {
+    tokio::time::timeout(PING_SLOT_WAIT, slots.acquire())
+        .await
+        .ok()?
+        .ok()
+}
+
+/// What became of a ping body.
+enum BodyRead {
+    /// Its first [`MAX_PING_BODY_BYTES`] bytes.
+    Read(Vec<u8>),
+    /// No reading place was free (heartbeat, project or endpoint).
+    Busy,
+    /// It did not arrive within [`PING_BODY_TIMEOUT`].
+    Late,
+    /// It broke off.
+    Broken,
+}
+
+/// Reads a ping body under its places: one per heartbeat,
+/// [`MAX_PING_BODIES_PER_PROJECT`] per project and
+/// [`MAX_PING_BODIES_IN_FLIGHT`] in all, never waited for. At most
+/// [`MAX_PING_BODY_BYTES`] are kept (the rest is not read) and the whole read
+/// must end within [`PING_BODY_TIMEOUT`].
+async fn read_output(
+    guards: &PingGuards,
+    heartbeat_id: Uuid,
+    project_id: Uuid,
+    body: Body,
+) -> BodyRead {
+    let Some(_heartbeat) = guards.bodies_per_heartbeat.try_enter(heartbeat_id) else {
+        return BodyRead::Busy;
+    };
+    let Some(_project) = guards.bodies_per_project.try_enter(project_id) else {
+        return BodyRead::Busy;
+    };
+    let Ok(_body_slot) = guards.body_slots.try_acquire() else {
+        return BodyRead::Busy;
+    };
+    let read = async {
+        let mut stream = body.into_data_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let Ok(chunk) = chunk else {
+                return BodyRead::Broken;
+            };
+            let room = MAX_PING_BODY_BYTES - bytes.len();
+            bytes.extend_from_slice(&chunk[..chunk.len().min(room)]);
+            if bytes.len() >= MAX_PING_BODY_BYTES {
+                break;
+            }
         }
-        current = error.source();
-    }
-    false
+        BodyRead::Read(bytes)
+    };
+    tokio::time::timeout(PING_BODY_TIMEOUT, read)
+        .await
+        .unwrap_or(BodyRead::Late)
 }
 
 fn body_too_large() -> Response {
@@ -516,8 +595,7 @@ fn body_too_large() -> Response {
         .into_response()
 }
 
-/// The reply to a heartbeat over its rate limit, or with a body already being
-/// read: try again in a second.
+/// The reply to a heartbeat over its rate limit: try again in a second.
 fn too_many() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -527,7 +605,8 @@ fn too_many() -> Response {
         .into_response()
 }
 
-/// The reply to a ping that found every place taken: try again in a second.
+/// The reply to a ping that waited [`PING_SLOT_WAIT`] for a database place in
+/// vain: try again in a second.
 fn busy() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -535,4 +614,66 @@ fn busy() -> Response {
         Json(json!({ "error": "busy, retry shortly" })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 400 failure pings with 10 KiB of output each, one every 9 s (an hour,
+    /// about 4 MiB sent), store at most the burst (1 MiB) plus one hour of
+    /// refill (1 MiB); the rest get the marker. Sustained, that is 1 MiB per
+    /// hour.
+    #[test]
+    fn an_hour_of_large_outputs_stores_about_the_budget() {
+        let budget = output_budget();
+        let heartbeat = Uuid::new_v4();
+        let start = Instant::now();
+        let mut stored = 0usize;
+        let mut markers = 0;
+        for n in 0..400u64 {
+            let now = start + Duration::from_secs(n * 9);
+            let output = charge_output(&budget, heartbeat, "x".repeat(MAX_OUTPUT_BYTES), now);
+            if output == OUTPUT_BUDGET_MARKER {
+                markers += 1;
+            } else {
+                stored += output.len();
+            }
+        }
+        // The burst (1 MiB) plus at most one hour of refill (1 MiB).
+        assert!(stored <= 2 * OUTPUT_BYTES_PER_HOUR, "{stored}");
+        assert!(markers > 0);
+
+        // All at once: exactly the burst.
+        let burst = output_budget();
+        let stored: usize = (0..200)
+            .map(|_| charge_output(&burst, heartbeat, "x".repeat(MAX_OUTPUT_BYTES), start))
+            .filter(|output| output != OUTPUT_BUDGET_MARKER)
+            .map(|output| output.len())
+            .sum();
+        assert!(stored <= OUTPUT_BYTES_PER_HOUR, "{stored}");
+        assert_eq!(
+            stored,
+            (OUTPUT_BYTES_PER_HOUR / MAX_OUTPUT_BYTES) * MAX_OUTPUT_BYTES
+        );
+    }
+
+    #[test]
+    fn budgets_are_per_heartbeat_and_markers_are_free() {
+        let budget = output_budget();
+        let now = Instant::now();
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let whole = "x".repeat(OUTPUT_BYTES_PER_HOUR);
+        assert_eq!(charge_output(&budget, a, whole.clone(), now), whole);
+        assert_eq!(
+            charge_output(&budget, a, "y".into(), now),
+            OUTPUT_BUDGET_MARKER
+        );
+        assert_eq!(charge_output(&budget, a, String::new(), now), "");
+        assert_eq!(
+            charge_output(&budget, a, OUTPUT_BUSY_MARKER.into(), now),
+            OUTPUT_BUSY_MARKER
+        );
+        assert_eq!(charge_output(&budget, b, "z".into(), now), "z");
+    }
 }

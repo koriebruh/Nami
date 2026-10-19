@@ -92,8 +92,23 @@ pub async fn resolve_for_monitor(
     .await
 }
 
+/// A heartbeat incident resolved less than this long ago is reopened, not
+/// followed by a new one, when the heartbeat goes down again (see
+/// [`open_for_heartbeat`]). Same length as the alert flap window
+/// (`uptime::alert_throttle::ALERT_FLAP_WINDOW`).
+pub const HEARTBEAT_REOPEN_WINDOW_SECS: i32 = 5 * 60;
+
 /// Heartbeat counterpart of [`open_for_monitor`], guarded by
-/// `incidents_one_open_per_heartbeat`.
+/// `incidents_one_open_per_heartbeat`, with flap control: when the
+/// heartbeat's latest incident was resolved less than
+/// [`HEARTBEAT_REOPEN_WINDOW_SECS`] before `started_at`, that incident is
+/// reopened (status open, `resolved_at` cleared, title and cause replaced,
+/// details cleared for the caller to attach the new ones; its id and
+/// `started_at` stay) and its id returned, instead of a new row. A job that
+/// fails and succeeds in turn (`/fail`, then `/0`, as fast as the ping rate
+/// limit allows) therefore keeps one incident row, however long it flaps,
+/// and its downtime counts from the first failure until it stays up. Called
+/// under the heartbeat's row lock (the ping and the sweep both hold it).
 pub async fn open_for_heartbeat(
     conn: &mut PgConnection,
     project_id: Uuid,
@@ -102,6 +117,28 @@ pub async fn open_for_heartbeat(
     cause: Option<&str>,
     started_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
+    let reopened: Option<Uuid> = sqlx::query_scalar(
+        "update incidents i
+         set status = 'open', resolved_at = null, title = $2, cause = $3, details = null
+         from (select id, status, resolved_at from incidents
+               where heartbeat_id = $1
+               order by started_at desc
+               limit 1) latest
+         where i.id = latest.id
+           and latest.status = 'resolved'
+           and latest.resolved_at > $4 - make_interval(secs => $5)
+         returning i.id",
+    )
+    .bind(heartbeat_id)
+    .bind(title)
+    .bind(cause)
+    .bind(started_at)
+    .bind(HEARTBEAT_REOPEN_WINDOW_SECS)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if reopened.is_some() {
+        return Ok(reopened);
+    }
     sqlx::query_scalar(
         "insert into incidents (project_id, heartbeat_id, title, cause, started_at)
          values ($1, $2, $3, $4, $5)
@@ -134,7 +171,7 @@ pub async fn resolve_for_heartbeat(
     .await
 }
 
-/// Stores the output of the ping that opened the incident.
+/// Stores the output of the ping that opened (or reopened) the incident.
 pub async fn attach_details(
     conn: &mut PgConnection,
     incident_id: Uuid,

@@ -20,11 +20,17 @@ use nami_engine::{
     email::Mailer,
     logs::rate_limit::TokenBuckets,
     models::incident,
-    routes::heartbeats::{MAX_PING_BODY_BYTES, MAX_PINGS_IN_FLIGHT, PING_BODY_TIMEOUT, PING_BURST},
+    routes::heartbeats::{
+        MAX_PING_BODIES_IN_FLIGHT, MAX_PING_BODIES_PER_PROJECT, MAX_PING_BODY_BYTES,
+        MAX_PINGS_IN_FLIGHT, PING_BODY_TIMEOUT, PING_BURST, PING_SLOT_WAIT,
+    },
     state::AppState,
     uptime::{
         alerts::{Subject, Transition, TransitionKind},
-        heartbeat::{OUTAGE_GAP, PingOutcome, note_worker_alive, record_ping, sweep_overdue},
+        heartbeat::{
+            MAX_OUTPUT_BYTES, OUTAGE_GAP, OUTPUT_BUSY_MARKER, OUTPUT_LATE_MARKER, PingOutcome,
+            TRUNCATED_MARKER, note_worker_alive, record_ping, sweep_overdue,
+        },
         worker::{Notifications, SWEEP_BATCH, run_forever, sweep_heartbeats, sweep_pass},
     },
 };
@@ -75,6 +81,23 @@ async fn heartbeat_state(pool: &sqlx::PgPool, id: Uuid) -> (String, bool) {
     sqlx::query_as("select current_status, last_ping_at is not null from heartbeats where id = $1")
         .bind(id)
         .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn last_ping_at(pool: &sqlx::PgPool, id: Uuid) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar("select last_ping_at from heartbeats where id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The `details` of the heartbeat's incidents, oldest first.
+async fn details_of(pool: &sqlx::PgPool, heartbeat: Uuid) -> Vec<Option<String>> {
+    sqlx::query_scalar("select details from incidents where heartbeat_id = $1 order by started_at")
+        .bind(heartbeat)
+        .fetch_all(pool)
         .await
         .unwrap()
 }
@@ -699,7 +722,9 @@ async fn no_token_ever_reaches_a_log_line(pool: sqlx::PgPool) {
         .0,
         StatusCode::NOT_FOUND
     );
-    assert_eq!(settled_mail(&recipient, 4).await.len(), 4);
+    // The second DOWN/UP pair falls inside the alert flap window: held back
+    // (and logged by ids only).
+    assert_eq!(settled_mail(&recipient, 2).await.len(), 2);
 
     let lines = log.lines();
     let all = lines.join("\n");
@@ -1084,6 +1109,22 @@ async fn a_heartbeat_has_at_most_one_open_incident(pool: sqlx::PgPool) {
             .unwrap(),
         None
     );
+    // Soon after its resolution, the incident is reopened, not followed.
+    let reopened = incident::open_for_heartbeat(&mut conn, project, id, "next", None, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(reopened, first);
+    assert_eq!(
+        incident::open_for_heartbeat(&mut conn, project, id, "again", None, Utc::now())
+            .await
+            .unwrap(),
+        None,
+        "still at most one open"
+    );
+    incident::resolve_for_heartbeat(&mut conn, id, Utc::now() - chrono::Duration::minutes(6))
+        .await
+        .unwrap();
+    // Resolved longer ago than the reopen window: a new incident.
     let next = incident::open_for_heartbeat(&mut conn, project, id, "next", None, Utc::now())
         .await
         .unwrap();
@@ -2409,9 +2450,9 @@ async fn the_public_listener_serves_none_of_the_api(pool: sqlx::PgPool) {
     assert_eq!(body, json!({ "status": "ok" }));
 }
 
-/// With every ping place taken, a ping is turned away at once with 503 and
-/// `Retry-After: 1`, before any database work, and the heartbeat is not
-/// touched. Text that is not a token is still an ordinary 404: it needs no
+/// With every ping place taken, a ping waits PING_SLOT_WAIT for one and is
+/// then turned away with 503 and `Retry-After: 1`, before any database work,
+/// and the heartbeat is not touched. Text that is not a token is still an ordinary 404: it needs no
 /// place. Once a place is free, pings are served again.
 #[sqlx::test]
 async fn a_full_ping_endpoint_turns_pings_away_with_retry_after(pool: sqlx::PgPool) {
@@ -2428,9 +2469,10 @@ async fn a_full_ping_endpoint_turns_pings_away_with_retry_after(pool: sqlx::PgPo
         let started = Instant::now();
         let (status, headers, body) = ping_raw(&public, method, &token).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{method}");
+        let waited = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "answered at once"
+            waited >= PING_SLOT_WAIT && waited < PING_SLOT_WAIT + Duration::from_secs(2),
+            "waited the bounded time: {waited:?}"
         );
         assert_eq!(
             headers.get("retry-after").map(|v| v.to_str().unwrap()),
@@ -2453,10 +2495,40 @@ async fn a_full_ping_endpoint_turns_pings_away_with_retry_after(pool: sqlx::PgPo
     let (status, _, _) = ping_raw(&public, "GET", "not-a-real-token").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // A place freed while a ping waits serves it.
+    let waiting = tokio::spawn({
+        let public = public.clone();
+        let token = token.clone();
+        async move { ping_raw(&public, "POST", &token).await.0 }
+    });
+    tokio::time::sleep(PING_SLOT_WAIT / 4).await;
     drop(held);
-    let (status, _, _) = ping_raw(&public, "POST", &token).await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(waiting.await.unwrap(), StatusCode::OK);
     assert_eq!(heartbeat_state(&pool, id).await, ("up".to_string(), true));
+}
+
+/// A cron fleet pinging at the same second: twenty heartbeats at once, with
+/// the default places, are all recorded (they wait their turn).
+#[sqlx::test]
+async fn simultaneous_pings_of_many_heartbeats_all_succeed(pool: sqlx::PgPool) {
+    let public = common::test_public_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let mut ids = Vec::new();
+    let mut pings = Vec::new();
+    for n in 0..20 {
+        let (id, token) = seed_heartbeat(&pool, project, &format!("job {n}"), 3600, 60, 0).await;
+        ids.push(id);
+        let public = public.clone();
+        pings.push(tokio::spawn(async move {
+            ping_raw(&public, "GET", &token).await.0
+        }));
+    }
+    for ping in pings {
+        assert_eq!(ping.await.unwrap(), StatusCode::OK);
+    }
+    for id in ids {
+        assert_eq!(heartbeat_state(&pool, id).await, ("up".to_string(), true));
+    }
 }
 
 /// A ping holds its place for as long as it runs, database work included: with
@@ -2558,9 +2630,16 @@ async fn a_non_zero_exit_code_is_a_failure_naming_the_code(pool: sqlx::PgPool) {
     let cause = Some("Heartbeat reported failure (exit code 137)".to_string());
     assert_eq!(incidents_of(&pool, id).await[0].2, cause);
 
-    // A second failure while down: still one incident, still naming 137.
+    let first_ping = last_ping_at(&pool, id)
+        .await
+        .expect("the failure counts as a ping");
+
+    // A second failure while down: still one incident, still naming 137, and
+    // the ping still counts (last_ping_at moves).
+    tokio::time::sleep(Duration::from_millis(5)).await;
     let (status, _, _) = ping_with(&public, &format!("/api/v1/heartbeat/{token}/2"), vec![]).await;
     assert_eq!(status, StatusCode::OK);
+    assert!(last_ping_at(&pool, id).await.unwrap() > first_ping);
     let incidents = incidents_of(&pool, id).await;
     assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0].0, "open");
@@ -2670,7 +2749,7 @@ async fn fail_pings_during_maintenance_or_pause_change_nothing_but_last_ping_at(
 }
 
 #[sqlx::test]
-async fn ping_bodies_over_one_mebibyte_are_413_and_change_nothing(pool: sqlx::PgPool) {
+async fn only_a_declared_body_over_one_mebibyte_is_413(pool: sqlx::PgPool) {
     let public = common::test_public_app(pool.clone());
     let project = seed_project(&pool).await;
     let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
@@ -2678,21 +2757,6 @@ async fn ping_bodies_over_one_mebibyte_are_413_and_change_nothing(pool: sqlx::Pg
     let too_large = json!({ "error": "ping body too large (max 1 MiB)" });
 
     let (status, _, body) = ping_with(&public, &path, vec![b'x'; MAX_PING_BODY_BYTES + 1]).await;
-    assert_eq!(
-        (status, body),
-        (StatusCode::PAYLOAD_TOO_LARGE, too_large.clone())
-    );
-    assert_eq!(
-        heartbeat_state(&pool, id).await,
-        ("pending".to_string(), false)
-    );
-
-    // The same size, chunked: no length is declared, the cap applies while
-    // the body streams in.
-    let chunks = [vec![b'x'; 600 * 1024], vec![b'x'; 600 * 1024]]
-        .map(|chunk| Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)));
-    let streamed = Body::from_stream(tokio_stream::iter(chunks));
-    let (status, _, body) = ping_body(&public, &path, streamed).await;
     assert_eq!(
         (status, body),
         (StatusCode::PAYLOAD_TOO_LARGE, too_large.clone())
@@ -2716,9 +2780,21 @@ async fn ping_bodies_over_one_mebibyte_are_413_and_change_nothing(pool: sqlx::Pg
         ("pending".to_string(), false)
     );
 
-    let (status, _, _) = ping_with(&public, &path, vec![b'x'; MAX_PING_BODY_BYTES]).await;
+    // The same size, chunked: no length is declared, so the signal counts;
+    // the first MiB is read and the output capped as usual.
+    let chunks = [vec![b'x'; 600 * 1024], vec![b'x'; 600 * 1024]]
+        .map(|chunk| Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)));
+    let streamed = Body::from_stream(tokio_stream::iter(chunks));
+    let (status, _, _) = ping_body(&public, &path, streamed).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(heartbeat_state(&pool, id).await, ("down".to_string(), true));
+    assert_eq!(
+        details_of(&pool, id).await,
+        vec![Some(format!(
+            "{}{TRUNCATED_MARKER}",
+            "x".repeat(MAX_OUTPUT_BYTES)
+        ))]
+    );
 }
 
 /// A body that fails the test if anyone reads it.
@@ -2791,10 +2867,15 @@ async fn one_body_per_heartbeat_is_read_at_a_time(pool: sqlx::PgPool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let (status, headers, body) = ping_with(&public, &path_a, b"again".to_vec()).await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(headers["retry-after"], "1");
-    assert_eq!(body, json!({ "error": "too many requests" }));
+    // A second body for A finds A's reading place taken: the failure is
+    // recorded all the same, with the busy marker in place of its output.
+    let (status, _, body) = ping_with(&public, &path_a, b"again".to_vec()).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
+    assert_eq!(heartbeat_state(&pool, a).await, ("down".to_string(), true));
+    assert_eq!(
+        details_of(&pool, a).await,
+        vec![Some(OUTPUT_BUSY_MARKER.to_string())]
+    );
     let (status, _, _) = ping_with(
         &public,
         &format!("/api/v1/heartbeat/{token_b}/fail"),
@@ -2807,23 +2888,147 @@ async fn one_body_per_heartbeat_is_read_at_a_time(pool: sqlx::PgPool) {
         "other heartbeats are unaffected, and no database place is held during the body read"
     );
 
-    // The slow body runs out of time: 408, and the heartbeat is unchanged.
+    // The slow body runs out of time: the ping still counts.
     tokio::time::pause();
     tokio::time::advance(PING_BODY_TIMEOUT + Duration::from_secs(1)).await;
     let (status, _, body) = slow.await.unwrap();
     tokio::time::resume();
-    assert_eq!(
-        (status, body),
-        (
-            StatusCode::REQUEST_TIMEOUT,
-            json!({ "error": "ping body not received in time" })
-        )
-    );
+    assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
     drop(sender);
+}
+
+/// A body that never finishes, sent to `path`: returns its sender (keep it to
+/// keep the body open) and the ping's task, once the first chunk was taken
+/// (the ping holds its reading places).
+async fn hold_body(
+    public: &Router,
+    path: &str,
+) -> (
+    tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+    tokio::task::JoinHandle<(StatusCode, HeaderMap, Value)>,
+) {
+    let (sender, receiver) =
+        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+    sender
+        .send(Ok(axum::body::Bytes::from_static(b"still running")))
+        .await
+        .unwrap();
+    let task = tokio::spawn({
+        let public = public.clone();
+        let path = path.to_string();
+        let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        async move { ping_body(&public, &path, body).await }
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sender.capacity() == 0 {
+        assert!(Instant::now() < deadline, "the held body was never read");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (sender, task)
+}
+
+/// A failure whose body does not arrive in time is recorded without its
+/// output: the heartbeat goes down and its incident opens with the marker.
+#[sqlx::test]
+async fn a_slow_body_never_loses_the_signal(pool: sqlx::PgPool) {
+    let public = common::test_public_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "A", 3600, 60, 0).await;
+    let (sender, slow) = hold_body(&public, &format!("/api/v1/heartbeat/{token}/fail")).await;
+
+    tokio::time::pause();
+    tokio::time::advance(PING_BODY_TIMEOUT + Duration::from_secs(1)).await;
+    let (status, _, body) = slow.await.unwrap();
+    tokio::time::resume();
+    assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
+    drop(sender);
+    assert_eq!(heartbeat_state(&pool, id).await, ("down".to_string(), true));
     assert_eq!(
-        heartbeat_state(&pool, a).await,
-        ("pending".to_string(), false)
+        incidents_of(&pool, id).await[0].2.as_deref(),
+        Some("Heartbeat reported failure")
     );
+    assert_eq!(
+        details_of(&pool, id).await,
+        vec![Some(OUTPUT_LATE_MARKER.to_string())]
+    );
+}
+
+/// With every body place of the endpoint held (two per project, so by eight
+/// projects), another tenant's failure with output is still recorded: down,
+/// an incident, the busy marker.
+#[sqlx::test]
+async fn held_body_places_never_lose_another_tenants_signal(pool: sqlx::PgPool) {
+    let public = common::test_public_app(pool.clone());
+    let mut held = Vec::new();
+    for _ in 0..MAX_PING_BODIES_IN_FLIGHT / MAX_PING_BODIES_PER_PROJECT {
+        let project = seed_project(&pool).await;
+        for n in 0..MAX_PING_BODIES_PER_PROJECT {
+            let (_, token) = seed_heartbeat(&pool, project, &format!("hog {n}"), 3600, 60, 0).await;
+            held.push(hold_body(&public, &format!("/api/v1/heartbeat/{token}/0")).await);
+        }
+    }
+    let victim_project = seed_project(&pool).await;
+    let (victim, token) = seed_heartbeat(&pool, victim_project, "backup", 3600, 60, 0).await;
+    let (status, _, body) = ping_with(
+        &public,
+        &format!("/api/v1/heartbeat/{token}/fail"),
+        b"disk full".to_vec(),
+    )
+    .await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
+    assert_eq!(
+        heartbeat_state(&pool, victim).await,
+        ("down".to_string(), true)
+    );
+    assert_eq!(incidents_of(&pool, victim).await.len(), 1);
+    assert_eq!(
+        details_of(&pool, victim).await,
+        vec![Some(OUTPUT_BUSY_MARKER.to_string())]
+    );
+    for (sender, task) in held {
+        drop(sender);
+        assert_eq!(task.await.unwrap().0, StatusCode::OK);
+    }
+}
+
+/// One project reads at most MAX_PING_BODIES_PER_PROJECT bodies at once: its
+/// next body gets the busy marker, while another project's body is read.
+#[sqlx::test]
+async fn body_reads_are_capped_per_project(pool: sqlx::PgPool) {
+    let public = common::test_public_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let mut held = Vec::new();
+    for n in 0..MAX_PING_BODIES_PER_PROJECT {
+        let (_, token) = seed_heartbeat(&pool, project, &format!("slow {n}"), 3600, 60, 0).await;
+        held.push(hold_body(&public, &format!("/api/v1/heartbeat/{token}/0")).await);
+    }
+    let (third, token) = seed_heartbeat(&pool, project, "third", 3600, 60, 0).await;
+    let (status, _, _) = ping_with(
+        &public,
+        &format!("/api/v1/heartbeat/{token}/fail"),
+        b"disk full".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        details_of(&pool, third).await,
+        vec![Some(OUTPUT_BUSY_MARKER.to_string())]
+    );
+
+    let other_project = seed_project(&pool).await;
+    let (other, token) = seed_heartbeat(&pool, other_project, "other", 3600, 60, 0).await;
+    let (status, _, _) = ping_with(
+        &public,
+        &format!("/api/v1/heartbeat/{token}/fail"),
+        b"disk full".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        details_of(&pool, other).await,
+        vec![Some("disk full".to_string())]
+    );
+    drop(held);
 }
 
 #[sqlx::test]
@@ -3037,4 +3242,280 @@ async fn the_database_refuses_a_group_of_another_project(pool: sqlx::PgPool) {
         err.as_database_error().and_then(|e| e.code()).as_deref(),
         Some("23503")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Flap control (Phase 3 final review): a job that fails and succeeds in turn
+// keeps one incident and costs each member at most one DOWN + recovery pair
+// per window.
+// ---------------------------------------------------------------------------
+
+/// A public router whose rate limit never gets in the way.
+fn unthrottled_public(state: AppState) -> Router {
+    nami_engine::router::build_public_router_with_ping_limits(
+        state,
+        Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT)),
+        Arc::new(TokenBuckets::new(1000.0, 1000.0)),
+    )
+}
+
+#[sqlx::test]
+async fn a_flapping_heartbeat_keeps_one_incident_and_sends_one_pair_of_emails(pool: sqlx::PgPool) {
+    let public = unthrottled_public(AppState::for_test(pool.clone()));
+    let (project, recipient) = project_with_recipient(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Flaky job", 3600, 60, 0).await;
+
+    for n in 0..10 {
+        let (status, _, _) = ping_with(
+            &public,
+            &format!("/api/v1/heartbeat/{token}/fail"),
+            format!("boom {n}").into_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) =
+            ping_with(&public, &format!("/api/v1/heartbeat/{token}/0"), vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let incidents = incidents_of(&pool, id).await;
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    assert_eq!(incidents[0].0, "resolved");
+    assert_eq!(
+        details_of(&pool, id).await,
+        vec![Some("boom 9".to_string())]
+    );
+    let mail = settled_mail(&recipient, 2).await;
+    let subjects: Vec<&str> = mail.iter().map(|(subject, _)| subject.as_str()).collect();
+    assert_eq!(
+        subjects,
+        vec!["[Nami] Flaky job is DOWN", "[Nami] Flaky job is back UP"]
+    );
+}
+
+/// A failure soon after a recovery reopens the same incident (same id, the
+/// latest cause and output); one after the reopen window opens a new one,
+/// and alerts.
+#[sqlx::test]
+async fn a_failure_reopens_a_recent_incident_and_opens_a_new_one_later(pool: sqlx::PgPool) {
+    let public = unthrottled_public(AppState::for_test(pool.clone()));
+    let (project, recipient) = project_with_recipient(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
+    let fail = |code: i32| format!("/api/v1/heartbeat/{token}/{code}");
+    let ids = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, Uuid>(
+            "select id from incidents where heartbeat_id = $1 order by started_at",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+    };
+
+    assert_eq!(
+        ping_with(&public, &fail(2), b"first".to_vec()).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(ping_with(&public, &fail(0), vec![]).await.0, StatusCode::OK);
+    let first = ids(pool.clone()).await;
+    assert_eq!(
+        ping_with(&public, &fail(3), b"second".to_vec()).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        ids(pool.clone()).await,
+        first,
+        "the same incident, reopened"
+    );
+    let incidents = incidents_of(&pool, id).await;
+    assert_eq!(incidents[0].0, "open");
+    assert_eq!(
+        incidents[0].2.as_deref(),
+        Some("Heartbeat reported failure (exit code 3)")
+    );
+    assert_eq!(
+        details_of(&pool, id).await,
+        vec![Some("second".to_string())]
+    );
+    let resolved_at: Option<DateTime<Utc>> =
+        sqlx::query_scalar("select resolved_at from incidents where id = $1")
+            .bind(first[0])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(resolved_at, None);
+
+    // Recover, then let six minutes pass (moved back in the database; a fresh
+    // engine state stands for the alert window having passed too).
+    assert_eq!(ping_with(&public, &fail(0), vec![]).await.0, StatusCode::OK);
+    sqlx::query(
+        "update incidents set resolved_at = resolved_at - interval '6 minutes',
+                              started_at = started_at - interval '7 minutes'
+         where heartbeat_id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let later = unthrottled_public(AppState::for_test(pool.clone()));
+    let before = settled_mail(&recipient, 2).await.len();
+    assert_eq!(
+        ping_with(&later, &fail(4), b"third".to_vec()).await.0,
+        StatusCode::OK
+    );
+    let now = ids(pool.clone()).await;
+    assert_eq!(now.len(), 2, "a new incident");
+    assert_eq!(now[0], first[0]);
+    assert_eq!(
+        details_of(&pool, id).await,
+        vec![Some("second".to_string()), Some("third".to_string())]
+    );
+    let mail = settled_mail(&recipient, before + 1).await;
+    assert_eq!(mail.len(), before + 1);
+    assert_eq!(mail.last().unwrap().0, "[Nami] Nightly backup is DOWN");
+}
+
+/// The sweep reopens a recent incident too: a job that recovered and then
+/// missed its deadline keeps one incident.
+#[sqlx::test]
+async fn a_missed_deadline_soon_after_a_recovery_reopens_the_incident(pool: sqlx::PgPool) {
+    let public = unthrottled_public(AppState::for_test(pool.clone()));
+    let project = seed_project(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 60, 0, 600).await;
+    assert_eq!(
+        ping_with(&public, &format!("/api/v1/heartbeat/{token}/fail"), vec![])
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        ping_with(&public, &format!("/api/v1/heartbeat/{token}/0"), vec![])
+            .await
+            .0,
+        StatusCode::OK
+    );
+    sqlx::query("update heartbeats set last_ping_at = now() - interval '2 minutes' where id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let transitions = sweep_overdue(&pool, SWEEP_BATCH).await.unwrap();
+    assert_eq!(transitions.len(), 1);
+    let incidents = incidents_of(&pool, id).await;
+    assert_eq!(incidents.len(), 1, "{incidents:?}");
+    assert_eq!(incidents[0].0, "open");
+    assert_eq!(incidents[0].1, "Nightly backup missed its heartbeat");
+    assert_eq!(details_of(&pool, id).await, vec![None]);
+}
+
+/// A heartbeat stored with a stray tag character in its name can still be
+/// paused; a new name with one is refused.
+#[sqlx::test]
+async fn a_heartbeat_with_a_stored_stray_tag_character_can_be_paused(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (id, _) = seed_heartbeat(&pool, project, "legacy\u{E0041}", 3600, 60, 0).await;
+    let item = format!("/projects/{project}/heartbeats/{id}");
+    let (status, body) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "paused": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["paused"], true);
+    let (status, _) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "name": "stray\u{E0041}" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An instance without the uptime worker (API only) still sends the DOWN its
+/// flap control held back for a ping it received, once the window is over;
+/// a project-wide maintenance window stops it.
+#[sqlx::test]
+async fn a_held_down_is_sent_without_the_worker(pool: sqlx::PgPool) {
+    use nami_engine::uptime::{alert_throttle::ALERT_FLAP_WINDOW, alerts::run_deferred_alerts};
+    let mut state = AppState::for_test(pool.clone());
+    state.config.uptime_worker_enabled = false;
+    let public = unthrottled_public(state.clone());
+    let (project, recipient) = project_with_recipient(&pool).await;
+    let (_, token) = seed_heartbeat(&pool, project, "Flaky job", 3600, 60, 0).await;
+    for path in ["fail", "0", "fail"] {
+        let (status, _, _) = ping_with(
+            &public,
+            &format!("/api/v1/heartbeat/{token}/{path}"),
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        settled_mail(&recipient, 2).await.len(),
+        2,
+        "the second DOWN is held"
+    );
+
+    // The loop every instance runs; the skew stands for the window passing.
+    let deferred = tokio::spawn(run_deferred_alerts(
+        state.clone(),
+        Duration::from_millis(50),
+        ALERT_FLAP_WINDOW,
+    ));
+    let mail = settled_mail(&recipient, 3).await;
+    deferred.abort();
+    let subjects: Vec<&str> = mail.iter().map(|(subject, _)| subject.as_str()).collect();
+    assert_eq!(
+        subjects,
+        vec![
+            "[Nami] Flaky job is DOWN",
+            "[Nami] Flaky job is back UP",
+            "[Nami] Flaky job is DOWN"
+        ]
+    );
+}
+
+/// A heartbeat's held-back DOWN is dropped while a project-wide maintenance
+/// window covers it.
+#[sqlx::test]
+async fn a_held_heartbeat_down_is_dropped_during_maintenance(pool: sqlx::PgPool) {
+    use nami_engine::uptime::{alert_throttle::ALERT_FLAP_WINDOW, alerts::send_deferred};
+    let state = AppState::for_test(pool.clone());
+    let public = unthrottled_public(state.clone());
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_heartbeat(&pool, project, "Flaky job", 3600, 60, 0).await;
+    for path in ["fail", "0", "fail"] {
+        let (status, _, _) = ping_with(
+            &public,
+            &format!("/api/v1/heartbeat/{token}/{path}"),
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    sqlx::query(
+        "insert into maintenance_windows (project_id, title, kind, starts_at, ends_at)
+         values ($1, 'maintenance', 'once', now() - interval '5 minutes', now() + interval '1 hour')",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // The alert tasks of the pings may still be running: wait for the held DOWN.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let later = || std::time::Instant::now() + ALERT_FLAP_WINDOW;
+    while state.alert_throttle.due(later()).is_empty() {
+        assert!(Instant::now() < deadline, "the DOWN was never held");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(send_deferred(&state, later()).await, 0);
+    assert!(state.alert_throttle.due(later()).is_empty());
 }

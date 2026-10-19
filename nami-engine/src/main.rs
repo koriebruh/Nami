@@ -77,8 +77,17 @@ async fn main() {
         clickhouse,
         cipher: Cipher::new(&config.encryption_key),
         logs: Arc::new(LogsState::default()),
+        alert_throttle: Arc::new(nami_engine::uptime::alert_throttle::AlertThrottle::new()),
         config,
     };
+
+    // Every instance sends the DOWN alerts its flap control held back, worker
+    // or not: pings are throttled in whichever process received them.
+    tokio::spawn(nami_engine::uptime::alerts::run_deferred_alerts(
+        state.clone(),
+        nami_engine::uptime::alerts::DEFERRED_ALERT_INTERVAL,
+        std::time::Duration::ZERO,
+    ));
 
     // Every instance that ingests logs adds its usage counters to Postgres.
     tokio::spawn(nami_engine::logs::usage::run_forever(state.clone()));

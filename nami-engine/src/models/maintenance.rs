@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
-use super::{ProjectQuota, nullable, validate_label};
+use super::{ProjectQuota, nullable, validate_label, with_unchanged_values};
 use crate::error::AppError;
 
 /// The longest a one-off window may last.
@@ -558,7 +558,10 @@ pub async fn update_in_project(
     let Some(current) = current else {
         return Ok(None);
     };
-    let w = validate(patch.apply_to(WindowConfig::from(&current))).map_err(AppError::Validation)?;
+    let w = with_unchanged_values(vec![current.title.clone()], || {
+        validate(patch.apply_to(WindowConfig::from(&current)))
+    })
+    .map_err(AppError::Validation)?;
     let updated: MaintenanceWindow = sqlx::query_as(
         "update maintenance_windows set
              monitor_id = $3, title = $4, kind = $5, starts_at = $6, ends_at = $7,

@@ -196,7 +196,7 @@ describe('heartbeat detail page: failure examples', () => {
 	it('shows /fail and the exit-code command to members only', () => {
 		const member = renderPage(heartbeat()).body;
 		expect(member).toContain(`${PING}/fail`);
-		expect(member).toContain('curl -fsS -m 10 --data-binary @-');
+		expect(member).toContain('| tail -c 10240 | curl -fsS -m 10 --retry 3 --data-binary @-');
 		const viewer = renderPage(heartbeat({ token: null })).body;
 		expect(viewer).not.toContain('/fail');
 		expect(viewer).not.toContain('--data-binary');

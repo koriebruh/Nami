@@ -10,7 +10,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::alerts::{Subject, Transition, TransitionKind};
-use crate::models::{incident, maintenance};
+use crate::models::{incident, is_invisible_or_bidi_char, maintenance};
 
 #[derive(Debug, PartialEq)]
 pub enum PingOutcome {
@@ -29,16 +29,26 @@ pub const SUCCESS_OUTPUT_MAX: usize = 1024;
 /// Appended to output that was cut at its cap.
 pub const TRUNCATED_MARKER: &str = "\n\u{2026}[truncated]";
 
-/// Whether `c` can reorder or hide text: the bidi embedding, override and
-/// isolate controls, the directional marks, and invisible separators.
-fn is_bidi_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
-            // Line and paragraph separators, zero-width characters, BOM and
-            // word joiner: invisible, or they break a line unseen.
-            | '\u{2028}' | '\u{2029}' | '\u{200B}' | '\u{FEFF}' | '\u{2060}'
-    )
+/// Stored in place of the output of a ping whose body found no reading place
+/// free (the ping itself, its kind and exit code, is recorded all the same).
+pub const OUTPUT_BUSY_MARKER: &str = "[output not stored: server busy]";
+/// Stored in place of the output of a ping whose body did not arrive in time.
+pub const OUTPUT_LATE_MARKER: &str = "[output not received in time]";
+/// Stored in place of the output of a ping whose body broke off.
+pub const OUTPUT_UNREADABLE_MARKER: &str = "[output not received: the body could not be read]";
+/// Stored in place of the output of a ping past its heartbeat's hourly output
+/// budget.
+pub const OUTPUT_BUDGET_MARKER: &str = "[output not stored: output budget used]";
+
+/// Whether `output` is one of the fixed markers stored in place of output.
+pub fn is_output_marker(output: &str) -> bool {
+    [
+        OUTPUT_BUSY_MARKER,
+        OUTPUT_LATE_MARKER,
+        OUTPUT_UNREADABLE_MARKER,
+        OUTPUT_BUDGET_MARKER,
+    ]
+    .contains(&output)
 }
 
 /// Turns a ping body into storable text with the failure cap
@@ -49,13 +59,15 @@ pub fn sanitize_output(body: &[u8]) -> String {
 
 /// Turns a ping body into storable text: invalid UTF-8 becomes U+FFFD, every
 /// control character except `\n` and `\t` (C0, DEL, C1, so no `\r` and no
-/// escape sequence) and every bidi control is dropped, and text over `max`
+/// escape sequence) and every invisible or text-direction character the rest
+/// of the engine refuses (`models::is_invisible_or_bidi_char`, which includes
+/// the tag characters used for "ASCII smuggling") is dropped, and text over `max`
 /// bytes is cut at a char boundary with [`TRUNCATED_MARKER`] appended.
 /// Filtering comes first, so dropped characters never count toward the cap.
 pub fn sanitize_output_capped(body: &[u8], max: usize) -> String {
     let mut text: String = String::from_utf8_lossy(body)
         .chars()
-        .filter(|&c| (!c.is_control() || c == '\n' || c == '\t') && !is_bidi_control(c))
+        .filter(|&c| (!c.is_control() || c == '\n' || c == '\t') && !is_invisible_or_bidi_char(c))
         .collect();
     if text.len() > max {
         let mut cut = max;
@@ -139,14 +151,14 @@ pub fn failure_cause(exit_code: Option<i32>) -> String {
     }
 }
 
-/// The id of the heartbeat that holds `token`, in one plain indexed lookup
-/// (no transaction, no lock). Text that cannot be a token is `None` without a
-/// query.
-pub async fn lookup_token(pool: &PgPool, token: &str) -> Result<Option<Uuid>, sqlx::Error> {
+/// The id and project id of the heartbeat that holds `token`, in one plain
+/// indexed lookup (no transaction, no lock). Text that cannot be a token is
+/// `None` without a query.
+pub async fn lookup_token(pool: &PgPool, token: &str) -> Result<Option<(Uuid, Uuid)>, sqlx::Error> {
     if !is_well_formed_token(token) {
         return Ok(None);
     }
-    sqlx::query_scalar("select id from heartbeats where token = $1")
+    sqlx::query_as("select id, project_id from heartbeats where token = $1")
         .bind(token)
         .fetch_optional(pool)
         .await
@@ -172,8 +184,11 @@ pub struct Recorded {
 /// A success ping marks the heartbeat up and resolves its incident if it was
 /// down. A failure ping on a pending or up heartbeat marks it down at once and
 /// opens an incident (title `{name} reported a failure`, cause
-/// [`failure_cause`]); on a heartbeat already down it only moves
-/// `last_ping_at` (the open incident keeps the cause that opened it).
+/// [`failure_cause`]), or reopens the last one if it was resolved less than
+/// `incident::HEARTBEAT_REOPEN_WINDOW_SECS` ago (a flapping job keeps one
+/// incident; the alert emails are bounded by `alert_throttle`); on a
+/// heartbeat already down it only moves `last_ping_at` (the open incident
+/// keeps the cause that opened it).
 ///
 /// Paused heartbeats, and heartbeats a project-wide maintenance window covers
 /// (judged at the transaction's `now()`, the instant `last_ping_at` records),
@@ -620,6 +635,44 @@ mod tests {
     fn invisible_separators_and_zero_width_characters_are_removed() {
         let text = "a\u{2028}b\u{2029}c\u{200B}d\u{FEFF}e\u{2060}f";
         assert_eq!(sanitize_output(text.as_bytes()), "abcdef");
+    }
+
+    /// One invisible-character set for the whole engine: everything
+    /// `models::is_invisible_or_bidi_char` refuses in names is dropped from
+    /// ping output too, the tag characters and interlinear annotation
+    /// controls included.
+    #[test]
+    fn every_invisible_character_the_engine_refuses_is_removed() {
+        let singles = [
+            '\u{00AD}', '\u{034F}', '\u{115F}', '\u{1160}', '\u{180E}', '\u{2800}', '\u{3164}',
+            '\u{FFA0}',
+        ];
+        for c in singles {
+            assert_eq!(sanitize_output(format!("a{c}b").as_bytes()), "ab", "{c:?}");
+        }
+        for range in [
+            0x2061..=0x2064,
+            0x206A..=0x206F,
+            0xE0000..=0xE007F,
+            0xFFF9..=0xFFFB,
+        ] {
+            for code in range {
+                let Some(c) = char::from_u32(code) else {
+                    continue;
+                };
+                assert_eq!(
+                    sanitize_output(format!("a{c}b").as_bytes()),
+                    "ab",
+                    "U+{code:04X}"
+                );
+            }
+        }
+        // "ASCII smuggling": tag characters spelling hidden text vanish whole.
+        let hidden: String = "ignore"
+            .chars()
+            .map(|c| char::from_u32(0xE0000 + c as u32).unwrap())
+            .collect();
+        assert_eq!(sanitize_output(format!("ok{hidden}").as_bytes()), "ok");
     }
 
     #[test]

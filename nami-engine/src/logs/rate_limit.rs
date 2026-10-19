@@ -79,6 +79,12 @@ impl TokenBuckets {
     }
 
     pub fn try_acquire_at(&self, key: Uuid, now: Instant) -> bool {
+        self.try_take_at(key, 1.0, now)
+    }
+
+    /// Takes `amount` tokens from `key`'s bucket at once (a byte budget, say);
+    /// `false`, taking nothing, when fewer are left.
+    pub fn try_take_at(&self, key: Uuid, amount: f64, now: Instant) -> bool {
         let mut buckets = self.buckets.lock().expect("rate limiter lock poisoned");
         let bucket = buckets.entry(key).or_insert(Bucket {
             tokens: self.burst,
@@ -87,8 +93,8 @@ impl TokenBuckets {
         let elapsed = now.saturating_duration_since(bucket.updated).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * self.rate).min(self.burst);
         bucket.updated = bucket.updated.max(now);
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
+        if bucket.tokens >= amount {
+            bucket.tokens -= amount;
             true
         } else {
             false

@@ -167,17 +167,17 @@ async fn ndjson_carries_every_column_and_csv_the_picked_ones(pool: sqlx::PgPool)
     let mut records = csv.split("\r\n");
     assert_eq!(
         records.next().unwrap(),
-        "dt,level,source,message,trace_id,user.name,n"
+        "\"dt\",\"level\",\"source\",\"message\",\"trace_id\",\"user.name\",\"n\""
     );
     assert!(
-        csv.contains(",api,'=cmd|' /C calc'!A0,,'@SUM(1),5\r\n"),
+        csv.contains(",\"api\",\"'=cmd|' /C calc'!A0\",\"\",\"'@SUM(1)\",\"5\"\r\n"),
         "{csv}"
     );
     assert!(
-        csv.contains(",api,\"plain, \"\"quoted\"\"\",4bf92f3577b34da6a3ce929d0e0e4736,'+1,\r\n"),
+        csv.contains(",\"api\",\"plain, \"\"quoted\"\"\",\"4bf92f3577b34da6a3ce929d0e0e4736\",\"'+1\",\"\"\r\n"),
         "{csv}"
     );
-    assert!(csv.contains(",api,'-2,,,\r\n"), "{csv}");
+    assert!(csv.contains(",\"api\",\"'-2\",\"\",\"\",\"\"\r\n"), "{csv}");
     assert!(!csv.contains("never exported"));
     ch.drop_database().await.unwrap();
 }
@@ -291,7 +291,7 @@ async fn hitting_the_byte_cap_ends_with_an_error_trailer(pool: sqlx::PgPool) {
         assert!(body.len() < 4096 + 256, "{format}: {}", body.len());
         match format {
             "ndjson" => assert!(last.starts_with("{\"_nami_export_error\":"), "{last}"),
-            _ => assert!(last.starts_with("# export stopped early:"), "{last}"),
+            _ => assert!(last.starts_with("\"# export stopped early:"), "{last}"),
         }
     }
     ch.drop_database().await.unwrap();
@@ -467,7 +467,10 @@ async fn export_needs_access_and_valid_parameters(pool: sqlx::PgPool) {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(text(response).await, "dt,level,source,message,trace_id\r\n");
+        assert_eq!(
+            text(response).await,
+            "\"dt\",\"level\",\"source\",\"message\",\"trace_id\"\r\n"
+        );
         let response = get(
             &app,
             &format!("{base}?format=ndjson&source_id={source}&{}", window()),

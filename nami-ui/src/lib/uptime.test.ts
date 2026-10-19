@@ -371,10 +371,14 @@ describe('heartbeat failure examples', () => {
 		const url = 'https://engine.example.com/api/v1/heartbeat/' + 'a'.repeat(64);
 		expect(failUrl(url)).toBe(url + '/fail');
 		expect(exitCodeCommand(url)).toBe(
-			`out=$(your-job 2>&1); code=$?; printf '%s' "$out" | curl -fsS -m 10 --data-binary @- '${url}'/$code`
+			`out=$(your-job 2>&1); code=$?; printf '%s' "$out" | tail -c 10240 | curl -fsS -m 10 --retry 3 --data-binary @- '${url}'/$code`
 		);
 		// Never `--data-binary "$out"`: output starting with @ would make curl upload a local file.
 		expect(exitCodeCommand(url)).not.toContain('--data-binary "$out"');
+		// Only the end of the output (where errors are) is sent, so a chatty
+		// job never trips the 1 MiB cap, and a busy engine is retried.
+		expect(exitCodeCommand(url)).toContain('| tail -c 10240 |');
+		expect(exitCodeCommand(url)).toContain('--retry 3');
 	});
 
 	it('groups heartbeats like monitors', () => {

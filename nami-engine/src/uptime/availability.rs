@@ -6,6 +6,11 @@
 //! incident and a window) cover counts once. The pure part ([`compute`]) takes
 //! spans; [`for_monitor`] and [`for_heartbeat`] gather them. Incident
 //! Management's SLA report reuses those two.
+//!
+//! Heartbeat incidents are reopened when the heartbeat goes down again within
+//! 5 minutes of a recovery (`incident::HEARTBEAT_REOPEN_WINDOW_SECS`), so the
+//! up gaps of a flapping heartbeat, up to 5 minutes each, count as downtime
+//! here. Monitor incidents are never reopened.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

@@ -2,8 +2,10 @@
 //! non-http probe), storing results in ClickHouse (`store`), the background
 //! worker and its state machine (`worker`), heartbeat pings and the overdue
 //! sweep (`heartbeat`), the heartbeat ping log in ClickHouse (`pings`), TLS for
-//! the non-http checks (`tls`), alert delivery (`alerts`), and the streaming
+//! the non-http checks (`tls`), alert delivery (`alerts`) and its flap control
+//! (`alert_throttle`), and the streaming
 //! CSV export of check history (`export`).
+pub mod alert_throttle;
 pub mod alerts;
 pub mod availability;
 pub mod checker;
