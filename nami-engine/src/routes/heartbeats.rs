@@ -28,11 +28,10 @@ use crate::{
         },
         maintenance, monitor_group,
     },
-    routes::monitors::RangeQuery,
     state::AppState,
     uptime::{
         alerts,
-        availability::{self, Availability},
+        availability::{self, Availability, RangeQuery},
         heartbeat::{
             MAX_OUTPUT_BYTES, Ping, PingKind, SUCCESS_OUTPUT_MAX, is_well_formed_token,
             lookup_token, parse_signal, record_signal, sanitize_output_capped,

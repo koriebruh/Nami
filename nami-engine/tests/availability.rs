@@ -215,6 +215,10 @@ async fn a_range_before_creation_has_no_uptime(pool: PgPool) {
     assert_eq!(secs(&body, "total_seconds"), 0);
     assert!(body["uptime_pct"].is_null(), "{body}");
     assert_eq!(secs(&body, "incidents"), 0);
+    assert_eq!(
+        body["from"], body["to"],
+        "both bounds are the clipped start: {body}"
+    );
 
     // A range entirely in the future is empty too (clipped to now).
     let (_, body) = call(

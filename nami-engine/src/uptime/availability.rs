@@ -8,7 +8,7 @@
 //! Management's SLA report reuses those two.
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -39,14 +39,18 @@ pub fn union(mut spans: Vec<Span>) -> Vec<Span> {
 /// The parts of `spans` that `minus` does not cover. Both are merged first,
 /// so any input order and overlap is fine.
 pub fn subtract(spans: &[Span], minus: &[Span]) -> Vec<Span> {
-    let minus = union(minus.to_vec());
+    subtract_sorted(&union(spans.to_vec()), &union(minus.to_vec()))
+}
+
+/// [`subtract`] for inputs that are already sorted and disjoint (the output
+/// of [`union`]): a binary search finds the first hole that can matter for
+/// each span, so the cost is O((n + k) log m) instead of rescanning the holes.
+fn subtract_sorted(spans: &[Span], minus: &[Span]) -> Vec<Span> {
     let mut out = Vec::new();
-    for span in union(spans.to_vec()) {
+    for span in spans {
         let mut start = span.start;
-        for hole in &minus {
-            if hole.end <= start {
-                continue;
-            }
+        let first = minus.partition_point(|hole| hole.end <= span.start);
+        for hole in &minus[first..] {
             if hole.start >= span.end {
                 break;
             }
@@ -83,6 +87,13 @@ fn clip(span: Span, to: Span) -> Span {
     }
 }
 
+/// `?from=&to=` of the availability reports (RFC 3339).
+#[derive(Debug, Deserialize)]
+pub struct RangeQuery {
+    pub from: DateTime<Utc>,
+    pub to: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Availability {
     /// The effective range: the requested one clipped to the monitor's
@@ -104,9 +115,10 @@ pub struct Availability {
 /// one gives zeros. Incidents and maintenance are clipped to it here.
 pub fn compute(total: Span, incidents: &[Span], maintenance: &[Span]) -> Availability {
     if total.start >= total.end {
+        // A range wholly before creation: both bounds are the clipped start.
         return Availability {
             from: total.start,
-            to: total.end,
+            to: total.start,
             total_seconds: 0,
             maintenance_seconds: 0,
             downtime_seconds: 0,
@@ -121,7 +133,7 @@ pub fn compute(total: Span, incidents: &[Span], maintenance: &[Span]) -> Availab
         .map(|s| clip(*s, total))
         .filter(|s| s.start < s.end)
         .collect();
-    let down = subtract(&union(clipped.clone()), &maintenance);
+    let down = subtract_sorted(&union(clipped.clone()), &maintenance);
     let total_seconds = seconds(&[total]);
     let maintenance_seconds = seconds(&maintenance);
     let downtime_seconds = seconds(&down);
@@ -137,7 +149,7 @@ pub fn compute(total: Span, incidents: &[Span], maintenance: &[Span]) -> Availab
         incidents: clipped.len() as u32,
         longest_incident_seconds: clipped
             .iter()
-            .map(|s| seconds(&subtract(&[*s], &maintenance)))
+            .map(|s| seconds(&subtract_sorted(&[*s], &maintenance)))
             .max()
             .unwrap_or(0),
     }
@@ -362,5 +374,88 @@ mod tests {
             check_range(t(0), t(24 * MAX_RANGE_DAYS + 1)),
             Err("the range must be at most 1096 days".into())
         );
+    }
+
+    /// Tiny deterministic generator (xorshift), no dependencies.
+    fn rng(seed: &mut u64) -> u64 {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        *seed
+    }
+
+    fn random_spans(seed: &mut u64, n: usize) -> Vec<Span> {
+        (0..n)
+            .map(|_| {
+                let a = (rng(seed) % 200) as i64 - 20;
+                let len = (rng(seed) % 15) as i64 - 2; // some empty or inverted
+                s(a, a + len)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn subtract_sorted_equals_subtract_on_random_inputs() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..500 {
+            let (n, m) = (
+                (rng(&mut seed) % 12) as usize,
+                (rng(&mut seed) % 12) as usize,
+            );
+            let (spans, minus) = (random_spans(&mut seed, n), random_spans(&mut seed, m));
+            let expected = subtract(&spans, &minus);
+            assert_eq!(
+                subtract_sorted(&union(spans.clone()), &union(minus.clone())),
+                expected,
+                "{spans:?} - {minus:?}"
+            );
+            // Seconds check against a brute-force hour grid.
+            let covered =
+                |set: &[Span], h: i64| set.iter().any(|x| x.start <= t(h) && t(h) < x.end);
+            for h in -30..230 {
+                assert_eq!(
+                    covered(&expected, h),
+                    covered(&spans, h) && !covered(&minus, h),
+                    "hour {h}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_three_year_report_with_thousands_of_incidents_is_fast() {
+        // 200 daily windows (as many as a project may hold) over three years
+        // and 5000 incidents; held to a generous bound in a debug build.
+        let sec = |n: i64| t(0) + TimeDelta::seconds(n);
+        let range = 1_096 * 86_400;
+        let maintenance: Vec<Span> = (0..219_000)
+            .map(|i| Span {
+                start: sec(i * 432),
+                end: sec(i * 432 + 200),
+            })
+            .collect();
+        let mut seed = 42u64;
+        let incidents: Vec<Span> = (0..5000)
+            .map(|_| {
+                let a = (rng(&mut seed) % range as u64) as i64;
+                Span {
+                    start: sec(a),
+                    end: sec(a + 1 + (rng(&mut seed) % 3000) as i64),
+                }
+            })
+            .collect();
+        let total = Span {
+            start: sec(0),
+            end: sec(range),
+        };
+        let started = std::time::Instant::now();
+        let a = compute(total, &incidents, &maintenance);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(a.incidents, 5000);
+        assert!(a.downtime_seconds > 0 && a.uptime_pct.is_some());
     }
 }

@@ -6,7 +6,7 @@ use axum::{
     http::StatusCode,
     routing::get,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -20,7 +20,7 @@ use crate::{
     },
     state::AppState,
     uptime::{
-        availability::{self, Availability},
+        availability::{self, Availability, RangeQuery},
         store::{self, MonitorStats, UptimeCheckRow},
     },
 };
@@ -243,13 +243,6 @@ async fn get_stats(
     Ok(Json(
         store::monitor_stats(&state.clickhouse, project_id, monitor_id, Utc::now()).await?,
     ))
-}
-
-/// `?from=&to=` of the availability reports (RFC 3339).
-#[derive(Debug, Deserialize)]
-pub struct RangeQuery {
-    pub from: DateTime<Utc>,
-    pub to: DateTime<Utc>,
 }
 
 async fn get_availability(
