@@ -601,7 +601,7 @@ async fn a_monitor_that_cannot_be_checked_is_down_instead_of_panicking() {
             },
             "invalid port -1",
         ),
-        (monitor("ping"), "unsupported check type \"ping\""),
+        (monitor("icmp"), "unsupported check type \"icmp\""),
     ];
     let ctx = check_context();
     for (case, expected) in cases {
