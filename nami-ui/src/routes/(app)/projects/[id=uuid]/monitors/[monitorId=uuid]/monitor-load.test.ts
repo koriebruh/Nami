@@ -56,8 +56,10 @@ describe('detail page load', () => {
 		[monitorPath]: monitor,
 		[`${monitorPath}/stats`]: { uptime_24h: 1, series: [] },
 		[`${monitorPath}/checks`]: [{ checked_at: '2026-10-13T10:00:00Z' }],
-		[`/projects/${PROJECT_ID}/incidents`]: [{ id: 'incident-1' }]
+		[`/projects/${PROJECT_ID}/incidents`]: [{ id: 'incident-1' }],
+		[`${monitorPath}/availability`]: { uptime_pct: 99.5, incidents: 2 }
 	};
+	const view30d = { key: '30d', from: expect.any(String), to: expect.any(String), error: null };
 
 	it('returns the monitor with its stats, recent checks and incidents', async () => {
 		const { event, calls } = fakeEvent({ respond: (url) => json(answers[url.pathname]) });
@@ -65,14 +67,66 @@ describe('detail page load', () => {
 			monitor,
 			stats: answers[`${monitorPath}/stats`],
 			checks: answers[`${monitorPath}/checks`],
-			incidents: answers[`/projects/${PROJECT_ID}/incidents`]
+			incidents: answers[`/projects/${PROJECT_ID}/incidents`],
+			availability: {
+				range: expect.objectContaining(view30d),
+				data: answers[`${monitorPath}/availability`],
+				unavailable: false
+			}
 		});
 		expect(calls().map((call) => call.path + call.search)).toEqual([
 			monitorPath,
 			`${monitorPath}/stats`,
 			`${monitorPath}/checks?limit=20`,
-			`/projects/${PROJECT_ID}/incidents?monitor_id=${MONITOR_ID}`
+			`/projects/${PROJECT_ID}/incidents?monitor_id=${MONITOR_ID}`,
+			expect.stringMatching(new RegExp(`^${monitorPath}/availability\\?from=[^&]+&to=[^&]+$`))
 		]);
+	});
+
+	it('asks the engine for the range of the query string, one call for it', async () => {
+		const { event, calls } = fakeEvent({
+			url: 'http://ui.test/?range=custom&from=2026-01-01&to=2026-01-31',
+			respond: (url) => json(answers[url.pathname] ?? {})
+		});
+		const data = (await loadDetail(event)) as any;
+		expect(data.availability.range).toMatchObject({ key: 'custom', from: '2026-01-01T00:00:00.000Z', to: '2026-02-01T00:00:00.000Z' });
+		const availability = calls().filter((call) => call.path.endsWith('/availability'));
+		expect(availability).toHaveLength(1);
+		expect(availability[0].search).toBe('?from=2026-01-01T00%3A00%3A00.000Z&to=2026-02-01T00%3A00%3A00.000Z');
+		expect(calls()).toHaveLength(5);
+	});
+
+	it('makes no availability call for a custom range that is not picked yet or is refused', async () => {
+		for (const query of ['range=custom', 'range=custom&from=2026-02-01&to=2026-01-01']) {
+			const { event, calls } = fakeEvent({ url: `http://ui.test/?${query}`, respond: (url) => json(answers[url.pathname] ?? {}) });
+			const data = (await loadDetail(event)) as any;
+			expect(data.availability).toMatchObject({ data: null, unavailable: false });
+			expect(calls().some((call) => call.path.endsWith('/availability'))).toBe(false);
+		}
+	});
+
+	it('still loads, with the card unavailable, when the availability call fails', async () => {
+		const { event } = fakeEvent({
+			respond: (url) =>
+				url.pathname.endsWith('/availability') ? json({ error: 'internal error' }, 500) : json(answers[url.pathname] ?? {})
+		});
+		const data = (await loadDetail(event)) as any;
+		expect(data.monitor).toEqual(monitor);
+		expect(data.availability).toMatchObject({ data: null, unavailable: true });
+	});
+
+	it('also copes with an unreachable availability call', async () => {
+		let n = 0;
+		const { event } = fakeEvent({
+			respond: (url) => {
+				if (url.pathname.endsWith('/availability')) throw new TypeError('fetch failed');
+				n++;
+				return json(answers[url.pathname] ?? {});
+			}
+		});
+		const data = (await loadDetail(event)) as any;
+		expect(n).toBe(4);
+		expect(data.availability.unavailable).toBe(true);
 	});
 
 	// History lives in ClickHouse: without it the page still shows the monitor.
@@ -80,7 +134,7 @@ describe('detail page load', () => {
 		const { event } = fakeEvent({
 			respond: (url) => (url.pathname === monitorPath ? json(monitor) : json({ error: 'internal error' }, 500))
 		});
-		expect(await loadDetail(event)).toEqual({ monitor, stats: null, checks: [], incidents: [] });
+		expect(await loadDetail(event)).toMatchObject({ monitor, stats: null, checks: [], incidents: [] });
 	});
 
 	it('keeps a hostile id inside one path segment of every engine path', async () => {
@@ -91,7 +145,8 @@ describe('detail page load', () => {
 			`/projects/${PROJECT_ID}/monitors/${id}`,
 			`/projects/${PROJECT_ID}/monitors/${id}/stats`,
 			`/projects/${PROJECT_ID}/monitors/${id}/checks?limit=20`,
-			`/projects/${PROJECT_ID}/incidents?monitor_id=${id}`
+			`/projects/${PROJECT_ID}/incidents?monitor_id=${id}`,
+			expect.stringMatching(new RegExp(`^/projects/${PROJECT_ID}/monitors/${id}/availability\\?from=`))
 		]);
 	});
 });

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import { refreshAll } from '$app/navigation';
+	import AvailabilityCard from '#lib/components/AvailabilityCard.svelte';
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
@@ -256,6 +257,8 @@
 			</ul>
 		{/if}
 	</div>
+
+	<AvailabilityCard availability={data.availability} />
 
 	<div class="card p-5 sm:p-6">
 		<h3 class="card-title">Settings</h3>

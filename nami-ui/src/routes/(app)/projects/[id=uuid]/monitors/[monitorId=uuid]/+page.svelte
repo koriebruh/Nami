@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import { refreshAll } from '$app/navigation';
+	import AvailabilityCard from '#lib/components/AvailabilityCard.svelte';
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import ResponseTimeChart from '#lib/components/ResponseTimeChart.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
@@ -177,6 +178,8 @@
 		{/each}
 	</section>
 
+	<AvailabilityCard availability={data.availability} exportBase="{base}/checks.csv" />
+
 	<Card title="Response time" subtitle="Last 24 hours, average per 30 minutes (UTC)">
 		{#if data.stats}
 			<ResponseTimeChart series={data.stats.series} />
@@ -186,7 +189,7 @@
 	</Card>
 
 	<div class="grid gap-6 xl:grid-cols-5">
-		<Card title="Recent checks" titleTag="h3" padded={false} class="xl:col-span-3">
+		<Card title="Recent checks" titleTag="h3" padded={false} class="min-w-0 xl:col-span-3">
 			{#if data.checks.length === 0}
 				<EmptyState icon="clock" message="No checks yet." />
 			{:else}
@@ -220,7 +223,7 @@
 			{/if}
 		</Card>
 
-		<Card title="Incidents" titleTag="h3" padded={false} class="xl:col-span-2">
+		<Card title="Incidents" titleTag="h3" padded={false} class="min-w-0 xl:col-span-2">
 			{#if data.incidents.length === 0}
 				<EmptyState icon="incident" message="No incidents." />
 			{:else}

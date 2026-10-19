@@ -70,7 +70,7 @@ Also out of scope (ruled 2026-10-13):
       cookies within a check, HTTP(S) proxy with encrypted credentials
 - [x] Availability (SLA) report for a monitor over an arbitrary range;
       check-history CSV export
-- [ ] UI for all of the above
+- [x] UI for all of the above
 
 ## 3. Log management
 

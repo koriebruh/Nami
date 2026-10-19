@@ -4,6 +4,7 @@
 // values surviving a refresh) is covered by the walkthrough.
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
+import { selectRange } from '#lib/availability';
 import { HEARTBEAT_ID, PROJECT_ID } from '#lib/server/fake-event';
 import type { Heartbeat, HeartbeatPing, MonitorGroup } from '#lib/uptime';
 import Page from './+page.svelte';
@@ -37,7 +38,8 @@ function renderPage(hb: Heartbeat, form: unknown = null, pings: HeartbeatPing[] 
 		heartbeat: hb,
 		pings,
 		groups,
-		engineUrl: ENGINE
+		engineUrl: ENGINE,
+		availability: { range: selectRange(new URLSearchParams(), new Date()), data: null, unavailable: false }
 	};
 	return render(Page, { props: { params: { id: PROJECT_ID, heartbeatId: HEARTBEAT_ID }, data, form } as never });
 }

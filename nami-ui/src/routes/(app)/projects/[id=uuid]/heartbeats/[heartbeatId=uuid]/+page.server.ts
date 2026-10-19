@@ -7,6 +7,7 @@ import {
 	publicEngineUrl,
 	redirectToLoginIfUnauthorized
 } from '#lib/server/engine';
+import { loadAvailability } from '#lib/server/availability';
 import { heartbeatPayloadFromForm } from '#lib/server/heartbeat-form';
 import { formText } from '#lib/server/monitor-form';
 import type { Heartbeat, HeartbeatPing, MonitorGroup } from '#lib/uptime';
@@ -34,10 +35,11 @@ export const load: PageServerLoad = async (event) => {
 	// throws when a header is set twice.
 	event.setHeaders({ 'cache-control': 'private, no-store' });
 
-	const [response, pingsResponse, groupsResponse] = await Promise.all([
+	const [response, pingsResponse, groupsResponse, availability] = await Promise.all([
 		callEngine(event, heartbeatPath(event.params)),
 		callEngine(event, `${heartbeatPath(event.params)}/pings?limit=50`),
-		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`)
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`),
+		loadAvailability(event, `${heartbeatPath(event.params)}/availability`)
 	]);
 	redirectToLoginIfUnauthorized(response);
 	if (response.status === 404) throw error(404, 'Heartbeat not found.');
@@ -53,7 +55,7 @@ export const load: PageServerLoad = async (event) => {
 	// Pings and groups are extras: the page renders without them.
 	const pings = await jsonArray<HeartbeatPing>(pingsResponse);
 	const groups = await jsonArray<MonitorGroup>(groupsResponse);
-	return { heartbeat, pings, groups, engineUrl: publicEngineUrl() };
+	return { heartbeat, pings, groups, engineUrl: publicEngineUrl(), availability };
 };
 
 type ActionName = 'update' | 'pause' | 'resume' | 'rotate' | 'delete';
