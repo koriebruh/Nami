@@ -1,5 +1,5 @@
-import { MIB, PLATFORMS, type Platform } from '#lib/logs';
-import { formText, formWholeNumber, type FormResult } from './monitor-form';
+import { MIB, PLATFORMS, type Platform } from '#lib/logs/logs';
+import { formText, formWholeNumber, type FormResult } from '../uptime/monitor-form';
 
 /**
  * Source form -> nami-engine JSON body. The daily quota is entered in MiB;

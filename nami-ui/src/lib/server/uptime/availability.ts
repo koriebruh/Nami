@@ -1,5 +1,5 @@
-import { selectRange, type Availability, type SelectedRange } from '#lib/availability';
-import { callEngine } from '#lib/server/engine';
+import { selectRange, type Availability, type SelectedRange } from '#lib/uptime/availability';
+import { callEngine } from '#lib/server/core/engine';
 import type { RequestEvent } from '@sveltejs/kit';
 
 export type AvailabilityView = {

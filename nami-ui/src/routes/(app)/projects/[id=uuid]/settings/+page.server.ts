@@ -5,10 +5,10 @@ import {
 	engineFailure,
 	enginePath,
 	redirectToLoginIfUnauthorized
-} from '#lib/server/engine';
-import { formText, formWholeNumber } from '#lib/server/monitor-form';
-import { isUuid } from '#lib/uuid';
-import type { MonitorGroup } from '#lib/uptime';
+} from '#lib/server/core/engine';
+import { formText, formWholeNumber } from '#lib/server/uptime/monitor-form';
+import { isUuid } from '#lib/core/uuid';
+import type { MonitorGroup } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {

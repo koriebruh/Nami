@@ -6,7 +6,7 @@
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
-	import { exitCodeCommand, failUrl, formatSeconds, formatUtc, pingCommand, pingUrl, timeAgo } from '#lib/uptime';
+	import { exitCodeCommand, failUrl, formatSeconds, formatUtc, pingCommand, pingUrl, timeAgo } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();

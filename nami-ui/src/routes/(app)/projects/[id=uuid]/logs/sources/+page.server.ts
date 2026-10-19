@@ -5,9 +5,9 @@ import {
 	engineFailure,
 	enginePath,
 	redirectToLoginIfUnauthorized
-} from '#lib/server/engine';
-import { sourcePayloadFromForm } from '#lib/server/source-form';
-import type { Source, SourceWithToken } from '#lib/logs';
+} from '#lib/server/core/engine';
+import { sourcePayloadFromForm } from '#lib/server/logs/source-form';
+import type { Source, SourceWithToken } from '#lib/logs/logs';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {

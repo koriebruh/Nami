@@ -4,9 +4,9 @@ import {
 	engineErrorMessage,
 	enginePath,
 	redirectToLoginIfUnauthorized
-} from '#lib/server/engine';
-import { importPayloadFromForm } from '#lib/server/import-form';
-import type { ImportReport, MonitorGroup } from '#lib/uptime';
+} from '#lib/server/core/engine';
+import { importPayloadFromForm } from '#lib/server/uptime/import-form';
+import type { ImportReport, MonitorGroup } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {

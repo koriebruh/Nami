@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fakeEvent, HEARTBEAT_ID, MONITOR_ID, PROJECT_ID } from '#lib/server/fake-event';
+import { fakeEvent, HEARTBEAT_ID, MONITOR_ID, PROJECT_ID } from '#lib/server/core/fake-event';
 import { load } from './+page.server';
 
 const incidentsPath = `/projects/${PROJECT_ID}/incidents`;

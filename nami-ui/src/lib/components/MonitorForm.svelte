@@ -16,7 +16,7 @@
 		type IpVersion,
 		type Monitor,
 		type MonitorGroup
-	} from '#lib/uptime';
+	} from '#lib/uptime/uptime';
 
 	let {
 		monitor = null,

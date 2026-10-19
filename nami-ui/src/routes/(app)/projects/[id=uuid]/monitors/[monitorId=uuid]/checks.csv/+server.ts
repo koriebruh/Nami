@@ -1,7 +1,7 @@
 import { error, redirect } from '@sveltejs/kit';
-import { callEngine, engineErrorMessage, enginePath } from '#lib/server/engine';
-import { relayStream } from '#lib/server/relay-stream';
-import { isUuid } from '#lib/uuid';
+import { callEngine, engineErrorMessage, enginePath } from '#lib/server/core/engine';
+import { relayStream } from '#lib/server/core/relay-stream';
+import { isUuid } from '#lib/core/uuid';
 import type { RequestHandler } from './$types';
 
 // An RFC 3339 timestamp or a plain date, nothing else: the values are parsed

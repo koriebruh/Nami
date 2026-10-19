@@ -17,7 +17,7 @@
 		monitorTarget,
 		statusSince,
 		timeAgo
-	} from '#lib/uptime';
+	} from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();

@@ -1,6 +1,6 @@
 import type { Actions, PageServerLoad } from './$types';
 import { redirect } from '@sveltejs/kit';
-import { callEngine } from '#lib/server/engine';
+import { callEngine } from '#lib/server/core/engine';
 
 export const load: PageServerLoad = async (event) => {
 	const response = await callEngine(event, '/projects');

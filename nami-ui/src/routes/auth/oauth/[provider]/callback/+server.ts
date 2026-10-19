@@ -1,5 +1,5 @@
 import { error, redirect } from '@sveltejs/kit';
-import { callEngine } from '#lib/server/engine';
+import { callEngine } from '#lib/server/core/engine';
 import type { RequestHandler } from './$types';
 
 // Mirrors /start: the OAuth provider redirects the browser back here (on

@@ -1,7 +1,7 @@
 import { fail, redirect } from '@sveltejs/kit';
-import { callEngine, engineFailure, enginePath, redirectToLoginIfUnauthorized } from '#lib/server/engine';
-import { monitorPayloadFromForm } from '#lib/server/monitor-form';
-import type { MonitorGroup } from '#lib/uptime';
+import { callEngine, engineFailure, enginePath, redirectToLoginIfUnauthorized } from '#lib/server/core/engine';
+import { monitorPayloadFromForm } from '#lib/server/uptime/monitor-form';
+import type { MonitorGroup } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {

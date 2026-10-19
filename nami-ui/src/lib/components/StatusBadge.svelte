@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { Status } from '#lib/uptime';
+	import type { Status } from '#lib/uptime/uptime';
 
 	let { status, paused = false }: { status: Status; paused?: boolean } = $props();
 

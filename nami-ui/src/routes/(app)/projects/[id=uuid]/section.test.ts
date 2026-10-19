@@ -1,6 +1,6 @@
 import { error } from '@sveltejs/kit';
 import { describe, expect, it } from 'vitest';
-import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/fake-event';
+import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/core/fake-event';
 import { load as loadLayout } from './+layout.server';
 import { load as loadRoot } from './+page.server';
 import { load as loadMonitors } from './monitors/+page.server';

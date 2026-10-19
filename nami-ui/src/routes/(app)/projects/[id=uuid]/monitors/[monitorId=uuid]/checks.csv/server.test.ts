@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/fake-event';
+import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/core/fake-event';
 import { GET } from './+server';
 
 const FROM = '2026-05-01T00:00:00.000Z';

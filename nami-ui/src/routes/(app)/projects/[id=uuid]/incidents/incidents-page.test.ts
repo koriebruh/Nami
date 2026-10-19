@@ -2,8 +2,8 @@
 // links to, which tab is current, and that text from a target stays text.
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
-import { HEARTBEAT_ID, MONITOR_ID, PROJECT_ID } from '#lib/server/fake-event';
-import type { Incident } from '#lib/uptime';
+import { HEARTBEAT_ID, MONITOR_ID, PROJECT_ID } from '#lib/server/core/fake-event';
+import type { Incident } from '#lib/uptime/uptime';
 import Page from './+page.svelte';
 
 function incident(overrides: Partial<Incident> = {}): Incident {

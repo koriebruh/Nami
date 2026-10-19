@@ -17,7 +17,7 @@
 // says so), except the expiry threshold, which null resets to the type's
 // default.
 
-import { IP_VERSION_TYPES, proxyMustBeReentered, secretsMustBeReentered, unescapePayload, type CheckType } from '../uptime';
+import { IP_VERSION_TYPES, proxyMustBeReentered, secretsMustBeReentered, unescapePayload, type CheckType } from '../../uptime/uptime';
 
 export type FormResult =
 	| { ok: true; payload: Record<string, unknown> }

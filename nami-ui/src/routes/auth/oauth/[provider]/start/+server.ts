@@ -1,5 +1,5 @@
 import { error, redirect } from '@sveltejs/kit';
-import { callEngine } from '#lib/server/engine';
+import { callEngine } from '#lib/server/core/engine';
 import type { RequestHandler } from './$types';
 
 // The browser never talks to nami-engine directly (BFF architecture): OAuth

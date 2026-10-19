@@ -4,7 +4,7 @@
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import Icon from '#lib/components/ui/Icon.svelte';
 	import SegmentedTabs from '#lib/components/ui/SegmentedTabs.svelte';
-	import { formatDuration, formatUtc } from '#lib/uptime';
+	import { formatDuration, formatUtc } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();

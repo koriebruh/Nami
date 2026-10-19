@@ -6,7 +6,7 @@
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
 	import Icon from '#lib/components/ui/Icon.svelte';
-	import { formatSeconds, groupMonitors, pingUrl, timeAgo } from '#lib/uptime';
+	import { formatSeconds, groupMonitors, pingUrl, timeAgo } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();

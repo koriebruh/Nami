@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { params } from '../params';
+import { params } from '../../params';
 import { isUuid } from './uuid';
 
 describe('isUuid', () => {

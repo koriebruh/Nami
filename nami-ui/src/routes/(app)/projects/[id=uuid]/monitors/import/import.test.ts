@@ -1,7 +1,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
-import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/fake-event';
-import type { ImportReport } from '#lib/uptime';
+import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/core/fake-event';
+import type { ImportReport } from '#lib/uptime/uptime';
 import { actions, load } from './+page.server';
 import Page from './+page.svelte';
 

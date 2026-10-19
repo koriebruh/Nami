@@ -5,10 +5,10 @@ import {
 	engineFailure,
 	enginePath,
 	redirectToLoginIfUnauthorized
-} from '#lib/server/engine';
-import { loadAvailability } from '#lib/server/availability';
-import { formText } from '#lib/server/monitor-form';
-import type { Incident, Monitor, MonitorStats, UptimeCheck } from '#lib/uptime';
+} from '#lib/server/core/engine';
+import { loadAvailability } from '#lib/server/uptime/availability';
+import { formText } from '#lib/server/uptime/monitor-form';
+import type { Incident, Monitor, MonitorStats, UptimeCheck } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
 export const load: PageServerLoad = async (event) => {

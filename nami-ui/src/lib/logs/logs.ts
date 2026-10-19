@@ -1,7 +1,7 @@
 // Shapes of nami-engine's log JSON, plus pure helpers for the log pages.
 // All times render in UTC (as on the uptime pages).
-import { shellQuote } from './uptime';
-import { isUuid } from './uuid';
+import { shellQuote } from '../uptime/uptime';
+import { isUuid } from '../core/uuid';
 
 export type Platform = 'http' | 'syslog' | 'vector' | 'docker' | 'other';
 

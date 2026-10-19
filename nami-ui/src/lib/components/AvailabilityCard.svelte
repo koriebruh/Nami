@@ -3,9 +3,9 @@
 	// downtime, incidents and the longest incident, with maintenance time left
 	// out. The range lives in the URL (`?range=7d`, or `?range=custom&from&to`),
 	// so the tabs are plain links and the card works without JavaScript.
-	import { exportRange, formatPct, RANGE_PRESETS, type Availability, type SelectedRange } from '#lib/availability';
-	import type { AvailabilityView } from '#lib/server/availability';
-	import { formatSeconds } from '#lib/uptime';
+	import { exportRange, formatPct, RANGE_PRESETS, type Availability, type SelectedRange } from '#lib/uptime/availability';
+	import type { AvailabilityView } from '#lib/server/uptime/availability';
+	import { formatSeconds } from '#lib/uptime/uptime';
 	import CardMenu from './ui/CardMenu.svelte';
 	import Card from './ui/Card.svelte';
 	import SegmentedTabs from './ui/SegmentedTabs.svelte';

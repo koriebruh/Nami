@@ -1,5 +1,5 @@
 import { error } from '@sveltejs/kit';
-import { callEngine, enginePath, redirectToLoginIfUnauthorized } from '#lib/server/engine';
+import { callEngine, enginePath, redirectToLoginIfUnauthorized } from '#lib/server/core/engine';
 import type { LayoutServerLoad } from './$types';
 
 const ENGINE_UNAVAILABLE = 'Engine unavailable, retrying';

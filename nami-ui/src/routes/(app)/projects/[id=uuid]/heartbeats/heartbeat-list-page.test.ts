@@ -3,8 +3,8 @@
 // the submit guard) is covered by the walkthrough, which needs a browser.
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
-import { HEARTBEAT_ID, PROJECT_ID } from '#lib/server/fake-event';
-import type { Heartbeat, MonitorGroup } from '#lib/uptime';
+import { HEARTBEAT_ID, PROJECT_ID } from '#lib/server/core/fake-event';
+import type { Heartbeat, MonitorGroup } from '#lib/uptime/uptime';
 import Page from './+page.svelte';
 
 const TOKEN = 'f'.repeat(64);

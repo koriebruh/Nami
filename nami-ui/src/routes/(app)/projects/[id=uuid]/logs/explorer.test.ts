@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fakeEvent, PROJECT_ID } from '#lib/server/fake-event';
+import { fakeEvent, PROJECT_ID } from '#lib/server/core/fake-event';
 import { load } from './+page.server';
 
 const SOURCE = '0b6f3f3e-6d2a-4c1e-9b7a-2f1d3c4b5a69';
