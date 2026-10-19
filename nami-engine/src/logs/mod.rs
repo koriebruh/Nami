@@ -3,15 +3,17 @@
 //! (`ingest`, `msgpack`, with the `budget` that caps what a body may decode
 //! to) with its per-source limits (`rate_limit`) and usage accounting
 //! (`usage`), syslog ingestion over TCP and UDP (`syslog`), and search
-//! (`query`, `search`) and the live tail (`tail`).
+//! (`query`, `search`, `patterns`) and the live tail (`tail`).
 pub mod budget;
 pub mod ingest;
 pub mod msgpack;
 pub mod normalize;
 pub mod pattern;
+pub mod patterns;
 pub mod query;
 pub mod rate_limit;
 pub mod search;
+pub mod slots;
 pub mod store;
 pub mod syslog;
 pub mod tail;
@@ -39,4 +41,8 @@ pub struct LogsState {
     /// Searches and histograms running per user (see
     /// [`search::MAX_QUERIES_PER_USER`]).
     pub query_slots: search::QuerySlots,
+    /// Whole-row reads running per user (see
+    /// [`search::MAX_ENTRY_READS_PER_USER`]); apart from `query_slots` so a
+    /// page's row clicks never compete with its searches.
+    pub entry_slots: std::sync::Arc<slots::UserSlots>,
 }

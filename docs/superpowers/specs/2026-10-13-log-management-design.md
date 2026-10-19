@@ -216,7 +216,7 @@ replaced by a marker object, with `truncated: true` on the row.
 404 when absent) returns one whole row for the explorer's expanded view.
 Log reads run with `max_result_bytes` (result_overflow_mode=throw) and the
 ClickHouse client refuses any response body over 32 MiB while reading it;
-one user may have at most 4 searches, histograms and entry reads running
+one user may have at most 4 searches and histograms, and 8 entry reads, running
 (→ 429).
 
 The project id is always bound from the path. Every value — including

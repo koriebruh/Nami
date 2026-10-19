@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     logs::{
-        query,
+        patterns, query,
         search::{self, Histogram, LogEntry, QueryPermit, SearchPage},
         tail,
     },
@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/projects/{id}/logs", get(search_logs))
         .route("/projects/{id}/logs/histogram", get(log_histogram))
+        .route("/projects/{id}/logs/patterns", get(log_patterns))
         .route("/projects/{id}/logs/tail", get(tail_logs))
         .route("/projects/{id}/logs/{log_id}", get(log_entry))
 }
@@ -71,6 +72,23 @@ async fn log_histogram(
     ))
 }
 
+/// `GET /projects/{id}/logs/patterns?from&to&<search filters>`: the top
+/// patterns of the window (viewer). Holds one of the user's query slots.
+async fn log_patterns(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(project_id): Path<Uuid>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<serde_json::Value>, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    let pairs = query::query_pairs(raw.as_deref());
+    let window = query::parse_window(&pairs, Utc::now()).map_err(AppError::Validation)?;
+    let filters = query::parse_filters(&pairs).map_err(AppError::Validation)?;
+    let _slot = QueryPermit::acquire(&state.logs, user.id)?;
+    let rows = patterns::top_patterns(&state.clickhouse, project_id, &window, &filters).await?;
+    Ok(Json(serde_json::json!({ "patterns": rows })))
+}
+
 /// `GET /projects/{id}/logs/{log_id}?dt=<RFC 3339>`: one whole row (list
 /// rows cut long messages and leave out large fields, see
 /// `search::ENTRY_COLUMNS`). `dt` is the row's own, as listed. 404 when the
@@ -89,7 +107,10 @@ async fn log_entry(
         .and_then(|(_, value)| DateTime::parse_from_rfc3339(value).ok())
         .map(|dt| dt.with_timezone(&Utc))
         .ok_or_else(|| AppError::Validation("dt must be an RFC 3339 timestamp".to_string()))?;
-    let _slot = QueryPermit::acquire(&state.logs, user.id)?;
+    let _slot = state
+        .logs
+        .entry_slots
+        .acquire(user.id, search::MAX_ENTRY_READS_PER_USER)?;
     search::entry(&state.clickhouse, project_id, log_id, dt)
         .await?
         .map(Json)

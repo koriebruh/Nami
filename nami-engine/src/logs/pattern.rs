@@ -182,13 +182,21 @@ fn replace_ipv6(run: &str) -> String {
     run.to_string()
 }
 
-/// An IPv6 address, as opposed to an identifier path that merely parses as
-/// one: `a::b2` or `be::f2` are made of hex digits and `::` too, but no
-/// address is written like that. Besides parsing, a token needs a group that
-/// marks it as an address: one starting with a digit (an identifier cannot)
-/// or one of four characters containing a digit (`fe80`, `ff02`, `c0a8`).
+/// An IPv6 address, as opposed to an identifier path or a number followed by
+/// `::` that merely parses as one: besides parsing and having an address
+/// group (see [`is_address_group`]), the text needs at least two non-empty
+/// groups (`2001:db8::`), or to start with `::` (`::1`, `::ffff:...`), or to be
+/// one full four-character group before `::` (`fe80::`). So `5::` and
+/// `12::` (a number, then punctuation) stay text.
 fn looks_like_ipv6(text: &str) -> bool {
-    text.contains(':') && text.split(':').any(is_address_group) && text.parse::<Ipv6Addr>().is_ok()
+    if !text.contains(':') || !text.split(':').any(is_address_group) {
+        return false;
+    }
+    let groups: Vec<&str> = text.split(':').filter(|g| !g.is_empty()).collect();
+    let shaped = groups.len() >= 2
+        || text.starts_with("::")
+        || (groups.len() == 1 && groups[0].len() == 4 && text.ends_with("::"));
+    shaped && text.parse::<Ipv6Addr>().is_ok()
 }
 
 fn is_address_group(group: &str) -> bool {
@@ -478,5 +486,25 @@ mod tests {
     fn empty_and_placeholder_like_text_is_stable() {
         assert_eq!(normalize_message(""), "");
         assert_eq!(normalize_message("<num> <ip>"), "<num> <ip>");
+    }
+
+    #[test]
+    fn a_number_before_a_double_colon_is_not_an_address() {
+        assert_eq!(normalize_message("retry 5:: next"), "retry <num>:: next");
+        assert_eq!(normalize_message("code 12::warn"), "code <num>::warn");
+    }
+
+    #[test]
+    fn real_ipv6_addresses_are_still_replaced() {
+        for (input, expected) in [
+            ("from ::1 ok", "from <ip> ok"),
+            ("net fe80:: up", "net <ip> up"),
+            ("net 2001:db8:: up", "net <ip> up"),
+            ("peer 2001:db8::7 refused", "peer <ip> refused"),
+            ("peer fe80::1%eth0", "peer <ip>%eth0"),
+            ("mapped ::ffff:192.0.2.1 ok", "mapped <ip> ok"),
+        ] {
+            assert_eq!(normalize_message(input), expected, "{input}");
+        }
     }
 }
