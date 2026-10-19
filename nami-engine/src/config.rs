@@ -66,6 +66,13 @@ pub struct Config {
     /// AES-256 key for secrets at rest (`NAMI_ENCRYPTION_KEY`, base64). Never
     /// logged: `Config` deliberately does not implement `Debug`.
     pub encryption_key: [u8; crate::crypto::KEY_LEN],
+    /// `SYSLOG_ENABLED=true` starts the RFC 5424 syslog listeners for log
+    /// ingestion (off by default; same spellings as `UPTIME_WORKER_ENABLED`).
+    /// They are a public ingress, like `PUBLIC_PORT`.
+    pub syslog_enabled: bool,
+    /// `SYSLOG_TCP_PORT` and `SYSLOG_UDP_PORT`, default 5140 each.
+    pub syslog_tcp_port: u16,
+    pub syslog_udp_port: u16,
 }
 
 impl Config {
@@ -199,6 +206,9 @@ impl Config {
             uptime_worker_enabled: env_flag("UPTIME_WORKER_ENABLED", true),
             // Tests only: `from_env` always replaces it with the real key.
             encryption_key: crate::crypto::TEST_KEY,
+            syslog_enabled: env_flag("SYSLOG_ENABLED", false),
+            syslog_tcp_port: env_port("SYSLOG_TCP_PORT", crate::logs::syslog::DEFAULT_PORT),
+            syslog_udp_port: env_port("SYSLOG_UDP_PORT", crate::logs::syslog::DEFAULT_PORT),
         }
     }
 }
@@ -345,6 +355,18 @@ where
     match value.parse::<T>() {
         Ok(number) if number > T::default() => number,
         _ => panic!("{name} must be a positive whole number, got {value:?}"),
+    }
+}
+
+/// A port number from the environment, `default` when unset; anything else
+/// stops startup.
+fn env_port(name: &str, default: u16) -> u16 {
+    match std::env::var(name) {
+        Ok(value) => value
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be a port number (0-65535), got {value:?}")),
+        Err(_) => default,
     }
 }
 

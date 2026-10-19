@@ -370,6 +370,31 @@ pub async fn find_by_token(
     .await
 }
 
+/// The sources whose token hash is in `hashes`, as (token hash, source): one
+/// query for a whole batch of syslog frames. Hashes of unknown tokens simply
+/// have no entry.
+pub async fn find_by_token_hashes(
+    pool: &PgPool,
+    hashes: &[String],
+) -> Result<Vec<(String, IngestSource)>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        token_hash: String,
+        #[sqlx(flatten)]
+        source: IngestSource,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "select token_hash, id, project_id, retention_days, daily_byte_quota from sources where token_hash = any($1)",
+    )
+    .bind(hashes)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.token_hash, row.source))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
