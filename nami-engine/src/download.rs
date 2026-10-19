@@ -14,8 +14,44 @@ use std::{
     task::{Context, Poll},
 };
 
-use axum::body::Bytes;
+use axum::{
+    Json,
+    body::Bytes,
+    http::{StatusCode, header},
+    response::{IntoResponse, Response},
+};
 use tokio::sync::mpsc;
+
+/// `Retry-After` of a refused download.
+pub const BUSY_RETRY_AFTER_SECS: &str = "5";
+
+/// A download refused for want of a slot. One convention for every export:
+/// the user's own cap is a 429 ([`user_busy`]), the instance being full a
+/// 503 ([`instance_busy`]); both say when to retry.
+fn busy(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        [
+            (header::RETRY_AFTER, BUSY_RETRY_AFTER_SECS),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
+}
+
+/// 429: the user already runs `max` downloads of this kind.
+pub fn user_busy(max: usize) -> Response {
+    busy(
+        StatusCode::TOO_MANY_REQUESTS,
+        &format!("you already have {max} exports running; retry when one finishes"),
+    )
+}
+
+/// 503: every download slot of the instance is taken.
+pub fn instance_busy() -> Response {
+    busy(StatusCode::SERVICE_UNAVAILABLE, "busy, retry shortly")
+}
 
 /// `cell`, with a leading `'` when a spreadsheet would read it as a formula
 /// (`=`, `+`, `-`, `@`, tab or CR first).

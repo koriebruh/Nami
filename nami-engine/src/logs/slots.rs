@@ -25,6 +25,15 @@ struct Counts {
     total: usize,
 }
 
+/// Why [`UserSlots::acquire_capped`] refused a slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRefused {
+    /// The user already holds their share.
+    User,
+    /// Every slot of the instance is out.
+    Total,
+}
+
 /// One running request; dropping it gives the slot back.
 #[derive(Debug)]
 pub struct UserPermit {
@@ -37,25 +46,27 @@ impl UserSlots {
     /// `max` running.
     pub fn acquire(self: &Arc<Self>, user_id: Uuid, max: usize) -> Result<UserPermit, AppError> {
         self.acquire_capped(user_id, max, usize::MAX)
+            .map_err(|_| AppError::RateLimited)
     }
 
-    /// As [`Self::acquire`], and also refused (429) once `total` permits of
-    /// every user together are out (exports, see
-    /// [`super::export::MAX_EXPORTS_PER_INSTANCE`]).
+    /// As [`Self::acquire`], and also refused once `total` permits of every
+    /// user together are out (exports, see
+    /// [`super::export::MAX_EXPORTS_PER_INSTANCE`]). The refusal says which
+    /// cap was hit, so the caller can answer each its own way.
     pub fn acquire_capped(
         self: &Arc<Self>,
         user_id: Uuid,
         per_user: usize,
         total: usize,
-    ) -> Result<UserPermit, AppError> {
+    ) -> Result<UserPermit, SlotRefused> {
         let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        if counts.per_user.get(&user_id).copied().unwrap_or(0) >= per_user {
+            return Err(SlotRefused::User);
+        }
         if counts.total >= total {
-            return Err(AppError::RateLimited);
+            return Err(SlotRefused::Total);
         }
         let count = counts.per_user.entry(user_id).or_insert(0);
-        if *count >= per_user {
-            return Err(AppError::RateLimited);
-        }
         *count += 1;
         counts.total += 1;
         Ok(UserPermit {
@@ -121,7 +132,7 @@ mod tests {
             .collect();
         assert!(matches!(
             slots.acquire_capped(Uuid::new_v4(), 2, 3),
-            Err(AppError::RateLimited)
+            Err(SlotRefused::Total)
         ));
         drop(held);
         assert!(slots.acquire_capped(Uuid::new_v4(), 2, 3).is_ok());
@@ -135,7 +146,7 @@ mod tests {
         let _b = slots.acquire_capped(user, 2, 8).unwrap();
         assert!(matches!(
             slots.acquire_capped(user, 2, 8),
-            Err(AppError::RateLimited)
+            Err(SlotRefused::User)
         ));
         assert_eq!(slots.open(user), 2);
         assert_eq!(slots.total(), 2);

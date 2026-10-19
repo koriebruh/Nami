@@ -51,8 +51,9 @@ pub const EXPORT_MAX_EXECUTION_SECS: u64 = 120;
 /// The per-request timeout of a streamed query. reqwest's per-request
 /// timeout replaces the client's 30 s one; it covers connecting, the headers
 /// and reading the whole body, but is only checked while the body is polled
-/// (the export task has its own deadline for a reader that stops).
-pub const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
+/// (the export task has its own deadline for a reader that stops). 5 s over
+/// `logs::export::EXPORT_DEADLINE`, so the task's deadline comes first.
+pub const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(155);
 
 /// The largest response body the client reads from ClickHouse; a larger one
 /// is refused with [`ClickHouseError::ResponseTooLarge`] as soon as it passes

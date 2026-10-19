@@ -20,8 +20,9 @@ const DISPOSITION = /^attachment; filename="nami-logs-\d{8}T\d{6}Z\.(csv|ndjson)
  * - the browser leaving aborts the engine request, which ends the export
  *   task and the ClickHouse query.
  *
- * An engine error before the file starts (400, 401, 403, 404, 429, 500) is
- * passed through with its status and JSON body.
+ * An engine error before the file starts (400, 401, 403, 429 the user's
+ * own 2 exports, 503 the engine's export slots all taken, 500) is passed
+ * through with its status, JSON body and `Retry-After`.
  */
 export const GET: RequestHandler = async (event) => {
 	if (!isUuid(event.params.id)) throw error(404, 'Not found');
@@ -41,10 +42,7 @@ export const GET: RequestHandler = async (event) => {
 	if (!response.ok || !response.body) {
 		return new Response(await response.text(), {
 			status: response.ok ? 502 : response.status,
-			headers: {
-				'content-type': response.headers.get('content-type') ?? 'application/json',
-				'cache-control': 'no-store'
-			}
+			headers: errorHeaders(response.headers.get('content-type') ?? 'application/json', response)
 		});
 	}
 	const type = response.headers.get('content-type') ?? '';
@@ -68,12 +66,25 @@ export const GET: RequestHandler = async (event) => {
 	return new Response(relayStream(response.body), { headers });
 };
 
+/**
+ * Headers of an answer that is not the file: never cached, never sniffed
+ * (the body may be the engine's text), and the engine's `Retry-After` on a
+ * 429/503 when it is a plain number.
+ */
+function errorHeaders(type: string, engine?: Response): Record<string, string> {
+	const headers: Record<string, string> = {
+		'content-type': type,
+		'cache-control': 'no-store',
+		'x-content-type-options': 'nosniff'
+	};
+	const wait = engine?.headers.get('retry-after');
+	if (wait && /^\d{1,4}$/.test(wait)) headers['retry-after'] = wait;
+	return headers;
+}
+
 function json502(message: string): Response {
 	return new Response(JSON.stringify({ error: message }), {
 		status: 502,
-		headers: {
-			'content-type': 'application/json',
-			'cache-control': 'no-store'
-		}
+		headers: errorHeaders('application/json')
 	});
 }

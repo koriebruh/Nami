@@ -32,10 +32,10 @@ use std::{
 };
 
 use axum::{
-    Extension, Json,
+    Extension,
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{StatusCode, header},
+    http::header,
     response::{IntoResponse, Response},
     routing::{MethodRouter, get},
 };
@@ -54,7 +54,7 @@ use super::{
 pub use crate::download::neutralize;
 use crate::{
     clickhouse::ClickHouseError,
-    download::AbortableBody,
+    download::{AbortableBody, instance_busy, user_busy},
     error::AppError,
     logs::slots::UserSlots,
     middleware::rbac::{CurrentUser, require_project_role},
@@ -66,7 +66,8 @@ use crate::{
 pub const MAX_EXPORT_DAYS: i64 = 180;
 /// First line of every export.
 pub const HEADER: &str = "checked_at,status,status_code,response_time_ms,error\r\n";
-/// Exports running at once across the engine; one more is a 503.
+/// Exports running at once across the engine; one more is a 503
+/// (`Retry-After: 5`).
 pub const MAX_EXPORTS_IN_FLIGHT: usize = 4;
 /// Size the producer batches lines into before sending them to the body.
 pub const CHUNK_BYTES: usize = 64 * 1024;
@@ -81,10 +82,9 @@ pub const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// client that reads just fast enough to dodge [`SEND_STALL_TIMEOUT`] (one
 /// chunk every 29 s) still gives its slot back after this, aborted.
 pub const EXPORT_TOTAL_DEADLINE: Duration = Duration::from_secs(600);
-/// Exports one user may run at once, so one viewer cannot take every slot.
+/// Exports one user may run at once, so one viewer cannot take every slot;
+/// one more is a 429 (`Retry-After: 5`).
 pub const MAX_EXPORTS_PER_USER: usize = 2;
-/// `Retry-After` of the 503 when every slot is taken.
-const BUSY_RETRY_AFTER_SECS: &str = "5";
 
 /// The export slots: one semaphore per router, so one per engine process
 /// (each test app builds its own router and gets its own slots), plus the
@@ -102,19 +102,6 @@ impl Default for ExportSlots {
             users: Arc::default(),
         }
     }
-}
-
-/// The 503 for an export that found no free slot.
-fn busy(message: &str) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [
-            (header::RETRY_AFTER, BUSY_RETRY_AFTER_SECS),
-            (header::CACHE_CONTROL, "no-store"),
-        ],
-        Json(serde_json::json!({ "error": message })),
-    )
-        .into_response()
 }
 
 /// The method router of the export route, with its slots attached.
@@ -184,12 +171,10 @@ async fn export_checks(
     // Both permits are RAII guards: every early return below (and the end of
     // the producer task) gives them back.
     let Ok(user_permit) = slots.users.acquire(user.id, MAX_EXPORTS_PER_USER) else {
-        return Ok(busy(
-            "you already have 2 exports running; retry when one finishes",
-        ));
+        return Ok(user_busy(MAX_EXPORTS_PER_USER));
     };
     let Ok(permit) = slots.global.try_acquire_owned() else {
-        return Ok(busy("busy, retry shortly"));
+        return Ok(instance_busy());
     };
 
     // Before the response starts: an outage here is the JSON 500.

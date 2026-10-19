@@ -18,12 +18,13 @@ use tower_sessions::Session;
 use uuid::Uuid;
 
 use crate::{
-    download::AbortableBody,
+    download::{AbortableBody, instance_busy, user_busy},
     error::AppError,
     logs::{
         export::{self, ExportFormat},
         patterns, query,
         search::{self, Histogram, LogEntry, QueryPermit, SearchPage},
+        slots::SlotRefused,
         tail,
     },
     middleware::rbac::{CurrentUser, require_project_role},
@@ -32,7 +33,8 @@ use crate::{
 };
 
 // Viewers and up. The project is always the one in the path: a source_id
-// of another project simply matches nothing.
+// of another project (or of none) simply matches nothing, in search,
+// histogram, patterns, tail and export alike.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/projects/{id}/logs", get(search_logs))
@@ -161,9 +163,10 @@ async fn tail_logs(
 /// first, at most `ExportLimits::rows` (see `logs::export`). Viewer.
 ///
 /// Everything that can fail before the file starts is answered as JSON
-/// (400 parameters, 404 a `source_id` that is not one of the project's, 429
-/// no export slot, 400/500 ClickHouse refusing the query); after that, only
-/// the file itself can say it stopped early.
+/// (400 parameters, 429 the user's 2 exports already running, 503 every
+/// export slot of the instance taken, both with `Retry-After: 5`, 400/500
+/// ClickHouse refusing the query); after that, only the file itself can say
+/// it stopped early.
 async fn export_logs(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -173,22 +176,21 @@ async fn export_logs(
     require_project_role(&state.db, &user, project_id, "viewer").await?;
     let params = export::parse_export(&query::query_pairs(raw.as_deref()), Utc::now())
         .map_err(AppError::Validation)?;
+    // Names for the CSV `source` column. A `source_id` filter naming a
+    // source that is not one of the project's simply matches nothing, as in
+    // search: the project in the WHERE is always the path's.
     let sources = source::names_for_project(&state.db, project_id).await?;
-    if params
-        .filters
-        .source_ids
-        .iter()
-        .any(|id| !sources.contains_key(id))
-    {
-        return Err(AppError::NotFound);
-    }
     // Moved into the streaming task below: held exactly as long as the file
     // streams (at most the deadline), and given back on every early return.
-    let permit = state.logs.export_slots.acquire_capped(
+    let permit = match state.logs.export_slots.acquire_capped(
         user.id,
         export::MAX_EXPORTS_PER_USER,
         export::MAX_EXPORTS_PER_INSTANCE,
-    )?;
+    ) {
+        Ok(permit) => permit,
+        Err(SlotRefused::User) => return Ok(user_busy(export::MAX_EXPORTS_PER_USER)),
+        Err(SlotRefused::Total) => return Ok(instance_busy()),
+    };
     let limits = state.logs.export_limits;
     let sql = export::export_sql(project_id, &params, limits.rows);
     let rows = state

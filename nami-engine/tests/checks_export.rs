@@ -410,7 +410,7 @@ async fn slots_are_bounded_and_freed_when_the_client_goes_away(pool: PgPool) {
 }
 
 /// One user runs at most two exports at once, whatever slots are free; the
-/// third is a 503 with `Retry-After`, another user is unaffected, and a
+/// third is a 429 with `Retry-After`, another user is unaffected, and a
 /// finished (dropped) export gives the user's slot back.
 #[sqlx::test]
 async fn one_user_runs_at_most_two_exports(pool: PgPool) {
@@ -433,7 +433,7 @@ async fn one_user_runs_at_most_two_exports(pool: PgPool) {
     }
     tokio::time::sleep(StdDuration::from_millis(300)).await;
     let third = get(&app, &uri, &viewer).await;
-    assert_eq!(third.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(header_of(&third, header::RETRY_AFTER), "5");
     assert_eq!(header_of(&third, header::CACHE_CONTROL), "no-store");
     let body = axum::body::to_bytes(third.into_body(), usize::MAX)
@@ -453,7 +453,7 @@ async fn one_user_runs_at_most_two_exports(pool: PgPool) {
         .unwrap();
     assert!(body.starts_with(HEADER.as_bytes()));
 
-    // Rejected requests (403/404/400 before the slot, 503 itself) never
+    // Rejected requests (403/404/400 before the slot, 429 itself) never
     // leak a slot; dropping one held export frees one for this user.
     drop(held.pop());
     let deadline = Instant::now() + StdDuration::from_secs(10);
@@ -462,7 +462,7 @@ async fn one_user_runs_at_most_two_exports(pool: PgPool) {
         if response.status() == StatusCode::OK {
             break;
         }
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(Instant::now() < deadline, "the user's slot was never freed");
         tokio::time::sleep(StdDuration::from_millis(50)).await;
     }

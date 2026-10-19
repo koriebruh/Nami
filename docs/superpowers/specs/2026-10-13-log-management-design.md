@@ -239,7 +239,9 @@ trace_id` plus the caller's `columns` (max 10 field paths, extracted
 server-side). CSV follows RFC 4180, and a cell starting with `=`, `+`,
 `-`, `@`, tab or CR gets a leading `'` (formula-injection guard).
 ClickHouse `max_execution_time` 120 s; max 2 concurrent exports per user
-and 8 per engine instance (→ 429). The export task ends at its 150 s
+(→ 429) and 8 per engine instance (→ 503), both with `Retry-After: 5`
+(the uptime check export uses the same convention). A `source_id` that is
+not one of the project's matches nothing, as in search. The export task ends at its 150 s
 deadline even when the client stops reading. A file cut short (size cap,
 row too large, a ClickHouse error mid-stream, the deadline) ends with an
 explicit trailer: NDJSON `{"_nami_export_error":"<reason>"}`, CSV a last

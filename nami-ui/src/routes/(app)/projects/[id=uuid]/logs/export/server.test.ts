@@ -157,7 +157,7 @@ describe('GET /projects/[id]/logs/export', () => {
 	});
 
 	it('passes engine errors through and rejects a bad project id', async () => {
-		for (const status of [400, 401, 403, 404, 429, 500]) {
+		for (const status of [400, 401, 403, 429, 500, 503]) {
 			const fetchMock = vi
 				.fn()
 				.mockResolvedValue(new Response(JSON.stringify({ error: 'nope' }), { status }));
@@ -166,11 +166,32 @@ describe('GET /projects/[id]/logs/export', () => {
 			);
 			expect(response.status).toBe(status);
 			expect(response.headers.get('cache-control')).toBe('no-store');
+			expect(response.headers.get('x-content-type-options')).toBe('nosniff');
 			expect(await response.json()).toEqual({ error: 'nope' });
 		}
 		await expect(GET(fakeEvent(vi.fn(), 'http://ui.test/x', 'not-a-uuid'))).rejects.toMatchObject({
 			status: 404
 		});
+	});
+
+	it('keeps a numeric Retry-After on a refused export, and only that', async () => {
+		for (const [status, wait, kept] of [
+			[429, '5', '5'],
+			[503, '5', '5'],
+			[503, 'soon; x=1', null]
+		] as const) {
+			const fetchMock = vi.fn().mockResolvedValue(
+				new Response(JSON.stringify({ error: 'busy' }), {
+					status,
+					headers: { 'content-type': 'application/json', 'retry-after': wait }
+				})
+			);
+			const response = await GET(
+				fakeEvent(fetchMock, `http://ui.test/projects/${PROJECT}/logs/export?format=csv`)
+			);
+			expect(response.status).toBe(status);
+			expect(response.headers.get('retry-after')).toBe(kept);
+		}
 	});
 
 	it('answers 502 when the engine is unreachable', async () => {
@@ -179,6 +200,7 @@ describe('GET /projects/[id]/logs/export', () => {
 			fakeEvent(fetchMock, `http://ui.test/projects/${PROJECT}/logs/export?format=csv`)
 		);
 		expect(response.status).toBe(502);
+		expect(response.headers.get('x-content-type-options')).toBe('nosniff');
 		expect(await response.json()).toEqual({
 			error: 'the log service is unreachable'
 		});

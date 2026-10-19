@@ -72,8 +72,16 @@ pub const MAX_EXPORTS_PER_USER: usize = 2;
 /// Exports one engine instance runs at once, all users together (429 past
 /// it, R-P2-15): each runs a ClickHouse query for up to 120 s.
 pub const MAX_EXPORTS_PER_INSTANCE: usize = 8;
-/// When the streaming task ends whatever the client does (R-P2-13); the
-/// same as the ClickHouse request timeout.
+/// When the streaming task ends whatever the client does (R-P2-13). The
+/// ClickHouse request timeout ([`crate::clickhouse::STREAM_REQUEST_TIMEOUT`])
+/// is 5 s longer, so a long export ends here, with the time-limit trailer.
+///
+/// These caps are the export's own. ClickHouse has one more: its
+/// `http_send_timeout` (server default 30 s) ends a query whose client has
+/// not taken data for that long. A reader that pauses that long (the queue
+/// here and the socket buffers full) can therefore be cut before the
+/// deadline; the export then ends with the "interrupted" trailer (or a cut
+/// connection when that cannot be sent).
 pub const EXPORT_DEADLINE: Duration = Duration::from_secs(150);
 /// How long past the deadline the trailer may take to go out.
 pub const TRAILER_GRACE: Duration = Duration::from_secs(1);
@@ -335,9 +343,22 @@ impl Output {
 fn error_kind(e: &ClickHouseError) -> &'static str {
     match e {
         ClickHouseError::Server { .. } => "server error",
-        ClickHouseError::Transport(error) if error.is_timeout() => "timeout",
         ClickHouseError::Transport(_) => "transport error",
         _ => "other error",
+    }
+}
+
+/// The trailer for a read from ClickHouse that failed mid-stream.
+fn stop_reason(e: &ClickHouseError) -> &'static str {
+    match e {
+        ClickHouseError::LineTooLong { .. } => REASON_ROW_TOO_LARGE,
+        // reqwest's own timeout (5 s after the deadline): the same time
+        // limit, said the same way.
+        ClickHouseError::Transport(error) if error.is_timeout() => REASON_TIME,
+        _ => {
+            tracing::warn!(error = error_kind(e), "a log export was interrupted");
+            REASON_INTERRUPTED
+        }
     }
 }
 
@@ -391,11 +412,7 @@ pub async fn stream(
             Err(_) => break Some(REASON_TIME),
             Ok(Ok(None)) => break None,
             Ok(Ok(Some(line))) => line,
-            Ok(Err(ClickHouseError::LineTooLong { .. })) => break Some(REASON_ROW_TOO_LARGE),
-            Ok(Err(e)) => {
-                tracing::warn!(error = error_kind(&e), "a log export was interrupted");
-                break Some(REASON_INTERRUPTED);
-            }
+            Ok(Err(e)) => break Some(stop_reason(&e)),
         };
         // `Err` gives the line back for the log.
         let row: Result<Vec<u8>, Vec<u8>> = if !line.starts_with(first_key) {
@@ -603,6 +620,40 @@ mod tests {
                 line_bytes: 4 * 1024 * 1024,
                 deadline: Duration::from_secs(150),
             }
+        );
+    }
+
+    /// A request timeout is the time limit, not "try again"; and the
+    /// request outlives the task's deadline, so the deadline comes first.
+    #[tokio::test]
+    async fn a_request_timeout_is_reported_as_the_time_limit() {
+        assert_eq!(
+            crate::clickhouse::STREAM_REQUEST_TIMEOUT,
+            EXPORT_DEADLINE + Duration::from_secs(5)
+        );
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+            .mount(&server)
+            .await;
+        let timeout = reqwest::Client::new()
+            .get(server.uri())
+            .timeout(Duration::from_millis(50))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(timeout.is_timeout());
+        assert_eq!(stop_reason(&ClickHouseError::from(timeout)), REASON_TIME);
+        assert_eq!(
+            stop_reason(&ClickHouseError::LineTooLong { limit: 1 }),
+            REASON_ROW_TOO_LARGE
+        );
+        assert_eq!(
+            stop_reason(&ClickHouseError::Server {
+                status: 500,
+                body: String::new()
+            }),
+            REASON_INTERRUPTED
         );
     }
 

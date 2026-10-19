@@ -316,6 +316,12 @@ async fn a_third_concurrent_export_is_refused(pool: sqlx::PgPool) {
     );
     let third = get(&app, &uri, &viewer).await;
     assert_eq!(third.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(third.headers()["retry-after"], "5");
+    assert_eq!(third.headers()["cache-control"], "no-store");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text(third).await).unwrap(),
+        json!({ "error": "you already have 2 exports running; retry when one finishes" })
+    );
     // The client going away gives its slot back.
     drop(first);
     common::logs::eventually("an export slot comes back", Duration::from_secs(5), || {
@@ -332,14 +338,15 @@ async fn a_third_concurrent_export_is_refused(pool: sqlx::PgPool) {
 }
 
 /// The instance-wide cap: with every slot taken by other users, a user
-/// with none of their own is refused too.
+/// with none of their own is refused too, with a 503 (the user's own cap is
+/// the 429).
 #[sqlx::test]
 async fn the_instance_cap_holds_across_users(pool: sqlx::PgPool) {
     let (state, ch) = state_with_clickhouse(&pool).await;
     let logs = state.logs.clone();
     let app = app(state);
     let project = seed_project(&pool).await;
-    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (user, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
     let uri = format!("/projects/{project}/logs/export?format=ndjson&{}", window());
     let held: Vec<_> = (0..MAX_EXPORTS_PER_INSTANCE)
         .map(|_| {
@@ -348,10 +355,14 @@ async fn the_instance_cap_holds_across_users(pool: sqlx::PgPool) {
                 .unwrap()
         })
         .collect();
+    let busy = get(&app, &uri, &viewer).await;
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(busy.headers()["retry-after"], "5");
     assert_eq!(
-        get(&app, &uri, &viewer).await.status(),
-        StatusCode::TOO_MANY_REQUESTS
+        serde_json::from_str::<Value>(&text(busy).await).unwrap(),
+        json!({ "error": "busy, retry shortly" })
     );
+    assert_eq!(logs.export_slots.open(user), 0, "a refusal holds nothing");
     drop(held);
     let response = get(&app, &uri, &viewer).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -405,13 +416,14 @@ async fn export_needs_access_and_valid_parameters(pool: sqlx::PgPool) {
     let project = seed_project(&pool).await;
     let other = seed_project(&pool).await;
     let (own_source, token) = seed_source(&pool, project, "api").await;
-    let (foreign_source, _) = seed_source(&pool, other, "theirs").await;
+    let (foreign_source, foreign_token) = seed_source(&pool, other, "theirs").await;
     let (user, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
     let (_, _, outsider) = user_with_role(&app, &pool, project, None).await;
     // Rows the regex runs on (ClickHouse only compiles it when a row with
     // the field reaches it).
     plant(&ch, project, own_source, 9).await;
     post_json(&public, &token, json!({ "message": "m", "a": "500" })).await;
+    post_json(&public, &foreign_token, json!({ "message": "theirs" })).await;
     let base = format!("/projects/{project}/logs/export");
     assert_eq!(
         call(&app, "GET", &format!("{base}?format=csv"), None, None)
@@ -445,21 +457,29 @@ async fn export_needs_access_and_valid_parameters(pool: sqlx::PgPool) {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {json}");
         assert!(json["error"].is_string(), "{json}");
     }
-    // A source of another project (or none at all) is not found, before
-    // anything streams.
+    // A source of another project (or of none) matches nothing, as in
+    // search: an NDJSON file with no line, a CSV file with only its header.
     for source in [foreign_source, Uuid::new_v4()] {
-        let (status, _) = call(
+        let response = get(
             &app,
-            "GET",
-            &format!(
-                "{base}?format=ndjson&source_id={own_source}&source_id={source}&{}",
-                window()
-            ),
-            Some(&viewer),
-            None,
+            &format!("{base}?format=csv&source_id={source}&{}", window()),
+            &viewer,
         )
         .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(text(response).await, "dt,level,source,message,trace_id\r\n");
+        let response = get(
+            &app,
+            &format!("{base}?format=ndjson&source_id={source}&{}", window()),
+            &viewer,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            text(response).await,
+            "",
+            "another project's source exports nothing"
+        );
     }
     let response = get(
         &app,
