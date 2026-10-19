@@ -8,3 +8,4 @@ pub mod monitors;
 pub mod incidents;
 pub mod heartbeats;
 pub mod maintenance;
+pub mod monitor_groups;

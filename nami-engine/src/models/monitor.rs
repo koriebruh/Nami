@@ -9,7 +9,7 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use super::{
-    is_invisible_or_bidi_char,
+    is_invisible_or_bidi_char, monitor_group,
     monitor_request::{
         self, BODY_METHODS, HTTP_METHODS, HeaderView, HeadersChange, MAX_BODY_BYTES,
         PasswordChange, RequestHeader, seal_headers, seal_password,
@@ -120,6 +120,8 @@ pub struct Monitor {
     pub use_tls: bool,
     /// udp: the datagram to send, verbatim (UTF-8, no NUL).
     pub udp_payload: Option<String>,
+    /// A `monitor_groups` row of the same project, or ungrouped.
+    pub group_id: Option<Uuid>,
 }
 
 /// What `Debug` prints in place of a sealed column that holds a value.
@@ -165,6 +167,7 @@ impl fmt::Debug for Monitor {
             expiry_threshold_days,
             use_tls,
             udp_payload,
+            group_id,
         } = self;
         f.debug_struct("Monitor")
             .field("id", id)
@@ -209,6 +212,7 @@ impl fmt::Debug for Monitor {
             .field("expiry_threshold_days", expiry_threshold_days)
             .field("use_tls", use_tls)
             .field("udp_payload", udp_payload)
+            .field("group_id", group_id)
             .finish()
     }
 }
@@ -341,6 +345,7 @@ pub struct MonitorConfig {
     pub expiry_threshold_days: Option<i32>,
     pub use_tls: bool,
     pub udp_payload: Option<String>,
+    pub group_id: Option<Uuid>,
 }
 
 impl From<&Monitor> for MonitorConfig {
@@ -377,15 +382,17 @@ impl From<&Monitor> for MonitorConfig {
             expiry_threshold_days: m.expiry_threshold_days,
             use_tls: m.use_tls,
             udp_payload: m.udp_payload.clone(),
+            group_id: m.group_id,
         }
     }
 }
 
 impl MonitorConfig {
     /// True when a field that changes how or when the monitor is checked
-    /// differs from `current`. Renaming, pausing and the confirmation and
-    /// recovery thresholds do not count; replacing or clearing a secret does
-    /// (a secret cannot be compared with its ciphertext).
+    /// differs from `current`. Renaming, pausing, regrouping and the
+    /// confirmation and recovery thresholds do not count; replacing or
+    /// clearing a secret does (a secret cannot be compared with its
+    /// ciphertext).
     pub fn changes_check_of(&self, current: &Monitor) -> bool {
         self.check_type != current.check_type
             || self.url != current.url
@@ -457,6 +464,7 @@ pub struct CreateMonitorRequest {
     #[serde(default)]
     pub use_tls: bool,
     pub udp_payload: Option<String>,
+    pub group_id: Option<Uuid>,
 }
 
 fn default_http_method() -> String {
@@ -539,6 +547,7 @@ impl CreateMonitorRequest {
             expiry_threshold_days: self.expiry_threshold_days,
             use_tls: self.use_tls,
             udp_payload: self.udp_payload,
+            group_id: self.group_id,
         }
     }
 }
@@ -585,6 +594,8 @@ pub struct PatchMonitorRequest {
     pub expiry_threshold_days: Option<Option<i32>>,
     pub use_tls: Option<bool>,
     pub udp_payload: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub group_id: Option<Option<Uuid>>,
 }
 
 /// A nullable PATCH field applied to its current value.
@@ -644,6 +655,7 @@ impl PatchMonitorRequest {
             expiry_threshold_days,
             use_tls: self.use_tls.unwrap_or(base.use_tls),
             udp_payload: self.udp_payload.or(base.udp_payload),
+            group_id: patched(self.group_id, base.group_id),
         }
     }
 }
@@ -1146,7 +1158,8 @@ async fn write_config(
              recovery_threshold = $26,
              dns_record_type = $27, dns_nameserver = $28, expected_value = $29,
              expiry_threshold_days = $30,
-             use_tls = $31, udp_payload = $32
+             use_tls = $31, udp_payload = $32,
+             group_id = $33
          where id = $1
          returning *",
     )
@@ -1182,6 +1195,7 @@ async fn write_config(
     .bind(c.expiry_threshold_days)
     .bind(c.use_tls)
     .bind(&c.udp_payload)
+    .bind(c.group_id)
     .fetch_one(&mut *conn)
     .await
 }
@@ -1233,8 +1247,22 @@ pub async fn update_in_project(
     };
     let config =
         validate(patch.apply_to(MonitorConfig::from(&current))).map_err(AppError::Validation)?;
+    if let Some(group_id) = config.group_id.filter(|g| Some(*g) != current.group_id) {
+        // A group of another project is a 404, like any foreign id.
+        if !monitor_group::belongs_to(&mut *tx, project_id, group_id).await? {
+            return Err(AppError::NotFound);
+        }
+    }
     let reschedule = config.changes_check_of(&current);
-    let updated = write_config(&mut tx, cipher, monitor_id, &config, reschedule).await?;
+    let updated = write_config(&mut tx, cipher, monitor_id, &config, reschedule)
+        .await
+        .map_err(|e| match &e {
+            // The group was deleted between the check and the write.
+            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
+                AppError::NotFound
+            }
+            _ => AppError::Database(e),
+        })?;
     tx.commit().await?;
     Ok(Some(updated))
 }

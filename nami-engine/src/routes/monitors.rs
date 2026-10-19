@@ -16,6 +16,7 @@ use crate::{
     models::{
         maintenance,
         monitor::{self, CreateMonitorRequest, Monitor, MonitorView, PatchMonitorRequest},
+        monitor_group,
     },
     state::AppState,
     uptime::store::{self, MonitorStats, UptimeCheckRow},
@@ -130,11 +131,18 @@ async fn create_monitor(
 ) -> Result<(StatusCode, Json<MonitorView>), AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
     let config = monitor::validate(payload.into_config()).map_err(AppError::Validation)?;
+    if let Some(group_id) = config.group_id {
+        // A group of another project is a 404, like any foreign id.
+        if !monitor_group::belongs_to(&state.db, project_id, group_id).await? {
+            return Err(AppError::NotFound);
+        }
+    }
     let created = monitor::insert_monitor(&state.db, &state.cipher, project_id, &config)
         .await
         .map_err(|e| match &e {
             // A global admin bypasses membership, so the project itself may
-            // not exist: SQLSTATE 23503 (foreign_key_violation) -> 404.
+            // not exist (or the group was just deleted): SQLSTATE 23503
+            // (foreign_key_violation) -> 404.
             sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
                 AppError::NotFound
             }
