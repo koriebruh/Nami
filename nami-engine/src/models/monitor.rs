@@ -60,9 +60,10 @@ pub const MAX_EXPECTED_VALUE_BYTES: usize = 1024;
 
 /// One `monitors` row. The `*_enc` columns and `request_header_names` are
 /// never serialized: API responses go through [`MonitorView`]. `Debug` leaves
-/// the sealed columns out too. `Default` exists for tests that build monitors
-/// in memory (`..Monitor::default()`); real monitors always come from the
-/// database.
+/// the sealed columns out too, and only says whether the request body, the
+/// basic-auth username and the udp payload are set. `Default` exists for
+/// tests that build monitors in memory (`..Monitor::default()`); real
+/// monitors always come from the database.
 #[derive(Clone, Default, PartialEq, sqlx::FromRow, Serialize)]
 pub struct Monitor {
     pub id: Uuid,
@@ -103,8 +104,10 @@ pub struct Monitor {
     /// Consecutive successful checks a `down` monitor needs before it
     /// recovers (1-10).
     pub recovery_threshold: i32,
-    /// The successes counted toward that so far. Only the worker moves it
-    /// (see `uptime::worker::apply_outcome`); no API request can.
+    /// The successes counted toward that so far. Only the worker counts them
+    /// (see `uptime::worker::apply_outcome`); no API request can set them, a
+    /// PATCH that changes what is checked, or resumes the monitor, zeroes
+    /// them (and `consecutive_failures`).
     pub consecutive_successes: i32,
     /// dns: the record type to look up, one of [`DNS_RECORD_TYPES`].
     pub dns_record_type: Option<String>,
@@ -126,6 +129,10 @@ pub struct Monitor {
 
 /// What `Debug` prints in place of a sealed column that holds a value.
 const SEALED: &str = "<sealed>";
+/// What `Debug` prints in place of a plaintext column that often carries a
+/// credential (request body, basic-auth username, udp payload) and holds a
+/// value: logs say whether it is set, not what it is.
+const SET: &str = "<set>";
 
 impl fmt::Debug for Monitor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -191,13 +198,13 @@ impl fmt::Debug for Monitor {
             .field("last_checked_at", last_checked_at)
             .field("next_check_at", next_check_at)
             .field("created_at", created_at)
-            .field("request_body", request_body)
+            .field("request_body", &request_body.as_ref().map(|_| SET))
             .field(
                 "request_headers_enc",
                 &request_headers_enc.as_ref().map(|_| SEALED),
             )
             .field("request_header_names", request_header_names)
-            .field("auth_username", auth_username)
+            .field("auth_username", &auth_username.as_ref().map(|_| SET))
             .field(
                 "auth_password_enc",
                 &auth_password_enc.as_ref().map(|_| SEALED),
@@ -211,15 +218,18 @@ impl fmt::Debug for Monitor {
             .field("expected_value", expected_value)
             .field("expiry_threshold_days", expiry_threshold_days)
             .field("use_tls", use_tls)
-            .field("udp_payload", udp_payload)
+            .field("udp_payload", &udp_payload.as_ref().map(|_| SET))
             .field("group_id", group_id)
             .finish()
     }
 }
 
 /// A monitor as every API response shows it: the secrets are reduced to
-/// `request_headers` (names, `value_set: true`) and `has_auth_password`, and
-/// `in_maintenance` says whether a maintenance window covers it right now.
+/// `request_headers` (names, `value_set: true`) and `has_auth_password`,
+/// `in_maintenance` says whether a maintenance window covers it right now, and
+/// `redacted` whether fields were masked for its reader (see
+/// [`Monitor::for_reader`]): a client tells a masked view from a URL that
+/// merely contains `***` by this flag, never by the text.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MonitorView {
     #[serde(flatten)]
@@ -227,9 +237,23 @@ pub struct MonitorView {
     pub request_headers: Vec<HeaderView>,
     pub has_auth_password: bool,
     pub in_maintenance: bool,
+    pub redacted: bool,
 }
 
 impl MonitorView {
+    /// The monitor as `reader` may see it (see [`Monitor::for_reader`]).
+    pub fn for_reader(
+        monitor: Monitor,
+        reader: ProjectReader,
+        in_maintenance: bool,
+    ) -> MonitorView {
+        MonitorView {
+            redacted: reader == ProjectReader::Viewer,
+            ..MonitorView::new(monitor.for_reader(reader), in_maintenance)
+        }
+    }
+
+    /// The whole monitor, for a member or above.
     pub fn new(monitor: Monitor, in_maintenance: bool) -> MonitorView {
         let request_headers = monitor
             .request_header_names
@@ -245,6 +269,7 @@ impl MonitorView {
             request_headers,
             has_auth_password,
             in_maintenance,
+            redacted: false,
         }
     }
 }
@@ -257,14 +282,16 @@ impl Monitor {
     /// The monitor as `reader` may see it: whole for a member or above (header
     /// values and the password are never part of a monitor, see
     /// [`MonitorView`]); for a viewer, with the secrets of its URL masked (see
-    /// [`redact_url`]) and its request body and basic-auth username hidden:
-    /// both carry credentials as often as a URL does, so a viewer learns that
-    /// they are set, not what they are.
+    /// [`redact_url`]) and its request body, basic-auth username and udp
+    /// payload hidden: they carry credentials (tokens, SNMP communities,
+    /// RADIUS secrets) as often as a URL does, so a viewer learns that they
+    /// are set, not what they are.
     pub fn for_reader(mut self, reader: ProjectReader) -> Self {
         if reader == ProjectReader::Viewer {
             self.url = self.url.as_deref().map(redact_url);
             self.request_body = self.request_body.map(|_| REDACTED.to_string());
             self.auth_username = self.auth_username.map(|_| REDACTED.to_string());
+            self.udp_payload = self.udp_payload.map(|_| REDACTED.to_string());
         }
         self
     }
@@ -617,12 +644,28 @@ impl PatchMonitorRequest {
             None if new_type != base.check_type => None,
             None => base.expiry_threshold_days,
         };
+        // Likewise a port that is the default of the old type and `use_tls`
+        // (smtp 25, smtps 465, ...) follows them to the new default when the
+        // request names none: `use_tls: true` must not leave a TLS check on
+        // the plaintext port. A port the user chose stays.
+        let new_tls = self.use_tls.unwrap_or(base.use_tls);
+        let port = match self.port {
+            Some(explicit) => Some(explicit),
+            None if (new_type, new_tls) != (base.check_type.as_str(), base.use_tls)
+                && default_port(new_type, new_tls).is_some()
+                && base.port.is_some()
+                && base.port == default_port(&base.check_type, base.use_tls) =>
+            {
+                None
+            }
+            None => base.port,
+        };
         MonitorConfig {
             name: self.name.unwrap_or(base.name),
             check_type: self.check_type.unwrap_or(base.check_type),
             url: self.url.or(base.url),
             host: self.host.or(base.host),
-            port: self.port.or(base.port),
+            port,
             http_method: self.http_method.unwrap_or(base.http_method),
             keyword: self.keyword.or(base.keyword),
             keyword_mode: self.keyword_mode.unwrap_or(base.keyword_mode),
@@ -949,7 +992,13 @@ fn validate_ping(c: &mut MonitorConfig) -> Result<(), String> {
 /// text an answer must contain. The nameserver is only an address here: a
 /// check refuses the ones no check may contact (see `uptime::dns`).
 fn validate_dns(c: &mut MonitorConfig) -> Result<(), String> {
-    c.host = Some(required_host(c)?);
+    let host = required_host(c)?;
+    // An address has no records to look up (`169.254.169.254` would be down
+    // forever with NXDOMAIN).
+    if is_ip_literal(&host) {
+        return Err("host must be a domain name to look up".into());
+    }
+    c.host = Some(host);
     let record_type = c
         .dns_record_type
         .as_deref()
@@ -974,6 +1023,25 @@ fn validate_dns(c: &mut MonitorConfig) -> Result<(), String> {
     };
     c.expected_value = validate_expected_value(c.expected_value.take())?;
     Ok(())
+}
+
+/// Whether `host` names an address rather than a domain, in any spelling a
+/// resolver or URL parser would read as one: dotted, decimal (`2852039166`),
+/// hex or octal parts (`0xa9.0xfe.0xa9.0xfe`), a trailing dot, IPv6 with or
+/// without brackets, or a zone id (`fe80::1%en0`, which no name contains).
+fn is_ip_literal(host: &str) -> bool {
+    if host.contains('%') {
+        return true;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    matches!(
+        url::Host::parse(host),
+        Ok(url::Host::Ipv4(_) | url::Host::Ipv6(_))
+    )
 }
 
 /// ssl_expiry: a host, a port (default 443) and the days before expiry
@@ -1012,20 +1080,29 @@ fn validate_domain_expiry(c: &mut MonitorConfig) -> Result<(), String> {
 /// 25, 110, 143, or with implicit TLS (`use_tls`) 465, 995, 993.
 fn validate_mail(c: &mut MonitorConfig) -> Result<(), String> {
     c.host = Some(required_host(c)?);
-    let default_port = match (c.check_type.as_str(), c.use_tls) {
-        ("smtp", false) => 25,
-        ("smtp", true) => 465,
-        ("pop3", false) => 110,
-        ("pop3", true) => 995,
-        ("imap", false) => 143,
-        _ => 993,
-    };
-    let port = c.port.unwrap_or(default_port);
+    let default = default_port(&c.check_type, c.use_tls).unwrap_or(993);
+    let port = c.port.unwrap_or(default);
     if !(1..=65535).contains(&port) {
         return Err("port must be between 1 and 65535".into());
     }
     c.port = Some(port);
     Ok(())
+}
+
+/// The port a type uses when none is given: 443 for ssl_expiry, and for the
+/// mail types the protocol's, plain or with implicit TLS. `None` for the types
+/// that require a port (tcp, udp) or have none.
+fn default_port(check_type: &str, use_tls: bool) -> Option<i32> {
+    Some(match (check_type, use_tls) {
+        ("ssl_expiry", _) => 443,
+        ("smtp", false) => 25,
+        ("smtp", true) => 465,
+        ("pop3", false) => 110,
+        ("pop3", true) => 995,
+        ("imap", false) => 143,
+        ("imap", true) => 993,
+        _ => return None,
+    })
 }
 
 /// udp: host, port and the payload to send are required; `keyword` is an
@@ -1111,22 +1188,33 @@ pub async fn insert_monitor(
     .bind(c.interval_seconds)
     .fetch_one(&mut *tx)
     .await?;
-    let monitor = write_config(&mut tx, cipher, id, c, false).await?;
+    let monitor = write_config(&mut tx, cipher, project_id, id, c, Write::default()).await?;
     tx.commit().await?;
     Ok(monitor)
 }
 
-/// Writes every configurable column of monitor `id` from a validated
-/// config, sealing new secrets for that monitor.
+/// What else a [`write_config`] does besides writing the config.
+#[derive(Debug, Clone, Copy, Default)]
+struct Write {
+    /// Make the monitor due now.
+    reschedule: bool,
+    /// Zero `consecutive_failures` and `consecutive_successes`.
+    reset_counters: bool,
+}
+
+/// Writes every configurable column of monitor `id` of project `project_id`
+/// from a validated config, sealing new secrets for that monitor.
 /// `HeadersChange::Keep`/`PasswordChange::Keep` leave the stored ciphertext
-/// untouched; `reschedule` makes the monitor due now. New columns are
+/// untouched. The statement is scoped by both ids, so it can never write
+/// another project's row whatever its caller checked. New columns are
 /// appended at the end of the statement.
 async fn write_config(
     conn: &mut PgConnection,
     cipher: &Cipher,
+    project_id: Uuid,
     id: Uuid,
     c: &MonitorConfig,
-    reschedule: bool,
+    write: Write,
 ) -> Result<Monitor, sqlx::Error> {
     let (keep_headers, header_names, sealed_headers) = match &c.request_headers {
         HeadersChange::Keep { .. } => (true, Vec::new(), None),
@@ -1159,12 +1247,14 @@ async fn write_config(
              dns_record_type = $27, dns_nameserver = $28, expected_value = $29,
              expiry_threshold_days = $30,
              use_tls = $31, udp_payload = $32,
-             group_id = $33
-         where id = $1
+             group_id = $33,
+             consecutive_failures = case when $35 then 0 else consecutive_failures end,
+             consecutive_successes = case when $35 then 0 else consecutive_successes end
+         where id = $1 and project_id = $34
          returning *",
     )
     .bind(id)
-    .bind(reschedule)
+    .bind(write.reschedule)
     .bind(&c.name)
     .bind(&c.check_type)
     .bind(&c.url)
@@ -1196,6 +1286,8 @@ async fn write_config(
     .bind(c.use_tls)
     .bind(&c.udp_payload)
     .bind(c.group_id)
+    .bind(project_id)
+    .bind(write.reset_counters)
     .fetch_one(&mut *conn)
     .await
 }
@@ -1245,8 +1337,10 @@ pub async fn update_in_project(
     let Some(current) = current else {
         return Ok(None);
     };
+    let resumed = current.paused && patch.paused == Some(false);
     let config =
         validate(patch.apply_to(MonitorConfig::from(&current))).map_err(AppError::Validation)?;
+    secrets_stay_where_they_were(&current, &config).map_err(AppError::Validation)?;
     if let Some(group_id) = config.group_id.filter(|g| Some(*g) != current.group_id) {
         // A group of another project is a 404, like any foreign id.
         if !monitor_group::belongs_to(&mut *tx, project_id, group_id).await? {
@@ -1254,7 +1348,13 @@ pub async fn update_in_project(
         }
     }
     let reschedule = config.changes_check_of(&current);
-    let updated = write_config(&mut tx, cipher, monitor_id, &config, reschedule)
+    let write = Write {
+        reschedule,
+        // Results against the old target, or from before the pause, say
+        // nothing about the monitor as it is now.
+        reset_counters: reschedule || resumed,
+    };
+    let updated = write_config(&mut tx, cipher, project_id, monitor_id, &config, write)
         .await
         .map_err(|e| match &e {
             // The group was deleted between the check and the write.
@@ -1265,6 +1365,46 @@ pub async fn update_in_project(
         })?;
     tx.commit().await?;
     Ok(Some(updated))
+}
+
+/// Refuses a PATCH that would send a stored write-only secret (header
+/// values, the basic-auth password) somewhere it was not entered for: to
+/// another origin (scheme, host or port, compared as `Url::origin` does, the
+/// rule redirects follow too), or over TLS without certificate verification.
+/// A member who never saw the secrets could otherwise point the monitor at a
+/// server of their own and read them off its next check. Every stored secret
+/// must be entered again or cleared in the same request. The message never
+/// names a header or a value.
+fn secrets_stay_where_they_were(current: &Monitor, config: &MonitorConfig) -> Result<(), String> {
+    let keeps_headers = current.request_headers_enc.is_some()
+        && matches!(config.request_headers, HeadersChange::Keep { .. });
+    let keeps_password = current.auth_password_enc.is_some()
+        && matches!(config.auth_password, PasswordChange::Keep { .. });
+    if !keeps_headers && !keeps_password {
+        return Ok(());
+    }
+    let origin = |url: Option<&str>| {
+        url.and_then(|u| reqwest::Url::parse(u).ok())
+            .map(|u| u.origin())
+    };
+    let (before, after) = (
+        origin(current.url.as_deref()),
+        origin(config.url.as_deref()),
+    );
+    // An unparsable stored URL (only a row written around the API holds one)
+    // gives no origin to compare with: refuse, like a redirect with nothing
+    // to compare to.
+    if before.is_none() || before != after {
+        return Err("changing the url's scheme, host or port requires entering the header values and password again, or clearing them".into());
+    }
+    let over_tls = config
+        .url
+        .as_deref()
+        .is_some_and(|u| reqwest::Url::parse(u).is_ok_and(|p| p.scheme() == "https"));
+    if over_tls && current.verify_ssl && !config.verify_ssl {
+        return Err("turning off certificate verification requires entering the header values and password again, or clearing them".into());
+    }
+    Ok(())
 }
 
 /// Returns false when no monitor with this id exists in this project.
@@ -1928,5 +2068,184 @@ mod tests {
             }
         );
         assert!(!unsealed.contains("<sealed>"), "{unsealed}");
+    }
+
+    // ---- Phase 2 final review -------------------------------------------
+
+    #[test]
+    fn debug_says_whether_the_body_and_username_are_set_not_what_they_are() {
+        let monitor = Monitor {
+            request_body: Some("{\"token\":\"body-secret\"}".to_string()),
+            auth_username: Some("user-secret".to_string()),
+            udp_payload: Some("community=snmp-secret".to_string()),
+            ..stored_monitor()
+        };
+        for printed in [format!("{monitor:?}"), format!("{monitor:#?}")] {
+            for secret in ["body-secret", "user-secret", "snmp-secret"] {
+                assert!(!printed.contains(secret), "{secret} in {printed}");
+            }
+            assert!(printed.contains("<set>"), "{printed}");
+        }
+    }
+
+    #[test]
+    fn viewers_read_the_udp_payload_masked() {
+        use crate::middleware::rbac::ProjectReader;
+
+        let monitor = Monitor {
+            check_type: "udp".to_string(),
+            udp_payload: Some("community=SNMP-COMMUNITY-SECRET".to_string()),
+            ..Monitor::default()
+        };
+        let viewer = monitor.clone().for_reader(ProjectReader::Viewer);
+        assert_eq!(viewer.udp_payload.as_deref(), Some("***"));
+        let member = monitor.clone().for_reader(ProjectReader::Member);
+        assert_eq!(member.udp_payload, monitor.udp_payload);
+        let none = Monitor::default().for_reader(ProjectReader::Viewer);
+        assert_eq!(none.udp_payload, None);
+    }
+
+    #[test]
+    fn a_view_says_whether_it_was_redacted_for_its_reader() {
+        use crate::middleware::rbac::ProjectReader;
+
+        // A member's URL can hold a literal `***`: that is not redaction.
+        let monitor = Monitor {
+            url: Some("https://example.com/***".to_string()),
+            ..stored_monitor()
+        };
+        let member = MonitorView::for_reader(monitor.clone(), ProjectReader::Member, false);
+        assert!(!member.redacted);
+        assert_eq!(member.monitor, monitor);
+        let viewer = MonitorView::for_reader(monitor.clone(), ProjectReader::Viewer, true);
+        assert!(viewer.redacted && viewer.in_maintenance);
+        assert_eq!(viewer.monitor.request_body.as_deref(), Some("***"));
+        assert!(!MonitorView::new(monitor, false).redacted);
+        let text = serde_json::to_string(&viewer).unwrap();
+        assert!(text.contains("\"redacted\":true"), "{text}");
+    }
+
+    fn mail_patch(
+        check_type: &str,
+        use_tls: bool,
+        port: i32,
+        body: serde_json::Value,
+    ) -> MonitorConfig {
+        let stored = Monitor {
+            check_type: check_type.to_string(),
+            host: Some("mail.example.com".to_string()),
+            port: Some(port),
+            use_tls,
+            ..stored_monitor()
+        };
+        validate(patch(body).apply_to(MonitorConfig::from(&stored))).unwrap()
+    }
+
+    /// The stored port was the default of the old (type, use_tls): it follows
+    /// the new default. A port the user chose, or one the request names, stays.
+    #[test]
+    fn a_default_mail_port_follows_use_tls_and_the_type() {
+        for (check_type, plain, tls) in [("smtp", 25, 465), ("pop3", 110, 995), ("imap", 143, 993)]
+        {
+            let on = mail_patch(check_type, false, plain, json!({ "use_tls": true }));
+            assert_eq!(on.port, Some(tls), "{check_type} on");
+            let off = mail_patch(check_type, true, tls, json!({ "use_tls": false }));
+            assert_eq!(off.port, Some(plain), "{check_type} off");
+        }
+        assert_eq!(
+            mail_patch("smtp", false, 25, json!({ "check_type": "imap" })).port,
+            Some(143)
+        );
+        assert_eq!(
+            mail_patch(
+                "smtp",
+                false,
+                25,
+                json!({ "check_type": "imap", "use_tls": true })
+            )
+            .port,
+            Some(993)
+        );
+        // Chosen ports stay.
+        assert_eq!(
+            mail_patch("smtp", false, 2525, json!({ "use_tls": true })).port,
+            Some(2525)
+        );
+        assert_eq!(
+            mail_patch("smtp", false, 25, json!({ "use_tls": true, "port": 25 })).port,
+            Some(25)
+        );
+        assert_eq!(
+            mail_patch("smtp", false, 25, json!({ "name": "x" })).port,
+            Some(25)
+        );
+        // A type that has no default port keeps the stored one.
+        let tcp = mail_patch(
+            "smtp",
+            false,
+            25,
+            json!({ "check_type": "tcp", "host": "mail.example.com" }),
+        );
+        assert_eq!(tcp.port, Some(25));
+    }
+
+    #[test]
+    fn a_dns_monitor_looks_up_a_name_not_an_address() {
+        for host in ["169.254.169.254", "10.0.0.1", "::1", "[::1]", "fe80::1"] {
+            let error = validate(MonitorConfig {
+                check_type: "dns".to_string(),
+                host: Some(host.to_string()),
+                ..MonitorConfig::from(&stored_monitor())
+            })
+            .unwrap_err();
+            assert!(
+                error == "host must be a domain name to look up" || error.contains("host"),
+                "{host}: {error}"
+            );
+        }
+        let error = validate(MonitorConfig {
+            check_type: "dns".to_string(),
+            host: Some("169.254.169.254".to_string()),
+            ..MonitorConfig::from(&stored_monitor())
+        })
+        .unwrap_err();
+        assert_eq!(error, "host must be a domain name to look up");
+        for host in [
+            "2852039166",
+            "0xa9.0xfe.0xa9.0xfe",
+            "0xa9fea9fe",
+            "169.254.169.254.",
+            "fe80::1%en0",
+            "127.1",
+        ] {
+            assert!(is_ip_literal(host), "{host}");
+            assert!(
+                validate(MonitorConfig {
+                    check_type: "dns".to_string(),
+                    host: Some(host.to_string()),
+                    ..MonitorConfig::from(&stored_monitor())
+                })
+                .unwrap_err()
+                .starts_with("host must be"),
+                "{host}"
+            );
+        }
+        for host in [
+            "example.com",
+            "example.com.",
+            "_dmarc.example.com",
+            "a1.b2",
+            "db.internal",
+        ] {
+            assert!(!is_ip_literal(host), "{host}");
+        }
+        assert!(
+            validate(MonitorConfig {
+                check_type: "dns".to_string(),
+                host: Some("example.com".to_string()),
+                ..MonitorConfig::from(&stored_monitor())
+            })
+            .is_ok()
+        );
     }
 }

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
-use super::validate_name;
+use super::{ProjectQuota, validate_name};
 use crate::error::AppError;
 
 pub const MAX_POSITION: i32 = 1_000_000;
@@ -43,20 +43,28 @@ pub fn validate(name: &str, position: i32) -> Result<(String, i32), String> {
     Ok((name, position))
 }
 
+/// Stores a group, unless the project already holds
+/// [`ProjectQuota::MAX_ROWS`] (a 400); a project that does not exist is a 404.
 pub async fn insert_group(
     pool: &PgPool,
     project_id: Uuid,
     name: &str,
     position: i32,
-) -> Result<MonitorGroup, sqlx::Error> {
-    sqlx::query_as(
+) -> Result<MonitorGroup, AppError> {
+    let mut tx = pool.begin().await?;
+    ProjectQuota::MonitorGroups
+        .check(&mut tx, project_id)
+        .await?;
+    let group = sqlx::query_as(
         "insert into monitor_groups (project_id, name, position) values ($1, $2, $3) returning *",
     )
     .bind(project_id)
     .bind(name)
     .bind(position)
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(group)
 }
 
 pub async fn list_for_project(

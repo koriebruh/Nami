@@ -431,3 +431,43 @@ async fn deleting_a_group_ungroups_its_heartbeats_and_monitors(pool: sqlx::PgPoo
         .unwrap();
     assert_eq!(kept, None, "the heartbeat survives, ungrouped");
 }
+
+#[sqlx::test]
+async fn a_project_holds_at_most_200_groups(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    for i in 0..199 {
+        seed_group(&pool, project, &format!("g{i}"), i).await;
+    }
+    let collection = format!("/projects/{project}/monitor-groups");
+    let (status, body) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(json!({ "name": "200th" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(json!({ "name": "201st" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"],
+        "a project can have at most 200 monitor groups: delete one first"
+    );
+    let count: i64 =
+        sqlx::query_scalar("select count(*) from monitor_groups where project_id = $1")
+            .bind(project)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 200);
+}

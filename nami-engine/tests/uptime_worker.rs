@@ -11,7 +11,7 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use common::{
-    LogCapture, add_member, mail_for, make_due, seed_http_monitor, seed_project, seed_user,
+    LogCapture, add_member, at, mail_for, make_due, seed_http_monitor, seed_project, seed_user,
     settled_mail, silent_server, state_with_clickhouse, stored_mail_for, unique_email,
 };
 use nami_engine::{
@@ -388,13 +388,6 @@ fn passed_check() -> CheckOutcome {
         error: None,
         checked_at: Utc::now(),
     }
-}
-
-/// The outcome as if its check had started `seconds` after a fixed instant.
-/// Whole seconds, so comparing two of them is exact in Postgres and in Rust.
-fn at(mut outcome: CheckOutcome, seconds: i64) -> CheckOutcome {
-    outcome.checked_at = DateTime::from_timestamp(1_792_000_000 + seconds, 0).unwrap();
-    outcome
 }
 
 #[sqlx::test]

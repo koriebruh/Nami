@@ -71,7 +71,8 @@ impl std::error::Error for DestinationNotAllowed {}
 ///
 /// - link-local addresses, `169.254.0.0/16` and `fe80::/10`, where cloud
 ///   metadata services answer (`169.254.169.254`) and hand out credentials;
-/// - AWS's IPv6 metadata address, `fd00:ec2::254`;
+/// - AWS's IPv6 metadata address, `fd00:ec2::254`, and Alibaba Cloud's
+///   metadata address, `100.100.100.200`;
 /// - "this network", `0.0.0.0/8`, and the unspecified address `::`, which
 ///   reach the engine's own host;
 /// - any of these written as an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`)
@@ -99,8 +100,13 @@ pub fn is_forbidden_destination(ip: IpAddr) -> bool {
     }
 }
 
+/// Alibaba Cloud ECS serves instance metadata and RAM credentials here, outside
+/// the link-local range. The rest of CGNAT space (`100.64.0.0/10`) stays
+/// allowed: it is ordinary internal addressing on many networks.
+const ALIBABA_METADATA: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+
 fn is_forbidden_v4(v4: Ipv4Addr) -> bool {
-    v4.octets()[0] == 0 || v4.is_link_local()
+    v4.octets()[0] == 0 || v4.is_link_local() || v4 == ALIBABA_METADATA
 }
 
 /// The addresses among `resolved` that a check may contact. An error when
@@ -316,13 +322,18 @@ impl HttpClients {
     /// The client for one request, built if no check has needed it yet.
     ///
     /// A request that carries credentials of any kind (custom headers, basic
-    /// auth, credentials in the URL) only follows redirects that stay on the
-    /// monitored origin. reqwest drops `Authorization`, `Cookie`,
-    /// `Proxy-Authorization` and `WWW-Authenticate` only on the hop that
-    /// crosses to another host, from that hop's copy of the request headers;
-    /// the next hop starts again from the original ones, so a chain that moves
-    /// to another host and carries on there gets them back. Every other header
-    /// (an API key, say) is forwarded to wherever the target points.
+    /// auth, credentials in the URL) or a request body only follows redirects
+    /// that stay on the monitored origin: scheme, host and port, compared as
+    /// browsers compare origins. A body is sent again by a 307 or 308, and
+    /// often carries a token.
+    ///
+    /// reqwest's own protection is not enough: it drops `Authorization`,
+    /// `Cookie`, `Proxy-Authorization` and `WWW-Authenticate` only on a hop
+    /// whose host, port or scheme differs from the previous hop's, from that
+    /// hop's copy of the request headers; the next hop starts again from the
+    /// original ones, so a chain that moves to another origin and carries on
+    /// there gets them back. Every other header (an API key, say) and the body
+    /// are forwarded to wherever the target points.
     ///
     /// # Panics
     ///
@@ -391,7 +402,7 @@ fn follow_policy(same_origin_only: bool) -> reqwest::redirect::Policy {
 }
 
 /// Why a redirect was refused: it leaves the monitored origin, and the request
-/// carries credentials (see [`HttpClients::select`]). Names where it points, as
+/// carries credentials or a body (see [`HttpClients::select`]). Names where it points, as
 /// an origin or just a host, never a path, query or userinfo. The reason comes
 /// first and the host is shortened (see [`named_host`]), so that the whole text
 /// fits `MAX_ERROR_CHARS` and its explanation is never what gets cut.
@@ -404,7 +415,7 @@ impl fmt::Display for CrossOriginRedirect {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "headers and credentials are only sent to the monitored origin, so the redirect to {} was not followed",
+            "headers, credentials and request bodies are only sent to the monitored origin, so the redirect to {} was not followed",
             self.target
         )
     }
@@ -698,17 +709,19 @@ fn build_request(
         header_map.append(name, value);
     }
     // Credentials of any kind keep the request on its origin (see
-    // `HttpClients::select`): custom headers, basic auth, and the ones in the
-    // URL itself, which reqwest sends as an `Authorization` header.
+    // `HttpClients::select`): custom headers, basic auth, the ones in the URL
+    // itself, which reqwest sends as an `Authorization` header, and a request
+    // body, which a 307 or 308 sends again to wherever it points.
+    let sends_body = BODY_METHODS.contains(&method.as_str());
     let carries_secrets = !headers.is_empty()
         || monitor.auth_username.is_some()
+        || (sends_body && monitor.request_body.is_some())
         || reqwest::Url::parse(url).is_ok_and(|parsed| url_has_credentials(&parsed));
     let client = ctx.http.select(
         monitor.follow_redirects,
         monitor.verify_ssl,
         carries_secrets,
     );
-    let sends_body = BODY_METHODS.contains(&method.as_str());
     let mut request = client.request(method, url).headers(header_map);
     if let Some(username) = &monitor.auth_username {
         request = request.basic_auth(username, password.as_ref().map(SecretString::expose));
@@ -995,6 +1008,10 @@ mod tests {
             "::ffff:0.1.2.3",
             "64:ff9b::a9fe:a9fe",
             "64:ff9b::1",
+            // Alibaba Cloud ECS metadata (and RAM credentials).
+            "100.100.100.200",
+            "::ffff:100.100.100.200",
+            "64:ff9b::6464:64c8",
         ] {
             assert!(is_forbidden_destination(ip(text)), "{text}");
         }
@@ -1010,7 +1027,11 @@ mod tests {
             "10.0.0.1",
             "172.16.0.1",
             "192.168.1.1",
-            "100.100.100.200",
+            // The rest of CGNAT space stays allowed.
+            "100.64.0.1",
+            "100.100.100.199",
+            "100.100.100.201",
+            "100.127.255.255",
             "8.8.8.8",
             "255.255.255.255",
             "::1",
@@ -1174,7 +1195,7 @@ mod tests {
         let refused = leaves_origin(&[url("http://a.test/")], &url("http://b.test/")).unwrap();
         assert_eq!(
             refused.to_string(),
-            "headers and credentials are only sent to the monitored origin, so the redirect to another host (b.test) was not followed"
+            "headers, credentials and request bodies are only sent to the monitored origin, so the redirect to another host (b.test) was not followed"
         );
     }
 
@@ -1203,8 +1224,9 @@ mod tests {
             let refused = leaves(&monitored, &next).unwrap();
             let message = CrossOriginRedirect { target: refused }.to_string();
             assert!(
-                message
-                    .starts_with("headers and credentials are only sent to the monitored origin"),
+                message.starts_with(
+                    "headers, credentials and request bodies are only sent to the monitored origin"
+                ),
                 "{message}"
             );
             assert!(

@@ -258,16 +258,97 @@ describe('monitorPayloadFromForm after a type switch on edit', () => {
 
 describe('parseHeaderLines', () => {
 	it('splits at the first colon and trims around it', () => {
-		expect(parseHeaderLines('Authorization: Bearer a:b\nX-Empty:')).toEqual({
+		expect(parseHeaderLines('Authorization: Bearer a:b\nX-Key: v')).toEqual({
 			ok: true,
 			headers: [
 				{ name: 'Authorization', value: 'Bearer a:b' },
-				{ name: 'X-Empty', value: '' }
+				{ name: 'X-Key', value: 'v' }
 			]
 		});
 		expect(parseHeaderLines('  \n')).toEqual({ ok: true, headers: [] });
 	});
 	it('names the first malformed line', () => {
 		expect(parseHeaderLines('X-Ok: 1\n: no name')).toEqual({ ok: false, message: 'Header line 2 must look like "Name: value"' });
+	});
+	// "Replace all" starts with one "Name: " line per stored header: one left
+	// unfilled would replace a stored secret with nothing.
+	it('refuses a line without a value', () => {
+		for (const text of ['X-Api-Key:', 'X-Ok: 1\nX-Api-Key: ', 'X-Ok: 1\nX-Api-Key:\t']) {
+			const line = text.split('\n').length;
+			expect(parseHeaderLines(text)).toEqual({ ok: false, message: `Header line ${line} needs a value` });
+		}
+	});
+});
+
+describe('monitorPayloadFromForm keeps secrets on their origin', () => {
+	// The hidden fields the edit form renders for a monitor with secrets.
+	const stored = {
+		name: 'API',
+		check_type: 'http',
+		auth_username: 'monitor',
+		initial_url: 'https://api.test/health',
+		initial_verify_ssl: 'on',
+		stored_headers: 'on',
+		stored_password: 'on',
+		...defaults
+	};
+	const edit = (fields: Record<string, string>) => monitorPayloadFromForm(form({ ...stored, ...fields }), 'edit');
+
+	it('refuses to keep stored secrets when the url moves to another origin', () => {
+		const cases: Record<string, string>[] = [
+			{ headers_action: 'keep', password_action: 'keep' },
+			{ headers_action: 'replace', request_headers: 'X-Api-Key: new', password_action: 'keep' },
+			{ headers_action: 'keep', password_action: 'replace', auth_password: 'new' }
+		];
+		for (const fields of cases) {
+			expect(edit({ url: 'https://evil.test/steal', ...fields })).toEqual({
+				ok: false,
+				message: "Changing the URL's scheme, host or port means entering the header values and password again, or removing them"
+			});
+		}
+		expect(edit({ url: 'http://api.test/health', headers_action: 'keep', password_action: 'clear' }).ok).toBe(false);
+	});
+
+	it('lets the url move once every stored secret is entered again or removed', () => {
+		const moved = edit({
+			url: 'https://other.test/h',
+			headers_action: 'replace',
+			request_headers: 'X-Api-Key: new',
+			password_action: 'clear'
+		});
+		expect(moved.ok && moved.payload).toMatchObject({ request_headers: [{ name: 'X-Api-Key', value: 'new' }], auth_password: null });
+	});
+
+	it('keeps them for a path change, and for a monitor without secrets', () => {
+		const path = edit({ url: 'https://api.test/v2?x=1', headers_action: 'keep', password_action: 'keep' });
+		expect(path.ok).toBe(true);
+		const bare = monitorPayloadFromForm(
+			form({ ...stored, stored_headers: '', stored_password: '', url: 'https://other.test/', headers_action: 'keep', password_action: 'keep' }),
+			'edit'
+		);
+		expect(bare.ok).toBe(true);
+	});
+
+	it('refuses to keep them when certificate checks are turned off', () => {
+		const { verify_ssl: _, ...unchecked } = stored;
+		const result = monitorPayloadFromForm(
+			form({ ...unchecked, url: 'https://api.test/health', headers_action: 'keep', password_action: 'keep' }),
+			'edit'
+		);
+		expect(result).toEqual({
+			ok: false,
+			message: 'Turning off certificate verification means entering the header values and password again, or removing them'
+		});
+	});
+});
+
+describe('monitorPayloadFromForm on edit, empty number fields', () => {
+	it('resets the expiry threshold to the type default with null and keeps the others', () => {
+		const result = monitorPayloadFromForm(
+			form({ name: 'Cert', check_type: 'ssl_expiry', initial_check_type: 'ssl_expiry', host: 'example.com', interval_seconds: '' }),
+			'edit'
+		);
+		expect(result.ok && result.payload.expiry_threshold_days).toBeNull();
+		expect(result.ok && 'interval_seconds' in result.payload).toBe(false);
 	});
 });

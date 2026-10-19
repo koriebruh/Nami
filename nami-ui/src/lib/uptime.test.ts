@@ -9,7 +9,10 @@ import {
 	formatUptime,
 	formatUtc,
 	groupMonitors,
-	hasMaskedValues,
+	isRedacted,
+	secretsMustBeReentered,
+	SECRETS_ORIGIN_MESSAGE,
+	SECRETS_TLS_MESSAGE,
 	monitorTarget,
 	niceTicks,
 	pingCommand,
@@ -321,16 +324,40 @@ describe('UDP payload escapes', () => {
 	});
 });
 
-describe('hasMaskedValues', () => {
-	const open = { url: 'https://x.test/h', request_body: null, auth_username: null };
-	it('is false for what a member reads', () => {
-		expect(hasMaskedValues(open)).toBe(false);
-		expect(hasMaskedValues({ ...open, request_body: '{"a":1}', auth_username: 'monitor' })).toBe(false);
+describe('isRedacted', () => {
+	it('follows the engine flag, never the text', () => {
+		expect(isRedacted({ redacted: true })).toBe(true);
+		expect(isRedacted({ redacted: false })).toBe(false);
 	});
-	it('spots the *** a viewer gets for a url secret, body or username', () => {
-		expect(hasMaskedValues({ ...open, url: 'https://x.test/h?token=***' })).toBe(true);
-		expect(hasMaskedValues({ ...open, url: 'https://u:***@x.test/h' })).toBe(true);
-		expect(hasMaskedValues({ ...open, request_body: '***' })).toBe(true);
-		expect(hasMaskedValues({ ...open, auth_username: '***' })).toBe(true);
+});
+
+describe('secretsMustBeReentered', () => {
+	const edit = {
+		storedUrl: 'https://api.test/health',
+		url: 'https://api.test/health',
+		storedVerifySsl: true,
+		verifySsl: true
+	};
+	it('lets a path or query change on the same origin keep the secrets', () => {
+		expect(secretsMustBeReentered(edit)).toBeNull();
+		expect(secretsMustBeReentered({ ...edit, url: 'https://api.test/v2/health?deep=1' })).toBeNull();
+		expect(secretsMustBeReentered({ ...edit, url: ' https://API.test:443/x ' })).toBeNull();
+	});
+	it('asks for them again when the scheme, host or port changes', () => {
+		for (const url of [
+			'http://api.test/health',
+			'https://evil.test/health',
+			'https://api.test:8443/health',
+			'not a url'
+		]) {
+			expect(secretsMustBeReentered({ ...edit, url })).toBe(SECRETS_ORIGIN_MESSAGE);
+		}
+	});
+	it('asks for them again when certificate checks are turned off over https', () => {
+		expect(secretsMustBeReentered({ ...edit, verifySsl: false })).toBe(SECRETS_TLS_MESSAGE);
+		expect(
+			secretsMustBeReentered({ ...edit, storedUrl: 'HTTPS://api.test/h', url: 'HTTPS://api.test/h', verifySsl: false })
+		).toBe(SECRETS_TLS_MESSAGE);
+		expect(secretsMustBeReentered({ ...edit, storedVerifySsl: false, verifySsl: false })).toBeNull();
 	});
 });

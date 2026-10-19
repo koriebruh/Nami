@@ -77,6 +77,8 @@ export type Monitor = {
 	udp_payload: string | null;
 	group_id: string | null;
 	in_maintenance: boolean;
+	/** True when fields were masked (`***`) for the reader, a viewer. */
+	redacted: boolean;
 };
 
 export type MonitorGroup = {
@@ -276,13 +278,56 @@ export function escapePayload(text: string): string {
 }
 
 /**
- * Whether the monitor carries the `***` the engine puts in place of a URL
- * secret, a request body or a basic-auth username when a viewer reads it. A
- * monitor like that cannot be edited from what it shows: saving would write
- * the mask over the real values.
+ * Whether the engine masked parts of this monitor for its reader (a viewer:
+ * URL secrets, request body, username and udp payload read `***`). A monitor
+ * like that cannot be edited from what it shows: saving would write the mask
+ * over the real values. Decided by the engine's flag, never by the text: a
+ * member's URL can contain a literal `***`.
  */
-export function hasMaskedValues(m: Pick<Monitor, 'url' | 'request_body' | 'auth_username'>): boolean {
-	return m.request_body === '***' || m.auth_username === '***' || (m.url?.includes('***') ?? false);
+export function isRedacted(m: Pick<Monitor, 'redacted'>): boolean {
+	return m.redacted === true;
+}
+
+function schemeOf(url: string): string | null {
+	try {
+		return new URL(url).protocol;
+	} catch {
+		return null;
+	}
+}
+
+function originOf(url: string | null): string | null {
+	try {
+		return url ? new URL(url).origin : null;
+	} catch {
+		return null;
+	}
+}
+
+export const SECRETS_ORIGIN_MESSAGE =
+	"Changing the URL's scheme, host or port means entering the header values and password again, or removing them";
+export const SECRETS_TLS_MESSAGE =
+	'Turning off certificate verification means entering the header values and password again, or removing them';
+
+/**
+ * Why the stored write-only secrets (header values, basic-auth password)
+ * cannot be kept by an edit, or null when they can: the engine refuses to
+ * send them to another origin (scheme, host, port) or over https without
+ * certificate verification unless they are entered again or removed.
+ */
+export function secretsMustBeReentered(edit: {
+	storedUrl: string | null;
+	url: string;
+	storedVerifySsl: boolean;
+	verifySsl: boolean;
+}): string | null {
+	if (originOf(edit.storedUrl) === null || originOf(edit.storedUrl) !== originOf(edit.url.trim())) {
+		return SECRETS_ORIGIN_MESSAGE;
+	}
+	if (edit.storedVerifySsl && !edit.verifySsl && schemeOf(edit.url.trim()) === 'https:') {
+		return SECRETS_TLS_MESSAGE;
+	}
+	return null;
 }
 
 export type MonitorSection<M> = { group: MonitorGroup | null; monitors: M[] };

@@ -12,7 +12,7 @@ use axum::{
     body::Body,
     http::{HeaderValue, Request, StatusCode, header},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use nami_engine::{
     crypto::{Cipher, SecretString, TEST_KEY},
     models::{
@@ -20,7 +20,7 @@ use nami_engine::{
         monitor_request::{RequestHeader, seal_headers, seal_password},
     },
     state::AppState,
-    uptime::checker::CheckContext,
+    uptime::checker::{CheckContext, CheckOutcome, CheckStatus},
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -503,4 +503,23 @@ pub async fn silent_server() -> (u16, tokio::task::JoinHandle<()>) {
         }
     });
     (port, accepting)
+}
+
+/// A check result of `status` taken now: 200 in 10 ms when up, "connection
+/// refused" when down.
+pub fn outcome(status: CheckStatus) -> CheckOutcome {
+    CheckOutcome {
+        status,
+        status_code: (status == CheckStatus::Up).then_some(200),
+        response_time_ms: Some(10),
+        error: (status == CheckStatus::Down).then(|| "connection refused".to_string()),
+        checked_at: Utc::now(),
+    }
+}
+
+/// The outcome as if its check had started `seconds` after a fixed instant.
+/// Whole seconds, so comparing two of them is exact in Postgres and in Rust.
+pub fn at(mut outcome: CheckOutcome, seconds: i64) -> CheckOutcome {
+    outcome.checked_at = DateTime::from_timestamp(1_792_000_000 + seconds, 0).unwrap();
+    outcome
 }

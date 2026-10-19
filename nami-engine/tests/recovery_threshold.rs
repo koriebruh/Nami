@@ -2,39 +2,21 @@
 mod common;
 
 use axum::http::StatusCode;
-use chrono::{DateTime, Utc};
 use common::{
-    add_member, call, make_due, seed_http_monitor, seed_project, seed_user, settled_mail,
-    state_with_clickhouse, test_app, unique_email, user_with_role,
+    add_member, at, call, make_due, outcome, seed_http_monitor, seed_project, seed_user,
+    settled_mail, state_with_clickhouse, test_app, unique_email, user_with_role,
 };
 use nami_engine::{
     models::monitor::Monitor,
     uptime::{
         alerts::TransitionKind,
-        checker::{CheckOutcome, CheckStatus},
+        checker::CheckStatus,
         worker::{apply_outcome, run_due_checks},
     },
 };
 use serde_json::json;
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
-
-fn outcome(status: CheckStatus) -> CheckOutcome {
-    CheckOutcome {
-        status,
-        status_code: (status == CheckStatus::Up).then_some(200),
-        response_time_ms: Some(10),
-        error: (status == CheckStatus::Down).then(|| "connection refused".to_string()),
-        checked_at: Utc::now(),
-    }
-}
-
-/// The outcome as if its check had started `seconds` after a fixed instant.
-/// Whole seconds, so comparing two of them is exact in Postgres and in Rust.
-fn at(mut outcome: CheckOutcome, seconds: i64) -> CheckOutcome {
-    outcome.checked_at = DateTime::from_timestamp(1_792_000_000 + seconds, 0).unwrap();
-    outcome
-}
 
 /// A monitor that goes down on its first failure and needs `recovery`
 /// consecutive successes to come back.
@@ -707,4 +689,193 @@ async fn the_recovery_alert_goes_out_only_when_the_threshold_is_reached(pool: sq
         ]
     );
     ch.drop_database().await.unwrap();
+}
+
+/// A member of the monitor's project, logged in, and the monitor's API path.
+async fn member_of(
+    pool: &sqlx::PgPool,
+    monitor: &Monitor,
+) -> (axum::Router, axum::http::HeaderValue, String) {
+    let app = test_app(pool.clone());
+    let (_, _, member) = user_with_role(&app, pool, monitor.project_id, Some("member")).await;
+    let item = format!("/projects/{}/monitors/{}", monitor.project_id, monitor.id);
+    (app, member, item)
+}
+
+/// Successes against the old target say nothing about the new one: editing
+/// what is checked starts both counts again (Phase 2 final review ruling).
+#[sqlx::test]
+async fn editing_the_target_starts_the_counts_again(pool: sqlx::PgPool) {
+    let monitor = monitor_with_recovery(&pool, 3).await;
+    apply(&pool, &monitor, CheckStatus::Down).await;
+    assert_eq!(apply(&pool, &monitor, CheckStatus::Up).await, None);
+    assert_eq!(
+        counters(&pool, monitor.id).await,
+        ("down".to_string(), 0, 1)
+    );
+    let (app, member, item) = member_of(&pool, &monitor).await;
+
+    let (status, body) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "url": "http://127.0.0.1:10/" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        counters(&pool, monitor.id).await,
+        ("down".to_string(), 0, 0)
+    );
+
+    // Failures too: two of three toward confirmation, then a new target.
+    let pending = seed_http_monitor(
+        &pool,
+        monitor.project_id,
+        "Pending",
+        "http://127.0.0.1:9/",
+        3,
+    )
+    .await;
+    let pending: Monitor = sqlx::query_as("select * from monitors where id = $1")
+        .bind(pending)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for seconds in 0..2 {
+        apply_at(&pool, &pending, CheckStatus::Down, seconds).await;
+    }
+    assert_eq!(counters(&pool, pending.id).await.1, 2);
+    let (status, _) = call(
+        &app,
+        "PATCH",
+        &format!("/projects/{}/monitors/{}", pending.project_id, pending.id),
+        Some(&member),
+        Some(json!({ "timeout_seconds": 7 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(counters(&pool, pending.id).await.1, 0);
+}
+
+#[sqlx::test]
+async fn resuming_a_paused_monitor_starts_the_counts_again(pool: sqlx::PgPool) {
+    let project = seed_project(&pool).await;
+    let id = seed_http_monitor(&pool, project, "Checkout API", "http://127.0.0.1:9/", 3).await;
+    let monitor: Monitor = sqlx::query_as("select * from monitors where id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for seconds in 0..2 {
+        apply_at(&pool, &monitor, CheckStatus::Down, seconds).await;
+    }
+    let (app, member, item) = member_of(&pool, &monitor).await;
+    for paused in [true, false] {
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            &item,
+            Some(&member),
+            Some(json!({ "paused": paused })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        if paused {
+            assert_eq!(counters(&pool, id).await.1, 2, "pausing alone keeps them");
+        }
+    }
+    assert_eq!(counters(&pool, id).await, ("pending".to_string(), 0, 0));
+}
+
+#[sqlx::test]
+async fn renaming_or_retuning_thresholds_keeps_the_counts(pool: sqlx::PgPool) {
+    let monitor = monitor_with_recovery(&pool, 3).await;
+    apply(&pool, &monitor, CheckStatus::Down).await;
+    apply(&pool, &monitor, CheckStatus::Up).await;
+    let (app, member, item) = member_of(&pool, &monitor).await;
+    for body in [
+        json!({ "name": "Renamed" }),
+        json!({ "recovery_threshold": 4 }),
+        json!({ "confirmation_threshold": 2 }),
+        json!({ "paused": false }),
+    ] {
+        let (status, response) =
+            call(&app, "PATCH", &item, Some(&member), Some(body.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(
+            counters(&pool, monitor.id).await,
+            ("down".to_string(), 0, 1),
+            "{body}"
+        );
+    }
+}
+
+/// At threshold 1 only a monitor that was down recovers: a success of an up
+/// or pending monitor is no transition at all.
+#[sqlx::test]
+async fn at_threshold_one_only_a_down_monitor_recovers(pool: sqlx::PgPool) {
+    let monitor = monitor_with_recovery(&pool, 1).await;
+    assert_eq!(
+        apply_at(&pool, &monitor, CheckStatus::Up, 0).await,
+        None,
+        "pending"
+    );
+    assert_eq!(
+        apply_at(&pool, &monitor, CheckStatus::Up, 1).await,
+        None,
+        "up"
+    );
+    assert_eq!(counters(&pool, monitor.id).await, ("up".to_string(), 0, 0));
+    assert_eq!(
+        apply_at(&pool, &monitor, CheckStatus::Down, 2).await,
+        Some(TransitionKind::Down)
+    );
+    assert_eq!(
+        apply_at(&pool, &monitor, CheckStatus::Up, 3).await,
+        Some(TransitionKind::Recovered)
+    );
+}
+
+/// Successes arriving together for a down monitor that needs three: whatever
+/// order they take the row lock in, exactly one recovers it and alerts.
+#[sqlx::test]
+async fn concurrent_successes_recover_exactly_once_above_threshold_one(pool: sqlx::PgPool) {
+    let monitor = monitor_with_recovery(&pool, 3).await;
+    apply_at(&pool, &monitor, CheckStatus::Down, 0).await;
+
+    let mut gate = pool.begin().await.unwrap();
+    sqlx::query("select id from monitors where id = $1 for update")
+        .bind(monitor.id)
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+    let mut applying = tokio::task::JoinSet::new();
+    for seconds in 1..=6 {
+        let (pool, monitor) = (pool.clone(), monitor.clone());
+        applying.spawn(async move {
+            apply_outcome(&pool, &monitor, &at(outcome(CheckStatus::Up), seconds)).await
+        });
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    gate.commit().await.unwrap();
+    let mut recovered = 0;
+    while let Some(done) = applying.join_next().await {
+        if done
+            .unwrap()
+            .unwrap()
+            .is_some_and(|t| t.kind == TransitionKind::Recovered)
+        {
+            recovered += 1;
+        }
+    }
+    assert!(recovered <= 1, "{recovered} recoveries");
+    let (status, _, _) = counters(&pool, monitor.id).await;
+    assert_eq!(
+        recovered == 1,
+        status == "up",
+        "a recovery is the one that brought it back"
+    );
+    assert_eq!(incident_statuses(&pool, monitor.id).await.len(), 1);
 }
