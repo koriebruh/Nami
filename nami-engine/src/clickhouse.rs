@@ -120,6 +120,10 @@ pub enum ClickHouseError {
     Server { status: u16, body: String },
     #[error("could not encode a row for clickhouse: {0}")]
     Encode(serde_json::Error),
+    /// The rows would encode to more than `limit` bytes ([`encode_rows_within`]).
+    /// Nothing was built or sent.
+    #[error("the rows encode to more than {limit} bytes")]
+    TooLarge { limit: usize },
     #[error("could not decode clickhouse row {line:?}: {source}")]
     Decode {
         line: String,
@@ -205,6 +209,40 @@ impl ClickHouse {
         rows: &[T],
         settings: &[(&'static str, &'static str)],
     ) -> Result<(), ClickHouseError> {
+        let pairs = self.insert_pairs(table, settings)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        self.post(pairs, encode_rows(rows)?).await.map(|_| ())
+    }
+
+    /// [`Self::insert_rows_with`] for a body that [`encode_rows`] has already
+    /// built: encoding a big batch takes real CPU time and as much memory as
+    /// the batch, so a caller with one does that on a blocking thread, then
+    /// only sends it from the async side. Everything else is as for
+    /// `insert_rows_with`, which this is the second half of; an empty body is
+    /// a no-op (`table` is still validated first).
+    pub async fn insert_encoded_with(
+        &self,
+        table: &str,
+        body: String,
+        settings: &[(&'static str, &'static str)],
+    ) -> Result<(), ClickHouseError> {
+        let pairs = self.insert_pairs(table, settings)?;
+        if body.is_empty() {
+            return Ok(());
+        }
+        self.post(pairs, body).await.map(|_| ())
+    }
+
+    /// The URL parameters of an `INSERT INTO <database>.<table> FORMAT
+    /// JSONEachRow`; validates `table` (and the database) before anything is
+    /// sent.
+    fn insert_pairs(
+        &self,
+        table: &str,
+        settings: &[(&'static str, &'static str)],
+    ) -> Result<Vec<(String, String)>, ClickHouseError> {
         let mut pairs = self.settings_with_database()?;
         push_extra_settings(&mut pairs, settings);
         pairs.push((
@@ -217,15 +255,7 @@ impl ClickHouse {
         ));
         pairs.push(identifier_param("db", &self.database)?);
         pairs.push(identifier_param("table", table)?);
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut body = String::new();
-        for row in rows {
-            body.push_str(&serde_json::to_string(row).map_err(ClickHouseError::Encode)?);
-            body.push('\n');
-        }
-        self.post(pairs, body).await.map(|_| ())
+        Ok(pairs)
     }
 
     /// Runs a `SELECT` and deserializes each `JSONEachRow` line into `T`.
@@ -407,6 +437,71 @@ impl ClickHouse {
     }
 }
 
+/// The `JSONEachRow` body of `rows`: one serde-encoded JSON object per line,
+/// each ended by a newline. The CPU-bound half of
+/// [`ClickHouse::insert_rows_with`], for callers that run it somewhere other
+/// than an async worker (see [`ClickHouse::insert_encoded_with`]).
+pub fn encode_rows<T: Serialize>(rows: &[T]) -> Result<String, ClickHouseError> {
+    let mut body = String::new();
+    for row in rows {
+        body.push_str(&serde_json::to_string(row).map_err(ClickHouseError::Encode)?);
+        body.push('\n');
+    }
+    Ok(body)
+}
+
+/// [`encode_rows`] for rows that cannot be trusted to be small, which gives
+/// up with [`ClickHouseError::TooLarge`] on a batch that would encode to more
+/// than `max_bytes`. JSON escaping can multiply a row (a control character is
+/// one byte in the row and six in the body, and the `fields` text is escaped a
+/// second time inside it), so what a batch weighs is only known once it is
+/// encoded.
+///
+/// It measures first, writing every row to a counter that keeps nothing, and
+/// stops at the row that passes the limit: a batch that is too large costs no
+/// memory, and one that fits is then written into a buffer of exactly its size
+/// (a `String` that grows by doubling can end up holding twice what it
+/// needs). The price is serializing the rows twice.
+pub fn encode_rows_within<T: Serialize>(
+    rows: &[T],
+    max_bytes: usize,
+) -> Result<String, ClickHouseError> {
+    struct Count(usize);
+
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut size = 0usize;
+    for row in rows {
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, row).map_err(ClickHouseError::Encode)?;
+        // The row and its newline.
+        size = size.saturating_add(count.0 + 1);
+        if size > max_bytes {
+            return Err(ClickHouseError::TooLarge { limit: max_bytes });
+        }
+    }
+    let mut body = Vec::with_capacity(size);
+    for row in rows {
+        serde_json::to_writer(&mut body, row).map_err(ClickHouseError::Encode)?;
+        body.push(b'\n');
+    }
+    // serde_json writes UTF-8 and nothing else.
+    String::from_utf8(body).map_err(|_| {
+        ClickHouseError::Encode(<serde_json::Error as serde::ser::Error>::custom(
+            "serde_json wrote bytes that are not UTF-8",
+        ))
+    })
+}
+
 /// Makes a typed query-parameter value (`String`, `UUID`, `Int64`, ...) arrive
 /// byte-for-byte. ClickHouse parses those values in its "escaped" (TSV) text
 /// format: a raw tab or newline is a parse error, and backslash sequences are
@@ -477,8 +572,8 @@ fn validate_identifier(name: &str) -> Result<&str, ClickHouseError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_SETTINGS, ClickHouse, ClickHouseError, RESERVED_SETTINGS, escape_param_value,
-        push_extra_settings, validate_identifier,
+        BASE_SETTINGS, ClickHouse, ClickHouseError, RESERVED_SETTINGS, encode_rows,
+        encode_rows_within, escape_param_value, push_extra_settings, validate_identifier,
     };
 
     /// Every SELECT is bounded on the server and stops there when the client
@@ -522,6 +617,92 @@ mod tests {
             !statement.contains_key("max_execution_time"),
             "{statement:?}"
         );
+    }
+
+    /// `insert_encoded_with` sends exactly what `insert_rows_with` does for
+    /// the same rows: the same settings, the same query, the same body.
+    #[tokio::test]
+    async fn an_encoded_body_is_sent_as_insert_rows_would_send_it() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_probe");
+        let rows = [
+            serde_json::json!({ "a": 1, "b": "x\ny" }),
+            serde_json::json!({ "a": 2 }),
+        ];
+        let settings = [("async_insert", "1"), ("wait_for_async_insert", "1")];
+
+        ch.insert_rows_with("logs", &rows, &settings).await.unwrap();
+        let body = encode_rows(&rows).unwrap();
+        ch.insert_encoded_with("logs", body.clone(), &settings)
+            .await
+            .unwrap();
+        assert_eq!(body, "{\"a\":1,\"b\":\"x\\ny\"}\n{\"a\":2}\n");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let query = |index: usize| -> Vec<(String, String)> {
+            let mut pairs: Vec<_> = requests[index].url.query_pairs().into_owned().collect();
+            pairs.sort();
+            pairs
+        };
+        assert_eq!(query(0), query(1), "the same settings and query");
+        assert_eq!(requests[0].body, requests[1].body, "the same body");
+        assert_eq!(requests[1].body, body.as_bytes());
+    }
+
+    /// An empty batch sends nothing, but a table name that is not an
+    /// identifier is refused all the same.
+    #[tokio::test]
+    async fn an_empty_encoded_body_sends_nothing_and_a_bad_table_is_refused_first() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami_probe");
+
+        ch.insert_encoded_with("logs", String::new(), &[])
+            .await
+            .unwrap();
+        assert!(server.received_requests().await.unwrap().is_empty());
+        for body in [String::new(), "{}\n".to_string()] {
+            assert!(matches!(
+                ch.insert_encoded_with("logs; drop", body, &[]).await,
+                Err(ClickHouseError::InvalidIdentifier(_))
+            ));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// `encode_rows_within` writes what `encode_rows` writes, into a buffer of
+    /// exactly that size, and refuses (building nothing) a batch over the limit,
+    /// at the row that passes it.
+    #[test]
+    fn rows_are_encoded_to_the_size_they_are_and_refused_over_the_limit() {
+        let rows: Vec<serde_json::Value> = (0..50)
+            .map(|n| serde_json::json!({ "n": n, "text": "x\u{1}y".repeat(n) }))
+            .collect();
+        let plain = encode_rows(&rows).unwrap();
+        let sized = encode_rows_within(&rows, plain.len()).unwrap();
+        assert_eq!(sized, plain);
+        assert_eq!(sized.capacity(), sized.len(), "no room wasted");
+        assert!(matches!(
+            encode_rows_within(&rows, plain.len() - 1),
+            Err(ClickHouseError::TooLarge { limit }) if limit == plain.len() - 1
+        ));
+        assert!(matches!(
+            encode_rows_within(&rows, 10),
+            Err(ClickHouseError::TooLarge { .. })
+        ));
+        assert_eq!(encode_rows_within::<serde_json::Value>(&[], 0).unwrap(), "");
     }
 
     #[test]

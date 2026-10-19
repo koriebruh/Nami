@@ -124,13 +124,16 @@ pub fn build_row_at(event: LogEvent, source: &IngestSource, now: DateTime<Utc>) 
     );
     let fields = normalize::cap_fields(fields);
     let pattern = pattern::normalize_message(&message);
+    // `to_string` grows its buffer by doubling; the row keeps only what it uses.
+    let mut fields_text = serde_json::Value::Object(fields).to_string();
+    fields_text.shrink_to_fit();
     LogRow {
         id: new_row_id(),
         project_id: source.project_id,
         source_id: source.id,
         dt: normalize::clamp_to_accepted_range(event.dt, now),
         level: normalize::level_from_name(&event.level).to_string(),
-        fields: serde_json::Value::Object(fields).to_string(),
+        fields: fields_text,
         message,
         trace_id,
         span_id,
@@ -144,6 +147,26 @@ pub fn build_row_at(event: LogEvent, source: &IngestSource, now: DateTime<Utc>) 
 
 pub async fn insert_logs(ch: &ClickHouse, rows: &[LogRow]) -> Result<(), ClickHouseError> {
     ch.insert_rows_with(LOGS_TABLE, rows, &INSERT_SETTINGS)
+        .await
+}
+
+/// The `JSONEachRow` body of `rows`, the CPU-bound half of [`insert_logs`]: a
+/// batch of 10,000 events is megabytes of text, so the HTTP ingest path builds
+/// it on a blocking thread (`ingest::prepare`) and only sends it from the
+/// async side with [`insert_encoded_logs`].
+///
+/// A batch that would encode to more than `max_bytes` is refused with
+/// [`ClickHouseError::TooLarge`] before anything is built (see
+/// [`crate::clickhouse::encode_rows_within`]): escaping can make the body far
+/// larger than the rows it is made of.
+pub fn encode_logs(rows: &[LogRow], max_bytes: usize) -> Result<String, ClickHouseError> {
+    crate::clickhouse::encode_rows_within(rows, max_bytes)
+}
+
+/// [`insert_logs`] for a body made by [`encode_logs`]: the same table, the
+/// same [`INSERT_SETTINGS`]. An empty body is a no-op.
+pub async fn insert_encoded_logs(ch: &ClickHouse, body: String) -> Result<(), ClickHouseError> {
+    ch.insert_encoded_with(LOGS_TABLE, body, &INSERT_SETTINGS)
         .await
 }
 

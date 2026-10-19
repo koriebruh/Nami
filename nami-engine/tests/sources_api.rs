@@ -2,7 +2,10 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{call, login, seed_project, seed_user, test_app, unique_email, user_with_role};
+use common::{
+    call, login, logs::unreachable_pool, seed_project, seed_user, test_app, unique_email,
+    user_with_role,
+};
 use nami_engine::{
     auth::token::hash_token,
     crypto::{Cipher, TEST_KEY},
@@ -644,5 +647,30 @@ async fn find_by_token_ignores_empty_and_oversized_tokens(pool: sqlx::PgPool) {
             .await
             .unwrap(),
         None
+    );
+}
+
+/// A token that cannot be a source's is never looked up: the answer is "no
+/// such source" even where the database cannot answer at all, while a token
+/// of the right shape does go to the database (and fails there).
+#[tokio::test]
+async fn find_by_token_never_queries_for_a_token_of_the_wrong_shape() {
+    let unreachable = unreachable_pool();
+    for token in [
+        String::new(),
+        "short".to_string(),
+        "a".repeat(44),
+        format!("{}+", "a".repeat(42)),
+    ] {
+        assert_eq!(
+            source::find_by_token(&unreachable, &token).await.unwrap(),
+            None,
+            "{token:?}"
+        );
+    }
+    assert!(
+        source::find_by_token(&unreachable, &source::new_token())
+            .await
+            .is_err()
     );
 }

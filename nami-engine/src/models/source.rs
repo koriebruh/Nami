@@ -29,8 +29,9 @@ pub const MIN_DAILY_BYTE_QUOTA: i64 = 1024 * 1024;
 /// The column part of the AES-GCM associated data of `sources.token_enc`.
 /// What is actually used is [`token_context`], which adds the source id.
 pub const TOKEN_CONTEXT: &str = "sources.token";
-/// Generated tokens are 43 characters; anything longer is never looked up.
-const MAX_TOKEN_LEN: usize = 128;
+/// A generated token is 32 random bytes in base64url without padding: 43
+/// characters.
+pub const TOKEN_LEN: usize = 43;
 /// What `Debug` prints in place of an ingest token.
 const REDACTED: &str = "<redacted>";
 
@@ -180,6 +181,17 @@ pub fn new_token() -> String {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Whether `token` has the shape of a generated one: exactly [`TOKEN_LEN`]
+/// characters of the base64url alphabet. Anything else is no source's token,
+/// so it is never looked up ([`find_by_token`]), and the public ingest paths
+/// refuse it before they spend a database query on it.
+pub fn is_well_formed_token(token: &str) -> bool {
+    token.len() == TOKEN_LEN
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 pub async fn insert_source(
@@ -341,12 +353,13 @@ pub async fn rotate_token(
     Ok(source.map(|source| SourceWithToken { source, token }))
 }
 
-/// The source a presented ingest token belongs to, if any.
+/// The source a presented ingest token belongs to, if any. A token that is
+/// not [`is_well_formed_token`] belongs to nobody, and costs no query.
 pub async fn find_by_token(
     pool: &PgPool,
     token: &str,
 ) -> Result<Option<IngestSource>, sqlx::Error> {
-    if token.is_empty() || token.len() > MAX_TOKEN_LEN {
+    if !is_well_formed_token(token) {
         return Ok(None);
     }
     sqlx::query_as(
@@ -389,6 +402,33 @@ mod tests {
             .decode(&a)
             .unwrap();
         assert_eq!(bytes.len(), 32);
+        assert!(is_well_formed_token(&a) && is_well_formed_token(&b));
+    }
+
+    #[test]
+    fn only_the_exact_shape_of_a_generated_token_is_well_formed() {
+        let token = "A".repeat(TOKEN_LEN);
+        assert!(is_well_formed_token(&token));
+        assert!(is_well_formed_token(&format!(
+            "-_{}",
+            "z9".repeat(20) + "Z"
+        )));
+        for bad in [
+            String::new(),
+            "A".repeat(TOKEN_LEN - 1),
+            "A".repeat(TOKEN_LEN + 1),
+            "A".repeat(10_000),
+            format!("{}+", "A".repeat(TOKEN_LEN - 1)),
+            format!("{}/", "A".repeat(TOKEN_LEN - 1)),
+            format!("{}=", "A".repeat(TOKEN_LEN - 1)),
+            format!("{} ", "A".repeat(TOKEN_LEN - 1)),
+            format!("{}\n", "A".repeat(TOKEN_LEN - 1)),
+            format!("{}\0", "A".repeat(TOKEN_LEN - 1)),
+            // 43 bytes, 42 characters: the length is in bytes.
+            format!("{}é", "A".repeat(TOKEN_LEN - 2)),
+        ] {
+            assert!(!is_well_formed_token(&bad), "{bad:?}");
+        }
     }
 
     #[test]

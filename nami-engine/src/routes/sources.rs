@@ -1,14 +1,17 @@
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State, rejection::QueryRejection},
     http::StatusCode,
     routing::{get, post},
 };
+use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
+    logs::usage::{self, DailyUsage},
     middleware::rbac::{CurrentUser, require_project_role},
     models::source::{self, CreateSourceRequest, PatchSourceRequest, Source, SourceWithToken},
     state::AppState,
@@ -33,6 +36,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/projects/{id}/sources/{source_id}/rotate",
             post(rotate_token),
+        )
+        .route(
+            "/projects/{id}/sources/{source_id}/usage",
+            get(source_usage),
         )
 }
 
@@ -124,4 +131,39 @@ async fn rotate_token(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(rotated))
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageQuery {
+    days: Option<i64>,
+}
+
+/// Daily ingestion counters for the last `days` days (default 30, at most
+/// the 400 kept), oldest first and zero-filled. Counts flushed by every
+/// engine instance, so the current day lags by up to ~10 s.
+async fn source_usage(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, source_id)): Path<(Uuid, Uuid)>,
+    query: Result<Query<UsageQuery>, QueryRejection>,
+) -> Result<Json<Vec<DailyUsage>>, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    source::find_in_project(&state.db, project_id, source_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    // A `days` that is not a number is the same kind of mistake as one out of
+    // range, and answers in the API's own JSON shape.
+    let invalid = || {
+        AppError::Validation(format!(
+            "days must be a whole number between 1 and {}",
+            usage::RETENTION_DAYS
+        ))
+    };
+    let days = query.map_err(|_| invalid())?.0.days.unwrap_or(30);
+    if !(1..=usage::RETENTION_DAYS).contains(&days) {
+        return Err(invalid());
+    }
+    Ok(Json(
+        usage::daily_usage(&state.db, source_id, days, Utc::now().date_naive()).await?,
+    ))
 }

@@ -428,3 +428,97 @@ async fn inserts_use_waited_async_inserts() {
         "{params:?}"
     );
 }
+
+/// The ingest path builds the insert body on a blocking thread
+/// (`store::encode_logs`) and sends it from the async side
+/// (`store::insert_encoded_logs`). That is the same insert as
+/// `store::insert_logs`: the same settings on the request, the same body, and
+/// the same rows in the table.
+#[tokio::test]
+async fn an_encoded_batch_is_inserted_like_insert_logs_inserts_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let probe = ClickHouse::new(&server.uri(), "nami", "nami", "nami_logs");
+    let source = source();
+    let rows: Vec<LogRow> = (0..3)
+        .map(|n| {
+            row(
+                &source,
+                json!({ "message": format!("m {n}"), "n": n }),
+                now_millis(),
+            )
+        })
+        .collect();
+    store::insert_logs(&probe, &rows).await.unwrap();
+    let body = store::encode_logs(&rows, 1 << 20).unwrap();
+    store::insert_encoded_logs(&probe, body.clone())
+        .await
+        .unwrap();
+    assert_eq!(body.lines().count(), 3);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let params = |index: usize| {
+        let mut pairs: Vec<(String, String)> = requests[index]
+            .url
+            .query_pairs()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    assert_eq!(params(0), params(1), "the same settings and query");
+    assert_eq!(requests[0].body, requests[1].body, "the same body");
+
+    // Nothing to send, nothing sent.
+    assert_eq!(store::encode_logs(&[], 0).unwrap(), "");
+    store::insert_encoded_logs(&probe, String::new())
+        .await
+        .unwrap();
+    assert_eq!(server.received_requests().await.unwrap().len(), 2);
+
+    // And in a real ClickHouse the encoded body is stored as rows.
+    let ch = ClickHouse::create_test_database().await.unwrap();
+    store::insert_encoded_logs(&ch, body).await.unwrap();
+    let stored: Vec<Value> = ch
+        .query_rows(
+            "SELECT message, fields FROM logs WHERE project_id = {p:UUID} ORDER BY message",
+            &[("p", source.project_id.to_string())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stored,
+        vec![
+            json!({ "message": "m 0", "fields": r#"{"n":0}"# }),
+            json!({ "message": "m 1", "fields": r#"{"n":1}"# }),
+            json!({ "message": "m 2", "fields": r#"{"n":2}"# }),
+        ]
+    );
+    ch.drop_database().await.unwrap();
+}
+
+/// A batch over the cap is refused before anything is built; one at exactly
+/// the cap is not.
+#[test]
+fn an_encoded_batch_over_the_cap_is_refused() {
+    let source = source();
+    let rows: Vec<LogRow> = (0..10)
+        .map(|n| {
+            row(
+                &source,
+                json!({ "message": format!("m {n}") }),
+                now_millis(),
+            )
+        })
+        .collect();
+    let exact = store::encode_logs(&rows, usize::MAX).unwrap().len();
+    assert_eq!(store::encode_logs(&rows, exact).unwrap().len(), exact);
+    assert!(matches!(
+        store::encode_logs(&rows, exact - 1),
+        Err(ClickHouseError::TooLarge { limit }) if limit == exact - 1
+    ));
+}
