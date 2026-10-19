@@ -32,8 +32,9 @@
 //! column's key (`{"id":` NDJSON, `{"dt":` CSV), and anything else ends the
 //! file with the "query failed" trailer without being written.
 //!
-//! CSV cells go through [`neutralize`] (formula guard), the header included
-//! (a column path may start with `-`).
+//! CSV cells go through [`crate::download::neutralize`] (formula guard), the
+//! header included (a column path may start with `-`), and are always quoted
+//! ([`push_csv_field`]).
 
 use std::{
     collections::HashMap,
@@ -54,10 +55,7 @@ use tokio::{
 use uuid::Uuid;
 
 use super::query::{self, LogFilters, Sql, Window};
-use crate::{
-    clickhouse::{ClickHouseError, RowStream},
-    download::neutralize,
-};
+use crate::clickhouse::{ClickHouseError, RowStream};
 
 /// Rows one export carries at most (the SQL `LIMIT`).
 pub const MAX_EXPORT_ROWS: u64 = 100_000;
@@ -208,31 +206,7 @@ pub fn export_sql(project_id: Uuid, params: &ExportParams, limit: u64) -> Sql {
     sql
 }
 
-/// Appends one RFC 4180 field: formula-guarded first ([`neutralize`]), then
-/// quoted when it holds `"`, `,`, CR or LF (inner quotes doubled).
-pub fn push_csv_field(out: &mut String, value: &str) {
-    let value = neutralize(value);
-    if value.contains(['"', ',', '\r', '\n']) {
-        out.push('"');
-        out.push_str(&value.replace('"', "\"\""));
-        out.push('"');
-    } else {
-        out.push_str(&value);
-    }
-}
-
-/// One CSV record, CRLF-terminated.
-pub fn csv_record(fields: &[&str]) -> String {
-    let mut out = String::new();
-    for (i, field) in fields.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        push_csv_field(&mut out, field);
-    }
-    out.push_str("\r\n");
-    out
-}
+pub use crate::download::{csv_record, push_csv_field};
 
 /// `nami-logs-<to as %Y%m%dT%H%M%SZ>.<csv|ndjson>`: no user text.
 pub fn file_name(format: ExportFormat, to: DateTime<Utc>) -> String {
@@ -473,28 +447,32 @@ mod tests {
     use tokio_stream::StreamExt;
 
     use super::*;
-    use crate::{clickhouse::ClickHouse, download::AbortableBody};
+    use crate::{
+        clickhouse::ClickHouse,
+        download::{AbortableBody, neutralize},
+    };
 
     #[test]
     fn csv_fields_follow_rfc_4180() {
         assert_eq!(
             csv_record(&["a", "b,c", "say \"hi\"", "line\nbreak", ""]),
-            "a,\"b,c\",\"say \"\"hi\"\"\",\"line\nbreak\",\r\n"
+            "\"a\",\"b,c\",\"say \"\"hi\"\"\",\"line\nbreak\",\"\"\r\n"
         );
     }
 
     #[test]
     fn formula_cells_are_prefixed() {
         for (input, expected) in [
-            ("=cmd|' /C calc'!A0", "'=cmd|' /C calc'!A0"),
-            ("+1", "'+1"),
-            ("-2", "'-2"),
-            ("@SUM(1)", "'@SUM(1)"),
-            ("\tx", "'\tx"),
+            ("=cmd|' /C calc'!A0", "\"'=cmd|' /C calc'!A0\""),
+            ("+1", "\"'+1\""),
+            ("-2", "\"'-2\""),
+            ("@SUM(1)", "\"'@SUM(1)\""),
+            ("\tx", "\"'\tx\""),
             ("\rx", "\"'\rx\""),
             ("=1,2", "\"'=1,2\""),
-            ("a=1", "a=1"),
-            (" =1", " =1"),
+            ("a=1", "\"a=1\""),
+            (" =1", "\" =1\""),
+            ("x;=2+5", "\"x;=2+5\""),
         ] {
             let mut out = String::new();
             push_csv_field(&mut out, input);
@@ -862,9 +840,9 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "dt,level,source,message,trace_id,user.name,'-n\r\n\
-                 2026-10-19T08:05:03.250Z,info,api,'=cmd|' /C calc'!A0,,'@SUM(1),5\r\n\
-                 2026-10-19T08:05:03.249Z,warn,{gone},\"a, \"\"b\"\"\nc\",t,,'-2\r\n"
+                "\"dt\",\"level\",\"source\",\"message\",\"trace_id\",\"user.name\",\"'-n\"\r\n\
+                 \"2026-10-19T08:05:03.250Z\",\"info\",\"api\",\"'=cmd|' /C calc'!A0\",\"\",\"'@SUM(1)\",\"5\"\r\n\
+                 \"2026-10-19T08:05:03.249Z\",\"warn\",\"{gone}\",\"a, \"\"b\"\"\nc\",\"t\",\"\",\"'-2\"\r\n"
             )
         );
     }

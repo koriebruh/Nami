@@ -11,7 +11,8 @@
 //! frees it) when the client goes away, when the client stops reading for
 //! [`SEND_STALL_TIMEOUT`], when the export has run for
 //! [`EXPORT_TOTAL_DEADLINE`], on a ClickHouse error, or at the end of the
-//! range. One user may hold at most [`MAX_EXPORTS_PER_USER`] of the slots.
+//! range. One user may hold at most [`MAX_EXPORTS_PER_USER`] of the slots,
+//! one project at most [`MAX_EXPORTS_PER_PROJECT`].
 //!
 //! The first slice is read before the response starts, so a ClickHouse outage
 //! is the usual JSON 500; a failure later can only abort the body (the client
@@ -54,7 +55,7 @@ use super::{
 pub use crate::download::neutralize;
 use crate::{
     clickhouse::ClickHouseError,
-    download::{AbortableBody, instance_busy, user_busy},
+    download::{AbortableBody, ProjectSlots, instance_busy, project_busy, user_busy},
     error::AppError,
     logs::slots::UserSlots,
     middleware::rbac::{CurrentUser, require_project_role},
@@ -67,8 +68,9 @@ pub const MAX_EXPORT_DAYS: i64 = 180;
 /// First line of every export.
 pub const HEADER: &str = "checked_at,status,status_code,response_time_ms,error\r\n";
 /// Exports running at once across the engine; one more is a 503
-/// (`Retry-After: 5`).
-pub const MAX_EXPORTS_IN_FLIGHT: usize = 4;
+/// (`Retry-After: 5`). With [`MAX_EXPORTS_PER_PROJECT`], filling every slot
+/// takes four projects.
+pub const MAX_EXPORTS_IN_FLIGHT: usize = 8;
 /// Size the producer batches lines into before sending them to the body.
 pub const CHUNK_BYTES: usize = 64 * 1024;
 /// Chunks buffered between the producer and the response body.
@@ -85,14 +87,18 @@ pub const EXPORT_TOTAL_DEADLINE: Duration = Duration::from_secs(600);
 /// Exports one user may run at once, so one viewer cannot take every slot;
 /// one more is a 429 (`Retry-After: 5`).
 pub const MAX_EXPORTS_PER_USER: usize = 2;
+/// Exports one project may run at once, whoever starts them, so the slots
+/// are shared out by tenant; one more is a 429 (`Retry-After: 5`).
+pub const MAX_EXPORTS_PER_PROJECT: usize = 2;
 
 /// The export slots: one semaphore per router, so one per engine process
 /// (each test app builds its own router and gets its own slots), plus the
-/// per-user counts.
+/// per-user and per-project counts.
 #[derive(Clone)]
 pub struct ExportSlots {
     global: Arc<Semaphore>,
     users: Arc<UserSlots>,
+    projects: Arc<ProjectSlots>,
 }
 
 impl Default for ExportSlots {
@@ -100,6 +106,7 @@ impl Default for ExportSlots {
         ExportSlots {
             global: Arc::new(Semaphore::new(MAX_EXPORTS_IN_FLIGHT)),
             users: Arc::default(),
+            projects: Arc::default(),
         }
     }
 }
@@ -109,7 +116,8 @@ pub fn route() -> MethodRouter<AppState> {
     get(export_checks).layer(Extension(ExportSlots::default()))
 }
 
-/// One RFC 4180 record (CRLF-terminated) for `row`, every cell neutralized.
+/// One RFC 4180 record (CRLF-terminated) for `row`, every cell neutralized
+/// and quoted (see [`crate::download::push_csv_field`]).
 pub fn csv_line(row: &UptimeCheckRow) -> String {
     let checked_at = row.checked_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
     let status = match row.status {
@@ -122,22 +130,7 @@ pub fn csv_line(row: &UptimeCheckRow) -> String {
         .map(|ms| ms.to_string())
         .unwrap_or_default();
     let error = row.error.as_deref().unwrap_or_default();
-    let mut writer = csv::WriterBuilder::new()
-        .terminator(csv::Terminator::CRLF)
-        .quote_style(csv::QuoteStyle::Necessary)
-        .buffer_capacity(512)
-        .from_writer(Vec::with_capacity(128));
-    writer
-        .write_record([
-            neutralize(&checked_at).as_ref(),
-            neutralize(status).as_ref(),
-            neutralize(&status_code).as_ref(),
-            neutralize(&response_time).as_ref(),
-            neutralize(error).as_ref(),
-        ])
-        .expect("writing to a Vec cannot fail");
-    let bytes = writer.into_inner().expect("flushing to a Vec cannot fail");
-    String::from_utf8(bytes).expect("every cell is UTF-8")
+    crate::download::csv_record(&[&checked_at, status, &status_code, &response_time, error])
 }
 
 /// `from < to` and at most [`MAX_EXPORT_DAYS`] apart.
@@ -168,10 +161,13 @@ async fn export_checks(
     monitor::find_in_project(&state.db, project_id, monitor_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    // Both permits are RAII guards: every early return below (and the end of
+    // Every permit is an RAII guard: every early return below (and the end of
     // the producer task) gives them back.
     let Ok(user_permit) = slots.users.acquire(user.id, MAX_EXPORTS_PER_USER) else {
         return Ok(user_busy(MAX_EXPORTS_PER_USER));
+    };
+    let Ok(project_permit) = slots.projects.acquire(project_id, MAX_EXPORTS_PER_PROJECT) else {
+        return Ok(project_busy(MAX_EXPORTS_PER_PROJECT));
     };
     let Ok(permit) = slots.global.try_acquire_owned() else {
         return Ok(instance_busy());
@@ -207,6 +203,7 @@ async fn export_checks(
         // The slots are held for as long as the producer runs, no longer.
         let _permit = permit;
         let _user_permit = user_permit;
+        let _project_permit = project_permit;
         producer.run(first, first_end, fetch).await;
     });
 
@@ -402,28 +399,27 @@ mod tests {
     fn rows_are_rfc4180_lines() {
         assert_eq!(
             csv_line(&row(None)),
-            "2026-10-14T17:46:40.123Z,down,503,42,\r\n"
+            "\"2026-10-14T17:46:40.123Z\",\"down\",\"503\",\"42\",\"\"\r\n"
         );
         assert_eq!(
             csv_line(&row(Some("expected status 200-399, got 503"))),
-            "2026-10-14T17:46:40.123Z,down,503,42,\"expected status 200-399, got 503\"\r\n"
+            "\"2026-10-14T17:46:40.123Z\",\"down\",\"503\",\"42\",\"expected status 200-399, got 503\"\r\n"
         );
         assert_eq!(
             csv_line(&row(Some("=HYPERLINK(\"http://evil.test\")"))),
-            "2026-10-14T17:46:40.123Z,down,503,42,\"'=HYPERLINK(\"\"http://evil.test\"\")\"\r\n"
+            "\"2026-10-14T17:46:40.123Z\",\"down\",\"503\",\"42\",\"'=HYPERLINK(\"\"http://evil.test\"\")\"\r\n"
         );
         assert_eq!(
             csv_line(&row(Some("line one\nline two"))),
-            "2026-10-14T17:46:40.123Z,down,503,42,\"line one\nline two\"\r\n"
+            "\"2026-10-14T17:46:40.123Z\",\"down\",\"503\",\"42\",\"line one\nline two\"\r\n"
         );
-        // A neutralized CR cell is still quoted (it contains a CR).
         assert_eq!(
             csv_line(&row(Some("\r=1"))),
-            "2026-10-14T17:46:40.123Z,down,503,42,\"'\r=1\"\r\n"
+            "\"2026-10-14T17:46:40.123Z\",\"down\",\"503\",\"42\",\"'\r=1\"\r\n"
         );
         assert_eq!(
             csv_line(&row(Some("-1,@x"))),
-            "2026-10-14T17:46:40.123Z,down,503,42,\"'-1,@x\"\r\n"
+            "\"2026-10-14T17:46:40.123Z\",\"down\",\"503\",\"42\",\"'-1,@x\"\r\n"
         );
         let up = UptimeCheckRow {
             status: CheckStatus::Up,
@@ -432,7 +428,19 @@ mod tests {
             error: None,
             ..row(None)
         };
-        assert_eq!(csv_line(&up), "2026-10-14T17:46:40.123Z,up,,,\r\n");
+        assert_eq!(csv_line(&up), "\"2026-10-14T17:46:40.123Z\",\"up\",\"\",\"\",\"\"\r\n");
+    }
+
+    /// Every cell is quoted, so a spreadsheet that splits on `;` (Excel in
+    /// de, fr, nl locales) never cuts a formula cell out of an error.
+    #[test]
+    fn semicolons_never_split_a_cell_into_a_formula() {
+        let line = csv_line(&row(Some("unexpected greeting 554 x;=2+5;@SUM(1+9)")));
+        assert!(
+            line.ends_with(",\"unexpected greeting 554 x;=2+5;@SUM(1+9)\"\r\n"),
+            "{line:?}"
+        );
+        assert!(line.starts_with('"'), "{line:?}");
     }
 
     /// Whatever an error holds, the line parses back as exactly five fields
