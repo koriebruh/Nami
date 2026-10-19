@@ -44,6 +44,14 @@ const BASE_SETTINGS: [(&str, &str); 3] = [
 /// than with the client giving up first.
 pub const QUERY_MAX_EXECUTION_SECS: u64 = 25;
 
+/// The largest response body the client reads from ClickHouse; a larger one
+/// is refused with [`ClickHouseError::ResponseTooLarge`] as soon as it passes
+/// this, before more of it is read. Every request is bounded by it, also one
+/// whose SQL bounds its rows, so a mistake in a query costs an error, never
+/// the engine's memory (the log reads also set `max_result_bytes`, see
+/// `logs::search::READ_SETTINGS`).
+pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Idempotent DDL applied by [`ClickHouse::migrate`], in order. Table names
 /// are unqualified because every request carries the `database` setting.
 const MIGRATIONS: [&str; 2] = [
@@ -115,6 +123,10 @@ pub enum ClickHouseError {
     /// wrapped error (see the `From` impl below).
     #[error("clickhouse request failed: {0}")]
     Transport(#[source] reqwest::Error),
+    /// The response body passed the client's cap ([`MAX_RESPONSE_BYTES`]);
+    /// what was read of it is dropped.
+    #[error("the clickhouse response is larger than {limit} bytes")]
+    ResponseTooLarge { limit: usize },
     /// Non-2xx response; `body` is ClickHouse's own error text.
     #[error("clickhouse returned HTTP {status}: {body}")]
     Server { status: u16, body: String },
@@ -152,6 +164,7 @@ pub struct ClickHouse {
     user: String,
     password: String,
     database: String,
+    max_response_bytes: usize,
 }
 
 impl ClickHouse {
@@ -172,7 +185,15 @@ impl ClickHouse {
             user: user.to_string(),
             password: password.to_string(),
             database: database.to_string(),
+            max_response_bytes: MAX_RESPONSE_BYTES,
         }
+    }
+
+    /// The same client with another response cap (tests shrink it; see
+    /// [`MAX_RESPONSE_BYTES`]).
+    pub fn with_max_response_bytes(mut self, limit: usize) -> Self {
+        self.max_response_bytes = limit;
+        self
     }
 
     pub fn database(&self) -> &str {
@@ -426,7 +447,7 @@ impl ClickHouse {
             .send()
             .await?;
         let status = response.status();
-        let text = response.text().await?;
+        let text = read_capped(response, self.max_response_bytes).await?;
         if !status.is_success() {
             return Err(ClickHouseError::Server {
                 status: status.as_u16(),
@@ -435,6 +456,30 @@ impl ClickHouse {
         }
         Ok(text)
     }
+}
+
+/// The body of `response`, refused with [`ClickHouseError::ResponseTooLarge`]
+/// once it passes `limit` bytes (a declared length over it is refused before
+/// anything is read). Not valid UTF-8 is replaced, as `Response::text` would.
+async fn read_capped(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<String, ClickHouseError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(ClickHouseError::ResponseTooLarge { limit });
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > limit {
+            return Err(ClickHouseError::ResponseTooLarge { limit });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8(body)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()))
 }
 
 /// The `JSONEachRow` body of `rows`: one serde-encoded JSON object per line,

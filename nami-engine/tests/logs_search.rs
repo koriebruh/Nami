@@ -634,3 +634,259 @@ async fn catastrophic_regexes_finish_quickly(pool: sqlx::PgPool) {
     );
     f.ch.drop_database().await.unwrap();
 }
+
+/// The raw body of a GET through the API router.
+async fn get_raw(
+    app: &Router,
+    uri: &str,
+    cookie: &axum::http::HeaderValue,
+) -> (StatusCode, Vec<u8>) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .uri(uri)
+        .header(axum::http::header::COOKIE, cookie)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+/// Security (memory amplification): rows stored at the caps and filled with
+/// control characters (one byte stored, six once JSON-escaped) are listed
+/// cut, so what a page weighs does not depend on what senders stored; the
+/// entry endpoint returns one whole row, confined to the project.
+#[sqlx::test]
+async fn list_rows_are_cut_and_the_entry_endpoint_returns_the_whole_row(pool: sqlx::PgPool) {
+    use nami_engine::logs::{
+        normalize::LogEvent,
+        search::{LIST_FIELDS_OMITTED, LIST_MESSAGE_CHARS},
+        store,
+    };
+    use nami_engine::models::source::IngestSource;
+
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let other_project = seed_project(&pool).await;
+    let (source_id, _) = seed_source(&pool, project, "api").await;
+    let (other_source, _) = seed_source(&pool, other_project, "theirs").await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (_, _, outsider) = user_with_role(&app, &pool, project, None).await;
+    let source = |id, project_id| IngestSource {
+        id,
+        project_id,
+        retention_days: 30,
+        daily_byte_quota: None,
+    };
+    let pad = "\u{1}".repeat(40_000);
+    let base = (Utc::now() - Duration::minutes(5))
+        .duration_trunc(Duration::milliseconds(1))
+        .unwrap();
+    const BIG_ROWS: i64 = 40;
+    let mut rows: Vec<store::LogRow> = (0..BIG_ROWS)
+        .map(|i| {
+            let mut fields = serde_json::Map::new();
+            fields.insert("pad".to_string(), json!(pad));
+            store::build_row(
+                LogEvent::new(
+                    base + Duration::milliseconds(i),
+                    "info",
+                    "\u{1}".repeat(70_000),
+                    fields,
+                    String::new(),
+                    String::new(),
+                ),
+                &source(source_id, project),
+            )
+        })
+        .collect();
+    let mut small_fields = serde_json::Map::new();
+    small_fields.insert("k".to_string(), json!("v"));
+    rows.push(store::build_row(
+        LogEvent::new(
+            base + Duration::seconds(1),
+            "info",
+            "small".to_string(),
+            small_fields,
+            String::new(),
+            String::new(),
+        ),
+        &source(source_id, project),
+    ));
+    let foreign = store::build_row(
+        LogEvent::new(
+            base,
+            "info",
+            "theirs".to_string(),
+            serde_json::Map::new(),
+            String::new(),
+            String::new(),
+        ),
+        &source(other_source, other_project),
+    );
+    rows.push(foreign.clone());
+    store::insert_logs(&ch, &rows).await.unwrap();
+    let stored_message = rows[0].message.clone();
+    assert!(stored_message.len() > 60_000);
+
+    let window = format!(
+        "from={}&to={}",
+        encode(&ts(base - Duration::minutes(1))),
+        encode(&ts(Utc::now()))
+    );
+    let (status, body) = get_raw(
+        &app,
+        &format!("/projects/{project}/logs?{window}&limit=500"),
+        &viewer,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Each cut row: 4096 characters of six escaped bytes, the marker, and the
+    // rest of the row. Uncut, these rows weigh about 600 KB each.
+    let per_row = LIST_MESSAGE_CHARS * 6 + LIST_FIELDS_OMITTED.len() + 1024;
+    assert!(
+        body.len() < (BIG_ROWS as usize + 1) * per_row,
+        "{} bytes for {} rows",
+        body.len(),
+        BIG_ROWS + 1
+    );
+    let page: Value = serde_json::from_slice(&body).unwrap();
+    let logs = page["logs"].as_array().unwrap();
+    assert_eq!(logs.len(), BIG_ROWS as usize + 1);
+    let small = &logs[0];
+    assert_eq!(small["message"], "small");
+    assert_eq!(small["fields"], json!({ "k": "v" }));
+    assert_eq!(small["truncated"], false);
+    let big = &logs[1];
+    assert_eq!(big["truncated"], true);
+    assert_eq!(
+        big["message"].as_str().unwrap().chars().count(),
+        LIST_MESSAGE_CHARS
+    );
+    assert_eq!(
+        big["fields"],
+        serde_json::from_str::<Value>(LIST_FIELDS_OMITTED).unwrap()
+    );
+
+    // The whole row, by id and dt.
+    let id = big["id"].as_str().unwrap();
+    let dt = big["dt"].as_str().unwrap();
+    let entry_uri = |id: &str, dt: &str| format!("/projects/{project}/logs/{id}?dt={}", encode(dt));
+    let (status, entry) = call(&app, "GET", &entry_uri(id, dt), Some(&viewer), None).await;
+    assert_eq!(status, StatusCode::OK, "{entry}");
+    assert_eq!(entry["truncated"], false);
+    assert_eq!(entry["message"].as_str().unwrap(), stored_message);
+    assert_eq!(entry["fields"]["pad"].as_str().unwrap(), pad);
+    assert_eq!(entry["id"], big["id"]);
+
+    // Confined to the project; the right id at the wrong dt is not found.
+    let foreign_dt = ts(foreign.dt);
+    let (status, _) = call(
+        &app,
+        "GET",
+        &entry_uri(&foreign.id.to_string(), &foreign_dt),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let other_dt = ts(parse_ts(&big["dt"]) + Duration::milliseconds(500));
+    assert_eq!(
+        call(&app, "GET", &entry_uri(id, &other_dt), Some(&viewer), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&app, "GET", &entry_uri(id, dt), Some(&outsider), None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&app, "GET", &entry_uri(id, dt), None, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    for bad in [
+        format!("/projects/{project}/logs/{id}"),
+        format!("/projects/{project}/logs/{id}?dt=yesterday"),
+    ] {
+        assert_eq!(
+            call(&app, "GET", &bad, Some(&viewer), None).await.0,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    // Another project's path is 403 for this viewer, whatever the row.
+    assert_eq!(
+        call(
+            &app,
+            "GET",
+            &format!(
+                "/projects/{other_project}/logs/{}?dt={}",
+                foreign.id,
+                encode(&foreign_dt)
+            ),
+            Some(&viewer),
+            None
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+    ch.drop_database().await.unwrap();
+}
+
+/// Security: one user can have at most `MAX_QUERIES_PER_USER` searches,
+/// histograms and entry reads running; the next is 429, and a finished one
+/// frees its slot.
+#[sqlx::test]
+async fn log_reads_are_capped_per_user(pool: sqlx::PgPool) {
+    use nami_engine::logs::search::{MAX_QUERIES_PER_USER, QueryPermit};
+
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let logs = state.logs.clone();
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (viewer_id, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (_, _, other) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let held: Vec<QueryPermit> = (0..MAX_QUERIES_PER_USER)
+        .map(|_| QueryPermit::acquire(&logs, viewer_id).unwrap())
+        .collect();
+    let paths = [
+        format!("/projects/{project}/logs"),
+        format!("/projects/{project}/logs/histogram"),
+        format!(
+            "/projects/{project}/logs/{}?dt={}",
+            Uuid::new_v4(),
+            encode(&ts(Utc::now()))
+        ),
+    ];
+    for path in &paths {
+        assert_eq!(
+            call(&app, "GET", path, Some(&viewer), None).await.0,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{path}"
+        );
+    }
+    // Another user is not affected, and nothing leaked a slot.
+    assert_eq!(
+        call(&app, "GET", &paths[0], Some(&other), None).await.0,
+        StatusCode::OK
+    );
+    drop(held);
+    assert_eq!(
+        call(&app, "GET", &paths[0], Some(&viewer), None).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&app, "GET", &paths[2], Some(&viewer), None).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(logs.query_slots.open(viewer_id), 0);
+    ch.drop_database().await.unwrap();
+}

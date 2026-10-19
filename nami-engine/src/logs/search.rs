@@ -2,20 +2,74 @@
 //! Both are always scoped to one project (bound from the path) and run with
 //! the ClickHouse client's server-side time limit (`query_rows`).
 
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, PoisonError},
+};
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::query::{self, Cursor, ERROR_LEVELS_SQL, LogFilters, SearchParams, Sql, Window};
+use super::{
+    LogsState,
+    query::{self, Cursor, ERROR_LEVELS_SQL, LogFilters, SearchParams, Sql, Window},
+};
 use crate::{
     clickhouse::{ClickHouse, ClickHouseError},
     error::AppError,
 };
 
-/// The columns every log query returns, in [`LogEntry`] order.
-pub const ENTRY_COLUMNS: &str = "SELECT id, source_id, dt, level, message, fields, trace_id, span_id, \
+/// The most characters of a message a list row (search page, live tail)
+/// carries; the whole message is read with [`entry`].
+pub const LIST_MESSAGE_CHARS: usize = 4096;
+
+/// The largest stored `fields` text a list row carries; a larger one is
+/// replaced by [`LIST_FIELDS_OMITTED`] and read whole with [`entry`].
+pub const LIST_FIELDS_BYTES: usize = 8192;
+
+/// The `fields` of a list row whose stored fields are over
+/// [`LIST_FIELDS_BYTES`].
+pub const LIST_FIELDS_OMITTED: &str =
+    r#"{"_nami_omitted":"fields over 8 KiB are not listed: open the entry"}"#;
+
+/// The columns of a list row, in [`LogEntry`] order. The message is cut to
+/// [`LIST_MESSAGE_CHARS`] and large fields are left out
+/// ([`LIST_FIELDS_BYTES`]), with `truncated` set, so what a page or a tail
+/// poll weighs does not depend on what senders stored: a stored row may hold
+/// 64 KiB of message and 256 KiB of fields, and escaping can make that six
+/// times larger on the wire. The aliases differ from the column names on
+/// purpose: ClickHouse resolves an alias everywhere in the query, so a
+/// `message` alias would make the filters match the cut message.
+///
+/// The numbers are literals (the text is a `&'static str`); a test pins them
+/// to the constants.
+pub const ENTRY_COLUMNS: &str = "SELECT id, source_id, dt, level, \
+     substringUTF8(message, 1, 4096) AS list_message, \
+     if(length(fields) > 8192, \
+        '{\"_nami_omitted\":\"fields over 8 KiB are not listed: open the entry\"}', fields) \
+        AS list_fields, \
+     trace_id, span_id, toString(pattern_hash) AS pattern_hash, \
+     toBool(lengthUTF8(message) > 4096 OR length(fields) > 8192) AS truncated FROM logs";
+
+/// The columns of one whole row ([`entry`]).
+pub const FULL_COLUMNS: &str = "SELECT id, source_id, dt, level, message, fields, trace_id, span_id, \
      toString(pattern_hash) AS pattern_hash FROM logs";
+
+/// Extra settings of every log read: ClickHouse refuses a result larger than
+/// this (in memory) rather than building it, and the client refuses a
+/// response body over [`crate::clickhouse::MAX_RESPONSE_BYTES`] as it reads
+/// it. With list rows cut ([`ENTRY_COLUMNS`]) and at most
+/// [`query::MAX_LIMIT`] rows a page, neither is reached by a legitimate query.
+pub const READ_SETTINGS: [(&str, &str); 2] = [
+    ("max_result_bytes", "33554432"),
+    ("result_overflow_mode", "throw"),
+];
+
+/// Concurrent searches and histograms one user may have running; the next is
+/// refused with 429. A page load takes two (search and histogram).
+pub const MAX_QUERIES_PER_USER: usize = 4;
 
 /// One log row as the API returns it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -31,6 +85,9 @@ pub struct LogEntry {
     pub span_id: String,
     /// Decimal string: a UInt64 does not fit a JavaScript number.
     pub pattern_hash: String,
+    /// The message was cut or the fields left out (list rows only, see
+    /// [`ENTRY_COLUMNS`]): [`entry`] returns the whole row.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,11 +96,15 @@ pub struct RawEntry {
     source_id: Uuid,
     dt: DateTime<Utc>,
     level: String,
+    #[serde(alias = "list_message")]
     message: String,
+    #[serde(alias = "list_fields")]
     fields: String,
     trace_id: String,
     span_id: String,
     pattern_hash: String,
+    #[serde(default)]
+    truncated: bool,
 }
 
 impl From<RawEntry> for LogEntry {
@@ -58,6 +119,7 @@ impl From<RawEntry> for LogEntry {
             trace_id: raw.trace_id,
             span_id: raw.span_id,
             pattern_hash: raw.pattern_hash,
+            truncated: raw.truncated,
         }
     }
 }
@@ -85,6 +147,13 @@ pub fn user_error(error: ClickHouseError) -> AppError {
         ClickHouseError::Server { body, .. } if body.contains("CANNOT_COMPILE_REGEXP") => {
             AppError::Validation("a filter regex is not valid RE2 syntax".to_string())
         }
+        ClickHouseError::Server { body, .. } if body.contains("TOO_MANY_ROWS_OR_BYTES") => {
+            AppError::Validation(too_large_message())
+        }
+        ClickHouseError::ResponseTooLarge { .. } => {
+            tracing::warn!("a log query result passed the client's response cap");
+            AppError::Validation(too_large_message())
+        }
         ClickHouseError::Server { body, .. } if body.contains("TIMEOUT_EXCEEDED") => {
             AppError::Validation(
                 "the query took too long: narrow the time window or add filters".to_string(),
@@ -92,6 +161,10 @@ pub fn user_error(error: ClickHouseError) -> AppError {
         }
         _ => AppError::ClickHouse(error),
     }
+}
+
+fn too_large_message() -> String {
+    "the result is too large: narrow the time window or add filters".to_string()
 }
 
 /// One page, newest first: `(dt, id)` descending, strictly after the cursor.
@@ -115,7 +188,7 @@ pub async fn search(
     sql.push(" ORDER BY dt DESC, id DESC LIMIT ")
         .value("UInt32", (params.limit + 1).to_string());
     let rows: Vec<RawEntry> = ch
-        .query_rows(sql.text(), &sql.params())
+        .query_rows_with(sql.text(), &sql.params(), &READ_SETTINGS)
         .await
         .map_err(user_error)?;
     let mut logs: Vec<LogEntry> = rows.into_iter().map(LogEntry::from).collect();
@@ -126,6 +199,99 @@ pub async fn search(
         None
     };
     Ok(SearchPage { logs, next_cursor })
+}
+
+/// One whole row of the project (message and fields uncut), found by its
+/// `dt` (part of the sort key, so the lookup reads one granule) and id;
+/// `None` when the project has no such row.
+pub async fn entry(
+    ch: &ClickHouse,
+    project_id: Uuid,
+    id: Uuid,
+    dt: DateTime<Utc>,
+) -> Result<Option<LogEntry>, AppError> {
+    let mut sql = Sql::new();
+    sql.push(FULL_COLUMNS)
+        .push(" WHERE project_id = ")
+        .value("UUID", project_id.to_string())
+        .push(" AND dt = fromUnixTimestamp64Milli(")
+        .value("Int64", dt.timestamp_millis().to_string())
+        .push(", 'UTC') AND id = ")
+        .value("UUID", id.to_string())
+        .push(" LIMIT 1");
+    let rows: Vec<RawEntry> = ch
+        .query_rows_with(sql.text(), &sql.params(), &READ_SETTINGS)
+        .await
+        .map_err(user_error)?;
+    Ok(rows.into_iter().next().map(LogEntry::from))
+}
+
+/// How many searches and histograms each user has running.
+#[derive(Debug, Default)]
+pub struct QuerySlots {
+    per_user: Mutex<HashMap<Uuid, usize>>,
+}
+
+/// One running search or histogram; dropping it (the request finished or
+/// its client went away) gives the slot back.
+#[derive(Debug)]
+pub struct QueryPermit {
+    logs: Arc<LogsState>,
+    user_id: Uuid,
+}
+
+impl QuerySlots {
+    /// Searches and histograms `user_id` has running.
+    pub fn open(&self, user_id: Uuid) -> usize {
+        let counts = self.per_user.lock().unwrap_or_else(PoisonError::into_inner);
+        counts.get(&user_id).copied().unwrap_or(0)
+    }
+}
+
+impl QueryPermit {
+    /// A slot for `user_id`, or `RateLimited` (429) when the user already has
+    /// [`MAX_QUERIES_PER_USER`] running.
+    pub fn acquire(logs: &Arc<LogsState>, user_id: Uuid) -> Result<QueryPermit, AppError> {
+        Self::acquire_with(logs, user_id, MAX_QUERIES_PER_USER)
+    }
+
+    pub fn acquire_with(
+        logs: &Arc<LogsState>,
+        user_id: Uuid,
+        max: usize,
+    ) -> Result<QueryPermit, AppError> {
+        let mut counts = logs
+            .query_slots
+            .per_user
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let count = counts.entry(user_id).or_insert(0);
+        if *count >= max {
+            return Err(AppError::RateLimited);
+        }
+        *count += 1;
+        Ok(QueryPermit {
+            logs: logs.clone(),
+            user_id,
+        })
+    }
+}
+
+impl Drop for QueryPermit {
+    fn drop(&mut self) {
+        let mut counts = self
+            .logs
+            .query_slots
+            .per_user
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&self.user_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.user_id);
+            }
+        }
+    }
 }
 
 /// Bucket sizes the histogram picks from (seconds).
@@ -192,7 +358,7 @@ pub async fn histogram(
     query::push_window(&mut sql, window);
     sql.push(" GROUP BY bucket_ms ORDER BY bucket_ms");
     let rows: Vec<BucketRow> = ch
-        .query_rows(sql.text(), &sql.params())
+        .query_rows_with(sql.text(), &sql.params(), &READ_SETTINGS)
         .await
         .map_err(user_error)?;
 
@@ -251,6 +417,46 @@ mod tests {
     }
 
     #[test]
+    fn the_list_columns_use_the_documented_limits() {
+        let squeezed: String = ENTRY_COLUMNS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(squeezed.contains(&format!("substringUTF8(message, 1, {LIST_MESSAGE_CHARS})")));
+        assert!(squeezed.contains(&format!("lengthUTF8(message) > {LIST_MESSAGE_CHARS}")));
+        assert_eq!(
+            squeezed
+                .matches(&format!("length(fields) > {LIST_FIELDS_BYTES}"))
+                .count(),
+            2
+        );
+        assert!(
+            squeezed.contains(&format!("'{LIST_FIELDS_OMITTED}'")),
+            "the marker in the SQL is LIST_FIELDS_OMITTED"
+        );
+        let marker: Value = serde_json::from_str(LIST_FIELDS_OMITTED).unwrap();
+        assert!(marker.is_object());
+        // The cut columns never shadow the stored ones the filters read.
+        assert!(!squeezed.contains(" AS message") && !squeezed.contains(" AS fields"));
+    }
+
+    #[test]
+    fn query_slots_cap_each_user_and_release_on_drop() {
+        let logs = Arc::new(LogsState::default());
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let first = QueryPermit::acquire_with(&logs, a, 2).unwrap();
+        let _second = QueryPermit::acquire_with(&logs, a, 2).unwrap();
+        assert!(matches!(
+            QueryPermit::acquire_with(&logs, a, 2),
+            Err(AppError::RateLimited)
+        ));
+        let _other = QueryPermit::acquire_with(&logs, b, 2).expect("another user is not affected");
+        drop(first);
+        assert_eq!(logs.query_slots.open(a), 1);
+        let _again = QueryPermit::acquire_with(&logs, a, 2).unwrap();
+    }
+
+    #[test]
     fn regex_and_timeout_errors_become_400s_and_others_stay_500s() {
         let server = |body: &str| ClickHouseError::Server {
             status: 500,
@@ -262,6 +468,14 @@ mod tests {
         ));
         assert!(matches!(
             user_error(server("Code: 159 ... (TIMEOUT_EXCEEDED)")),
+            AppError::Validation(_)
+        ));
+        assert!(matches!(
+            user_error(server("Code: 396 ... (TOO_MANY_ROWS_OR_BYTES)")),
+            AppError::Validation(_)
+        ));
+        assert!(matches!(
+            user_error(ClickHouseError::ResponseTooLarge { limit: 1 }),
             AppError::Validation(_)
         ));
         assert!(matches!(

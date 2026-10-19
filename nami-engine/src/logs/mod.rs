@@ -33,4 +33,7 @@ pub struct LogsState {
     /// Live-tail timings (tests shorten them) and open-stream counts.
     pub tail: tail::TailTimings,
     pub tail_slots: tail::TailSlots,
+    /// Searches and histograms running per user (see
+    /// [`search::MAX_QUERIES_PER_USER`]).
+    pub query_slots: search::QuerySlots,
 }
