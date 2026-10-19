@@ -77,6 +77,7 @@ async fn main() {
         clickhouse,
         cipher: Cipher::new(&config.encryption_key),
         logs: Arc::new(LogsState::default()),
+        alert_throttle: Arc::new(nami_engine::uptime::alert_throttle::AlertThrottle::new()),
         config,
     };
 
