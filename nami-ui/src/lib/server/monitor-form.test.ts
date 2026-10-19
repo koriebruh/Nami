@@ -408,4 +408,29 @@ describe('monitorPayloadFromForm advanced options', () => {
 		expect(payload({ ...stored, proxy_url: '', proxy_password_action: 'clear' }, 'edit').ok).toBe(true);
 		expect(payload({ ...stored, proxy_url: 'http://other:3128', proxy_password_action: 'replace', proxy_password: 'n' }, 'edit').ok).toBe(true);
 	});
+
+	it('refuses to keep only the basic-auth password while the proxy moves', () => {
+		const result = payload(
+			{
+				check_type: 'http',
+				url: 'https://a.test',
+				initial_url: 'https://a.test',
+				initial_verify_ssl: 'on',
+				initial_proxy_url: 'http://proxy:3128',
+				stored_password: 'on',
+				password_action: 'keep',
+				headers_action: 'keep',
+				proxy_url: 'http://evil:3128'
+			},
+			'edit'
+		);
+		expect(result).toEqual({
+			ok: false,
+			message: 'Changing the proxy requires entering the passwords and header values again, or clearing them'
+		});
+		// Same stored password, proxy unchanged: allowed.
+		expect(
+			payload({ check_type: 'http', url: 'https://a.test', initial_url: 'https://a.test', initial_verify_ssl: 'on', initial_proxy_url: 'http://proxy:3128', stored_password: 'on', password_action: 'keep', headers_action: 'keep', proxy_url: 'http://proxy:3128' }, 'edit').ok
+		).toBe(true);
+	});
 });

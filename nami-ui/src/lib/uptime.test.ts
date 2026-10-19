@@ -12,6 +12,7 @@ import {
 	failUrl,
 	groupMonitors,
 	isRedacted,
+	proxyMustBeReentered,
 	secretsMustBeReentered,
 	SECRETS_ORIGIN_MESSAGE,
 	SECRETS_TLS_MESSAGE,
@@ -383,5 +384,31 @@ describe('heartbeat failure examples', () => {
 			['Backups', 1],
 			[null, 1]
 		]);
+	});
+});
+
+describe('proxyMustBeReentered', () => {
+	const moved = 'Changing the proxy requires entering the passwords and header values again, or clearing them';
+	const check = (storedProxyUrl: string | null, proxyUrl: string) => proxyMustBeReentered({ storedProxyUrl, proxyUrl });
+
+	it('compares origins, not spellings', () => {
+		expect(check('http://proxy:3128', 'http://PROXY:3128/other')).toBeNull();
+		expect(check('http://P', 'http://p:80')).toBeNull();
+		expect(check('http://p:80', 'http://P')).toBeNull();
+	});
+	it('asks again for another scheme, host or port', () => {
+		expect(check('http://p:3128', 'https://p:3128')).toBe(moved);
+		expect(check('http://p:3128', 'http://q:3128')).toBe(moved);
+		expect(check('http://p:3128', 'http://p:3129')).toBe(moved);
+	});
+	it('counts an unparsable url as a change, stored or new', () => {
+		expect(check('http://p:3128', 'not a url')).toBe(moved);
+		expect(check('not a url', 'http://p:3128')).toBe(moved);
+	});
+	it('counts adding a proxy as a change and removing one as exempt', () => {
+		expect(check(null, 'http://p:3128')).toBe(moved);
+		expect(check('http://p:3128', '')).toBeNull();
+		expect(check('http://p:3128', '   ')).toBeNull();
+		expect(check(null, '')).toBeNull();
 	});
 });
