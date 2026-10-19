@@ -907,6 +907,25 @@ fn the_skip_key_is_the_check_type_and_the_url_or_lowercased_host_and_port() {
     let config = |body: Value| validated(&body).unwrap();
     assert_eq!(
         existing_key(&config(
+            json!({"name": "a", "check_type": "dns", "host": "Example.COM", "dns_record_type": "mx"})
+        )),
+        "dns MX example.com"
+    );
+    assert_eq!(
+        existing_key(&config(
+            json!({"name": "a", "check_type": "dns", "host": "example.com"})
+        )),
+        "dns A example.com",
+        "the default record type is part of the key"
+    );
+    assert_eq!(
+        existing_key(&config(
+            json!({"name": "a", "check_type": "keyword", "url": "https://k.test/", "keyword": "sold out", "keyword_mode": "not_contains"})
+        )),
+        "keyword not_contains sold out https://k.test/"
+    );
+    assert_eq!(
+        existing_key(&config(
             json!({"name": "a", "check_type": "http", "url": " https://A.test/x "})
         )),
         "http https://A.test/x"
@@ -1477,7 +1496,9 @@ async fn the_check_type_is_part_of_the_skip_key(pool: sqlx::PgPool) {
         { "name": "site", "type": "http", "url": "https://site.test/" },
         { "name": "site kw", "type": "keyword", "url": "https://site.test/", "keyword": "ok" },
         { "name": "gw ping again", "type": "ping", "hostname": "GW.example.com" },
-        { "name": "site kw again", "type": "keyword", "url": "https://site.test/", "keyword": "other" },
+        { "name": "site kw again", "type": "keyword", "url": "https://site.test/", "keyword": "ok" },
+        { "name": "site kw other", "type": "keyword", "url": "https://site.test/", "keyword": "other" },
+        { "name": "site kw inverted", "type": "keyword", "url": "https://site.test/", "keyword": "ok", "invertKeyword": true },
     ]);
     let statuses = |body: &Value| -> Vec<String> {
         body["results"]
@@ -1492,10 +1513,10 @@ async fn the_check_type_is_part_of_the_skip_key(pool: sqlx::PgPool) {
     assert_eq!(
         statuses(&body),
         [
-            "created", "created", "created", "created", "skipped", "skipped"
+            "created", "created", "created", "created", "skipped", "skipped", "created", "created"
         ]
     );
-    assert_eq!(monitor_count(&pool, project).await, 4);
+    assert_eq!(monitor_count(&pool, project).await, 6);
 
     // Against the project: one existing monitor per type, the other type of
     // the same target is still created.
@@ -1511,8 +1532,62 @@ async fn the_check_type_is_part_of_the_skip_key(pool: sqlx::PgPool) {
     assert_eq!(
         statuses(&body),
         [
-            "skipped", "created", "skipped", "created", "skipped", "skipped"
+            "skipped", "created", "skipped", "created", "skipped", "skipped", "created", "created"
         ]
     );
-    assert_eq!(monitor_count(&pool, other).await, 4);
+    assert_eq!(monitor_count(&pool, other).await, 6);
+}
+
+#[sqlx::test]
+async fn dns_monitors_of_different_record_types_are_not_duplicates(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let entries = json!([
+        { "name": "a", "type": "dns", "hostname": "example.com", "dns_resolve_type": "A" },
+        { "name": "mx", "type": "dns", "hostname": "example.com", "dns_resolve_type": "MX" },
+        { "name": "a again", "type": "dns", "hostname": "EXAMPLE.com", "dns_resolve_type": "A" },
+    ]);
+    let (status, body) = import(&app, project, &member, kuma(entries.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let statuses: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, ["created", "created", "skipped"]);
+    let (_, body) = import(&app, project, &member, kuma(entries)).await;
+    assert_eq!(body["skipped"], 3, "{body}");
+    assert_eq!(monitor_count(&pool, project).await, 2);
+}
+
+#[sqlx::test]
+async fn a_global_admin_importing_into_a_missing_project_gets_404(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let email = common::unique_email("admin");
+    common::seed_user(&pool, &email, "admin").await;
+    let admin = common::login(&app, &email).await;
+    let missing = Uuid::new_v4();
+    for dry_run in [false, true] {
+        let (status, body) = import(
+            &app,
+            missing,
+            &admin,
+            json!({ "format": "urls", "content": "https://a.test/\nhttps://b.test/", "dry_run": dry_run }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body, json!({ "error": "not found" }));
+    }
+    // Same answer as a single create.
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/projects/{missing}/monitors"),
+        Some(&admin),
+        Some(json!({ "name": "a", "check_type": "http", "url": "https://a.test/" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

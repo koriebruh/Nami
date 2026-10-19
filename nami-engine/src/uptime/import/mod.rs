@@ -258,22 +258,36 @@ const UNSTORABLE_ENTRY: &str = "entry could not be stored";
 const ALREADY_MONITORED: &str = "already monitored";
 const BUSY: &str = "another import is running in this project; try again when it finishes";
 
-/// The `skip_existing` key: the check type and the normalized target, so a
-/// ping and a dns monitor of one host, or an http and a keyword monitor of one
-/// URL, are not duplicates (controller ruling). The target is the validated
-/// URL for http/keyword, otherwise the lowercased host plus `:port` when the
-/// type has a port. A space separates the two: neither a check type nor a
-/// validated URL or host contains one.
+/// The `skip_existing` key: the check type and the normalized target, plus
+/// what makes two monitors of one target different checks (controller
+/// rulings). So a ping and a dns monitor of one host, an http and a keyword
+/// monitor of one URL, dns monitors of different record types and keyword
+/// monitors of different keywords or modes are not duplicates.
+///
+/// - http: `http {url}`
+/// - keyword: `keyword {keyword_mode} {keyword} {url}`
+/// - dns: `dns {record_type} {host}`
+/// - others: `{check_type} {host}[:{port}]`
+///
+/// URLs are the validated string, hosts are lowercased. Parts are separated
+/// by a space; only the keyword may contain one, and the URL after it never
+/// does, so two different keys cannot collide.
 pub fn existing_key(c: &MonitorConfig) -> String {
-    let target = match (&c.url, &c.host) {
-        (Some(url), _) if matches!(c.check_type.as_str(), "http" | "keyword") => url.clone(),
-        (_, Some(host)) => match c.port {
-            Some(port) => format!("{}:{port}", host.to_lowercase()),
-            None => host.to_lowercase(),
+    let url = c.url.as_deref().unwrap_or_default();
+    let host = c.host.as_deref().unwrap_or_default().to_lowercase();
+    match c.check_type.as_str() {
+        "http" => format!("http {url}"),
+        "keyword" => format!(
+            "keyword {} {} {url}",
+            c.keyword_mode,
+            c.keyword.as_deref().unwrap_or_default()
+        ),
+        "dns" => format!("dns {} {host}", c.dns_record_type.as_deref().unwrap_or("A")),
+        other => match c.port {
+            Some(port) => format!("{other} {host}:{port}"),
+            None => format!("{other} {host}"),
         },
-        _ => String::new(),
-    };
-    format!("{} {target}", c.check_type)
+    }
 }
 
 /// What a result row shows of a validated monitor's target.
@@ -305,6 +319,14 @@ pub async fn run_import(
     project_id: Uuid,
     request: ImportRequest,
 ) -> Result<ImportReport, AppError> {
+    // A global admin bypasses membership, so the project itself may not
+    // exist: 404 before anything else, as a single create answers.
+    if crate::models::project::find_by_id(pool, project_id)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::NotFound);
+    }
     if let Some(group) = request.defaults.group_id
         && !monitor_group::belongs_to(pool, project_id, group).await?
     {
