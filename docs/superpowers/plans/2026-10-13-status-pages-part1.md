@@ -126,7 +126,19 @@ Recorded in the decisions log by the final review, verbatim:
 2. **Bar thresholds accepted:** 100 % operational, ≥ 99 % degraded, ≥ 95 % partial outage, below that major outage (R7).
 3. **Caps accepted:** 10,000 confirmed and 500 pending subscribers per page, 3 emails per address per page per day, 20 emailed (notified) updates per report (R8, R15).
 4. **Custom domains need DNS TXT verification before they are served (spec addition).** An unverified domain routes nowhere (R5).
-5. **Paused monitors and heartbeats show "no data" (grey), never operational** (R6). An active maintenance window still shows `maintenance` for a paused source, since the window is an explicit operator signal; neither is `operational`.
+5. **Paused monitors and heartbeats show "no data" (grey), never operational** (R6). An active maintenance window still shows `maintenance` for a paused source, since the window is an explicit operator signal; neither is `operational`. Confirmed by the controller after review: maintenance wins over paused.
+6. **IP allowlist fails closed without a trusted client-address header (post-review ruling).**
+   - nami-ui grants allowlist access only when `ADDRESS_HEADER` is explicitly configured, read once at startup. Otherwise the allowlist grants nothing: password unlock still works, and an allowlist-only page stays locked.
+   - The admin editor warns on the allowlist field: "client addresses are not trusted on this deployment; set ADDRESS_HEADER behind your proxy".
+   - Implemented in T7 (engine: the BFF forwards `client_ip` only when trusted) and T13 (nami-ui config + warning).
+   - Tests: with no header configured, an allowlisted address is still refused; with the header configured, it is admitted.
+7. **Accepted additions and limits:**
+   - a day wholly in maintenance shows a `maintenance` bar;
+   - unlock is limited to 30 attempts per address per 15 min;
+   - one-click requests allow a burst of 100 at 50/s;
+   - history bars do not show past pause intervals;
+   - status changes rely on the 30 s TTL;
+   - one-click tokens sit in the URL path, per RFC 8058.
 
 ## Plan review (2026-10-19), what changed
 
