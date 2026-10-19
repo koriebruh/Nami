@@ -8,8 +8,16 @@
 // with the stored ones — keep (field omitted), replace (new value sent) or
 // clear (null sent). Blank optional fields are omitted on create (engine
 // defaults apply) and sent as null on edit (the stored value is cleared).
+// The stored secrets cannot be kept when the URL moves to another origin or
+// certificate checks are turned off (the engine refuses it too): the edit
+// form renders what it needs to tell (`initial_url`, `initial_verify_ssl`,
+// `stored_headers`, `stored_password`) as hidden fields.
+//
+// Blank numbers are omitted on edit, so the stored value stays (the form
+// says so), except the expiry threshold, which null resets to the type's
+// default.
 
-import { unescapePayload } from '../uptime';
+import { secretsMustBeReentered, unescapePayload } from '../uptime';
 
 export type FormResult =
 	| { ok: true; payload: Record<string, unknown> }
@@ -31,7 +39,7 @@ export function formWholeNumber(form: FormData, field: string): number | undefin
 	return /^-?\d+$/.test(raw) ? Number(raw) : 'invalid';
 }
 
-/** "Name: value" per line; blank lines are skipped. */
+/** "Name: value" per line; blank lines are skipped, a value is required. */
 export function parseHeaderLines(
 	text: string
 ): { ok: true; headers: { name: string; value: string }[] } | { ok: false; message: string } {
@@ -42,7 +50,10 @@ export function parseHeaderLines(
 		if (colon <= 0 || line.slice(0, colon).trim() === '') {
 			return { ok: false, message: `Header line ${index + 1} must look like "Name: value"` };
 		}
-		headers.push({ name: line.slice(0, colon).trim(), value: line.slice(colon + 1).trim() });
+		const value = line.slice(colon + 1).trim();
+		// A "Name: " line left unfilled would store an empty secret.
+		if (value === '') return { ok: false, message: `Header line ${index + 1} needs a value` };
+		headers.push({ name: line.slice(0, colon).trim(), value });
 	}
 	return { ok: true, headers };
 }
@@ -113,6 +124,7 @@ export function monitorPayloadFromForm(form: FormData, mode: FormMode = 'create'
 		if (value === 'invalid') return { ok: false, message: `${field} must be a whole number` };
 		if (value !== undefined) payload[field] = value;
 		else if (field in switched) payload[field] = switched[field];
+		else if (mode === 'edit' && field === 'expiry_threshold_days') payload[field] = null;
 	}
 	return { ok: true, payload };
 }
@@ -158,6 +170,19 @@ function addRequestConfig(
 		payload.auth_password = password;
 	} else if (passwordAction === 'clear') {
 		payload.auth_password = null;
+	}
+
+	const keepsSecret =
+		(headersAction === 'keep' && form.get('stored_headers') === 'on') ||
+		(passwordAction === 'keep' && form.get('stored_password') === 'on');
+	if (mode === 'edit' && keepsSecret) {
+		const reason = secretsMustBeReentered({
+			storedUrl: formText(form, 'initial_url') || null,
+			url: String(payload.url),
+			storedVerifySsl: form.get('initial_verify_ssl') === 'on',
+			verifySsl: payload.verify_ssl === true
+		});
+		if (reason) return reason;
 	}
 	return null;
 }

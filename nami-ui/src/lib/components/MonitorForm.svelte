@@ -5,7 +5,8 @@
 		DNS_RECORD_TYPES,
 		HTTP_METHODS,
 		escapePayload,
-		hasMaskedValues,
+		isRedacted,
+		secretsMustBeReentered,
 		type CheckType,
 		type DnsRecordType,
 		type HttpMethod,
@@ -47,6 +48,12 @@
 	function initialGroup(): string {
 		return monitor?.group_id ?? '';
 	}
+	function initialUrl(): string {
+		return monitor?.url ?? '';
+	}
+	function initialVerifySsl(): boolean {
+		return monitor?.verify_ssl ?? true;
+	}
 	// Header values are write-only: the textarea of a replacement starts with
 	// one "Name: " line per stored header, so that every value is asked for.
 	function storedHeaderLines(): string {
@@ -58,15 +65,40 @@
 	let keywordMode = $state(initialKeywordMode());
 	let recordType = $state<DnsRecordType>(initialRecordType());
 	let groupId = $state(initialGroup());
+	// Bound, not defaultValue: whether the stored secrets can be kept depends
+	// on them (see `secretsReason`).
+	let url = $state(initialUrl());
+	let verifySsl = $state(initialVerifySsl());
 	// Edit only: what to do with the stored write-only secrets.
 	let headersAction = $state<'keep' | 'replace' | 'clear'>('keep');
 	let passwordAction = $state<'keep' | 'replace' | 'clear'>('keep');
 
 	const editing = $derived(monitor !== null);
-	// A viewer reads `***` for URL secrets, the body and the username: that
-	// monitor is shown as it is, read-only, because saving would write the
-	// mask over the real values (the engine refuses a viewer's save anyway).
-	const masked = $derived(monitor !== null && hasMaskedValues(monitor));
+	// A viewer reads `***` for URL secrets, the body, the username and the
+	// udp payload (the engine flags the view `redacted`): that monitor is
+	// shown as it is, read-only, because saving would write the mask over the
+	// real values (the engine refuses a viewer's save anyway).
+	const masked = $derived(monitor !== null && isRedacted(monitor));
+	const storedHeaders = $derived((monitor?.request_headers.length ?? 0) > 0);
+	const storedPassword = $derived(monitor?.has_auth_password ?? false);
+	// The engine never sends stored secrets to another origin, nor over https
+	// without certificate checks: an edit that does either must enter them
+	// again or remove them, so "Keep" is taken away and replace is preselected.
+	const secretsReason = $derived(
+		editing && (storedHeaders || storedPassword)
+			? secretsMustBeReentered({
+					storedUrl: monitor?.url ?? null,
+					url,
+					storedVerifySsl: monitor?.verify_ssl ?? true,
+					verifySsl
+				})
+			: null
+	);
+	$effect(() => {
+		if (secretsReason === null) return;
+		if (storedHeaders && headersAction === 'keep') headersAction = 'replace';
+		if (storedPassword && passwordAction === 'keep') passwordAction = 'replace';
+	});
 	const isHttp = $derived(checkType === 'http' || checkType === 'keyword');
 	const isMail = $derived(checkType === 'smtp' || checkType === 'pop3' || checkType === 'imap');
 	const isExpiry = $derived(checkType === 'ssl_expiry' || checkType === 'domain_expiry');
@@ -147,11 +179,18 @@
 	{/if}
 	{#if masked}
 		<div class="rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-300">
-			Parts of this monitor (URL secrets, request body, username) are hidden for your role, so it is shown read-only.
+			Parts of this monitor (URL secrets, request body, username, UDP payload) are hidden for your role, so it is shown
+			read-only.
 		</div>
 	{/if}
 
-	{#if monitor}<input type="hidden" name="initial_check_type" defaultValue={monitor.check_type} />{/if}
+	{#if monitor}
+		<input type="hidden" name="initial_check_type" defaultValue={monitor.check_type} />
+		<input type="hidden" name="initial_url" defaultValue={monitor.url ?? ''} />
+		{#if monitor.verify_ssl}<input type="hidden" name="initial_verify_ssl" defaultValue="on" />{/if}
+		{#if storedHeaders}<input type="hidden" name="stored_headers" defaultValue="on" />{/if}
+		{#if storedPassword}<input type="hidden" name="stored_password" defaultValue="on" />{/if}
+	{/if}
 
 	<fieldset disabled={masked} class="min-w-0 space-y-5">
 		<div class="grid gap-4 sm:grid-cols-2">
@@ -204,9 +243,12 @@
 						required
 						maxlength="2048"
 						placeholder="https://example.com/health"
-						defaultValue={monitor?.url ?? ''}
+						bind:value={url}
 						class={input}
 					/>
+					{#if secretsReason}
+						<p class="mt-1 text-xs text-amber-400" role="status">{secretsReason}: see Custom headers and Basic auth below.</p>
+					{/if}
 				</div>
 			</div>
 			{#if checkType === 'keyword'}
@@ -273,7 +315,10 @@
 							{/if}
 						</p>
 						<div class="flex flex-wrap gap-4">
-							<label class={radio}><input type="radio" name="headers_action" value="keep" bind:group={headersAction} /> Keep</label>
+							<label class={radio}
+								><input type="radio" name="headers_action" value="keep" bind:group={headersAction} disabled={secretsReason !== null && storedHeaders} />
+								Keep</label
+							>
 							<label class={radio}><input type="radio" name="headers_action" value="replace" bind:group={headersAction} /> Replace all</label>
 							<label class={radio}><input type="radio" name="headers_action" value="clear" bind:group={headersAction} /> Remove all</label>
 						</div>
@@ -305,7 +350,13 @@
 						{#if editing}
 							<div class="flex flex-wrap gap-4">
 								<label class={radio}>
-									<input type="radio" name="password_action" value="keep" bind:group={passwordAction} />
+									<input
+										type="radio"
+										name="password_action"
+										value="keep"
+										bind:group={passwordAction}
+										disabled={secretsReason !== null && storedPassword}
+									/>
 									Keep {monitor?.has_auth_password ? '(set)' : '(none)'}
 								</label>
 								<label class={radio}><input type="radio" name="password_action" value="replace" bind:group={passwordAction} /> Replace</label>
@@ -324,7 +375,7 @@
 						Follow redirects (up to 10)
 					</label>
 					<label class={radio}>
-						<input type="checkbox" name="verify_ssl" defaultChecked={monitor?.verify_ssl ?? true} />
+						<input type="checkbox" name="verify_ssl" bind:checked={verifySsl} />
 						Verify SSL certificate
 					</label>
 				</div>
@@ -470,7 +521,9 @@
 				</div>
 				<!-- The engine rejects a timeout that is not shorter than the interval. -->
 				<p id="timeout-hint" class="text-xs text-neutral-500 sm:col-span-4">
-					Timeout must be less than the interval. Empty fields use the default shown.
+					Timeout must be less than the interval. {editing
+						? 'Empty fields keep the current value.'
+						: 'Empty fields use the default shown.'}
 				</p>
 		</div>
 

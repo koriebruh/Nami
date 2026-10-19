@@ -44,6 +44,7 @@ function monitor(overrides: Partial<Monitor> = {}): Monitor {
 		udp_payload: null,
 		group_id: null,
 		in_maintenance: false,
+		redacted: false,
 		...overrides
 	};
 }
@@ -61,11 +62,43 @@ describe('monitor form render', () => {
 
 	it('shows a viewer the masked monitor read-only, without a save button', () => {
 		const { body } = render(MonitorForm, {
-			props: { ...props, monitor: monitor({ request_body: '***', auth_username: '***', url: 'https://example.com/h?k=***' }) }
+			props: {
+				...props,
+				monitor: monitor({ request_body: '***', auth_username: '***', url: 'https://example.com/h?k=***', redacted: true })
+			}
 		});
 		expect(body).toContain('read-only');
 		expect(body).not.toContain('>Save changes<');
 		expect(body).toMatch(/<fieldset[^>]*disabled/);
+	});
+
+	// The engine's flag decides, not the text: a member's own URL can hold `***`.
+	it('lets a member edit a monitor whose url contains a literal ***', () => {
+		const { body } = render(MonitorForm, {
+			props: { ...props, monitor: monitor({ url: 'https://example.com/***/health', request_body: '***' }) }
+		});
+		expect(body).not.toContain('read-only');
+		expect(body).toContain('>Save changes<');
+		expect(body).not.toMatch(/<fieldset[^>]*disabled/);
+	});
+
+	it('tells the form action which secrets are stored and where they may go', () => {
+		const { body } = render(MonitorForm, { props: { ...props, monitor: monitor() } });
+		expect(body).toMatch(/name="initial_url"[^>]*value="https:\/\/example.com\/health"/);
+		expect(body).toMatch(/name="stored_headers"/);
+		expect(body).toMatch(/name="stored_password"/);
+		expect(body).toMatch(/name="initial_verify_ssl"/);
+		const bare = render(MonitorForm, {
+			props: { ...props, monitor: monitor({ request_headers: [], has_auth_password: false, verify_ssl: false }) }
+		}).body;
+		expect(bare).not.toMatch(/name="stored_(headers|password)"|name="initial_verify_ssl"/);
+		// Same origin as stored: "Keep" stays available, nothing is forced.
+		expect(body).not.toMatch(/name="headers_action" value="keep"[^>]*disabled/);
+	});
+
+	it('says on edit that empty number fields keep the current value', () => {
+		expect(render(MonitorForm, { props: { ...props, monitor: monitor() } }).body).toContain('Empty fields keep the current value.');
+		expect(render(MonitorForm, { props: { ...props, monitor: null } }).body).toContain('Empty fields use the default shown.');
 	});
 
 	it('hints at the final URL for secret-bearing monitors and caps field sizes', () => {
