@@ -104,6 +104,24 @@ export type MonitorGroup = {
 	created_at: string;
 };
 
+export type ImportRow = {
+	line: number;
+	status: 'created' | 'skipped' | 'error';
+	name?: string;
+	target?: string;
+	monitor_id?: string;
+	error?: string;
+	warning?: string;
+};
+
+export type ImportReport = {
+	dry_run: boolean;
+	created: number;
+	skipped: number;
+	errors: number;
+	results: ImportRow[];
+};
+
 export type MonitorSummary = Monitor & { uptime_24h: number | null };
 
 export type UptimeCheck = {
