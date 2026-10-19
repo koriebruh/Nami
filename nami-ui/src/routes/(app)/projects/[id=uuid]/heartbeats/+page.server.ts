@@ -8,8 +8,18 @@ import {
 	redirectToLoginIfUnauthorized
 } from '#lib/server/engine';
 import { heartbeatPayloadFromForm } from '#lib/server/heartbeat-form';
-import type { Heartbeat } from '#lib/uptime';
+import type { Heartbeat, MonitorGroup } from '#lib/uptime';
 import type { Actions, PageServerLoad } from './$types';
+
+async function jsonArray<T>(response: Response): Promise<T[]> {
+	if (!response.ok) return [];
+	try {
+		const body: unknown = await response.json();
+		return Array.isArray(body) ? (body as T[]) : [];
+	} catch {
+		return [];
+	}
+}
 
 export const load: PageServerLoad = async (event) => {
 	// The page carries the ping tokens, in its markup and in the data that goes
@@ -18,7 +28,10 @@ export const load: PageServerLoad = async (event) => {
 	// only here: SvelteKit throws when a header is set twice.
 	event.setHeaders({ 'cache-control': 'private, no-store' });
 
-	const response = await callEngine(event, enginePath`/projects/${event.params.id}/heartbeats`);
+	const [response, groupsResponse] = await Promise.all([
+		callEngine(event, enginePath`/projects/${event.params.id}/heartbeats`),
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`)
+	]);
 	redirectToLoginIfUnauthorized(response);
 	if (!response.ok) {
 		throw error(
@@ -29,7 +42,9 @@ export const load: PageServerLoad = async (event) => {
 	// A viewer's heartbeats carry `token: null`: the engine only gives the ping
 	// token to members, and this load passes the list on as it came.
 	const heartbeats: Heartbeat[] = await response.json();
-	return { heartbeats, engineUrl: publicEngineUrl() };
+	// Groups only arrange the list: without them it still renders, flat.
+	const groups = await jsonArray<MonitorGroup>(groupsResponse);
+	return { heartbeats, groups, engineUrl: publicEngineUrl() };
 };
 
 export const actions: Actions = {

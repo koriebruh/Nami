@@ -9,8 +9,18 @@ import {
 } from '#lib/server/engine';
 import { heartbeatPayloadFromForm } from '#lib/server/heartbeat-form';
 import { formText } from '#lib/server/monitor-form';
-import type { Heartbeat } from '#lib/uptime';
+import type { Heartbeat, HeartbeatPing, MonitorGroup } from '#lib/uptime';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
+
+async function jsonArray<T>(response: Response): Promise<T[]> {
+	if (!response.ok) return [];
+	try {
+		const body: unknown = await response.json();
+		return Array.isArray(body) ? (body as T[]) : [];
+	} catch {
+		return [];
+	}
+}
 
 function heartbeatPath(params: { id: string; heartbeatId: string }): string {
 	return enginePath`/projects/${params.id}/heartbeats/${params.heartbeatId}`;
@@ -24,7 +34,11 @@ export const load: PageServerLoad = async (event) => {
 	// throws when a header is set twice.
 	event.setHeaders({ 'cache-control': 'private, no-store' });
 
-	const response = await callEngine(event, heartbeatPath(event.params));
+	const [response, pingsResponse, groupsResponse] = await Promise.all([
+		callEngine(event, heartbeatPath(event.params)),
+		callEngine(event, `${heartbeatPath(event.params)}/pings?limit=50`),
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`)
+	]);
 	redirectToLoginIfUnauthorized(response);
 	if (response.status === 404) throw error(404, 'Heartbeat not found.');
 	if (!response.ok) {
@@ -36,7 +50,10 @@ export const load: PageServerLoad = async (event) => {
 	// `token` is null for a viewer (see the list load): the page shows no ping
 	// URL then.
 	const heartbeat: Heartbeat = await response.json();
-	return { heartbeat, engineUrl: publicEngineUrl() };
+	// Pings and groups are extras: the page renders without them.
+	const pings = await jsonArray<HeartbeatPing>(pingsResponse);
+	const groups = await jsonArray<MonitorGroup>(groupsResponse);
+	return { heartbeat, pings, groups, engineUrl: publicEngineUrl() };
 };
 
 type ActionName = 'update' | 'pause' | 'resume' | 'rotate' | 'delete';
@@ -63,7 +80,7 @@ async function setPaused(event: RequestEvent, paused: boolean) {
 
 export const actions: Actions = {
 	update: async (event) => {
-		const parsed = heartbeatPayloadFromForm(await event.request.formData());
+		const parsed = heartbeatPayloadFromForm(await event.request.formData(), 'edit');
 		if (!parsed.ok) return fail(400, { action: 'update' as const, message: parsed.message });
 		const response = await patchHeartbeat(event, parsed.payload);
 		if (!response.ok) return failure('update', response, 'Could not update heartbeat.');

@@ -4,7 +4,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 import { HEARTBEAT_ID, PROJECT_ID } from '#lib/server/fake-event';
-import type { Heartbeat } from '#lib/uptime';
+import type { Heartbeat, MonitorGroup } from '#lib/uptime';
 import Page from './+page.svelte';
 
 const TOKEN = 'f'.repeat(64);
@@ -23,15 +23,17 @@ function heartbeat(overrides: Partial<Heartbeat> = {}): Heartbeat {
 		last_ping_at: '2026-10-13T10:00:00Z',
 		created_at: '2026-10-12T10:00:00Z',
 		in_maintenance: false,
+		group_id: null,
 		...overrides
 	};
 }
 
-function renderPage(heartbeats: Heartbeat[], form: unknown = null) {
+function renderPage(heartbeats: Heartbeat[], form: unknown = null, groups: MonitorGroup[] = []) {
 	const data = {
 		user: { id: 'u', email: 'a@b.test', global_role: 'member' },
 		project: { id: PROJECT_ID, name: 'Demo', slug: 'demo' },
 		heartbeats,
+		groups,
 		engineUrl: ENGINE
 	};
 	return render(Page, { props: { params: { id: PROJECT_ID }, data, form } as never });
@@ -115,5 +117,28 @@ describe('heartbeat list page', () => {
 
 	it('sets the page title', () => {
 		expect(renderPage([]).head).toContain('Heartbeats · Demo');
+	});
+
+	describe('groups', () => {
+		const group: MonitorGroup = { id: 'g1', project_id: PROJECT_ID, name: 'Backups', position: 0, created_at: '2026-10-13T00:00:00Z' };
+
+		it('lists grouped heartbeats under their group heading and ungrouped ones last', () => {
+			const { body } = renderPage(
+				[heartbeat({ id: 'a', name: 'Loose job' }), heartbeat({ id: 'b', name: 'Nightly', group_id: 'g1' })],
+				null,
+				[group]
+			);
+			expect(body).toContain('>Backups<');
+			expect(body).toContain('>Ungrouped<');
+			expect(body.indexOf('>Backups<')).toBeLessThan(body.indexOf('>Ungrouped<'));
+			expect(body.indexOf('Nightly')).toBeLessThan(body.indexOf('Loose job'));
+			expect(body).toContain('<option value="g1">Backups</option>');
+		});
+
+		it('renders no headings and no group select without groups', () => {
+			const { body } = renderPage([heartbeat()]);
+			expect(body).not.toContain('Ungrouped');
+			expect(body).not.toContain('name="group_id"');
+		});
 	});
 });

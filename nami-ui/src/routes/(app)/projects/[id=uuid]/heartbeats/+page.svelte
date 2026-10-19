@@ -5,7 +5,8 @@
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
-	import { formatSeconds, pingUrl, timeAgo } from '#lib/uptime';
+	import Icon from '#lib/components/ui/Icon.svelte';
+	import { formatSeconds, groupMonitors, pingUrl, timeAgo } from '#lib/uptime';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();
@@ -36,28 +37,16 @@
 		};
 	};
 
+	const sections = $derived(groupMonitors(data.heartbeats, data.groups));
+	const grouped = $derived(data.groups.length > 0);
+
 	const input = 'input';
 	const label = 'label';
 </script>
 
-<svelte:head>
-	<title>Heartbeats · {data.project.name}</title>
-</svelte:head>
-
-<div class="space-y-6">
-	<div class="card">
-		<div class="border-b border-border px-5 py-4 sm:px-6">
-			<h2 class="text-lg font-light text-ink">Heartbeats</h2>
-			<p class="text-xs text-muted">
-				Cron jobs ping their URL after each run; a heartbeat goes down when no ping arrives within its period plus
-				grace. Refreshes every 30 seconds.
-			</p>
-		</div>
-		{#if data.heartbeats.length === 0}
-			<EmptyState icon="heartbeat" message="No heartbeats yet — create one below." />
-		{:else}
+{#snippet rows(heartbeats: typeof data.heartbeats)}
 			<ul>
-				{#each data.heartbeats as heartbeat (heartbeat.id)}
+				{#each heartbeats as heartbeat (heartbeat.id)}
 					<!-- The engine sends no token to a viewer: no ping URL then. -->
 					{@const url = heartbeat.token ? pingUrl(data.engineUrl, heartbeat.token) : null}
 					<li class="space-y-2 border-b border-border px-6 py-4 last:border-0">
@@ -89,6 +78,44 @@
 					</li>
 				{/each}
 			</ul>
+{/snippet}
+
+<svelte:head>
+	<title>Heartbeats · {data.project.name}</title>
+</svelte:head>
+
+<div class="space-y-6">
+	<div class="card">
+		<div class="border-b border-border px-5 py-4 sm:px-6">
+			<h2 class="text-lg font-light text-ink">Heartbeats</h2>
+			<p class="text-xs text-muted">
+				Cron jobs ping their URL after each run; a heartbeat goes down when no ping arrives within its period plus
+				grace. Refreshes every 30 seconds.
+			</p>
+		</div>
+		{#if data.heartbeats.length === 0}
+			<EmptyState icon="heartbeat" message="No heartbeats yet — create one below." />
+		{:else}
+			{#if !grouped}
+				{@render rows(data.heartbeats)}
+			{:else}
+				{#each sections as section (section.group?.id ?? 'ungrouped')}
+					{@const down = section.monitors.filter((h) => h.current_status === 'down' && !h.paused).length}
+					<details open class="group/section border-b border-border last:border-0">
+						<summary
+							class="flex cursor-pointer list-none items-center gap-3 bg-surface-2 px-5 py-3 text-sm hover:bg-primary-soft sm:px-6 [&::-webkit-details-marker]:hidden"
+						>
+							<Icon name="chevronDown" size={16} class="-rotate-90 text-muted transition-transform group-open/section:rotate-0" />
+							<span class="font-medium wrap-anywhere text-ink">{section.group?.name ?? 'Ungrouped'}</span>
+							<span class="text-xs text-muted">
+								{section.monitors.length} heartbeat{section.monitors.length === 1 ? '' : 's'}
+							</span>
+							{#if down > 0}<span class="badge badge-danger">{down} down</span>{/if}
+						</summary>
+						{@render rows(section.monitors)}
+					</details>
+				{/each}
+			{/if}
 		{/if}
 	</div>
 
@@ -131,6 +158,17 @@
 					class={input}
 				/>
 			</div>
+			{#if data.groups.length > 0}
+				<div class="sm:col-span-3 sm:max-w-sm">
+					<label for="hb-group" class={label}>Group</label>
+					<select id="hb-group" name="group_id" class="select">
+						<option value="">No group</option>
+						{#each data.groups as group (group.id)}
+							<option value={group.id}>{group.name}</option>
+						{/each}
+					</select>
+				</div>
+			{/if}
 			<button
 				type="submit"
 				disabled={creating}

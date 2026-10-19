@@ -7,6 +7,18 @@ const listPath = `/projects/${PROJECT_ID}/heartbeats`;
 const hostile = '../auth/me?';
 const hostileSegment = '..%2Fauth%2Fme%3F';
 
+const pingsPath = `${heartbeatPath}/pings`;
+const groupsPath = `/projects/${PROJECT_ID}/monitor-groups`;
+
+/** The heartbeat, its pings and the groups answer differently. */
+const answer = (heartbeat: unknown, pings: unknown = [], groups: unknown = [], pingsStatus = 200, groupsStatus = 200) =>
+	(url: URL) =>
+		url.pathname === pingsPath
+			? new Response(JSON.stringify(pings), { status: pingsStatus })
+			: url.pathname === groupsPath
+				? new Response(JSON.stringify(groups), { status: groupsStatus })
+				: new Response(JSON.stringify(heartbeat), { status: 200 });
+
 type Scenario = [name: string, engine: Parameters<typeof fakeEvent>[0], rejection: { status: number } | null];
 
 describe('heartbeat detail load', () => {
@@ -22,17 +34,21 @@ describe('heartbeat detail load', () => {
 	it('returns the heartbeat with the engine URL that its ping URL is built on', async () => {
 		process.env.PUBLIC_ENGINE_URL = 'https://engine.example.com/';
 		const heartbeat = { id: HEARTBEAT_ID, name: 'Backup', token: 'b'.repeat(64) };
-		const { event, calls } = fakeEvent({ body: JSON.stringify(heartbeat) });
-		expect(await load(event)).toEqual({ heartbeat, engineUrl: 'https://engine.example.com' });
-		expect(calls()).toEqual([{ method: 'GET', path: heartbeatPath, search: '', body: undefined }]);
+		const { event, calls } = fakeEvent({ respond: answer(heartbeat) });
+		expect(await load(event)).toEqual({ heartbeat, pings: [], groups: [], engineUrl: 'https://engine.example.com' });
+		expect(calls()).toEqual([
+			{ method: 'GET', path: heartbeatPath, search: '', body: undefined },
+			{ method: 'GET', path: pingsPath, search: '?limit=50', body: undefined },
+			{ method: 'GET', path: groupsPath, search: '', body: undefined }
+		]);
 	});
 
 	// A viewer's heartbeat has no token (null). The load keeps it that way.
 	it('passes a null token (a viewer) through untouched', async () => {
 		const heartbeat = { id: HEARTBEAT_ID, name: 'Backup', token: null };
-		const { event } = fakeEvent({ body: JSON.stringify(heartbeat) });
+		const { event } = fakeEvent({ respond: answer(heartbeat) });
 		const data = await load(event);
-		expect(data).toEqual({ heartbeat, engineUrl: 'http://localhost:8081' });
+		expect(data).toEqual({ heartbeat, pings: [], groups: [], engineUrl: 'http://localhost:8081' });
 		expect(data).toHaveProperty('heartbeat.token', null);
 	});
 
@@ -56,6 +72,16 @@ describe('heartbeat detail load', () => {
 		await expect(load(event)).rejects.toMatchObject({ status: 500, body: { message: 'Could not load heartbeat.' } });
 	});
 
+	it('returns the pings and groups, and renders without them when they fail', async () => {
+		const heartbeat = { id: HEARTBEAT_ID, name: 'Backup', token: null };
+		const pings = [{ kind: 'fail', exit_code: 2, output: 'boom' }];
+		const groups = [{ id: 'g1', name: 'Backups' }];
+		const ok = await load(fakeEvent({ respond: answer(heartbeat, pings, groups) }).event);
+		expect(ok).toMatchObject({ pings, groups });
+		const degraded = await load(fakeEvent({ respond: answer(heartbeat, { error: 'x' }, { error: 'forbidden' }, 500, 403) }).event);
+		expect(degraded).toMatchObject({ pings: [], groups: [] });
+	});
+
 	it('sends a visitor whose session is gone to the login page', async () => {
 		const { event } = fakeEvent({ status: 401, body: '{"error":"unauthorized"}' });
 		await expect(load(event)).rejects.toMatchObject({ status: 303, location: '/login' });
@@ -64,11 +90,20 @@ describe('heartbeat detail load', () => {
 	it('keeps a hostile id inside one path segment', async () => {
 		const project = fakeEvent({ params: { id: hostile }, body: '{}' });
 		await load(project.event);
-		expect(project.calls().map((call) => call.path)).toEqual([`/projects/${hostileSegment}/heartbeats/${HEARTBEAT_ID}`]);
+		const base = `/projects/${hostileSegment}`;
+		expect(project.calls().map((call) => call.path)).toEqual([
+			`${base}/heartbeats/${HEARTBEAT_ID}`,
+			`${base}/heartbeats/${HEARTBEAT_ID}/pings`,
+			`${base}/monitor-groups`
+		]);
 
 		const heartbeat = fakeEvent({ params: { heartbeatId: hostile }, body: '{}' });
 		await load(heartbeat.event);
-		expect(heartbeat.calls().map((call) => call.path)).toEqual([`${listPath}/${hostileSegment}`]);
+		expect(heartbeat.calls().map((call) => call.path)).toEqual([
+			`${listPath}/${hostileSegment}`,
+			`${listPath}/${hostileSegment}/pings`,
+			groupsPath
+		]);
 	});
 
 	// The page carries the ping token, in its markup and in the data sent with
@@ -103,6 +138,16 @@ describe('heartbeat detail load', () => {
 describe('heartbeat settings action', () => {
 	const fields = { name: 'Nightly backup', period_seconds: '3600', grace_seconds: '120' };
 
+	it('forwards the group, and ungroups with null when it is blank', async () => {
+		const g = '0b9d1f6c-5a3e-4c2f-9d47-6e8a1c3b7f25';
+		const set = fakeEvent({ form: { ...fields, group_id: g } });
+		await actions.update(set.event);
+		expect(JSON.parse(set.calls()[0].body!)).toMatchObject({ group_id: g });
+		const cleared = fakeEvent({ form: { ...fields, group_id: '' } });
+		await actions.update(cleared.event);
+		expect(JSON.parse(cleared.calls()[0].body!)).toMatchObject({ group_id: null });
+	});
+
 	it('patches name, period and grace and says it saved', async () => {
 		const { event, calls } = fakeEvent({ form: fields });
 		expect(await actions.update(event)).toEqual({ saved: true });
@@ -111,7 +156,7 @@ describe('heartbeat settings action', () => {
 				method: 'PATCH',
 				path: heartbeatPath,
 				search: '',
-				body: '{"name":"Nightly backup","period_seconds":3600,"grace_seconds":120}'
+				body: '{"name":"Nightly backup","period_seconds":3600,"grace_seconds":120,"group_id":null}'
 			}
 		]);
 	});

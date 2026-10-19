@@ -76,6 +76,13 @@
 							{#if incident.cause}
 								<p class="text-sm wrap-anywhere text-ink-2">{incident.cause}</p>
 							{/if}
+							{#if incident.details}
+								<!-- Job output from a failing heartbeat: text only. -->
+								<details>
+									<summary class="cursor-pointer text-xs text-primary">Job output</summary>
+									<pre class="mt-2 max-h-64 overflow-auto rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap text-ink-2">{incident.details}</pre>
+								</details>
+							{/if}
 							<p class="text-xs text-muted">
 								Started {formatUtc(incident.started_at)}
 								{#if incident.resolved_at}· resolved {formatUtc(incident.resolved_at)}{/if}
