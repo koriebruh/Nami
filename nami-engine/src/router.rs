@@ -24,7 +24,10 @@ use tower_governor::{
 };
 use tower_sessions::{Expiry, SessionManagerLayer, SessionStore, cookie::SameSite};
 
-use crate::{error::AppError, routes, routes::logs_ingest::IngestLimits, state::AppState};
+use crate::{
+    error::AppError, logs::rate_limit::TokenBuckets, routes, routes::logs_ingest::IngestLimits,
+    state::AppState,
+};
 
 /// Wraps `rate_limited_router()` with the real governor config: per-IP
 /// (`SmartIpKeyExtractor`, not `GlobalKeyExtractor` — see the historical
@@ -136,33 +139,64 @@ fn declares_json(headers: &HeaderMap) -> bool {
 /// `Authorization` header (never a cookie) is its credential.
 pub fn build_public_router(state: AppState) -> Router {
     let ingest_limits = IngestLimits::for_pool(state.config.database_max_connections);
-    build_public_router_with_limits(state, default_ping_slots(), ingest_limits)
+    build_public_router_with_limits(
+        state,
+        default_ping_slots(),
+        default_ping_limits(),
+        ingest_limits,
+    )
 }
 
 /// [`build_public_router`] whose pings hold places of `ping_slots` (tests hold
 /// its places to fill the endpoint up).
 pub fn build_public_router_with_ping_slots(state: AppState, ping_slots: Arc<Semaphore>) -> Router {
-    build_public_router_with_limits(state, ping_slots, IngestLimits::default())
+    build_public_router_with_limits(
+        state,
+        ping_slots,
+        default_ping_limits(),
+        IngestLimits::default(),
+    )
+}
+
+/// [`build_public_router`] whose pings hold places of `ping_slots` and take
+/// tokens of `ping_limits` (tests drain a heartbeat's bucket, or lift the
+/// limit for tests that ping one token often).
+pub fn build_public_router_with_ping_limits(
+    state: AppState,
+    ping_slots: Arc<Semaphore>,
+    ping_limits: Arc<TokenBuckets>,
+) -> Router {
+    build_public_router_with_limits(state, ping_slots, ping_limits, IngestLimits::default())
 }
 
 /// [`build_public_router`] with the given limits on the ingest endpoint
 /// (tests fill its places up, or shorten how long it waits for a body).
 pub fn build_public_router_with_ingest_limits(state: AppState, limits: IngestLimits) -> Router {
-    build_public_router_with_limits(state, default_ping_slots(), limits)
+    build_public_router_with_limits(state, default_ping_slots(), default_ping_limits(), limits)
 }
 
 fn default_ping_slots() -> Arc<Semaphore> {
     Arc::new(Semaphore::new(routes::heartbeats::MAX_PINGS_IN_FLIGHT))
 }
 
+/// One token bucket per heartbeat: [`routes::heartbeats::PINGS_PER_SECOND`],
+/// burst [`routes::heartbeats::PING_BURST`].
+fn default_ping_limits() -> Arc<TokenBuckets> {
+    Arc::new(TokenBuckets::new(
+        routes::heartbeats::PINGS_PER_SECOND,
+        routes::heartbeats::PING_BURST,
+    ))
+}
+
 fn build_public_router_with_limits(
     state: AppState,
     ping_slots: Arc<Semaphore>,
+    ping_limits: Arc<TokenBuckets>,
     ingest_limits: IngestLimits,
 ) -> Router {
     Router::new()
         .merge(routes::health::public_router())
-        .merge(routes::heartbeats::public_router(ping_slots))
+        .merge(routes::heartbeats::public_router(ping_slots, ping_limits))
         .merge(routes::logs_ingest::public_router(ingest_limits))
         .with_state(state)
 }

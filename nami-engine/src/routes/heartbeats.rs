@@ -1,7 +1,11 @@
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Extension, Json, Router,
+    body::{Body, HttpBody},
     extract::{Path, Request, State, rejection::PathRejection},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
@@ -15,6 +19,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
+    logs::rate_limit::{InFlight, TokenBuckets},
     middleware::rbac::{CurrentUser, ProjectReader, require_project_reader, require_project_role},
     models::{
         heartbeat::{
@@ -25,7 +30,9 @@ use crate::{
     state::AppState,
     uptime::{
         alerts,
-        heartbeat::{PingOutcome, is_well_formed_token, record_ping},
+        heartbeat::{
+            Ping, PingKind, is_well_formed_token, lookup_token, parse_signal, record_signal,
+        },
     },
 };
 
@@ -57,20 +64,60 @@ pub fn router() -> Router<AppState> {
 /// the pool they share.
 pub const MAX_PINGS_IN_FLIGHT: usize = 4;
 
-/// The places a ping holds while it runs (see [`MAX_PINGS_IN_FLIGHT`]).
+/// The largest ping body read (`curl --data-binary`, the job's output); a
+/// larger one is `413`, whether it declares its length or not.
+pub const MAX_PING_BODY_BYTES: usize = 1024 * 1024;
+/// The steady rate of pings one heartbeat may send, per second.
+pub const PINGS_PER_SECOND: f64 = 1.0;
+/// How many pings one heartbeat may send at once before [`PINGS_PER_SECOND`]
+/// applies; beyond that, `429` with `Retry-After: 1`.
+pub const PING_BURST: f64 = 10.0;
+/// How many ping bodies are read at once across the endpoint (one per
+/// heartbeat at most); a body that finds every place taken is `503`.
+pub const MAX_PING_BODIES_IN_FLIGHT: usize = 16;
+/// How long a ping body may take to arrive; a slower one is `408`.
+pub const PING_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Past this many rate-limit buckets, the full ones (which behave like
+/// missing ones) are dropped before a ping takes a token.
+const PRUNE_BUCKETS_ABOVE: usize = 10_000;
+
+/// Everything that bounds the work pings cause: the database places (see
+/// [`MAX_PINGS_IN_FLIGHT`]), the per-heartbeat token buckets, one body read
+/// per heartbeat at a time and [`MAX_PING_BODIES_IN_FLIGHT`] body reads in
+/// all.
 #[derive(Clone)]
-struct PingSlots(Arc<Semaphore>);
+struct PingGuards {
+    slots: Arc<Semaphore>,
+    limits: Arc<TokenBuckets>,
+    bodies_per_heartbeat: Arc<InFlight>,
+    body_slots: Arc<Semaphore>,
+}
 
 /// The public ping endpoint, served on the public listener only (see
 /// `router::build_public_router`). No session: the token in the path is the
-/// secret, and cron jobs call it directly. A ping must hold one of
-/// `ping_slots`' places while it runs. Every reply says
-/// `Cache-Control: no-store`: a ping is a GET with a side effect, which no
-/// cache may answer or keep.
-pub fn public_router(ping_slots: Arc<Semaphore>) -> Router<AppState> {
+/// secret, and cron jobs call it directly. `/{token}` is a success ping,
+/// `/{token}/fail` a failure and `/{token}/{exit_code}` either (`0` is a
+/// success). Each database step of a ping must hold one of `ping_slots`'
+/// places; `ping_limits` holds the per-heartbeat token buckets. Every reply
+/// says `Cache-Control: no-store`: a ping is a GET with a side effect, which
+/// no cache may answer or keep.
+pub fn public_router(
+    ping_slots: Arc<Semaphore>,
+    ping_limits: Arc<TokenBuckets>,
+) -> Router<AppState> {
+    let guards = PingGuards {
+        slots: ping_slots,
+        limits: ping_limits,
+        bodies_per_heartbeat: Arc::new(InFlight::new(1)),
+        body_slots: Arc::new(Semaphore::new(MAX_PING_BODIES_IN_FLIGHT)),
+    };
     Router::new()
         .route("/api/v1/heartbeat/{token}", get(ping).post(ping))
-        .layer(Extension(PingSlots(ping_slots)))
+        .route(
+            "/api/v1/heartbeat/{token}/{signal}",
+            get(ping_signal).post(ping_signal),
+        )
+        .layer(Extension(guards))
         .layer(middleware::from_fn(no_store))
 }
 
@@ -202,33 +249,177 @@ async fn delete_heartbeat(
 
 async fn ping(
     State(state): State<AppState>,
-    Extension(PingSlots(slots)): Extension<PingSlots>,
+    Extension(guards): Extension<PingGuards>,
     token: Result<Path<String>, PathRejection>,
+    request: Request,
 ) -> Result<Response, AppError> {
-    // A path segment that is not even valid UTF-8, or not a token's exact
-    // shape, is as unknown a token as any other, and costs no database work:
-    // the endpoint only ever answers 200, 404 or 503 (bar a database failure).
+    // A path segment that is not even valid UTF-8 is as unknown a token as
+    // any other, and costs no database work.
     let Ok(Path(token)) = token else {
         return Err(AppError::NotFound);
     };
+    handle_ping(state, guards, token, None, request).await
+}
+
+async fn ping_signal(
+    State(state): State<AppState>,
+    Extension(guards): Extension<PingGuards>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    request: Request,
+) -> Result<Response, AppError> {
+    let Ok(Path((token, signal))) = path else {
+        return Err(AppError::NotFound);
+    };
+    handle_ping(state, guards, token, Some(signal), request).await
+}
+
+/// One ping, every step returning before the next (see the plan's "Path order
+/// on pings"): token shape (404) → suffix (400) → declared length (413) →
+/// token lookup under a database place (503, 404) → the heartbeat's rate
+/// limit (429) → the body, one per heartbeat and [`MAX_PING_BODIES_IN_FLIGHT`]
+/// in all, at most [`MAX_PING_BODY_BYTES`] within [`PING_BODY_TIMEOUT`]
+/// (429, 503, 413, 408) → the record under a database place again (503).
+///
+/// No body is read before its token is known and its rate limit passed, so
+/// nobody without a token can make the endpoint buffer anything, and no
+/// database place is held while a body arrives, so a slow body (one token
+/// holder's) cannot block other heartbeats' pings.
+async fn handle_ping(
+    state: AppState,
+    guards: PingGuards,
+    token: String,
+    signal: Option<String>,
+    request: Request,
+) -> Result<Response, AppError> {
     if !is_well_formed_token(&token) {
         return Err(AppError::NotFound);
     }
-    let Ok(_slot) = slots.try_acquire() else {
-        return Ok(busy());
+    let (kind, exit_code) = match signal.as_deref().map(parse_signal) {
+        None => (PingKind::Success, None),
+        Some(Some(parsed)) => parsed,
+        Some(None) => {
+            return Err(AppError::Validation(
+                "the last path segment must be fail or an exit code".to_string(),
+            ));
+        }
     };
-    match record_ping(&state.db, &token).await? {
-        PingOutcome::UnknownToken => Err(AppError::NotFound),
-        PingOutcome::Recorded { transition } => {
-            if let Some(transition) = transition {
-                // A cron job is waiting on this response: deliver the
-                // recovery alert in the background.
-                let state = state.clone();
-                tokio::spawn(async move { alerts::notify_transition(&state, &transition).await });
-            }
-            Ok(Json(json!({ "ok": true })).into_response())
+    let (parts, body) = request.into_parts();
+    let declared = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > MAX_PING_BODY_BYTES as u64) {
+        return Ok(body_too_large());
+    }
+
+    let heartbeat_id = {
+        let Ok(_slot) = guards.slots.try_acquire() else {
+            return Ok(busy());
+        };
+        lookup_token(&state.db, &token)
+            .await?
+            .ok_or(AppError::NotFound)?
+    };
+
+    if guards.limits.len() > PRUNE_BUCKETS_ABOVE {
+        guards.limits.prune_full(Instant::now());
+    }
+    if !guards.limits.try_acquire(heartbeat_id) {
+        return Ok(too_many());
+    }
+
+    if body.size_hint().exact() != Some(0) {
+        let Some(_reading) = guards.bodies_per_heartbeat.try_enter(heartbeat_id) else {
+            return Ok(too_many());
+        };
+        let Ok(_body_slot) = guards.body_slots.try_acquire() else {
+            return Ok(busy());
+        };
+        // Read, bounded, and not stored yet (NAMI-UP-21 stores the output).
+        match read_body(body).await {
+            Ok(_output) => {}
+            Err(reply) => return Ok(*reply),
         }
     }
+
+    let recorded = {
+        let Ok(_slot) = guards.slots.try_acquire() else {
+            return Ok(busy());
+        };
+        let ping = Ping {
+            kind,
+            exit_code,
+            output: String::new(),
+        };
+        record_signal(&state.db, &token, &ping)
+            .await?
+            .ok_or(AppError::NotFound)?
+    };
+    if let Some(transition) = recorded.transition {
+        // A cron job is waiting on this response: deliver the alert in the
+        // background.
+        let state = state.clone();
+        tokio::spawn(async move { alerts::notify_transition(&state, &transition).await });
+    }
+    Ok(Json(json!({ "ok": true })).into_response())
+}
+
+/// Reads a ping body of at most [`MAX_PING_BODY_BYTES`] within
+/// [`PING_BODY_TIMEOUT`], or the reply that says why it was not.
+async fn read_body(body: Body) -> Result<axum::body::Bytes, Box<Response>> {
+    let read = tokio::time::timeout(
+        PING_BODY_TIMEOUT,
+        axum::body::to_bytes(body, MAX_PING_BODY_BYTES),
+    )
+    .await;
+    let reply = match read {
+        Ok(Ok(bytes)) => return Ok(bytes),
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(json!({ "error": "ping body not received in time" })),
+        )
+            .into_response(),
+        Ok(Err(error)) if is_length_limit(&error) => body_too_large(),
+        Ok(Err(_)) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "ping body could not be read" })),
+        )
+            .into_response(),
+    };
+    Err(Box::new(reply))
+}
+
+/// Whether a body error is the length cap of `to_bytes` (anywhere in its
+/// source chain).
+fn is_length_limit(error: &axum::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        if error.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn body_too_large() -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(json!({ "error": "ping body too large (max 1 MiB)" })),
+    )
+        .into_response()
+}
+
+/// The reply to a heartbeat over its rate limit, or with a body already being
+/// read: try again in a second.
+fn too_many() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(header::RETRY_AFTER, "1")],
+        Json(json!({ "error": "too many requests" })),
+    )
+        .into_response()
 }
 
 /// The reply to a ping that found every place taken: try again in a second.

@@ -1,10 +1,11 @@
-//! Heartbeat state machine: pings (`record_ping`), the overdue sweep
+//! Heartbeat state machine: pings (`record_signal`, `record_ping`), the overdue sweep
 //! (`sweep_overdue`) and the worker's liveness record, which keeps an outage
 //! of the engine from counting against the jobs (`note_worker_alive`). Same
 //! transitions as monitors: going down opens an incident, a ping on a down
 //! heartbeat resolves it.
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -33,30 +34,108 @@ pub fn is_well_formed_token(token: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Records a ping in one transaction, under the heartbeat's row lock so a
-/// ping and a concurrent sweep apply one after the other.
+/// What a ping says about the job: it ran fine, or it failed.
 ///
-/// An unknown token costs one plain indexed lookup and no transaction: only a
-/// token that exists gets the locking transaction, which looks it up again
-/// (so a heartbeat deleted, or its token rotated, in between is unknown too:
-/// once a rotation has committed, the old token records nothing).
+/// Serialized in lowercase (`success` / `fail`): the ping log stores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PingKind {
+    Success,
+    Fail,
+}
+
+/// One ping: its kind, the exit code its path carried (if any) and the body
+/// the job sent with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ping {
+    pub kind: PingKind,
+    pub exit_code: Option<i32>,
+    pub output: String,
+}
+
+impl Ping {
+    /// A plain success ping (`/{token}`): no exit code, no output.
+    pub fn success() -> Ping {
+        Ping {
+            kind: PingKind::Success,
+            exit_code: None,
+            output: String::new(),
+        }
+    }
+}
+
+/// Reads the path segment after the token: `fail` is a failure without an
+/// exit code; an `i32` is an exit code, `0` a success and anything else a
+/// failure. Every other text (`FAIL`, `1.5`, a number beyond `i32`) is `None`.
+pub fn parse_signal(segment: &str) -> Option<(PingKind, Option<i32>)> {
+    if segment == "fail" {
+        return Some((PingKind::Fail, None));
+    }
+    // `str::parse` accepts a leading `+`; nothing a cron job prints, but
+    // harmless: `+1` is exit code 1.
+    let code: i32 = segment.parse().ok()?;
+    if code == 0 {
+        Some((PingKind::Success, Some(0)))
+    } else {
+        Some((PingKind::Fail, Some(code)))
+    }
+}
+
+/// The incident cause of a failure ping.
+pub fn failure_cause(exit_code: Option<i32>) -> String {
+    match exit_code {
+        Some(code) => format!("Heartbeat reported failure (exit code {code})"),
+        None => "Heartbeat reported failure".to_string(),
+    }
+}
+
+/// The id of the heartbeat that holds `token`, in one plain indexed lookup
+/// (no transaction, no lock). Text that cannot be a token is `None` without a
+/// query.
+pub async fn lookup_token(pool: &PgPool, token: &str) -> Result<Option<Uuid>, sqlx::Error> {
+    if !is_well_formed_token(token) {
+        return Ok(None);
+    }
+    sqlx::query_scalar("select id from heartbeats where token = $1")
+        .bind(token)
+        .fetch_optional(pool)
+        .await
+}
+
+/// A ping [`record_signal`] recorded: whose it was, and the state change it
+/// made, if any.
+#[derive(Debug, PartialEq)]
+pub struct Recorded {
+    pub heartbeat_id: Uuid,
+    pub project_id: Uuid,
+    pub transition: Option<Transition>,
+}
+
+/// Records a ping in one transaction, under the heartbeat's row lock so a
+/// ping and a concurrent sweep apply one after the other. `None` when no
+/// heartbeat holds `token` under the lock (a heartbeat deleted, or its token
+/// rotated, since the caller looked it up: once a rotation has committed, the
+/// old token records nothing).
+///
+/// A success ping marks the heartbeat up and resolves its incident if it was
+/// down. A failure ping on a pending or up heartbeat marks it down at once and
+/// opens an incident (title `{name} reported a failure`, cause
+/// [`failure_cause`]); on a heartbeat already down it only moves
+/// `last_ping_at` (the open incident keeps the cause that opened it).
 ///
 /// Paused heartbeats, and heartbeats a project-wide maintenance window covers
 /// (judged at the transaction's `now()`, the instant `last_ping_at` records),
 /// keep accepting pings — `last_ping_at` stays fresh, so resuming, or the
 /// window ending, does not immediately trip the sweep — but their state is
-/// frozen: no status change, no incident change, no alert.
-pub async fn record_ping(pool: &PgPool, token: &str) -> Result<PingOutcome, sqlx::Error> {
+/// frozen: no status change, no incident change, no alert, failure pings
+/// included.
+pub async fn record_signal(
+    pool: &PgPool,
+    token: &str,
+    ping: &Ping,
+) -> Result<Option<Recorded>, sqlx::Error> {
     if !is_well_formed_token(token) {
-        return Ok(PingOutcome::UnknownToken);
-    }
-    let known: bool =
-        sqlx::query_scalar("select exists (select 1 from heartbeats where token = $1)")
-            .bind(token)
-            .fetch_one(pool)
-            .await?;
-    if !known {
-        return Ok(PingOutcome::UnknownToken);
+        return Ok(None);
     }
     let mut tx = pool.begin().await?;
     let row: Option<(Uuid, Uuid, String, String, bool, DateTime<Utc>)> = sqlx::query_as(
@@ -67,39 +146,99 @@ pub async fn record_ping(pool: &PgPool, token: &str) -> Result<PingOutcome, sqlx
     .fetch_optional(&mut *tx)
     .await?;
     let Some((id, project_id, name, status, paused, now)) = row else {
-        return Ok(PingOutcome::UnknownToken);
+        return Ok(None);
     };
 
-    if paused || maintenance::heartbeat_in_maintenance(&mut *tx, project_id, now).await? {
-        sqlx::query("update heartbeats set last_ping_at = now() where id = $1")
+    let frozen = paused || maintenance::heartbeat_in_maintenance(&mut *tx, project_id, now).await?;
+    let transition = match (frozen, ping.kind) {
+        (true, _) => {
+            touch(&mut tx, id).await?;
+            None
+        }
+        (false, PingKind::Fail) if status == "down" => {
+            touch(&mut tx, id).await?;
+            None
+        }
+        (false, PingKind::Success) => {
+            let pinged_at: DateTime<Utc> = sqlx::query_scalar(
+                "update heartbeats set last_ping_at = now(), current_status = 'up' where id = $1 returning last_ping_at",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if status == "down" {
+                incident::resolve_for_heartbeat(&mut tx, id, pinged_at).await?;
+                Some(Transition {
+                    kind: TransitionKind::Recovered,
+                    subject: Subject::Heartbeat(id),
+                    project_id,
+                    name,
+                    cause: None,
+                    at: pinged_at,
+                })
+            } else {
+                None
+            }
+        }
+        (false, PingKind::Fail) => {
+            sqlx::query(
+                "update heartbeats set last_ping_at = now(), current_status = 'down' where id = $1",
+            )
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        tx.commit().await?;
-        return Ok(PingOutcome::Recorded { transition: None });
-    }
-
-    let pinged_at: DateTime<Utc> = sqlx::query_scalar(
-        "update heartbeats set last_ping_at = now(), current_status = 'up' where id = $1 returning last_ping_at",
-    )
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?;
-    let transition = if status == "down" {
-        incident::resolve_for_heartbeat(&mut tx, id, pinged_at).await?;
-        Some(Transition {
-            kind: TransitionKind::Recovered,
-            subject: Subject::Heartbeat(id),
-            project_id,
-            name,
-            cause: None,
-            at: pinged_at,
-        })
-    } else {
-        None
+            let cause = failure_cause(ping.exit_code);
+            let opened = incident::open_for_heartbeat(
+                &mut tx,
+                project_id,
+                id,
+                &format!("{name} reported a failure"),
+                Some(&cause),
+                now,
+            )
+            .await?;
+            opened.map(|_| Transition {
+                kind: TransitionKind::Down,
+                subject: Subject::Heartbeat(id),
+                project_id,
+                name,
+                cause: Some(cause),
+                at: now,
+            })
+        }
     };
     tx.commit().await?;
-    Ok(PingOutcome::Recorded { transition })
+    Ok(Some(Recorded {
+        heartbeat_id: id,
+        project_id,
+        transition,
+    }))
+}
+
+/// Records that a ping arrived and changes nothing else.
+async fn touch(tx: &mut sqlx::PgConnection, id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("update heartbeats set last_ping_at = now() where id = $1")
+        .bind(id)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+/// Records a plain success ping (see [`record_signal`]).
+///
+/// An unknown token costs one plain indexed lookup ([`lookup_token`]) and no
+/// transaction: only a token that exists gets the locking transaction, which
+/// looks it up again.
+pub async fn record_ping(pool: &PgPool, token: &str) -> Result<PingOutcome, sqlx::Error> {
+    if lookup_token(pool, token).await?.is_none() {
+        return Ok(PingOutcome::UnknownToken);
+    }
+    Ok(match record_signal(pool, token, &Ping::success()).await? {
+        None => PingOutcome::UnknownToken,
+        Some(recorded) => PingOutcome::Recorded {
+            transition: recorded.transition,
+        },
+    })
 }
 
 /// When a heartbeat is due: its period and grace after its anchor. The anchor
@@ -333,5 +472,51 @@ mod tests {
         );
         // 64 bytes but fewer characters: never a token either.
         assert!(!is_well_formed_token(&"\u{e9}".repeat(TOKEN_LEN / 2)));
+    }
+
+    #[test]
+    fn signals_parse_to_kind_and_exit_code() {
+        assert_eq!(parse_signal("fail"), Some((PingKind::Fail, None)));
+        assert_eq!(parse_signal("0"), Some((PingKind::Success, Some(0))));
+        assert_eq!(parse_signal("1"), Some((PingKind::Fail, Some(1))));
+        assert_eq!(parse_signal("137"), Some((PingKind::Fail, Some(137))));
+        assert_eq!(parse_signal("-1"), Some((PingKind::Fail, Some(-1))));
+        assert_eq!(
+            parse_signal("2147483647"),
+            Some((PingKind::Fail, Some(i32::MAX)))
+        );
+        for bad in [
+            "",
+            "FAIL",
+            "Fail",
+            "fail ",
+            "1.5",
+            "2147483648",
+            "0x1",
+            "abc",
+            "1e3",
+            "/",
+        ] {
+            assert_eq!(parse_signal(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn failure_causes_name_the_exit_code_when_there_is_one() {
+        assert_eq!(
+            failure_cause(Some(2)),
+            "Heartbeat reported failure (exit code 2)"
+        );
+        assert_eq!(failure_cause(None), "Heartbeat reported failure");
+    }
+
+    #[test]
+    fn ping_kinds_serialize_in_lowercase() {
+        assert_eq!(serde_json::to_string(&PingKind::Fail).unwrap(), "\"fail\"");
+        assert_eq!(
+            serde_json::from_str::<PingKind>("\"success\"").unwrap(),
+            PingKind::Success
+        );
+        assert_eq!(Ping::success().exit_code, None);
     }
 }
