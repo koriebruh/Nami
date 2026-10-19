@@ -29,11 +29,14 @@
 //!
 //! Resource bounds (nothing grows with what a peer sends):
 //! - at most [`MAX_TCP_CONNECTIONS`] TCP connections, and at most
-//!   [`MAX_TCP_CONNECTIONS_PER_IP`] of one peer address; further ones are
-//!   closed at once and counted as `refused_connections`. A connection also
-//!   ends at its first frame that does not parse or has no well-formed token
-//!   (an honest shipper never sends one), and only frames that pass intake
-//!   restart its idle timer, so a peer cannot keep a slot with garbage;
+//!   [`MAX_TCP_CONNECTIONS_PER_IP`] of one peer address (an IPv6 peer counts
+//!   per /64, the block one host usually gets); further ones are closed at
+//!   once and counted as `refused_connections`. A connection also ends at its
+//!   first frame that does not parse, has no well-formed token (an honest
+//!   shipper never sends one) or carries a token the batcher recently found
+//!   no source for ([`UnknownTokens`]), and only frames that pass intake
+//!   restart its idle timer, so a peer cannot keep a slot with garbage or
+//!   with made-up tokens;
 //! - a frame is at most 64 KiB ([`MAX_FRAME_BYTES`]); an octet count above
 //!   that is refused before anything is allocated, a UDP datagram larger than
 //!   that is dropped; a TCP connection buffers at most one frame;
@@ -100,6 +103,10 @@ pub const BATCH_MAX_WAIT: Duration = Duration::from_secs(1);
 pub const EVENTS_PER_SECOND: f64 = 2_000.0;
 pub const EVENTS_BURST: f64 = 4_000.0;
 const WARN_EVERY: Duration = Duration::from_secs(10);
+/// How long a token the batcher found no source for is refused at intake.
+pub const UNKNOWN_TOKEN_TTL: Duration = Duration::from_secs(300);
+/// Most unknown tokens remembered (their hashes); the oldest go first.
+pub const MAX_UNKNOWN_TOKENS: usize = 10_000;
 
 #[derive(Debug, Clone)]
 pub struct SyslogConfig {
@@ -206,6 +213,7 @@ pub async fn spawn(state: AppState, config: SyslogConfig) -> std::io::Result<Sys
     let stats = Arc::new(SyslogStats::default());
     let warnings = Arc::new(DropWarnings::default());
     let (tx, rx) = mpsc::channel(QUEUE_CAPACITY);
+    let unknown = Arc::new(UnknownTokens::new(UNKNOWN_TOKEN_TTL, MAX_UNKNOWN_TOKENS));
     let handle = SyslogHandle {
         tcp_addr: tcp.local_addr()?,
         udp_addr: udp.local_addr()?,
@@ -216,11 +224,13 @@ pub async fn spawn(state: AppState, config: SyslogConfig) -> std::io::Result<Sys
         queue_bytes: Arc::new(Semaphore::new(config.queue_max_bytes)),
         stats: Arc::clone(&stats),
         warnings: Arc::clone(&warnings),
+        unknown: Arc::clone(&unknown),
     });
     let batcher = Batcher {
         state,
         stats,
         warnings,
+        unknown,
         limiter: TokenBuckets::new(config.events_per_second, config.events_burst),
         max_rows: config.batch_max_rows,
         max_wait: config.batch_max_wait,
@@ -261,6 +271,98 @@ impl DropWarnings {
     }
 }
 
+/// Hashes of well-formed tokens the batcher looked up and found no source
+/// for, each refused at intake for `ttl` (a rotated or deleted token, or one
+/// made up). Without it such frames pass intake: they would restart a
+/// connection's idle timer and keep its slot, and cost a lookup each batch.
+/// Bounded: at most `max` hashes, the oldest forgotten first.
+#[derive(Debug)]
+struct UnknownTokens {
+    ttl: Duration,
+    max: usize,
+    entries: Mutex<UnknownEntries>,
+}
+
+#[derive(Debug, Default)]
+struct UnknownEntries {
+    added: HashMap<String, Instant>,
+    /// The same hashes in the order they were added (each once).
+    order: std::collections::VecDeque<String>,
+}
+
+impl UnknownTokens {
+    fn new(ttl: Duration, max: usize) -> UnknownTokens {
+        UnknownTokens {
+            ttl,
+            max,
+            entries: Mutex::new(UnknownEntries::default()),
+        }
+    }
+
+    fn contains(&self, hash: &str) -> bool {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .added
+            .get(hash)
+            .is_some_and(|added| added.elapsed() < self.ttl)
+    }
+
+    fn insert(&self, hash: &str) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if self.max == 0
+            || entries
+                .added
+                .get(hash)
+                .is_some_and(|added| now.duration_since(*added) < self.ttl)
+        {
+            return;
+        }
+        // Forget the expired ones (this one included), then the oldest while
+        // full.
+        while let Some(oldest) = entries.order.front() {
+            let expired = entries
+                .added
+                .get(oldest)
+                .is_none_or(|added| now.duration_since(*added) >= self.ttl);
+            if !expired && entries.order.len() < self.max {
+                break;
+            }
+            let oldest = entries.order.pop_front().expect("front exists");
+            entries.added.remove(&oldest);
+        }
+        // Insertion times only grow, so the expired hashes are a prefix of
+        // `order`: this one, if it was there, is gone now.
+        entries.added.insert(hash.to_string(), now);
+        entries.order.push_back(hash.to_string());
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .added
+            .len()
+    }
+}
+
+/// The key a peer's connections are counted under: its IPv4 address (also
+/// when it arrives IPv4-mapped), or the /64 of its IPv6 address, the block
+/// one host or site usually gets, so a peer cannot pass the per-address cap
+/// by moving through the addresses of its own block.
+fn peer_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(std::net::Ipv6Addr::from(
+                u128::from(v6) & !((1u128 << 64) - 1),
+            )),
+        },
+    }
+}
+
 /// A parsed, token-shaped frame waiting for the batcher. `Debug` is not
 /// derived: the message holds the token (and its own `Debug` hides it).
 struct Pending {
@@ -279,7 +381,8 @@ enum Intaken {
     Queued,
     /// Not parsed or queued: no room. Not the sender's fault.
     Overloaded,
-    /// Not RFC 5424, or no well-formed token: a TCP connection ends here.
+    /// Not RFC 5424, no well-formed token, or a token recently found to
+    /// belong to no source: a TCP connection ends here.
     Rejected,
 }
 
@@ -289,6 +392,7 @@ struct Intake {
     queue_bytes: Arc<Semaphore>,
     stats: Arc<SyslogStats>,
     warnings: Arc<DropWarnings>,
+    unknown: Arc<UnknownTokens>,
 }
 
 impl Intake {
@@ -317,6 +421,11 @@ impl Intake {
             return Intaken::Rejected;
         };
         let token_hash = hash_token(token);
+        if self.unknown.contains(&token_hash) {
+            bump(&self.stats.unauthenticated, 1);
+            self.warnings.warn(Some(peer), "unknown source token");
+            return Intaken::Rejected;
+        }
         let pending = Pending {
             token_hash,
             message,
@@ -404,7 +513,7 @@ async fn run_tcp(
                 let place = Arc::clone(&permits)
                     .try_acquire_owned()
                     .ok()
-                    .and_then(|permit| Some((permit, peers.try_enter(peer.ip())?)));
+                    .and_then(|permit| Some((permit, peers.try_enter(peer_key(peer.ip()))?)));
                 let Some((permit, peer_slot)) = place else {
                     // Over a limit: close at once, nothing is read.
                     bump(&intake.stats.refused_connections, 1);
@@ -487,6 +596,7 @@ struct Batcher {
     state: AppState,
     stats: Arc<SyslogStats>,
     warnings: Arc<DropWarnings>,
+    unknown: Arc<UnknownTokens>,
     limiter: TokenBuckets,
     max_rows: usize,
     max_wait: Duration,
@@ -538,6 +648,9 @@ impl Batcher {
         let mut allowed: Vec<(Pending, IngestSource)> = Vec::with_capacity(batch.len());
         for pending in batch {
             let Some(source) = sources.get(&pending.token_hash) else {
+                // The lookup worked and found nothing: refused at intake
+                // from now on, for a while.
+                self.unknown.insert(&pending.token_hash);
                 unauthenticated += 1;
                 continue;
             };
@@ -628,6 +741,47 @@ impl Batcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_tokens_expire_and_stay_bounded() {
+        let unknown = UnknownTokens::new(Duration::from_millis(50), 3);
+        unknown.insert("a");
+        assert!(unknown.contains("a"));
+        assert!(!unknown.contains("b"));
+        for hash in ["b", "c", "d"] {
+            unknown.insert(hash);
+        }
+        assert_eq!(unknown.len(), 3, "never more than the maximum");
+        assert!(!unknown.contains("a"), "the oldest went first");
+        assert!(unknown.contains("d"));
+        unknown.insert("d");
+        assert_eq!(unknown.len(), 3, "a hash is kept once");
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(!unknown.contains("d"), "expired");
+        unknown.insert("e");
+        assert_eq!(unknown.len(), 1, "expired ones are forgotten");
+        assert!(unknown.contains("e"));
+    }
+
+    #[test]
+    fn ipv6_peers_count_per_64_and_mapped_ipv4_as_ipv4() {
+        let key = |text: &str| peer_key(text.parse().unwrap());
+        assert_eq!(key("10.0.0.1"), key("10.0.0.1"));
+        assert_ne!(key("10.0.0.1"), key("10.0.0.2"));
+        assert_eq!(
+            key("2001:db8:1:2::1"),
+            key("2001:db8:1:2:ffff:ffff:ffff:ffff")
+        );
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2::"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_eq!(key("::ffff:10.0.0.1"), key("10.0.0.1"));
+
+        // One /64 shares one cap.
+        let peers = PeerConnections::new(1);
+        let _first = peers.try_enter(key("2001:db8::1")).unwrap();
+        assert!(peers.try_enter(key("2001:db8::2")).is_none());
+        assert!(peers.try_enter(key("2001:db8:0:1::1")).is_some());
+    }
 
     #[test]
     fn peer_connections_are_capped_per_address_and_forgotten_at_zero() {

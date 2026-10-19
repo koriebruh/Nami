@@ -678,3 +678,42 @@ async fn tokens_never_reach_the_log(pool: sqlx::PgPool) {
     }
     ch.drop_database().await.unwrap();
 }
+
+/// Security: a well-formed token the batcher found no source for is refused
+/// at intake for a while, so a connection sending made-up (or rotated)
+/// tokens loses its slot instead of keeping it alive; UDP frames with it are
+/// dropped at intake too. A valid token is not affected.
+#[sqlx::test]
+async fn a_token_found_to_be_unknown_is_refused_at_intake(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let handle = start_with(state, |c| c.idle_timeout = Duration::from_secs(60)).await;
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "edge").await;
+    let unknown = "B".repeat(43);
+
+    let mut tcp = TcpStream::connect(handle.tcp_addr).await.unwrap();
+    tcp.write_all(format!("{}\n", frame(&unknown, "first")).as_bytes())
+        .await
+        .unwrap();
+    // The first one passes intake and is dropped by the batcher.
+    let stats = stats_eventually(&handle, |s| s.unauthenticated == 1).await;
+    assert_eq!(stats.unauthenticated, 1);
+    // From now on it ends the connection at intake.
+    tcp.write_all(format!("{}\n", frame(&unknown, "second")).as_bytes())
+        .await
+        .unwrap();
+    assert_closed_by_server(&mut tcp).await;
+    send_udp(&handle, frame(&unknown, "over udp").as_bytes()).await;
+    let stats = stats_eventually(&handle, |s| s.unauthenticated == 3).await;
+    assert_eq!((stats.received, stats.unauthenticated), (3, 3), "{stats:?}");
+
+    let mut tcp = TcpStream::connect(handle.tcp_addr).await.unwrap();
+    tcp.write_all(format!("{}\n", frame(&token, "valid")).as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_eventually(&ch, project, 1).await[0]["message"],
+        "valid"
+    );
+    ch.drop_database().await.unwrap();
+}
