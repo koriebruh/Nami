@@ -82,6 +82,15 @@ async fn main() {
     // Every instance that ingests logs adds its usage counters to Postgres.
     tokio::spawn(nami_engine::logs::usage::run_forever(state.clone()));
 
+    // A public ingress like PUBLIC_PORT: off unless SYSLOG_ENABLED=true.
+    if state.config.syslog_enabled {
+        let syslog_config = nami_engine::logs::syslog::SyslogConfig::from_config(&state.config);
+        let syslog = nami_engine::logs::syslog::spawn(state.clone(), syslog_config)
+            .await
+            .expect("failed to bind the syslog listeners (SYSLOG_TCP_PORT / SYSLOG_UDP_PORT)");
+        tracing::info!(tcp = %syslog.tcp_addr, udp = %syslog.udp_addr, "syslog listeners started");
+    }
+
     if state.config.uptime_worker_enabled {
         tokio::spawn(nami_engine::uptime::worker::run_forever(state.clone()));
         tracing::info!("uptime worker started");
