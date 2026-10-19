@@ -77,6 +77,11 @@ pub struct Config {
     /// (`RDAP_BASE_URL`, default `https://rdap.org`, which redirects to the
     /// registry's own RDAP server).
     pub rdap_base_url: String,
+    /// The most log sources one project may have (`MAX_SOURCES_PER_PROJECT`,
+    /// default 50); creating one more is a 409. Each source may hold its own
+    /// share of the ingest endpoint, so this bounds what one project's
+    /// members can claim.
+    pub max_sources_per_project: i64,
 }
 
 impl Config {
@@ -121,6 +126,10 @@ impl Config {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
             encryption_key: encryption_key_from_env(),
+            max_sources_per_project: env_positive(
+                "MAX_SOURCES_PER_PROJECT",
+                DEFAULT_MAX_SOURCES_PER_PROJECT,
+            ),
             ..Self::from_env_defaults_only()
         }
         .with_distinct_ports()
@@ -215,9 +224,13 @@ impl Config {
             syslog_udp_port: env_port("SYSLOG_UDP_PORT", crate::logs::syslog::DEFAULT_PORT),
             rdap_base_url: std::env::var("RDAP_BASE_URL")
                 .unwrap_or_else(|_| crate::uptime::checker::DEFAULT_RDAP_BASE_URL.to_string()),
+            max_sources_per_project: DEFAULT_MAX_SOURCES_PER_PROJECT,
         }
     }
 }
+
+/// `MAX_SOURCES_PER_PROJECT` when unset.
+pub const DEFAULT_MAX_SOURCES_PER_PROJECT: i64 = 50;
 
 /// `NAMI_ENCRYPTION_KEY` is required outside tests: a missing or malformed
 /// key stops startup instead of running with secrets nobody can decrypt

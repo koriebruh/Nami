@@ -1,9 +1,11 @@
-//! Per-source limits for HTTP ingestion, in memory and local to each engine
-//! instance: a token bucket per source id (50 requests/s, burst 100), a cap on
-//! how many requests of one source may be in flight (4), and a cap on how many
-//! of its bodies are decoded at once (2). Only authenticated sources get an
-//! entry, and an entry is dropped when its source has nothing in flight, so
-//! the maps do not grow with the sources seen.
+//! Per-source and per-project limits for HTTP ingestion, in memory and local
+//! to each engine instance: a token bucket per source id (50 requests/s, burst
+//! 100), a cap on how many requests of one source (4) and of one project (8)
+//! may be in flight, and a cap on how many bodies of one source (2) and of one
+//! project (2) are decoded at once. The project caps keep a project with many
+//! sources from taking the whole endpoint. Only authenticated sources get an
+//! entry, and an entry is dropped when its source (or project) has nothing in
+//! flight, so the maps do not grow with the sources seen.
 
 use std::{
     collections::HashMap,
@@ -29,6 +31,17 @@ pub const MAX_IN_FLIGHT_PER_SOURCE: usize = 4;
 /// one source may have in flight could hold every one of those places, and
 /// leave the other sources waiting behind them.
 pub const MAX_DECODES_PER_SOURCE: usize = 2;
+
+/// How many requests of one project may be in flight at once, whatever
+/// number of sources it has: the endpoint has
+/// `routes::logs_ingest::MAX_INGEST_IN_FLIGHT` places, so without this, eight
+/// sources of one project (four requests each) could take every place and
+/// leave every other project with 503.
+pub const MAX_IN_FLIGHT_PER_PROJECT: usize = 8;
+/// How many bodies of one project may be decoded at once: half of the
+/// engine's `routes::logs_ingest::MAX_DECODES_IN_FLIGHT`, however many sources
+/// the project has.
+pub const MAX_DECODES_PER_PROJECT: usize = 2;
 
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -128,6 +141,23 @@ impl InFlight {
     /// How many requests `source` has in flight now.
     pub fn count(&self, source: Uuid) -> usize {
         lock(&self.counts).get(&source).copied().unwrap_or(0)
+    }
+}
+
+/// The limits of [`MAX_IN_FLIGHT_PER_PROJECT`] and
+/// [`MAX_DECODES_PER_PROJECT`], keyed by project id.
+#[derive(Debug)]
+pub struct ProjectLimits {
+    pub in_flight: InFlight,
+    pub decode_shares: DecodeShares,
+}
+
+impl Default for ProjectLimits {
+    fn default() -> Self {
+        ProjectLimits {
+            in_flight: InFlight::new(MAX_IN_FLIGHT_PER_PROJECT),
+            decode_shares: DecodeShares::new(MAX_DECODES_PER_PROJECT),
+        }
     }
 }
 

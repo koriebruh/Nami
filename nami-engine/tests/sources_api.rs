@@ -674,3 +674,77 @@ async fn find_by_token_never_queries_for_a_token_of_the_wrong_shape() {
             .is_err()
     );
 }
+
+/// A project has at most `MAX_SOURCES_PER_PROJECT` sources (each gets its own
+/// share of the ingest limits); one more is 409, also when the requests race,
+/// and deleting one makes room again.
+#[sqlx::test]
+async fn a_project_has_at_most_its_maximum_number_of_sources(pool: sqlx::PgPool) {
+    use nami_engine::state::AppState;
+
+    let mut state = AppState::for_test(pool.clone());
+    state.config.max_sources_per_project = 3;
+    let app = common::app(state);
+    let project = seed_project(&pool).await;
+    let other = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (_, _, other_member) = user_with_role(&app, &pool, other, Some("member")).await;
+
+    // Racing creations cannot pass the cap together.
+    let attempts: Vec<_> = (0..8)
+        .map(|n| {
+            let app = app.clone();
+            let member = member.clone();
+            tokio::spawn(async move {
+                call(
+                    &app,
+                    "POST",
+                    &format!("/projects/{project}/sources"),
+                    Some(&member),
+                    Some(json!({ "name": format!("s{n}") })),
+                )
+                .await
+            })
+        })
+        .collect();
+    let mut results = Vec::new();
+    for attempt in attempts {
+        results.push(attempt.await.unwrap());
+    }
+    let created: Vec<&Value> = results
+        .iter()
+        .filter(|(status, _)| *status == StatusCode::CREATED)
+        .map(|(_, body)| body)
+        .collect();
+    assert_eq!(created.len(), 3, "{results:?}");
+    for (status, body) in &results {
+        if *status != StatusCode::CREATED {
+            assert_eq!(*status, StatusCode::CONFLICT, "{body}");
+            assert!(
+                body["error"].as_str().unwrap().contains("at most 3"),
+                "{body}"
+            );
+        }
+    }
+    let count: i64 = sqlx::query_scalar("select count(*) from sources where project_id = $1")
+        .bind(project)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 3);
+
+    // Another project has its own count.
+    create(&app, other, &other_member, json!({ "name": "theirs" })).await;
+
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/projects/{project}/sources/{}", id_of(created[0])),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    create(&app, project, &member, json!({ "name": "again" })).await;
+}

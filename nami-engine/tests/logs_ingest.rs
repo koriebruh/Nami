@@ -1590,3 +1590,76 @@ async fn tokens_never_appear_in_log_output(pool: sqlx::PgPool) {
     );
     ch.drop_database().await.unwrap();
 }
+
+/// Fairness between projects: however many sources one project has, it holds
+/// at most `MAX_IN_FLIGHT_PER_PROJECT` of the endpoint's places, so eight
+/// sources each stalling four uploads (enough to fill all 32 places) leave
+/// another project served.
+#[sqlx::test]
+async fn one_project_cannot_hold_every_place_with_many_sources(pool: sqlx::PgPool) {
+    use nami_engine::logs::rate_limit::{MAX_IN_FLIGHT_PER_PROJECT, MAX_IN_FLIGHT_PER_SOURCE};
+    use nami_engine::routes::logs_ingest::MAX_INGEST_IN_FLIGHT;
+    use tokio::io::AsyncWriteExt;
+
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let logs = state.logs.clone();
+    let limits = IngestLimits::default();
+    let places = limits.places.clone();
+    let served = serve(build_public_router_with_ingest_limits(state, limits)).await;
+    let busy = seed_project(&pool).await;
+    let mut tokens = Vec::new();
+    for n in 0..MAX_INGEST_IN_FLIGHT / MAX_IN_FLIGHT_PER_SOURCE {
+        tokens.push(seed_source(&pool, busy, &format!("s{n}")).await.1);
+    }
+    let mut stalled = Vec::new();
+    for token in &tokens {
+        for _ in 0..MAX_IN_FLIGHT_PER_SOURCE {
+            let mut client = tokio::net::TcpStream::connect(served.addr).await.unwrap();
+            client
+                .write_all(format!("{}{{", ingest_head(token, 1000)).as_bytes())
+                .await
+                .unwrap();
+            stalled.push(client);
+        }
+    }
+    eventually("the project holds its share", WAIT, || {
+        logs.project_limits.in_flight.count(busy) == MAX_IN_FLIGHT_PER_PROJECT
+    })
+    .await;
+    eventually("the requests over its share were turned away", WAIT, || {
+        places.available_permits() == MAX_INGEST_IN_FLIGHT - MAX_IN_FLIGHT_PER_PROJECT
+    })
+    .await;
+    let message = json!({ "message": "m" });
+    let (status, _, json) = post_to(served.addr, &tokens[0], &message, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{json}");
+    assert_eq!(json["code"], "too_many_in_flight");
+    assert!(
+        json["error"].as_str().unwrap().contains("project"),
+        "{json}"
+    );
+
+    let other = seed_project(&pool).await;
+    let (_, other_token) = seed_source(&pool, other, "theirs").await;
+    let (status, _, json) = post_to(served.addr, &other_token, &message, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "another project is served: {json}"
+    );
+    assert_eq!(
+        logs.project_limits.in_flight.count(busy),
+        MAX_IN_FLIGHT_PER_PROJECT,
+        "never more than its share"
+    );
+    drop(stalled);
+    eventually("the project's count is back to zero", WAIT, || {
+        logs.project_limits.in_flight.count(busy) == 0
+    })
+    .await;
+    ch.drop_database().await.unwrap();
+}
