@@ -1,4 +1,7 @@
-use std::{fmt, net::Ipv6Addr};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv6Addr},
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,6 +22,7 @@ use crate::{
     crypto::{Cipher, SecretString},
     error::AppError,
     middleware::rbac::ProjectReader,
+    uptime::expiry::{DEFAULT_DOMAIN_THRESHOLD_DAYS, DEFAULT_SSL_THRESHOLD_DAYS},
 };
 
 /// Size caps for the free-text target fields. Without them only the 2 MiB
@@ -28,7 +32,15 @@ const MAX_URL_BYTES: usize = 2048;
 const MAX_KEYWORD_BYTES: usize = 1024;
 
 /// What `check_type` may be.
-pub const CHECK_TYPES: [&str; 5] = ["http", "keyword", "tcp", "ping", "dns"];
+pub const CHECK_TYPES: [&str; 7] = [
+    "http",
+    "keyword",
+    "tcp",
+    "ping",
+    "dns",
+    "ssl_expiry",
+    "domain_expiry",
+];
 
 /// The record types a dns monitor can look up (the `dns_record_type` column's
 /// check constraint lists the same).
@@ -93,6 +105,9 @@ pub struct Monitor {
     pub dns_nameserver: Option<String>,
     /// dns: text that one answer must contain (case-insensitive).
     pub expected_value: Option<String>,
+    /// ssl_expiry and domain_expiry: down when the expiry is less than this
+    /// many days away (1-365).
+    pub expiry_threshold_days: Option<i32>,
 }
 
 /// What `Debug` prints in place of a sealed column that holds a value.
@@ -135,6 +150,7 @@ impl fmt::Debug for Monitor {
             dns_record_type,
             dns_nameserver,
             expected_value,
+            expiry_threshold_days,
         } = self;
         f.debug_struct("Monitor")
             .field("id", id)
@@ -176,6 +192,7 @@ impl fmt::Debug for Monitor {
             .field("dns_record_type", dns_record_type)
             .field("dns_nameserver", dns_nameserver)
             .field("expected_value", expected_value)
+            .field("expiry_threshold_days", expiry_threshold_days)
             .finish()
     }
 }
@@ -302,6 +319,7 @@ pub struct MonitorConfig {
     pub dns_record_type: Option<String>,
     pub dns_nameserver: Option<String>,
     pub expected_value: Option<String>,
+    pub expiry_threshold_days: Option<i32>,
 }
 
 impl From<&Monitor> for MonitorConfig {
@@ -335,6 +353,7 @@ impl From<&Monitor> for MonitorConfig {
             dns_record_type: m.dns_record_type.clone(),
             dns_nameserver: m.dns_nameserver.clone(),
             expected_value: m.expected_value.clone(),
+            expiry_threshold_days: m.expiry_threshold_days,
         }
     }
 }
@@ -365,6 +384,7 @@ impl MonitorConfig {
             || self.dns_record_type != current.dns_record_type
             || self.dns_nameserver != current.dns_nameserver
             || self.expected_value != current.expected_value
+            || self.expiry_threshold_days != current.expiry_threshold_days
     }
 }
 
@@ -387,12 +407,12 @@ pub struct CreateMonitorRequest {
     pub expected_status_min: i32,
     #[serde(default = "default_expected_status_max")]
     pub expected_status_max: i32,
-    #[serde(default = "default_interval_seconds")]
-    pub interval_seconds: i32,
+    /// Defaults by type, see [`default_interval_for`].
+    pub interval_seconds: Option<i32>,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: i32,
-    #[serde(default = "default_confirmation_threshold")]
-    pub confirmation_threshold: i32,
+    /// Defaults by type, see [`default_confirmation_for`].
+    pub confirmation_threshold: Option<i32>,
     #[serde(default)]
     pub paused: bool,
     pub request_body: Option<String>,
@@ -408,6 +428,7 @@ pub struct CreateMonitorRequest {
     pub dns_record_type: Option<String>,
     pub dns_nameserver: Option<String>,
     pub expected_value: Option<String>,
+    pub expiry_threshold_days: Option<i32>,
 }
 
 fn default_http_method() -> String {
@@ -422,14 +443,24 @@ fn default_expected_status_min() -> i32 {
 fn default_expected_status_max() -> i32 {
     399
 }
-fn default_interval_seconds() -> i32 {
-    60
+/// 60 s, or daily for the expiry types: expiry dates move slowly.
+fn default_interval_for(check_type: &str) -> i32 {
+    if is_expiry_type(check_type) {
+        86_400
+    } else {
+        60
+    }
+}
+fn is_expiry_type(check_type: &str) -> bool {
+    matches!(check_type, "ssl_expiry" | "domain_expiry")
 }
 fn default_timeout_seconds() -> i32 {
     10
 }
-fn default_confirmation_threshold() -> i32 {
-    2
+/// 2 failed checks, or 1 for the expiry types: they run daily, so waiting for
+/// a second failure would delay the alert by a day.
+fn default_confirmation_for(check_type: &str) -> i32 {
+    if is_expiry_type(check_type) { 1 } else { 2 }
 }
 fn default_true() -> bool {
     true
@@ -440,6 +471,12 @@ fn default_recovery_threshold() -> i32 {
 
 impl CreateMonitorRequest {
     pub fn into_config(self) -> MonitorConfig {
+        let interval_seconds = self
+            .interval_seconds
+            .unwrap_or_else(|| default_interval_for(&self.check_type));
+        let confirmation_threshold = self
+            .confirmation_threshold
+            .unwrap_or_else(|| default_confirmation_for(&self.check_type));
         MonitorConfig {
             name: self.name,
             check_type: self.check_type,
@@ -451,9 +488,9 @@ impl CreateMonitorRequest {
             keyword_mode: self.keyword_mode,
             expected_status_min: self.expected_status_min,
             expected_status_max: self.expected_status_max,
-            interval_seconds: self.interval_seconds,
+            interval_seconds,
             timeout_seconds: self.timeout_seconds,
-            confirmation_threshold: self.confirmation_threshold,
+            confirmation_threshold,
             paused: self.paused,
             request_body: self.request_body,
             request_headers: match self.request_headers {
@@ -471,6 +508,7 @@ impl CreateMonitorRequest {
             dns_record_type: self.dns_record_type,
             dns_nameserver: self.dns_nameserver,
             expected_value: self.expected_value,
+            expiry_threshold_days: self.expiry_threshold_days,
         }
     }
 }
@@ -512,6 +550,9 @@ pub struct PatchMonitorRequest {
     pub dns_nameserver: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
     pub expected_value: Option<Option<String>>,
+    /// `null` resets to the type's default (see `validate_threshold`).
+    #[serde(default, deserialize_with = "nullable")]
+    pub expiry_threshold_days: Option<Option<i32>>,
 }
 
 /// A nullable PATCH field applied to its current value.
@@ -524,6 +565,15 @@ fn patched<T>(patch: Option<Option<T>>, current: Option<T>) -> Option<T> {
 
 impl PatchMonitorRequest {
     pub fn apply_to(self, base: MonitorConfig) -> MonitorConfig {
+        // The threshold's default differs per expiry type (14 days for ssl,
+        // 30 for domain): a type change drops the stored one unless the
+        // request names a value, and validation then fills the new default.
+        let new_type = self.check_type.as_deref().unwrap_or(&base.check_type);
+        let expiry_threshold_days = match self.expiry_threshold_days {
+            Some(explicit) => explicit,
+            None if new_type != base.check_type => None,
+            None => base.expiry_threshold_days,
+        };
         MonitorConfig {
             name: self.name.unwrap_or(base.name),
             check_type: self.check_type.unwrap_or(base.check_type),
@@ -559,6 +609,7 @@ impl PatchMonitorRequest {
             dns_record_type: self.dns_record_type.or(base.dns_record_type),
             dns_nameserver: patched(self.dns_nameserver, base.dns_nameserver),
             expected_value: patched(self.expected_value, base.expected_value),
+            expiry_threshold_days,
         }
     }
 }
@@ -583,6 +634,8 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
         "tcp" => validate_tcp(&mut c)?,
         "ping" => validate_ping(&mut c)?,
         "dns" => validate_dns(&mut c)?,
+        "ssl_expiry" => validate_ssl_expiry(&mut c)?,
+        "domain_expiry" => validate_domain_expiry(&mut c)?,
         _ => {
             return Err(format!(
                 "check_type must be one of {}",
@@ -593,6 +646,12 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
     clear_unused_fields(&mut c);
     if c.interval_seconds < 30 {
         return Err("interval_seconds must be at least 30".into());
+    }
+    if is_expiry_type(&c.check_type) && c.interval_seconds < 3600 {
+        return Err(
+            "interval_seconds must be at least 3600 for ssl_expiry and domain_expiry monitors"
+                .into(),
+        );
     }
     if !(1..=60).contains(&c.timeout_seconds) {
         return Err("timeout_seconds must be between 1 and 60".into());
@@ -747,16 +806,19 @@ fn clear_unused_fields(c: &mut MonitorConfig) {
     if !uses(&["keyword"]) {
         c.keyword = None;
     }
-    if !uses(&["tcp", "ping", "dns"]) {
+    if !uses(&["tcp", "ping", "dns", "ssl_expiry", "domain_expiry"]) {
         c.host = None;
     }
-    if !uses(&["tcp"]) {
+    if !uses(&["tcp", "ssl_expiry"]) {
         c.port = None;
     }
     if !uses(&["dns"]) {
         c.dns_record_type = None;
         c.dns_nameserver = None;
         c.expected_value = None;
+    }
+    if !uses(&["ssl_expiry", "domain_expiry"]) {
+        c.expiry_threshold_days = None;
     }
 }
 
@@ -841,6 +903,46 @@ fn validate_dns(c: &mut MonitorConfig) -> Result<(), String> {
     };
     c.expected_value = validate_expected_value(c.expected_value.take())?;
     Ok(())
+}
+
+/// ssl_expiry: a host, a port (default 443) and the days before expiry
+/// that make the monitor go down (default 14).
+fn validate_ssl_expiry(c: &mut MonitorConfig) -> Result<(), String> {
+    c.host = Some(required_host(c)?);
+    let port = c.port.unwrap_or(443);
+    if !(1..=65535).contains(&port) {
+        return Err("port must be between 1 and 65535".into());
+    }
+    c.port = Some(port);
+    c.expiry_threshold_days = Some(validate_threshold(
+        c.expiry_threshold_days,
+        DEFAULT_SSL_THRESHOLD_DAYS,
+    )?);
+    Ok(())
+}
+
+/// domain_expiry: a registered domain name (not an IP address, not a single
+/// label), stored without a trailing dot, and the threshold (default 30).
+fn validate_domain_expiry(c: &mut MonitorConfig) -> Result<(), String> {
+    let host = required_host(c)?;
+    let domain = host.trim_end_matches('.').to_string();
+    if domain.parse::<IpAddr>().is_ok() || !domain.contains('.') {
+        return Err("host must be a domain name such as example.com".into());
+    }
+    c.host = Some(domain);
+    c.expiry_threshold_days = Some(validate_threshold(
+        c.expiry_threshold_days,
+        DEFAULT_DOMAIN_THRESHOLD_DAYS,
+    )?);
+    Ok(())
+}
+
+fn validate_threshold(days: Option<i32>, default: i32) -> Result<i32, String> {
+    let days = days.unwrap_or(default);
+    if !(1..=365).contains(&days) {
+        return Err("expiry_threshold_days must be between 1 and 365".into());
+    }
+    Ok(days)
 }
 
 /// Optional text an answer must contain: trimmed, empty means unset, and the
@@ -933,7 +1035,8 @@ async fn write_config(
              request_headers_enc = case when $21 then request_headers_enc else $23 end,
              auth_password_enc = case when $24 then auth_password_enc else $25 end,
              recovery_threshold = $26,
-             dns_record_type = $27, dns_nameserver = $28, expected_value = $29
+             dns_record_type = $27, dns_nameserver = $28, expected_value = $29,
+             expiry_threshold_days = $30
          where id = $1
          returning *",
     )
@@ -966,6 +1069,7 @@ async fn write_config(
     .bind(&c.dns_record_type)
     .bind(&c.dns_nameserver)
     .bind(&c.expected_value)
+    .bind(c.expiry_threshold_days)
     .fetch_one(&mut *conn)
     .await
 }

@@ -129,7 +129,7 @@ pub(crate) fn allowed_addresses(
 /// they are resolved (see [`GuardedResolver`]): an IP literal never reaches a
 /// resolver, so it is checked here, for the monitor's URL and for every
 /// redirect.
-fn names_forbidden_address(url: &reqwest::Url) -> bool {
+pub(crate) fn names_forbidden_address(url: &reqwest::Url) -> bool {
     // The URL parser has already turned every numeric host (`0x7f000001`,
     // `2130706433`, `127.1`) into a dotted IPv4 address and brackets IPv6
     // ones, so a host that parses as neither is a name.
@@ -213,6 +213,9 @@ pub struct CheckOutcome {
     pub checked_at: DateTime<Utc>,
 }
 
+/// Where `domain_expiry` checks start their RDAP lookup (`RDAP_BASE_URL`).
+pub const DEFAULT_RDAP_BASE_URL: &str = "https://rdap.org";
+
 /// What every check of one worker pass shares: the HTTP clients and the cipher
 /// that opens the monitors' secrets. Cloning is cheap: every clone shares the
 /// same clients (including the ones built later, see [`HttpClients`]) and key
@@ -228,6 +231,9 @@ pub struct CheckOutcome {
 pub struct CheckContext {
     pub http: HttpClients,
     pub cipher: Cipher,
+    /// Trust roots for `ssl_expiry` and mail TLS (tests inject their own CA).
+    pub tls: Arc<rustls::ClientConfig>,
+    pub rdap_base_url: String,
 }
 
 impl CheckContext {
@@ -235,11 +241,16 @@ impl CheckContext {
         CheckContext {
             http: HttpClients::new(),
             cipher,
+            tls: super::tls::webpki_client_config(),
+            rdap_base_url: DEFAULT_RDAP_BASE_URL.to_string(),
         }
     }
 
     pub fn for_state(state: &AppState) -> CheckContext {
-        CheckContext::new(state.cipher.clone())
+        CheckContext {
+            rdap_base_url: state.config.rdap_base_url.clone(),
+            ..CheckContext::new(state.cipher.clone())
+        }
     }
 }
 
@@ -478,6 +489,8 @@ pub async fn perform_check(ctx: &CheckContext, monitor: &Monitor) -> CheckOutcom
             "tcp" => probe_tcp(monitor, started).await,
             "ping" => super::ping::probe(monitor, timeout).await,
             "dns" => super::dns::probe(monitor, timeout, started).await,
+            "ssl_expiry" => super::expiry::probe_ssl(ctx, monitor, started).await,
+            "domain_expiry" => super::expiry::probe_domain(ctx, monitor, started).await,
             other => Observation::down(None, None, format!("unsupported check type {other:?}")),
         }
     };
@@ -720,7 +733,7 @@ fn request_method(stored: &str, needs_body: bool) -> Result<reqwest::Method, Str
         .ok_or_else(|| format!("unsupported http method {method:?}"))
 }
 
-async fn read_capped(
+pub(crate) async fn read_capped(
     response: &mut reqwest::Response,
     cap: usize,
 ) -> Result<Vec<u8>, reqwest::Error> {
@@ -758,7 +771,7 @@ async fn probe_tcp(monitor: &Monitor, started: Instant) -> Observation {
     }
 }
 
-fn describe_request_error(error: &reqwest::Error) -> String {
+pub(crate) fn describe_request_error(error: &reqwest::Error) -> String {
     if caused_by::<DestinationNotAllowed>(error) {
         return DESTINATION_NOT_ALLOWED.to_string();
     }
@@ -776,7 +789,7 @@ fn describe_request_error(error: &reqwest::Error) -> String {
     }
 }
 
-fn describe_io_error(error: &std::io::Error) -> String {
+pub(crate) fn describe_io_error(error: &std::io::Error) -> String {
     match io_kind_message(error.kind()) {
         Some(message) => message.to_string(),
         None => format!("connection failed: {error}"),

@@ -73,6 +73,10 @@ pub struct Config {
     /// `SYSLOG_TCP_PORT` and `SYSLOG_UDP_PORT`, default 5140 each.
     pub syslog_tcp_port: u16,
     pub syslog_udp_port: u16,
+    /// Where `domain_expiry` checks start their RDAP lookups
+    /// (`RDAP_BASE_URL`, default `https://rdap.org`, which redirects to the
+    /// registry's own RDAP server).
+    pub rdap_base_url: String,
 }
 
 impl Config {
@@ -209,6 +213,8 @@ impl Config {
             syslog_enabled: env_flag("SYSLOG_ENABLED", false),
             syslog_tcp_port: env_port("SYSLOG_TCP_PORT", crate::logs::syslog::DEFAULT_PORT),
             syslog_udp_port: env_port("SYSLOG_UDP_PORT", crate::logs::syslog::DEFAULT_PORT),
+            rdap_base_url: std::env::var("RDAP_BASE_URL")
+                .unwrap_or_else(|_| crate::uptime::checker::DEFAULT_RDAP_BASE_URL.to_string()),
         }
     }
 }
