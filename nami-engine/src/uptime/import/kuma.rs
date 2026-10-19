@@ -1,9 +1,9 @@
 //! Uptime Kuma backup (`monitorList` of a JSON export). Only monitor fields
 //! are read: the notification list, proxies and everything else in the
 //! document are never touched, so their secrets cannot leak.
+use super::printable;
 use super::{MAX_ENTRIES, ParseError, ParsedEntry};
 use crate::models::monitor::DNS_RECORD_TYPES;
-use crate::uptime::checker::printable;
 use serde_json::{Map, Value};
 
 pub fn parse(content: &str) -> Result<Vec<ParsedEntry>, ParseError> {
@@ -43,6 +43,26 @@ fn str_field<'a>(m: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     m.get(key).and_then(Value::as_str)
 }
 
+/// A Kuma boolean column: JSON bool, 0/1, or the strings "true"/"false"/"1"/"0"
+/// (backups from different versions and databases differ). Anything else is
+/// `None`, so the caller's default applies.
+fn flag(m: &Map<String, Value>, key: &str) -> Option<bool> {
+    match m.get(key)? {
+        Value::Bool(b) => Some(*b),
+        Value::Number(n) => match n.as_i64() {
+            Some(0) => Some(false),
+            Some(1) => Some(true),
+            _ => None,
+        },
+        Value::String(s) => match s.trim().to_lowercase().as_str() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn int_field(m: &Map<String, Value>, key: &str) -> Option<i64> {
     let v = m.get(key)?;
     v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64))
@@ -55,7 +75,7 @@ fn entry(item: &Value) -> Result<Map<String, Value>, String> {
     let name = str_field(m, "name")
         .filter(|n| !n.trim().is_empty())
         .ok_or_else(|| "entry has no name".to_string())?;
-    if m.get("upsideDown").and_then(Value::as_bool) == Some(true) {
+    if flag(m, "upsideDown") == Some(true) {
         return Err("upside-down mode is not supported".into());
     }
     let kind = str_field(m, "type").unwrap_or("");
@@ -132,11 +152,7 @@ fn entry(item: &Value) -> Result<Map<String, Value>, String> {
             (timeout.round() as i64).clamp(1, ceiling).into(),
         );
     }
-    let active = match m.get("active") {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_i64() != Some(0),
-        _ => true,
-    };
+    let active = flag(m, "active").unwrap_or(true);
     body.insert("paused".into(), (!active).into());
     Ok(body)
 }
@@ -155,7 +171,7 @@ fn http_fields(
         let keyword =
             str_field(m, "keyword").ok_or_else(|| "keyword monitor has no keyword".to_string())?;
         body.insert("keyword".into(), keyword.into());
-        if m.get("invertKeyword").and_then(Value::as_bool) == Some(true) {
+        if flag(m, "invertKeyword") == Some(true) {
             body.insert("keyword_mode".into(), "not_contains".into());
         }
     }
@@ -221,7 +237,7 @@ fn http_fields(
         body.insert("expected_status_min".into(), lo.into());
         body.insert("expected_status_max".into(), hi.into());
     }
-    if let Some(ignore) = m.get("ignoreTls").and_then(Value::as_bool) {
+    if let Some(ignore) = flag(m, "ignoreTls") {
         body.insert("verify_ssl".into(), (!ignore).into());
     }
     if let Some(redirects) = int_field(m, "maxredirects") {

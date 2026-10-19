@@ -3,6 +3,8 @@ use super::{MAX_ENTRIES, ParseError, ParsedEntry};
 use serde_json::{Map, Value};
 
 pub fn parse(content: &str) -> Result<Vec<ParsedEntry>, ParseError> {
+    // Notepad and spreadsheets prepend a byte-order mark.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let lines: Vec<(usize, &str)> = content
         .lines()
         .enumerate()

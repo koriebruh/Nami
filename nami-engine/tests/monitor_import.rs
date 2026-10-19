@@ -584,3 +584,115 @@ fn kuma_status_range_and_dns_type_errors_do_not_echo_long_input() {
         assert!(body.unwrap_err().len() < 120);
     }
 }
+
+// ---- review follow-ups ----
+
+#[test]
+fn kuma_flags_accept_bools_numbers_and_strings() {
+    let doc = json!({"monitorList": [
+        {"name": "a", "type": "http", "url": "https://a.test", "upsideDown": 1},
+        {"name": "b", "type": "http", "url": "https://b.test", "upsideDown": "true"},
+        {"name": "c", "type": "keyword", "url": "https://c.test", "keyword": "k", "invertKeyword": 1},
+        {"name": "d", "type": "keyword", "url": "https://d.test", "keyword": "k", "invertKeyword": "true"},
+        {"name": "e", "type": "http", "url": "https://e.test", "ignoreTls": 1},
+        {"name": "f", "type": "http", "url": "https://f.test", "ignoreTls": "0", "active": "false"},
+        {"name": "g", "type": "http", "url": "https://g.test", "upsideDown": 0, "active": 0},
+    ]});
+    let got = bodies(ImportFormat::UptimeKuma, &doc.to_string());
+    assert_eq!(got[0].1, Err("upside-down mode is not supported".into()));
+    assert_eq!(got[1].1, Err("upside-down mode is not supported".into()));
+    assert_eq!(got[2].1.as_ref().unwrap()["keyword_mode"], "not_contains");
+    assert_eq!(got[3].1.as_ref().unwrap()["keyword_mode"], "not_contains");
+    assert_eq!(got[4].1.as_ref().unwrap()["verify_ssl"], false);
+    assert_eq!(got[5].1.as_ref().unwrap()["verify_ssl"], true);
+    assert_eq!(got[5].1.as_ref().unwrap()["paused"], true);
+    assert_eq!(got[6].1.as_ref().unwrap()["paused"], true);
+}
+
+#[test]
+fn urls_strip_a_leading_bom() {
+    let got = bodies(ImportFormat::Urls, "\u{feff}https://a.test/\n");
+    assert_eq!(got[0].1.as_ref().unwrap()["url"], "https://a.test/");
+}
+
+#[test]
+fn error_text_drops_invisible_characters_from_quoted_input() {
+    let doc = json!({"monitorList": [{"name": "a", "type": "do\u{202e}cker"}]});
+    let err = bodies(ImportFormat::UptimeKuma, &doc.to_string())[0]
+        .1
+        .clone()
+        .unwrap_err();
+    assert_eq!(err, "Uptime Kuma monitor type \"docker\" is not supported");
+}
+
+#[test]
+fn debug_output_masks_header_values_and_the_password() {
+    let content = std::fs::read_to_string("tests/fixtures/import/uptime_kuma.json").unwrap();
+    let entries = parse(
+        ImportFormat::UptimeKuma,
+        &content,
+        &ImportDefaults::default(),
+    )
+    .unwrap();
+    let rendered = format!("{entries:?}");
+    assert!(!rendered.contains("kuma-header-secret") && !rendered.contains("kuma-basic-secret"));
+    assert!(rendered.contains("X-Api-Key") && rendered.contains("<set>"));
+    // The real values are still in the body.
+    assert_eq!(
+        entries[0].body.as_ref().unwrap()["auth_password"],
+        "kuma-basic-secret"
+    );
+}
+
+#[test]
+fn no_error_path_echoes_a_password_or_header_value() {
+    let docs = [
+        json!({"name": "a", "type": "http", "url": "https://a.test", "authMethod": "ntlm",
+               "basic_auth_user": "u", "basic_auth_pass": "PW-SECRET",
+               "headers": "{\"X\": \"HDR-SECRET\"}"}),
+        json!({"name": "b", "type": "http", "url": "https://b.test", "upsideDown": true,
+               "basic_auth_pass": "PW-SECRET", "headers": "{\"X\": \"HDR-SECRET\"}"}),
+        json!({"name": "c", "type": "http", "url": "https://c.test", "accepted_statuscodes": ["x"],
+               "basic_auth_pass": "PW-SECRET", "headers": "{\"X\": \"HDR-SECRET\"}"}),
+        json!({"name": "d", "type": "http", "url": "https://d.test",
+               "basic_auth_pass": "PW-SECRET", "headers": "{\"X\": 1, \"Y\": \"HDR-SECRET\"}"}),
+        json!({"name": "e", "type": "http", "url": "https://e.test",
+               "basic_auth_pass": "PW-SECRET", "headers": "HDR-SECRET"}),
+        json!({"name": "f", "type": "PW-SECRET", "basic_auth_pass": "PW-SECRET"}),
+    ];
+    for doc in docs {
+        let list = json!({"monitorList": [doc]}).to_string();
+        let got = bodies(ImportFormat::UptimeKuma, &list);
+        let err = got[0].1.clone().unwrap_err();
+        assert!(!err.contains("HDR-SECRET"), "{err}");
+        if !err.contains("monitor type") {
+            assert!(!err.contains("PW-SECRET"), "{err}");
+        }
+    }
+    // Whole-document errors never quote content.
+    let bad = r#"{"monitorList": [1,], "x": "PW-SECRET"}"#;
+    let err = parse(ImportFormat::UptimeKuma, bad, &ImportDefaults::default()).unwrap_err();
+    assert!(!err.to_string().contains("PW-SECRET"));
+}
+
+#[test]
+fn numbers_above_the_i32_range_parse_but_cannot_become_create_requests() {
+    // Recorded behaviour for NAMI-UP-26: the parsers keep the wide integer
+    // (no silent clamp); deserializing it as CreateMonitorRequest (i32 fields)
+    // fails, and that error text must not be shown raw to the client.
+    let kuma = json!({"monitorList": [
+        {"name": "p", "type": "port", "hostname": "h.test", "port": 4_294_967_297u64, "interval": 99_999_999_999u64}
+    ]});
+    let got = bodies(ImportFormat::UptimeKuma, &kuma.to_string());
+    let body = got[0].1.as_ref().unwrap();
+    assert_eq!(body["port"], 4_294_967_297u64);
+    assert_eq!(body["interval_seconds"], 99_999_999_999u64);
+    assert!(serde_json::from_value::<CreateMonitorRequest>(body.clone()).is_err());
+
+    let csv = "Friendly Name,URL/IP,Type,Port,Interval\nm,h.test,Port,4294967297,99999999999\n";
+    let got = bodies(ImportFormat::Uptimerobot, csv);
+    let body = got[0].1.as_ref().unwrap();
+    assert_eq!(body["port"], 4_294_967_297u64);
+    assert_eq!(body["interval_seconds"], 99_999_999_999u64);
+    assert!(serde_json::from_value::<CreateMonitorRequest>(body.clone()).is_err());
+}

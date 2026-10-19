@@ -1,8 +1,8 @@
 //! UptimeRobot CSV export. Columns are found by header name (case-insensitive,
 //! unknown columns ignored). Cells are plain text: a leading `=` is just a
 //! character in a name, never evaluated, and validation judges it later.
+use super::printable;
 use super::{MAX_ENTRIES, ParseError, ParsedEntry};
-use crate::uptime::checker::printable;
 use serde_json::{Map, Value};
 
 #[derive(Default)]

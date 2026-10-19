@@ -43,10 +43,48 @@ pub struct ImportDefaults {
 
 /// One source entry: its 1-based line (URL list, CSV) or index (Kuma), and
 /// either a create body or why it cannot be one.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct ParsedEntry {
     pub line: usize,
     pub body: Result<Map<String, Value>, String>,
+}
+
+/// What `Debug` prints in place of a secret that is set.
+const MASKED: &str = "<set>";
+
+impl fmt::Debug for ParsedEntry {
+    /// Header values and the basic-auth password are masked, so a stray
+    /// `{:?}` in a log line cannot leak them.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let body = self.body.as_ref().map(|body| {
+            let mut body = body.clone();
+            if let Some(password) = body.get_mut("auth_password") {
+                *password = Value::from(MASKED);
+            }
+            if let Some(Value::Array(headers)) = body.get_mut("request_headers") {
+                for header in headers {
+                    if let Some(value) = header.get_mut("value") {
+                        *value = Value::from(MASKED);
+                    }
+                }
+            }
+            body
+        });
+        f.debug_struct("ParsedEntry")
+            .field("line", &self.line)
+            .field("body", &body)
+            .finish()
+    }
+}
+
+/// `checker::printable` plus the invisible and text-direction characters the
+/// monitor validators reject, for source text quoted in error messages.
+pub(crate) fn printable(text: &str, max_chars: usize) -> String {
+    let visible: String = text
+        .chars()
+        .filter(|c| !crate::models::is_invisible_or_bidi_char(*c))
+        .collect();
+    crate::uptime::checker::printable(&visible, max_chars)
 }
 
 #[derive(Debug, PartialEq)]
