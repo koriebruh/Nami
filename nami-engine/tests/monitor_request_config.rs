@@ -1250,7 +1250,7 @@ fn request_types_never_print_secrets() {
         auth_password_enc: Some(vec![0xCA, 0xFE, 0xBA, 0xBE]),
         ..Monitor::default()
     };
-    let view = MonitorView::from(monitor.clone());
+    let view = MonitorView::new(monitor.clone(), false);
 
     let printed = [
         ("headers", format!("{headers:?}")),

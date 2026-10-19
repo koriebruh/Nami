@@ -214,17 +214,19 @@ impl fmt::Debug for Monitor {
 }
 
 /// A monitor as every API response shows it: the secrets are reduced to
-/// `request_headers` (names, `value_set: true`) and `has_auth_password`.
+/// `request_headers` (names, `value_set: true`) and `has_auth_password`, and
+/// `in_maintenance` says whether a maintenance window covers it right now.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MonitorView {
     #[serde(flatten)]
     pub monitor: Monitor,
     pub request_headers: Vec<HeaderView>,
     pub has_auth_password: bool,
+    pub in_maintenance: bool,
 }
 
-impl From<Monitor> for MonitorView {
-    fn from(monitor: Monitor) -> Self {
+impl MonitorView {
+    pub fn new(monitor: Monitor, in_maintenance: bool) -> MonitorView {
         let request_headers = monitor
             .request_header_names
             .iter()
@@ -238,6 +240,7 @@ impl From<Monitor> for MonitorView {
             monitor,
             request_headers,
             has_auth_password,
+            in_maintenance,
         }
     }
 }
@@ -1848,7 +1851,7 @@ mod tests {
 
     #[test]
     fn a_view_lists_header_names_and_whether_a_password_is_set_and_nothing_sealed() {
-        let view = MonitorView::from(stored_monitor());
+        let view = MonitorView::new(stored_monitor(), false);
         assert_eq!(
             view.request_headers,
             [HeaderView {
@@ -1863,12 +1866,16 @@ mod tests {
         }
         assert!(text.contains("\"request_headers\":[{\"name\":\"X-Api-Key\",\"value_set\":true}]"));
 
-        let none = MonitorView::from(Monitor {
-            request_headers_enc: None,
-            request_header_names: Vec::new(),
-            auth_password_enc: None,
-            ..stored_monitor()
-        });
+        let none = MonitorView::new(
+            Monitor {
+                request_headers_enc: None,
+                request_header_names: Vec::new(),
+                auth_password_enc: None,
+                ..stored_monitor()
+            },
+            true,
+        );
+        assert!(none.in_maintenance);
         assert!(none.request_headers.is_empty() && !none.has_auth_password);
     }
 

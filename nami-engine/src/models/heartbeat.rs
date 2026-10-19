@@ -72,8 +72,9 @@ impl fmt::Debug for Heartbeat {
 
 impl Heartbeat {
     /// The API's shape of this heartbeat. `with_token` says whether the
-    /// caller may see the ping token (see [`HeartbeatView::token`]).
-    pub fn into_view(self, with_token: bool) -> HeartbeatView {
+    /// caller may see the ping token (see [`HeartbeatView::token`]);
+    /// `in_maintenance` whether a project-wide maintenance window covers it now.
+    pub fn into_view(self, with_token: bool, in_maintenance: bool) -> HeartbeatView {
         let Heartbeat {
             id,
             project_id,
@@ -98,6 +99,7 @@ impl Heartbeat {
             current_status,
             last_ping_at,
             created_at,
+            in_maintenance,
         }
     }
 }
@@ -118,6 +120,9 @@ pub struct HeartbeatView {
     pub current_status: String,
     pub last_ping_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// Whether a project-wide maintenance window covers it right now: pings
+    /// are recorded but its state is frozen (see `uptime::heartbeat`).
+    pub in_maintenance: bool,
 }
 
 impl fmt::Debug for HeartbeatView {
@@ -133,6 +138,7 @@ impl fmt::Debug for HeartbeatView {
             current_status,
             last_ping_at,
             created_at,
+            in_maintenance,
         } = self;
         f.debug_struct("HeartbeatView")
             .field("id", id)
@@ -145,6 +151,7 @@ impl fmt::Debug for HeartbeatView {
             .field("current_status", current_status)
             .field("last_ping_at", last_ping_at)
             .field("created_at", created_at)
+            .field("in_maintenance", in_maintenance)
             .finish()
     }
 }
@@ -394,10 +401,10 @@ mod tests {
                 "{text}"
             );
         }
-        let view = format!("{:?}", row.into_view(true));
+        let view = format!("{:?}", row.into_view(true, false));
         assert!(!view.contains(TOKEN), "{view}");
         assert!(view.contains("Some(\"<redacted>\")"), "{view}");
-        assert!(format!("{:?}", heartbeat().into_view(false)).contains("token: None"));
+        assert!(format!("{:?}", heartbeat().into_view(false, false)).contains("token: None"));
         // And inside other types that derive Debug.
         let held = (heartbeat(), Some(heartbeat()), vec![heartbeat()]);
         assert!(!format!("{held:?}").contains(TOKEN));
@@ -405,8 +412,8 @@ mod tests {
 
     #[test]
     fn the_view_carries_the_token_only_when_asked() {
-        let with = serde_json::to_value(heartbeat().into_view(true)).unwrap();
-        let without = serde_json::to_value(heartbeat().into_view(false)).unwrap();
+        let with = serde_json::to_value(heartbeat().into_view(true, false)).unwrap();
+        let without = serde_json::to_value(heartbeat().into_view(false, false)).unwrap();
         assert_eq!(with["token"], TOKEN);
         assert!(
             without.get("token").is_some_and(|token| token.is_null()),

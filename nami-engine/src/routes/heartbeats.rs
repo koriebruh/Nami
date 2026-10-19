@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::Utc;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -15,7 +16,12 @@ use uuid::Uuid;
 use crate::{
     error::AppError,
     middleware::rbac::{CurrentUser, ProjectReader, require_project_reader, require_project_role},
-    models::heartbeat::{self, CreateHeartbeatRequest, HeartbeatView, PatchHeartbeatRequest},
+    models::{
+        heartbeat::{
+            self, CreateHeartbeatRequest, Heartbeat, HeartbeatView, PatchHeartbeatRequest,
+        },
+        maintenance,
+    },
     state::AppState,
     uptime::{
         alerts,
@@ -90,6 +96,19 @@ async fn read_access(
     Ok(reader == ProjectReader::Member)
 }
 
+/// Whether a project-wide maintenance window covers the heartbeats of
+/// `project_id` now. One query, whether for one heartbeat or a whole list:
+/// every heartbeat of a project shares the answer.
+async fn in_maintenance(state: &AppState, project_id: Uuid) -> Result<bool, AppError> {
+    Ok(maintenance::heartbeat_in_maintenance(&state.db, project_id, Utc::now()).await?)
+}
+
+/// `heartbeat` as a member sees it (with its token), maintenance looked up.
+async fn member_view(state: &AppState, heartbeat: Heartbeat) -> Result<HeartbeatView, AppError> {
+    let in_maintenance = in_maintenance(state, heartbeat.project_id).await?;
+    Ok(heartbeat.into_view(true, in_maintenance))
+}
+
 async fn list_heartbeats(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -97,10 +116,11 @@ async fn list_heartbeats(
 ) -> Result<Json<Vec<HeartbeatView>>, AppError> {
     let with_token = read_access(&state, &user, project_id).await?;
     let heartbeats = heartbeat::list_for_project(&state.db, project_id).await?;
+    let in_maintenance = in_maintenance(&state, project_id).await?;
     Ok(Json(
         heartbeats
             .into_iter()
-            .map(|heartbeat| heartbeat.into_view(with_token))
+            .map(|heartbeat| heartbeat.into_view(with_token, in_maintenance))
             .collect(),
     ))
 }
@@ -122,7 +142,10 @@ async fn create_heartbeat(
             }
             _ => AppError::Database(e),
         })?;
-    Ok((StatusCode::CREATED, Json(created.into_view(true))))
+    Ok((
+        StatusCode::CREATED,
+        Json(member_view(&state, created).await?),
+    ))
 }
 
 async fn get_heartbeat(
@@ -134,7 +157,8 @@ async fn get_heartbeat(
     let found = heartbeat::find_in_project(&state.db, project_id, heartbeat_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(found.into_view(with_token)))
+    let in_maintenance = in_maintenance(&state, project_id).await?;
+    Ok(Json(found.into_view(with_token, in_maintenance)))
 }
 
 async fn patch_heartbeat(
@@ -147,7 +171,7 @@ async fn patch_heartbeat(
     let updated = heartbeat::update_in_project(&state.db, project_id, heartbeat_id, payload)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(updated.into_view(true)))
+    Ok(Json(member_view(&state, updated).await?))
 }
 
 /// Replaces the ping token; the old one stops working at once. The reply is
@@ -161,7 +185,7 @@ async fn rotate_heartbeat_token(
     let rotated = heartbeat::rotate_token(&state.db, project_id, heartbeat_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(rotated.into_view(true)))
+    Ok(Json(member_view(&state, rotated).await?))
 }
 
 async fn delete_heartbeat(
