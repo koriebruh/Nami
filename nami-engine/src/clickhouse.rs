@@ -54,7 +54,7 @@ pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Idempotent DDL applied by [`ClickHouse::migrate`], in order. Table names
 /// are unqualified because every request carries the `database` setting.
-const MIGRATIONS: [&str; 2] = [
+const MIGRATIONS: [&str; 3] = [
     "CREATE TABLE IF NOT EXISTS uptime_checks (
     monitor_id UUID,
     project_id UUID,
@@ -90,6 +90,18 @@ TTL toDateTime(checked_at) + INTERVAL 180 DAY",
 PARTITION BY toYYYYMMDD(dt)
 ORDER BY (project_id, dt, id)
 TTL toDateTime(dt) + toIntervalDay(retention_days)",
+    // Every heartbeat ping (see `uptime::pings`): kind, exit code and the
+    // sanitized output the job sent.
+    "CREATE TABLE IF NOT EXISTS heartbeat_pings (
+    heartbeat_id UUID,
+    project_id UUID,
+    received_at DateTime64(3, 'UTC'),
+    kind Enum8('success' = 1, 'fail' = 2),
+    exit_code Nullable(Int32),
+    output String
+) ENGINE = MergeTree
+ORDER BY (heartbeat_id, received_at)
+TTL toDateTime(received_at) + INTERVAL 180 DAY",
 ];
 
 /// Settings a caller may never pass as extra settings: they are owned by

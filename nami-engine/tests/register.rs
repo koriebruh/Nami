@@ -1,7 +1,10 @@
-use axum::{body::{self, Body}, http::{Request, StatusCode}};
-use tower::ServiceExt;
+use axum::{
+    body::{self, Body},
+    http::{Request, StatusCode},
+};
 use nami_engine::state::AppState;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+use tower::ServiceExt;
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState::for_test(pool);
@@ -110,7 +113,9 @@ async fn first_registered_user_becomes_global_admin(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/register")
                 .header("content-type", "application/json")
-                .body(Body::from(json!({ "email": "first@example.com", "password": "password123" }).to_string()))
+                .body(Body::from(
+                    json!({ "email": "first@example.com", "password": "password123" }).to_string(),
+                ))
                 .unwrap(),
         )
         .await
@@ -137,13 +142,22 @@ async fn second_registered_user_stays_member(pool: sqlx::PgPool) {
             .method("POST")
             .uri("/auth/register")
             .header("content-type", "application/json")
-            .body(Body::from(json!({ "email": email, "password": "password123" }).to_string()))
+            .body(Body::from(
+                json!({ "email": email, "password": "password123" }).to_string(),
+            ))
             .unwrap()
     };
 
-    let first = app.clone().oneshot(make_request("firstuser@example.com")).await.unwrap();
+    let first = app
+        .clone()
+        .oneshot(make_request("firstuser@example.com"))
+        .await
+        .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
-    let second = app.oneshot(make_request("seconduser@example.com")).await.unwrap();
+    let second = app
+        .oneshot(make_request("seconduser@example.com"))
+        .await
+        .unwrap();
     assert_eq!(second.status(), StatusCode::OK);
 
     let first_role: (String,) = sqlx::query_as("select global_role from users where email = $1")

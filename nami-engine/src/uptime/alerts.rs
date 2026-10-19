@@ -6,7 +6,7 @@
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use super::checker::is_unsafe_in_text;
+use super::{checker::is_unsafe_in_text, heartbeat::sanitize_output};
 use crate::state::AppState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +31,9 @@ pub struct Transition {
     pub project_id: Uuid,
     pub name: String,
     pub cause: Option<String>,
+    /// Output of the heartbeat ping that opened the incident (already
+    /// sanitized); only heartbeat failure transitions carry it.
+    pub details: Option<String>,
     pub at: DateTime<Utc>,
 }
 
@@ -121,11 +124,26 @@ pub fn render(ui_base_url: &str, transition: &Transition) -> (String, String) {
         }
     };
     let at = transition.at.format("%Y-%m-%d %H:%M:%S UTC");
+    // Quoted line by line, so no line of a job's output can start a
+    // header-looking line of its own. Sanitized again for a Transition built
+    // any other way.
+    let output = match transition.details.as_deref() {
+        Some(details) if !details.is_empty() => {
+            let mut quoted = String::from("\nOutput:\n");
+            for line in sanitize_output(details.as_bytes()).lines() {
+                quoted.push_str("> ");
+                quoted.push_str(line);
+                quoted.push('\n');
+            }
+            quoted
+        }
+        _ => String::new(),
+    };
     match transition.kind {
         TransitionKind::Down => (
             format!("[Nami] {name} is DOWN"),
             format!(
-                "{name} is DOWN.\n\nCause: {}\nSince: {at}\n\nDetails: {link}\n",
+                "{name} is DOWN.\n\nCause: {}\nSince: {at}\n{output}\nDetails: {link}\n",
                 // Already one line when it comes from `apply_outcome`; the
                 // same filter here covers a Transition built any other way.
                 transition
@@ -154,6 +172,7 @@ mod tests {
             project_id: Uuid::nil(),
             name: name.to_string(),
             cause: Some("expected status 200-399, got 503".to_string()),
+            details: None,
             at: DateTime::from_timestamp(1_792_000_000, 0).unwrap(),
         }
     }
@@ -203,6 +222,32 @@ mod tests {
             body.contains(&format!("http://ui.test/projects/{nil}/heartbeats/{nil}")),
             "{body}"
         );
+    }
+
+    #[test]
+    fn heartbeat_output_is_quoted_line_by_line_between_since_and_details() {
+        let down = Transition {
+            subject: Subject::Heartbeat(Uuid::nil()),
+            cause: Some("Heartbeat reported failure (exit code 2)".into()),
+            details: Some("<script>alert(1)</script>\nBcc: x@evil.test\n\tdisk full".into()),
+            ..transition(TransitionKind::Down, "Nightly backup")
+        };
+        let (subject, body) = render("http://ui.test", &down);
+        assert_eq!(subject, "[Nami] Nightly backup is DOWN");
+        assert!(body.contains(
+            "Since: 2026-10-14 17:46:40 UTC\n\nOutput:\n> <script>alert(1)</script>\n> Bcc: x@evil.test\n> \tdisk full\n\nDetails: "
+        ), "{body:?}");
+        assert!(!body.lines().any(|l| l.starts_with("Bcc:")), "{body:?}");
+    }
+
+    #[test]
+    fn details_are_sanitized_again_when_rendered() {
+        let down = Transition {
+            details: Some("a\rb\u{1b}c".into()),
+            ..transition(TransitionKind::Down, "X")
+        };
+        let (_, body) = render("http://ui.test", &down);
+        assert!(body.contains("Output:\n> abc\n"), "{body:?}");
     }
 
     #[test]

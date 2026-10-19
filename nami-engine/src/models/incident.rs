@@ -14,6 +14,8 @@ pub struct IncidentListItem {
     pub source_name: Option<String>,
     pub title: String,
     pub cause: Option<String>,
+    /// Output of the heartbeat ping that opened the incident (sanitized).
+    pub details: Option<String>,
     pub status: String,
     pub started_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
@@ -29,7 +31,7 @@ pub async fn list_for_project(
 ) -> Result<Vec<IncidentListItem>, sqlx::Error> {
     sqlx::query_as(
         "select i.id, i.project_id, i.monitor_id, i.heartbeat_id,
-                coalesce(m.name, h.name) as source_name, i.title, i.cause, i.status,
+                coalesce(m.name, h.name) as source_name, i.title, i.cause, i.details, i.status,
                 i.started_at, i.resolved_at
          from incidents i
          left join monitors m on m.id = i.monitor_id
@@ -130,4 +132,18 @@ pub async fn resolve_for_heartbeat(
     .bind(resolved_at)
     .fetch_optional(&mut *conn)
     .await
+}
+
+/// Stores the output of the ping that opened the incident.
+pub async fn attach_details(
+    conn: &mut PgConnection,
+    incident_id: Uuid,
+    details: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("update incidents set details = $2 where id = $1")
+        .bind(incident_id)
+        .bind(details)
+        .execute(&mut *conn)
+        .await?;
+    Ok(())
 }

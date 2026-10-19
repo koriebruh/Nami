@@ -12,7 +12,11 @@ async fn sent_email_is_captured_by_mailpit() {
 
     let mailer = Mailer::new("localhost", 1025);
     mailer
-        .send("someone@example.com", "Verify your email", "click here".to_string())
+        .send(
+            "someone@example.com",
+            "Verify your email",
+            "click here".to_string(),
+        )
         .await
         .unwrap();
 
