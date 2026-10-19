@@ -99,7 +99,7 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - kinds are `email`, `webhook`, `slack`, `teams`, `telegram`, `discord`;
   - config is sealed with AES-GCM and write-only, and responses never carry secrets;
   - every channel has a "send test" action;
-  - webhook bodies are `{event, incident:{id,title,cause,status,source,severity,started_at,url}, project:{id,name}}` with `X-Nami-Signature: sha256=<hex HMAC-SHA256 of body>` under a per-channel secret shown once at creation.
+  - webhook bodies are `{event, incident:{id,title,cause,status,source,severity,started_at,url}, project:{id,name}}` with `X-Nami-Timestamp: <unix seconds>` and `X-Nami-Signature: sha256=<lowercase hex HMAC-SHA256(secret, "{timestamp}.{body}")>` under a per-channel secret shown once at creation (R29, controller ruling: a signed timestamp, not the spec's body-only HMAC).
 - Delivery (spec): durable queue, pending → sent | failed, up to **5 attempts** with exponential backoff (**30 s … 1 h**), **10 s** timeout, each attempt recorded in the incident timeline. A delivery that succeeded is never resent.
 - Escaping (spec):
   - Slack: escape `&`, `<`, `>`.
@@ -161,8 +161,8 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - A user who is not a project member when the step runs is skipped, even if they are on call or named directly. Global admins are no exception: add them as members to page them.
   - Recipients are deduplicated within a step by `target_key` (`email:{user_id}` / `channel:{channel_id}`).
   - A person may be notified again by a later step or pass. That is the point of escalating.
-- **R8 Personal channel kinds.** `webhook`, `slack`, `teams`, `telegram` and `discord` are allowed. A personal `email` channel is not: the implicit verified address covers it, and an unverified extra address would let anyone mail third parties through Nami. Project `email` channels (admin) take any address, for example a team list.
-- **R9 URL rules per kind.** These are checked at create/update and again before each send.
+- **R8 Personal channel kinds.** `webhook`, `slack`, `teams`, `telegram` and `discord` are allowed. A personal `email` channel is not: the implicit verified address covers it, and an unverified extra address would let anyone mail third parties through Nami. Project `email` channels (admin) take any address, for example a team list. **Controller ruling (2026-10-19): confirmed.**
+- **R9 URL rules per kind.** These are checked at create/update and again before each send. **Controller ruling (2026-10-19): kept.** Personal webhooks and every chat-host webhook (Slack, Discord, Teams) reach public addresses only, checked again on every connection.
   - webhook: `http` or `https`, no userinfo, host required.
     - A **project** webhook (admin) may point at private and loopback hosts (self-hosted receivers). It is sent with `outbound::client()`, the same DNS guard as monitors.
     - A **personal** webhook must resolve to public addresses only. It is sent with `outbound::public_client()`. Personal channels can be made by any logged-in user, a global viewer with no project included. Without this rule, "send test" would hand such a user a POST to any internal service, and its status line ("HTTP 404" or "connection failed") would let them scan ports. The create/update check refuses a private or loopback IP literal with 400 `personal channels must point at a public address`. Names are judged by `PublicOnlyResolver` when the request connects.
@@ -208,7 +208,7 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - `kick` does nothing when `config.incidents_worker_enabled` is false (R23).
   - The worker loop (every 2 s) is the durable backstop.
   - The source wrappers (`models::incident::open_for_monitor` and the others) keep their signatures and call `lifecycle::open` with the source's `escalation_policy_id`/`severity_id`.
-  - Log alerts keep the R-P2-27 seam. `logs::alerts::open_alert_incident` is unchanged: it calls the `open_for_log_alert` wrapper. In `resolve_alert_incident(.., notify)`, `notify: true` calls the `resolve_for_log_alert` wrapper (resolved notices go out). `notify: false` (an alerting alert being disabled) calls `lifecycle::resolve_source_silently(conn, &IncidentSource::LogAlert(id), at)`. That resolves and records the `resolved` event with metadata `{"silent": true}`, and queues nothing, which keeps Logs Part 2's "disable resolves without a notification" behaviour.
+  - Log alerts keep the R-P2-27 seam. `logs::alerts::open_alert_incident` is unchanged: it calls the `open_for_log_alert` wrapper. In `resolve_alert_incident(.., notify)`, `notify: true` calls the `resolve_for_log_alert` wrapper (resolved notices go out). **Controller ruling (2026-10-19):** `notify: false` (an alerting alert being disabled) calls `lifecycle::resolve_source_with_reason(conn, &IncidentSource::LogAlert(id), at, "alert disabled")`. That resolves the incident like any automatic resolution: everyone already paged gets the normal "Resolved" notice, which carries `Reason: alert disabled`. The `resolved` event's message is `alert disabled` and its metadata is `{"reason": "alert disabled"}`. `resolve_alert_incident` still returns `None` (no transition, so no `notify_transition`). The route that disables the alert calls `incidents::worker::kick(&state)` after its transaction commits, and the worker loop is the backstop. **This supersedes Logs Part 2's "disabling resolves without a notification" behaviour (R-P2-27, NAMI-LOG-14) once NAMI-INC-10 lands.** Task 10 updates Logs Part 2's disable test to match.
 - **R18 Email subjects change** with routing (Task 10). **Controller ruling (2026-10-19): accepted.** A step notification is `[Nami] [<severity>] <title>`. A resolution is `[Nami] Resolved: <title>`. The existing worker, heartbeat, maintenance and log-alert tests that assert the old subjects (`… is DOWN`, `… is back UP`, `Log alert … triggered/resolved`) are updated in Task 10. Their counts stay the same (one email per member per transition). A handful of `tests/uptime_worker.rs` tests pin the *mechanics* of the old SMTP path: sequential per-recipient sends, giving up after one timeout, its log lines. Task 10 lists them with the property each keeps.
 - **R19 Time windows** reuse `models::maintenance::Schedule::Weekly::covers` and `weekday_from_iso` (Phase 2, already DST-tested). `from == to` means a full 24 h, as for maintenance windows. Wall-clock semantics apply: a window inside a skipped hour does not happen that day, and one across a repeated hour lasts an hour longer.
 - **R20 Rotation math.**
@@ -226,7 +226,9 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
 - **R27 Deploying between tasks.** `main` stays deployable after every merge.
   - The incidents worker is spawned from `main.rs` only in Task 10, when routing switches. Before that, nothing in production queues deliveries ("send test" is synchronous). So Tasks 5-9 can never page someone alongside the old email path.
   - From Task 8 on, `lifecycle::open` arms escalation for monitor, heartbeat and log-alert incidents too. Those incidents were emailed by the old path, so migration `0065` (Task 10) disarms every unresolved incident of those sources (`next_escalation_at = null`, `escalation_legacy = true`), as R6 does at `0064`. Manual incidents created before Task 10 were never notified by anyone, so they stay armed.
-- **R28 Project members and roles for the UI.** The engine has no members list today (`/projects/{id}/members` takes POST only), and the project layout returns no role. Task 7 adds `GET /projects/{id}/members` (viewer) → `[{user_id, email, project_role}]`, by email. Schedule participants, override users and policy user targets are chosen from it. The UI does not hide admin forms by role: every page shows its forms and surfaces the engine's 403 as the form message, as the incident list does (Task 12). That needs no role endpoint, and the engine stays the only authority.
+- **R29 Signed webhook timestamp. Controller ruling (2026-10-19).** Every webhook request carries `X-Nami-Timestamp: <unix seconds>` (decimal, no fraction) and `X-Nami-Signature: sha256=<lowercase hex>`. The hex is HMAC-SHA256 with the channel's signing secret (the 43-char string shown once, as its ASCII bytes) over the exact bytes `<timestamp>` `.` `<raw body>`. Example: `1792000000.{"event":...}`. `X-Nami-Delivery: <delivery uuid>` stays. Receiver guidance, shown on the channel page right after creation (Task 13) and in the spec's webhook section: recompute the HMAC over `{X-Nami-Timestamp}.{raw body}` and compare in constant time; reject a timestamp more than 5 minutes old (or in the future); store `X-Nami-Delivery` ids for at least 5 minutes and drop a repeat. The timestamp is taken once per attempt, just before sending, so a retry has a fresh one. This supersedes the spec's "HMAC of body"; the spec's webhook bullet is updated in Task 4's commit.
+- **R30 Resolution reasons.** A resolution may carry a short reason (≤ 200 chars, one line), stored as the `resolved` event's message and `metadata.reason`. Part 1 sets it only for a log alert disabled while alerting (`alert disabled`, R17). The delivery drain reads the reason of the incident's latest `resolved` event when it builds a `resolved` message (`IncidentSummary.resolution_reason`).
+- **R28 Project members and roles for the UI.** The engine has no members list today (`/projects/{id}/members` takes POST only), and the project layout returns no role. Task 7 adds `GET /projects/{id}/members` (viewer) → `[{user_id, email, project_role}]`, by email. Schedule participants, override users and policy user targets are chosen from it. **Controller ruling (2026-10-19):** Task 7 also makes `GET /projects/{id}` return the caller's effective role, `role: "admin" | "member" | "viewer"` (a global admin is `"admin"`, member or not). The project layout (`(app)/projects/[id=uuid]/+layout.server.ts`) passes it on as `data.role`. The UI hides admin-only forms (channels, policies, schedules, overrides) for non-admins and member-only actions (incident actions, comments, postmortem, new incident) for viewers. The engine stays the authority: every hidden action still answers 403, and the pages still show an engine 403 as the form message. Tests cover both sides: the engine route × role tests, and UI render tests with `role: 'viewer'` (no form) and `role: 'admin'` (form).
 
 ## File Structure
 
@@ -276,14 +278,14 @@ nami-engine/
       severities.rs                    T2
       channels.rs                      T3 project + personal channels; T5 test send
       schedules.rs                     T7
-      projects.rs                      T7 GET /projects/{id}/members (R28)
+      projects.rs                      T7 GET /projects/{id}/members; GET /projects/{id} gains `role` (R28)
       escalation_policies.rs           T8
       incident_actions.rs              T11 inspect/confirm (no session)
     uptime/
       checker.rs                       T3 `GuardedResolver` and `caused_by` become pub(crate) (no move, no behaviour change)
       alerts.rs                        T10 notify_transition → incidents::worker::kick; render removed
       worker.rs, heartbeat.rs          unchanged: policy/severity come through the models::incident wrappers
-    logs/alerts.rs                     T10 resolve_alert_incident(notify: false) → lifecycle::resolve_source_silently (R17)
+    logs/alerts.rs                     T10 resolve_alert_incident(notify: false) → lifecycle::resolve_source_with_reason(.., "alert disabled") (R17)
   tests/
     common/mod.rs                      T1 open_test_incident; T5 run_incident_ticks; T8 seed_policy helpers
     incident_lifecycle.rs              T1
@@ -1628,7 +1630,9 @@ impl NotifyEvent { pub fn webhook_name(self) -> &'static str }  // "incident.tri
 pub struct IncidentSummary { pub id: Uuid, pub title: String, pub cause: Option<String>, pub status: String,
     pub source: String, pub severity: String, pub started_at: DateTime<Utc>,
     /// `incidents.details` (heartbeat output, R26): email only.
-    pub details: Option<String> }
+    pub details: Option<String>,
+    /// R30: the latest `resolved` event's reason ("alert disabled"), `Resolved` messages only.
+    pub resolution_reason: Option<String> }
 #[derive(Debug, Clone)]
 pub struct ActionLinks { pub acknowledge: String, pub resolve: String }
 #[derive(Debug, Clone)]
@@ -1641,7 +1645,10 @@ pub fn discord(m: &Message) -> serde_json::Value;
 pub fn telegram(m: &Message, chat_id: &str) -> serde_json::Value;
 pub fn teams(m: &Message) -> serde_json::Value;
 pub fn webhook_body(m: &Message) -> Vec<u8>;
-pub fn signature(secret: &[u8], body: &[u8]) -> String;    // "sha256=<lowercase hex>"
+/// R29: "sha256=" + lowercase hex HMAC-SHA256(secret, "{timestamp}." + body).
+pub fn signature(secret: &[u8], timestamp: i64, body: &[u8]) -> String;
+/// Lowercase hex HMAC-SHA256(secret, bytes); `signature` is built on it.
+pub fn hmac_hex(secret: &[u8], bytes: &[u8]) -> String;
 pub fn escape_slack(s: &str) -> String;
 pub fn escape_discord(s: &str) -> String;
 pub fn escape_telegram(s: &str) -> String;
@@ -1652,6 +1659,7 @@ pub const MAX_CHAT_CAUSE_CHARS: usize = 1000;
 Content rules:
 - **Every user text is first made one line.** Title and project name go through `is_unsafe_in_text` → space. The cause keeps `\n` (shown as a block) but loses every other unsafe char, and is cut to 1,000 chars with `…` for chat (the email keeps 10 KiB).
 - **Headline.** Triggered: `[<severity>] <title>`. Resolved: `Resolved: <title>`. Test: `Test notification from Nami`.
+- **Resolution reason (R30).** When `resolution_reason` is set on a `Resolved` message: the email body adds `Reason: <reason>` right after `Status:`. Slack, Discord, Telegram and Teams append ` · Reason: <reason>` (escaped per channel) to their second line. The webhook body is unchanged (the spec fixes it).
 - **Email.** Subject `[Nami] [<severity>] <title>` / `[Nami] Resolved: <title>` / `[Nami] Test notification`. Body:
 
   ```
@@ -1674,7 +1682,7 @@ Content rules:
 - **Discord.** `{"content": "<escaped headline>\n<escaped project> · <severity> · <status>\n<escaped cause>\n<incident_url>", "allowed_mentions": {"parse": []}}`, cut to 2,000 chars. `escape_discord` puts a backslash before `\ * _ ~ ` ` | > # - [ ] ( ) @ :` and before `<`.
 - **Telegram.** `{"chat_id": .., "text": "<b>headline</b>\n...\n<a href=\"<incident_url>\">View incident</a>", "parse_mode": "HTML", "disable_web_page_preview": true}`. `escape_telegram` handles `&`, `<`, `>` (and `"` for the attribute). The text is cut to 4,096 chars before the link line is appended.
 - **Teams.** `{"type": "message", "attachments": [{"contentType": "application/vnd.microsoft.card.adaptive", "content": {"$schema": "http://adaptivecards.io/schemas/adaptive-card.json", "type": "AdaptiveCard", "version": "1.4", "body": [TextBlock headline (weight bolder, wrap), TextBlock "<project> · <severity> · <status>", TextBlock cause (wrap)], "actions": [{"type": "Action.OpenUrl", "title": "View incident", "url": incident_url}]}}]}`. `escape_teams` puts a backslash before each of `\ * _ [ ] ( ) ` # > - !` and replaces `&`, `<`, `>` with entities.
-- **Webhook.** `{"event": .., "incident": {"id", "title", "cause", "status", "source", "severity", "started_at", "url"}, "project": {"id", "name"}}`, serialised once. `signature` is computed over exactly those bytes.
+- **Webhook.** `{"event": .., "incident": {"id", "title", "cause", "status", "source", "severity", "started_at", "url"}, "project": {"id", "name"}}`, serialised once. `signature(secret, timestamp, body)` is computed over `{timestamp}.` followed by exactly those bytes (R29).
 
 - [ ] **Step 1: Write the failing tests** in `format.rs` `mod tests`:
 
@@ -1686,7 +1694,8 @@ fn message(title: &str, cause: Option<&str>) -> Message {
         event: NotifyEvent::Triggered,
         incident: IncidentSummary { id: Uuid::nil(), title: title.into(), cause: cause.map(Into::into),
             status: "open".into(), source: "monitor".into(), severity: "critical".into(),
-            started_at: DateTime::from_timestamp(1_792_000_000, 0).unwrap(), details: None },
+            started_at: DateTime::from_timestamp(1_792_000_000, 0).unwrap(), details: None,
+            resolution_reason: None },
         project_id: Uuid::nil(), project_name: "Shop".into(),
         incident_url: format!("http://ui.test/projects/{0}/incidents/{0}", Uuid::nil()),
         actions: None,
@@ -1796,14 +1805,35 @@ fn webhook_bodies_are_signed_with_hmac_sha256_over_the_exact_bytes() {
     assert_eq!(v["project"]["name"], "Shop");
     assert_eq!(v.as_object().unwrap().len(), 3);
     // RFC 4231 test case 2.
-    assert_eq!(signature(b"Jefe", b"what do ya want for nothing?"),
-        "sha256=5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    assert_eq!(hmac_hex(b"Jefe", b"what do ya want for nothing?"),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    // R29: the signed bytes are "{timestamp}.{body}", never the body alone.
+    let mut signed = b"1792000000.".to_vec();
+    signed.extend_from_slice(&body);
+    assert_eq!(signature(b"k", 1_792_000_000, &body), format!("sha256={}", hmac_hex(b"k", &signed)));
+    assert_ne!(signature(b"k", 1_792_000_000, &body), signature(b"k", 1_792_000_001, &body), "the timestamp is signed");
+    assert_ne!(signature(b"k", 1_792_000_000, &body), format!("sha256={}", hmac_hex(b"k", &body)));
+}
+
+#[test]
+fn a_resolution_reason_reaches_every_format_escaped() {
+    let mut m = Message { event: NotifyEvent::Resolved, ..message("Log alert: Checkout errors", None) };
+    m.incident.resolution_reason = Some("alert disabled".into());
+    let (subject, body) = email(&m);
+    assert_eq!(subject, "[Nami] Resolved: Log alert: Checkout errors");
+    assert!(body.contains("Status: open\nReason: alert disabled\n"), "{body}");
+    assert!(slack(&m).to_string().contains("Reason: alert disabled"));
+    assert!(discord(&m)["content"].as_str().unwrap().contains("Reason: alert disabled"));
+    assert!(telegram(&m, "1")["text"].as_str().unwrap().contains("Reason: alert disabled"));
+    assert!(teams(&m).to_string().contains("Reason: alert disabled"));
+    let v: serde_json::Value = serde_json::from_slice(&webhook_body(&m)).unwrap();
+    assert!(v["incident"].get("reason").is_none(), "the webhook body stays as the spec fixes it");
 }
 ```
 
 Run: engine command `--lib incidents::format`. Expected: FAIL to compile.
 
-- [ ] **Step 2: Implement** `format.rs` to the rules above. `signature` uses `Hmac::<Sha256>::new_from_slice(secret)`, `update(body)`, then `hex::encode(finalize().into_bytes())`.
+- [ ] **Step 2: Implement** `format.rs` to the rules above. `hmac_hex` uses `Hmac::<Sha256>::new_from_slice(secret)`, `update(bytes)`, then `hex::encode(finalize().into_bytes())`. `signature` feeds `timestamp.to_string()`, `b"."` and the body into one MAC (no intermediate copy needed). The same commit updates the webhook bullet of `docs/superpowers/specs/2026-10-13-incident-management-design.md` to R29's format and receiver guidance, noting the controller ruling.
 
 - [ ] **Step 3: Run** engine command `--lib incidents::format`, then clippy. Expected: PASS.
 
@@ -2050,14 +2080,15 @@ async fn a_rejected_request_is_not_retried(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test]
-async fn webhooks_are_signed_and_carry_the_delivery_id(pool: sqlx::PgPool) {
+async fn webhooks_are_signed_with_a_timestamp_and_carry_the_delivery_id(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
     let (user, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
     let incident = open_test_incident(&pool, project, user).await;
     let hook = MockServer::start().await;
-    Mock::given(method("POST")).and(header_exists("x-nami-signature")).and(header_exists("x-nami-delivery"))
+    Mock::given(method("POST")).and(header_exists("x-nami-signature")).and(header_exists("x-nami-timestamp"))
+        .and(header_exists("x-nami-delivery"))
         .respond_with(ResponseTemplate::new(204)).expect(1).mount(&hook).await;
     let channel = insert_channel(&pool, Some(project), None, "hook", ChannelConfig::Webhook { url: hook.uri() }).await;
     queue(&pool, incident, "p0r0s0", Target::Channel { channel_id: channel, user_id: None }).await;
@@ -2067,8 +2098,14 @@ async fn webhooks_are_signed_and_carry_the_delivery_id(pool: sqlx::PgPool) {
     let sealed: Vec<u8> = sqlx::query_scalar("select signing_secret_enc from notification_channels where id = $1")
         .bind(channel).fetch_one(&pool).await.unwrap();
     let secret = state.cipher.decrypt(&nami_engine::models::channel::signing_secret_context(channel), &sealed).unwrap();
-    let expected = nami_engine::incidents::format::signature(&secret, &request.body);
+    let timestamp: i64 = request.headers.get("x-nami-timestamp").unwrap().to_str().unwrap().parse().unwrap();
+    assert!((chrono::Utc::now().timestamp() - timestamp).abs() <= 60, "a fresh unix-seconds timestamp");
+    let expected = nami_engine::incidents::format::signature(&secret, timestamp, &request.body);
     assert_eq!(request.headers.get("x-nami-signature").unwrap().to_str().unwrap(), expected);
+    // What a receiver does (R29): HMAC over "{timestamp}.{raw body}".
+    let mut signed = format!("{timestamp}.").into_bytes();
+    signed.extend_from_slice(&request.body);
+    assert_eq!(expected, format!("sha256={}", nami_engine::incidents::format::hmac_hex(&secret, &signed)));
     let body: Value = serde_json::from_slice(&request.body).unwrap();
     assert_eq!(body["event"], "incident.triggered");
     assert_eq!(body["incident"]["id"], json!(incident));
@@ -2308,7 +2345,7 @@ returning d.id, d.incident_id, d.event, d.round, d.user_id, d.channel_id, d.atte
    The email address appears in the event message only for that user's own implicit email (members can see each other's addresses on the project already).
 
 `send_to_channel` per kind (method POST, JSON body, 10 s from the client):
-- webhook: `webhook_body`, headers `content-type: application/json`, `x-nami-signature`, `x-nami-delivery: <id>`, `x-nami-event`.
+- webhook: `webhook_body`, headers `content-type: application/json`, `x-nami-timestamp: <unix seconds, taken just before this attempt>`, `x-nami-signature: sha256=<hex>` over `{timestamp}.{body}` (R29), `x-nami-delivery: <id>`, `x-nami-event`.
 - slack / discord / teams: their JSON.
 - telegram: `{telegram_base}/bot{token}/sendMessage` with `format::telegram`.
 - email (project channel): `send_email` to the configured address.
@@ -2629,7 +2666,7 @@ Branch `feat/NAMI-INC-7-schedules-api`, worktree `.worktrees/NAMI-INC-7/`.
 
 **Files:**
 - Create: `nami-engine/migrations/0063_create_on_call_schedules.sql`, `nami-engine/src/models/schedule.rs`, `nami-engine/src/routes/schedules.rs`
-- Modify: `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/src/models/project.rs` + `nami-engine/src/routes/projects.rs` (the members list, R28), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (schedule POST/PUT, override POST)
+- Modify: `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/src/models/project.rs` + `nami-engine/src/routes/projects.rs` (the members list and the caller's `role` on `GET /projects/{id}`, R28), `nami-ui/src/routes/(app)/projects/[id=uuid]/+layout.server.ts` (return `role` with `project`; default `'viewer'` when the field is missing) + `section.test.ts` (the layout passes `role` through), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (schedule POST/PUT, override POST)
 - Test: `nami-engine/tests/schedules_api.rs`
 
 **Interfaces:**
@@ -2643,6 +2680,13 @@ pub struct MemberView { pub user_id: Uuid, pub email: String, pub project_role: 
 pub async fn list_members(pool: &PgPool, project_id: Uuid) -> Result<Vec<MemberView>, sqlx::Error>; // by email
 // routes::projects: add `.get(list_members)` to the existing
 // `.route("/projects/{id}/members", post(add_member))` line (one route, two methods), viewer.
+// GET /projects/{id} (R28, controller ruling) returns `ProjectView`, the project plus the caller's
+// effective role; `models::project::Project` itself is unchanged (the list route keeps its shape).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectView { #[serde(flatten)] pub project: Project, pub role: String }  // "admin" | "member" | "viewer"
+/// Global admin → "admin" (member or not); otherwise the `project_members.project_role`.
+/// Called after `require_project_role(.., "viewer")` passed, so a row exists for non-admins.
+pub async fn effective_role(pool: &PgPool, user: &CurrentUser, project_id: Uuid) -> Result<String, sqlx::Error>;
 
 // models::schedule
 pub const MAX_SCHEDULES_PER_PROJECT: i64 = 50;
@@ -2812,6 +2856,25 @@ async fn viewers_list_project_members_and_outsiders_get_403(pool: sqlx::PgPool) 
     let entry = members.as_array().unwrap().iter().find(|m| m["user_id"] == json!(alice)).unwrap().clone();
     assert_eq!(entry, json!({"user_id": alice, "email": alice_email, "project_role": "member"}));
     let (status, _) = call(&app, "GET", &path, Some(&outsider), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[sqlx::test]
+async fn the_project_tells_the_caller_its_effective_role(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    for role in ["admin", "member", "viewer"] {
+        let (_, _, cookie) = user_with_role(&app, &pool, project, Some(role)).await;
+        let (status, body) = call(&app, "GET", &format!("/projects/{project}"), Some(&cookie), None).await;
+        assert_eq!((status, body["role"].as_str()), (StatusCode::OK, Some(role)), "{body}");
+    }
+    let email = common::unique_email("root");
+    common::seed_user(&pool, &email, "admin").await;
+    let root = common::login(&app, &email).await;
+    let (_, body) = call(&app, "GET", &format!("/projects/{project}"), Some(&root), None).await;
+    assert_eq!(body["role"], "admin", "a global admin without membership is admin");
+    let (_, _, outsider) = user_with_role(&app, &pool, project, None).await;
+    let (status, _) = call(&app, "GET", &format!("/projects/{project}"), Some(&outsider), None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
@@ -3419,10 +3482,11 @@ pub async fn recipients(conn: &mut PgConnection, project_id: Uuid, step_id: Uuid
 // `sent` triggered delivery in the current generation (rounds `like 'g' || generation || 'p%'`;
 // the `p` keeps g1 from matching g10), or, for `escalation_legacy` incidents, one email per
 // project member, round "resolved:g{generation}".
-/// R17: resolves without queuing any notice; the `resolved` event carries {"silent": true}.
+/// R17/R30: `resolve_source` with a reason (≤ 200 chars, unsafe chars → space). Queues the normal
+/// `resolved` notices; the `resolved` event's message is the reason, metadata {"reason": ..}.
 /// Only Logs Part 2's disable path (`resolve_alert_incident(.., notify: false)`) uses it (Task 10).
-pub async fn resolve_source_silently(conn: &mut PgConnection, source: &IncidentSource, at: DateTime<Utc>)
-    -> Result<Option<Uuid>, sqlx::Error>;
+pub async fn resolve_source_with_reason(conn: &mut PgConnection, source: &IncidentSource, at: DateTime<Utc>,
+    reason: &str) -> Result<Option<Uuid>, sqlx::Error>;
 ```
 
 `tests/common/mod.rs` gains:
@@ -3786,7 +3850,7 @@ async fn an_outage_never_replays_missed_steps_as_a_burst(pool: sqlx::PgPool) {
 
 Run: engine command `--test escalation_engine`. Expected: FAIL.
 
-- [ ] **Step 2: Implement** `run.rs`, the `resolve` hook, `resolve_source_silently` and `kick` as specified above. `kick` takes its `KICKS` permit (Task 5), then runs `escalation::run::tick` and then `deliveries::drain`, logging each error separately: a failed tick never skips the drain. Add a lifecycle test in `tests/incident_lifecycle.rs`: `a_silent_resolution_queues_nothing`. A monitor incident whose step already sent one email, resolved with `resolve_source_silently`, has no `resolved:g0` delivery, and its last event is `resolved` with metadata `{"silent": true}`.
+- [ ] **Step 2: Implement** `run.rs`, the `resolve` hook, `resolve_source_with_reason` and `kick` as specified above. The drain fills `IncidentSummary.resolution_reason` for `resolved` deliveries from `select message from incident_events where incident_id = $1 and kind = 'resolved' order by id desc limit 1` (R30). `kick` takes its `KICKS` permit (Task 5), then runs `escalation::run::tick` and then `deliveries::drain`, logging each error separately: a failed tick never skips the drain. Add a test in `tests/escalation_engine.rs`: `a_resolution_with_a_reason_notifies_the_paged_with_it`. A monitor incident whose step already emailed alice, resolved with `resolve_source_with_reason(.., "alert disabled")`, queues one `resolved:g0` delivery for alice. After `run_incident_ticks` her second email is `[Nami] Resolved: <title>` and its body contains `Reason: alert disabled`. The last event is `resolved` with message `alert disabled` and metadata `{"reason": "alert disabled"}`.
 - [ ] **Step 3: Run** engine command `--test escalation_engine --test notification_deliveries --test incidents_api --test incident_lifecycle`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
 - [ ] **Step 4: Commit**
 
@@ -3806,7 +3870,8 @@ Branch `feat/NAMI-INC-10-incident-routing`, worktree `.worktrees/NAMI-INC-10/`.
 - Modify:
   - `nami-engine/src/models/incident.rs`: the six wrappers read the source's `escalation_policy_id`/`severity_id` and pass them to `lifecycle::open`.
   - `nami-engine/src/uptime/alerts.rs`: `notify_transition` calls `incidents::worker::kick`. `render` and its unit tests are removed, including Logs Part 2's `log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert` and NAMI-UP-21's `heartbeat_output_is_quoted_line_by_line_between_since_and_details` / `details_are_sanitized_again_when_rendered`. Their properties live in `incidents::format`'s tests (Task 4). `sanitize_cause`, `Transition` (with UP-21's `details`) and `Subject` stay: the worker's `log_dropped` and the call sites use them.
-  - `nami-engine/src/logs/alerts.rs`: the R-P2-27 seam. `resolve_alert_incident(.., notify: false)` calls `lifecycle::resolve_source_silently` instead of the wrapper (R17). `open_alert_incident` and the `notify: true` path are unchanged.
+  - `nami-engine/src/logs/alerts.rs`: the R-P2-27 seam. `resolve_alert_incident(.., notify: false)` calls `lifecycle::resolve_source_with_reason(.., "alert disabled")` instead of the wrapper (R17, controller ruling). `open_alert_incident` and the `notify: true` path are unchanged. `routes/log_alerts.rs`: the PATCH handler calls `incidents::worker::kick(&state).await` after the update commits.
+  - `docs/superpowers/plans/2026-10-13-log-management-part2.md` is merged history and is not edited. The Part 1 decisions log records that R17 supersedes R-P2-27's silent disable.
   - `nami-engine/src/main.rs`: spawn `incidents::worker::run_forever(state.clone())` when `state.config.incidents_worker_enabled`, next to the uptime worker block, with the same two log lines (`"incidents worker started"` / `"incidents worker disabled (INCIDENTS_WORKER_ENABLED=false)"`). R23, R27.
   - `nami-engine/src/models/{monitor,heartbeat,log_alert}.rs` and their routes: the two new optional fields in create/patch bodies and views.
   - The existing tests that assert alert subjects (R18): `tests/uptime_worker.rs`, `tests/heartbeats.rs`, `tests/maintenance_windows.rs`, `tests/recovery_threshold.rs`, `tests/uptime_worker_timing.rs`, `tests/checker_http_config.rs`, `tests/log_alerts.rs`, `tests/heartbeat_pings.rs` (NAMI-UP-21).
@@ -4006,7 +4071,42 @@ pub async fn notify_transition(state: &AppState, _transition: &Transition) {
 
 Delete `render` and its unit tests. The escaping they covered (CR/LF in names never reaching a subject) is covered by `incidents::format` (`email_subject_and_body_carry_severity_and_links_on_single_lines`). The heartbeat output quoting is covered by `a_cause_cannot_forge_a_link_line_and_job_output_is_quoted`. Fix the uses of `render` that the compiler reports. Logs Part 2's `log_alert_emails_say_triggered_and_resolved...` test and NAMI-UP-21's two `render` tests go with it.
 
-The log-alert seam (R17): in `logs::alerts::resolve_alert_incident`, `notify: false` calls `lifecycle::resolve_source_silently(conn, &IncidentSource::LogAlert(alert_id), at)` and returns `None`. Logs Part 2's disable test (the alert disabled while alerting resolves its incident and sends nothing) must keep passing unchanged.
+The log-alert seam (R17, controller ruling): in `logs::alerts::resolve_alert_incident`, `notify: false` calls `lifecycle::resolve_source_with_reason(conn, &IncidentSource::LogAlert(alert_id), at, "alert disabled")` and returns `None`. Logs Part 2's "no email on disable" behaviour is **superseded** from this task on. Its disable test in `tests/log_alerts.rs` (the alert disabled while alerting resolves its incident) is updated in Step 4 to expect, after `common::run_incident_ticks`, exactly one `[Nami] Resolved: Log alert: <name>` email per member who got the triggered email, with `Reason: alert disabled` in the body. A member never paged gets nothing.
+
+Add to `tests/incident_routing.rs`:
+
+```rust
+#[sqlx::test]
+async fn disabling_an_alerting_log_alert_resolves_and_tells_the_paged_why(pool: sqlx::PgPool) {
+    let state = nami_engine::state::AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (alice, alice_email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    set_policy(&app, project, &admin, json!({"name": "Default",
+        "steps": [{"delay_minutes": 0, "targets": [{"type": "user", "id": alice}]}]})).await;
+    let alert: Uuid = sqlx::query_scalar(
+        "insert into log_alerts (project_id, name, threshold, comparison, window_seconds, interval_seconds)
+         values ($1, 'Checkout errors', 10, 'gt', 300, 60) returning id")
+        .bind(project).fetch_one(&pool).await.unwrap();
+    let due = alerts::claim_due_alerts(&pool, 10).await.unwrap();
+    let transition = alerts::apply_evaluation(&pool, &due[0], 12, chrono::Utc::now()).await.unwrap().unwrap();
+    uptime_alerts::notify_transition(&state, &transition).await;
+    assert_eq!(settled_mail(&alice_email, 1).await.len(), 1);
+
+    let (status, body) = call(&app, "PATCH", &format!("/projects/{project}/log-alerts/{alert}"), Some(&admin),
+        Some(json!({"enabled": false}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    common::run_incident_ticks(&state).await;
+    let mail = settled_mail(&alice_email, 2).await;
+    assert_eq!(mail[1].0, "[Nami] Resolved: Log alert: Checkout errors");
+    assert!(mail[1].1.contains("Reason: alert disabled"), "{}", mail[1].1);
+    let (status, reason): (String, Option<String>) = sqlx::query_as(
+        "select i.status, e.message from incidents i join incident_events e on e.incident_id = i.id and e.kind = 'resolved'
+         where i.log_alert_id = $1").bind(alert).fetch_one(&pool).await.unwrap();
+    assert_eq!((status.as_str(), reason.as_deref()), ("resolved", Some("alert disabled")));
+}
+```
 
 - [ ] **Step 4: Update the existing assertions (R18)**
 
@@ -4018,6 +4118,7 @@ Run the full engine suite. Expect two kinds of failure.
 - heartbeats (sweep): `"[Nami] [high] X missed its heartbeat"` / `"[Nami] Resolved: X missed its heartbeat"`
 - heartbeats (failure ping, NAMI-UP-20): `"[Nami] [high] X reported a failure"` / `"[Nami] Resolved: X reported a failure"`
 - log alerts: `"[Nami] [high] Log alert: X"` / `"[Nami] Resolved: Log alert: X"`
+- Logs Part 2's disable test: from "no email" to one `Resolved` email with `Reason: alert disabled` per paged member (R17, superseding R-P2-27's silent disable).
 - `a_name_written_around_the_api_cannot_inject_headers_or_recipients`: unsafe characters now become spaces instead of being dropped, so the subject is `format!("[Nami] [high] API  Bcc: {victim}  Cc: {victim} is down")`. Its recipient/header assertions stay as they are.
 
 Body assertions that looked for `Cause: …` keep working (the format keeps that line). NAMI-UP-21's `Output:\n> …\n` assertion keeps working (Task 4).
@@ -4385,11 +4486,11 @@ Page behaviour:
 - **List** (`/projects/{id}/incidents`):
   - Tabs Unresolved (default), Acknowledged, Resolved, All. A source `<select>`. "Load more" carries the cursor in the query string.
   - Columns: severity badge, title (link to detail), source with link, started, duration, acknowledged by, status.
-  - A "New incident" form (members; shown to everyone, and the engine's 403 surfaces as the form error): title, description, severity, escalation policy. The `create` action redirects to the new incident.
+  - A "New incident" form, shown when `data.role` is `member` or `admin` (R28; viewers do not see it, and an engine 403 still surfaces as the form error): title, description, severity, escalation policy. The `create` action redirects to the new incident.
   - Query values are only forwarded after `parseListQuery` keeps them (known tab/source, cursor `^[A-Za-z0-9_-]{1,200}$`).
 - **Detail** (`/projects/{id}/incidents/{incidentId}`):
   - Header with title, severity badge, status, started/duration, source link, acknowledged/resolved by.
-  - Buttons: Acknowledge (open), Resolve (open/acknowledged), Reopen (resolved). Each is a named action posting `{}`.
+  - Buttons: Acknowledge (open), Resolve (open/acknowledged), Reopen (resolved). Each is a named action posting `{}`. They, the severity select, the comment form and the postmortem editor render only when `data.role` is `member` or `admin` (R28). An engine 403 still surfaces, and `incident-detail.test.ts` renders the page for `viewer` (no action forms) and `member`.
   - Severity `<select>` (action `severity`).
   - Timeline, oldest first: event label, actor email, time (UTC), and message. Messages render as text (Svelte escapes); comments keep line breaks with `white-space: pre-wrap`.
   - Comment form (action `comment`).
@@ -4550,10 +4651,10 @@ Values are trimmed. Secret inputs are `type="password"` with `autocomplete="off"
 
 Pages:
 - Both list channels (name, kind, summary, enabled toggle), with forms to create, edit, "Send test" (shows the engine's `ok` or error), and two-step delete (`confirm=yes`; the first submit returns `{ confirmDelete: id }`).
-- After a webhook create, the action result carries `signingSecret` once. It is shown in a copy box with "Shown once. Store it now." and never placed in a URL or a redirect.
+- After a webhook create, the action result carries `signingSecret` once. It is shown in a copy box with "Shown once. Store it now." and never placed in a URL or a redirect. Under it, the receiver guidance of R29: "Each request has `X-Nami-Timestamp` and `X-Nami-Signature: sha256=<hex>`, the HMAC-SHA256 of `{X-Nami-Timestamp}.{raw body}` with this secret. Reject requests whose timestamp is more than 5 minutes old, and drop repeats of `X-Nami-Delivery`."
 - Both loads set `cache-control: private, no-store`.
 - Channel ids from forms pass `isUuid` before reaching `enginePath`.
-- The project page shows the forms to everyone, and the engine's 403 for a non-admin surfaces as the form message (R28: the project layout has no role, and the engine stays the only authority). The page says "Only project admins can change project channels." above the forms.
+- The project page shows the create/edit/test/delete forms only when `data.role === 'admin'` (R28, controller ruling). Others see the list and the line "Only project admins can change project channels." The actions still surface an engine 403 as the form message (the engine stays the authority). `project-channels.test.ts` renders the page with `role: 'viewer'` (no `<form>`) and `role: 'admin'` (forms), and keeps the case where the engine answers 403 to a create.
 
 - [ ] **Step 1: Failing tests**
 
@@ -4660,7 +4761,7 @@ The editor page keeps steps in `$state` (add, remove, move up/down) and renders 
 - project channels: `GET /projects/{id}/notification-channels`;
 - policies: for the fallback, excluding itself.
 
-The list page shows policies, the default badge, a "Make default" action and two-step delete (a 409 shows the engine message). Admin-only forms; viewers read.
+The list page shows policies, the default badge, a "Make default" action and two-step delete (a 409 shows the engine message). Admin-only forms render only when `data.role === 'admin'` (R28); others read. Tests render both roles, and an engine 403 still surfaces. The policy/severity selects on monitor, heartbeat and log-alert forms follow those forms' existing (member) visibility.
 
 Source forms: `escalation_policy_id` and `severity_id` selects ("Project default" = empty). Create omits empty values. Edit sends `null` for empty (clear) and the id otherwise. Both values must pass `isUuid` when non-empty.
 
@@ -4775,7 +4876,7 @@ Pages:
 - The list shows schedules with "on call now" and "until" in the schedule's zone (also UTC in a tooltip), and creation (admin).
 - The detail page holds the editor (admin), participants order (move up/down), restrictions, the next 14 days of shifts (`shiftRows`; overrides marked), overrides (list, add, two-step delete), and a schedule delete (two-step; a 409 "used by escalation policy" is shown).
 - Non-member participants are flagged "not a project member: never paged" (R7).
-- Participant and override-user choices come from `GET /projects/{id}/members` (Task 7, R28). Admin forms are shown to everyone and the engine's 403 surfaces as the form message.
+- Participant and override-user choices come from `GET /projects/{id}/members` (Task 7, R28). Schedule, participant, restriction and override forms render only when `data.role === 'admin'`. The actions still surface an engine 403. Route tests render both roles (R28).
 
 - [ ] **Step 1: Failing tests**
 
@@ -4861,7 +4962,7 @@ Do not tick:
 - "Severities … and incident metadata": management is Part 2.
 - "UI for all of the above": that waits for Part 2.
 
-Record the rulings above (R1-R28, including the controller rulings in R18, R23 and R25) and any execution-time changes in `docs/superpowers/decisions/2026-10-13-incident-management-part1.md`.
+Record the rulings above (R1-R30, including the controller rulings in R8, R9, R16-R18, R23, R25, R28 and R29; R17 supersedes Logs Part 2's R-P2-27 silent disable) and any execution-time changes in `docs/superpowers/decisions/2026-10-13-incident-management-part1.md`.
 
 ## Final review (whole Part 1)
 
@@ -4879,7 +4980,7 @@ When NAMI-INC-1 .. NAMI-INC-15 are merged, run the sub-project's dedicated **sec
    - Channel configs and signing secrets are sealed under per-row contexts and never appear in responses, logs (INFO and below), the timeline, `Debug` output or error strings.
    - Grep the engine for `webhook_url`, `bot_token` and `signing_secret` uses outside `models/channel.rs`, `routes/channels.rs` and `incidents/send.rs`.
    - No type holding a secret derives `Debug` (Global Constraints), and no `tracing` call or `#[instrument]` records one.
-   - Webhook signatures are `HMAC-SHA256(secret, exact body bytes)`, verifiable by receivers. `X-Nami-Delivery` lets them drop at-least-once duplicates.
+   - Webhook signatures are `sha256=` + hex HMAC-SHA256(secret, `{X-Nami-Timestamp}.{exact body bytes}`) (R29), verifiable by receivers, with a fresh timestamp per attempt. `X-Nami-Delivery` lets them drop at-least-once duplicates and replays inside the 5-minute window.
    - `describe_error` never includes a URL.
 3. **Escaping.** Re-run the injection inputs (mentions, markup, HTML, links, CR/LF, bidi controls, oversized text) through all six formatters and the nami-ui pages (titles, comments, causes, timeline messages, postmortem markdown).
 4. **Escalation safety.**
