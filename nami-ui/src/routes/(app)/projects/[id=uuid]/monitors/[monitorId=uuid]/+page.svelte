@@ -22,6 +22,19 @@
 
 	let { data, form }: PageProps = $props();
 
+	// Advanced options, listed only when they differ from the defaults.
+	const advancedRows = $derived.by(() => {
+		const m = data.monitor;
+		const rows: { label: string; value: string }[] = [];
+		if (m.ip_version !== 'any') rows.push({ label: 'IP version', value: m.ip_version === 'ipv4' ? 'IPv4 only' : 'IPv6 only' });
+		if (m.remember_cookies) rows.push({ label: 'Cookies', value: 'remembered during a check' });
+		if (m.proxy_url) {
+			const auth = m.proxy_username ? `, user ${m.proxy_username}${m.has_proxy_password ? ', password set' : ''}` : m.has_proxy_password ? ', password set' : '';
+			rows.push({ label: 'Proxy', value: `${m.proxy_url}${auth}` });
+		}
+		return rows;
+	});
+
 	let now = $state(Date.now());
 	$effect(() => {
 		const refresh = setInterval(() => void refreshAll(), 30_000);
@@ -134,6 +147,14 @@
 						· recovers after {data.monitor.recovery_threshold} successful checks
 					{/if}
 				</p>
+				{#if advancedRows.length}
+					<dl class="mt-3 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+						{#each advancedRows as row (row.label)}
+							<dt class="text-muted">{row.label}</dt>
+							<dd class="font-mono wrap-anywhere text-ink-2">{row.value}</dd>
+						{/each}
+					</dl>
+				{/if}
 			</div>
 			<div class="flex flex-wrap gap-2">
 				<a href="{base}/edit" class={button}>Edit</a>

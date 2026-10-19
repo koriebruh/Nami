@@ -188,7 +188,7 @@ describe('new monitor action', () => {
 				method: 'POST',
 				path: `/projects/${PROJECT_ID}/monitors`,
 				search: '',
-				body: '{"name":"API","check_type":"http","url":"https://example.com","http_method":"GET","follow_redirects":true,"verify_ssl":true}'
+				body: '{"name":"API","check_type":"http","ip_version":"any","url":"https://example.com","http_method":"GET","follow_redirects":true,"verify_ssl":true,"remember_cookies":false}'
 			}
 		]);
 	});
