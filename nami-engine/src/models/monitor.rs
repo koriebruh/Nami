@@ -411,8 +411,8 @@ pub struct CreateMonitorRequest {
     pub interval_seconds: Option<i32>,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: i32,
-    #[serde(default = "default_confirmation_threshold")]
-    pub confirmation_threshold: i32,
+    /// Defaults by type, see [`default_confirmation_for`].
+    pub confirmation_threshold: Option<i32>,
     #[serde(default)]
     pub paused: bool,
     pub request_body: Option<String>,
@@ -457,8 +457,10 @@ fn is_expiry_type(check_type: &str) -> bool {
 fn default_timeout_seconds() -> i32 {
     10
 }
-fn default_confirmation_threshold() -> i32 {
-    2
+/// 2 failed checks, or 1 for the expiry types: they run daily, so waiting for
+/// a second failure would delay the alert by a day.
+fn default_confirmation_for(check_type: &str) -> i32 {
+    if is_expiry_type(check_type) { 1 } else { 2 }
 }
 fn default_true() -> bool {
     true
@@ -472,6 +474,9 @@ impl CreateMonitorRequest {
         let interval_seconds = self
             .interval_seconds
             .unwrap_or_else(|| default_interval_for(&self.check_type));
+        let confirmation_threshold = self
+            .confirmation_threshold
+            .unwrap_or_else(|| default_confirmation_for(&self.check_type));
         MonitorConfig {
             name: self.name,
             check_type: self.check_type,
@@ -485,7 +490,7 @@ impl CreateMonitorRequest {
             expected_status_max: self.expected_status_max,
             interval_seconds,
             timeout_seconds: self.timeout_seconds,
-            confirmation_threshold: self.confirmation_threshold,
+            confirmation_threshold,
             paused: self.paused,
             request_body: self.request_body,
             request_headers: match self.request_headers {
@@ -545,7 +550,9 @@ pub struct PatchMonitorRequest {
     pub dns_nameserver: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
     pub expected_value: Option<Option<String>>,
-    pub expiry_threshold_days: Option<i32>,
+    /// `null` resets to the type's default (see `validate_threshold`).
+    #[serde(default, deserialize_with = "nullable")]
+    pub expiry_threshold_days: Option<Option<i32>>,
 }
 
 /// A nullable PATCH field applied to its current value.
@@ -558,6 +565,15 @@ fn patched<T>(patch: Option<Option<T>>, current: Option<T>) -> Option<T> {
 
 impl PatchMonitorRequest {
     pub fn apply_to(self, base: MonitorConfig) -> MonitorConfig {
+        // The threshold's default differs per expiry type (14 days for ssl,
+        // 30 for domain): a type change drops the stored one unless the
+        // request names a value, and validation then fills the new default.
+        let new_type = self.check_type.as_deref().unwrap_or(&base.check_type);
+        let expiry_threshold_days = match self.expiry_threshold_days {
+            Some(explicit) => explicit,
+            None if new_type != base.check_type => None,
+            None => base.expiry_threshold_days,
+        };
         MonitorConfig {
             name: self.name.unwrap_or(base.name),
             check_type: self.check_type.unwrap_or(base.check_type),
@@ -593,7 +609,7 @@ impl PatchMonitorRequest {
             dns_record_type: self.dns_record_type.or(base.dns_record_type),
             dns_nameserver: patched(self.dns_nameserver, base.dns_nameserver),
             expected_value: patched(self.expected_value, base.expected_value),
-            expiry_threshold_days: self.expiry_threshold_days.or(base.expiry_threshold_days),
+            expiry_threshold_days,
         }
     }
 }

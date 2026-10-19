@@ -37,8 +37,18 @@ impl TestCa {
 
     /// A `localhost` certificate valid from 30 days ago until `not_after`.
     pub fn leaf(&self, not_after: time::OffsetDateTime) -> CertAndKey {
+        let not_before = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+        self.leaf_between(not_before, not_after)
+    }
+
+    /// A `localhost` certificate valid from `not_before` until `not_after`.
+    pub fn leaf_between(
+        &self,
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> CertAndKey {
         let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+        params.not_before = not_before;
         params.not_after = not_after;
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, &self.issuer).unwrap();
@@ -95,6 +105,45 @@ pub async fn serve_https_ok(cert_and_key: CertAndKey) -> u16 {
                         .await;
                     let _ = tls.shutdown().await;
                 }
+            });
+        }
+    });
+    port
+}
+
+/// How the handshakes of a counting TLS server went.
+#[derive(Default)]
+pub struct Handshakes {
+    pub full: std::sync::atomic::AtomicUsize,
+    pub resumed: std::sync::atomic::AtomicUsize,
+}
+
+/// Like [`serve_https_ok`], counting full and resumed handshakes.
+pub async fn serve_https_counting(cert_and_key: CertAndKey, handshakes: Arc<Handshakes>) -> u16 {
+    use std::sync::atomic::Ordering;
+    let acceptor = acceptor(cert_and_key);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (acceptor, handshakes) = (acceptor.clone(), Arc::clone(&handshakes));
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let counter = match tls.get_ref().1.handshake_kind() {
+                    Some(rustls::HandshakeKind::Resumed) => &handshakes.resumed,
+                    _ => &handshakes.full,
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut request = [0u8; 4096];
+                let _ = tls.read(&mut request).await;
+                let _ = tls
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
+                    .await;
+                let _ = tls.shutdown().await;
             });
         }
     });

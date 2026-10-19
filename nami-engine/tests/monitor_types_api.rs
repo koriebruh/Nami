@@ -760,3 +760,69 @@ async fn editing_an_expiry_monitor_revalidates_the_interval_and_threshold(pool: 
     assert_eq!(body["expiry_threshold_days"], Value::Null);
     assert_eq!(body["port"], Value::Null);
 }
+
+#[sqlx::test]
+async fn switching_between_expiry_types_resets_the_threshold_to_the_new_default(
+    pool: sqlx::PgPool,
+) {
+    let c = ctx(pool).await;
+    let (_, ssl) = c
+        .create(json!({ "name": "TLS", "check_type": "ssl_expiry", "host": "example.com", "expiry_threshold_days": 7 }))
+        .await;
+    let id = ssl["id"].as_str().unwrap();
+    assert_eq!(ssl["expiry_threshold_days"], 7);
+
+    // Renaming keeps it.
+    let (_, body) = c.patch(id, json!({ "name": "TLS 2" })).await;
+    assert_eq!(body["expiry_threshold_days"], 7);
+    // A type change without a value takes the new type's default.
+    let (status, body) = c.patch(id, json!({ "check_type": "domain_expiry" })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["expiry_threshold_days"], 30);
+    // ...and an explicit value wins.
+    let (_, body) = c
+        .patch(
+            id,
+            json!({ "check_type": "ssl_expiry", "expiry_threshold_days": 21 }),
+        )
+        .await;
+    assert_eq!(body["expiry_threshold_days"], 21);
+    // Sending the same type again is no change.
+    let (_, body) = c.patch(id, json!({ "check_type": "ssl_expiry" })).await;
+    assert_eq!(body["expiry_threshold_days"], 21);
+    // null resets to the type's default.
+    let (status, body) = c.patch(id, json!({ "expiry_threshold_days": null })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["expiry_threshold_days"], 14);
+    // Into an expiry type from another one.
+    let (_, ping) = c
+        .create(json!({ "name": "P", "check_type": "ping", "host": "example.com" }))
+        .await;
+    let (status, body) = c
+        .patch(
+            ping["id"].as_str().unwrap(),
+            json!({ "check_type": "domain_expiry", "interval_seconds": 86400 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["expiry_threshold_days"], 30);
+}
+
+#[sqlx::test]
+async fn expiry_monitors_alert_on_the_first_failed_check_by_default(pool: sqlx::PgPool) {
+    let c = ctx(pool).await;
+    for check_type in ["ssl_expiry", "domain_expiry"] {
+        let (_, created) = c
+            .create(json!({ "name": check_type, "check_type": check_type, "host": "example.com" }))
+            .await;
+        assert_eq!(created["confirmation_threshold"], 1, "{check_type}");
+        let (_, explicit) = c
+            .create(json!({ "name": "e", "check_type": check_type, "host": "example.com", "confirmation_threshold": 3 }))
+            .await;
+        assert_eq!(explicit["confirmation_threshold"], 3, "{check_type}");
+    }
+    let (_, http) = c
+        .create(json!({ "name": "h", "check_type": "http", "url": "https://example.com" }))
+        .await;
+    assert_eq!(http["confirmation_threshold"], 2, "other types keep 2");
+}

@@ -217,7 +217,7 @@ async fn rdap_failures_and_answers_without_an_expiration_are_down() {
     let cases = [
         (
             ResponseTemplate::new(200).set_body_json(rdap_body(None)),
-            "RDAP response has no expiration date",
+            "RDAP response has no expiration event",
         ),
         (ResponseTemplate::new(404), "RDAP lookup failed: HTTP 404"),
         (
@@ -292,14 +292,166 @@ async fn an_rdap_base_url_that_is_unusable_or_forbidden_is_down() {
 
 #[tokio::test]
 async fn a_huge_rdap_answer_is_read_only_up_to_the_cap() {
-    // Padding past the 1 MiB cap makes the JSON unparseable: down, not a hang or OOM.
-    let rdap =
-        rdap_answering(ResponseTemplate::new(200).set_body_string("x".repeat(3 * 1024 * 1024)))
-            .await;
+    // Valid JSON whose far-future expiration event lies past the 1 MiB cap:
+    // were the body read whole it would parse and the domain would be up.
+    let expires = Utc::now() + chrono::Duration::days(400);
+    let body = format!(
+        r#"{{"pad":"{}","events":[{{"eventAction":"expiration","eventDate":"{}"}}]}}"#,
+        "x".repeat(3 * 1024 * 1024),
+        expires.to_rfc3339()
+    );
+    assert!(serde_json::from_str::<serde_json::Value>(&body).is_ok());
+    let rdap = rdap_answering(ResponseTemplate::new(200).set_body_string(body)).await;
     let outcome = check_domain(&rdap, 30).await;
     assert_eq!(outcome.status, CheckStatus::Down);
     assert_eq!(
         outcome.error.as_deref(),
         Some("RDAP response is not valid JSON")
     );
+}
+
+#[tokio::test]
+async fn a_certificate_that_is_not_valid_yet_says_since_when() {
+    let ca = tls::TestCa::new();
+    let not_before = OffsetDateTime::now_utc() + Duration::days(2) + Duration::hours(1);
+    let cert = ca.leaf_between(not_before, not_before + Duration::days(90));
+    let port = tls::serve_https_ok(cert).await;
+    let outcome = check_ssl(&ca, "localhost", port, 14).await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(
+        outcome.error,
+        Some(format!("certificate not valid until {}", date_in(2)))
+    );
+}
+
+#[tokio::test]
+async fn rdap_dates_without_a_time_and_events_without_fields_are_understood() {
+    let soon = (Utc::now() + chrono::Duration::days(10))
+        .format("%Y-%m-%d")
+        .to_string();
+    let body = json!({ "events": [
+        { "eventDate": "2000-01-01" },
+        { "eventAction": "expiration" },
+        { "eventAction": "expiration", "eventDate": "not a date" },
+        { "eventAction": "expiration", "eventDate": soon },
+    ]});
+    let rdap = rdap_answering(ResponseTemplate::new(200).set_body_json(body)).await;
+    let outcome = check_domain(&rdap, 30).await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    assert_eq!(
+        outcome
+            .error
+            .as_deref()
+            .map(|e| e.starts_with("domain expires in ")),
+        Some(true),
+        "{:?}",
+        outcome.error
+    );
+
+    let body = json!({ "events": [{ "eventAction": "expiration", "eventDate": "someday" }] });
+    let rdap = rdap_answering(ResponseTemplate::new(200).set_body_json(body)).await;
+    let outcome = check_domain(&rdap, 30).await;
+    assert_eq!(
+        outcome.error.as_deref(),
+        Some("RDAP expiration date is not valid")
+    );
+}
+
+/// The boundary, end to end: a certificate with a little over N days left is
+/// up, one with a little under is down.
+#[tokio::test]
+async fn the_threshold_boundary_holds_end_to_end() {
+    let ca = tls::TestCa::new();
+    let just_over = OffsetDateTime::now_utc() + Duration::days(14) + Duration::minutes(5);
+    let port = tls::serve_https_ok(ca.leaf(just_over)).await;
+    assert_eq!(
+        check_ssl(&ca, "localhost", port, 14).await.status,
+        CheckStatus::Up
+    );
+    let just_under = OffsetDateTime::now_utc() + Duration::days(14) - Duration::minutes(5);
+    let port = tls::serve_https_ok(ca.leaf(just_under)).await;
+    let outcome = check_ssl(&ca, "localhost", port, 14).await;
+    assert_eq!(outcome.status, CheckStatus::Down);
+    let date =
+        (Utc::now() + chrono::Duration::days(14) - chrono::Duration::minutes(5)).format("%Y-%m-%d");
+    assert_eq!(
+        outcome.error,
+        Some(format!("certificate expires in 13 days ({date})"))
+    );
+}
+
+/// One config serves every check of a pass: it must never resume a session,
+/// which would skip verifying the certificate the server presents now.
+#[tokio::test]
+async fn ssl_checks_never_resume_a_tls_session() {
+    use std::sync::{Arc, atomic::Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn handshake(config: &Arc<rustls::ClientConfig>, port: u16) {
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut stream = tokio_rustls::TlsConnector::from(config.clone())
+            .connect(name, tcp)
+            .await
+            .unwrap();
+        // Reading is what hands the session ticket to the client.
+        stream.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response).await;
+    }
+
+    let ca = tls::TestCa::new();
+    let handshakes = Arc::new(tls::Handshakes::default());
+    let leaf = ca.leaf(OffsetDateTime::now_utc() + Duration::days(60));
+    let port = tls::serve_https_counting(leaf, Arc::clone(&handshakes)).await;
+
+    // The control: a default rustls client config does resume.
+    let default = Arc::new(
+        rustls::ClientConfig::builder_with_provider(tls::provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(ca.roots())
+            .with_no_client_auth(),
+    );
+    handshake(&default, port).await;
+    handshake(&default, port).await;
+    assert_eq!(handshakes.resumed.load(Ordering::SeqCst), 1, "control");
+    handshakes.full.store(0, Ordering::SeqCst);
+    handshakes.resumed.store(0, Ordering::SeqCst);
+
+    // The checker's own config, shared, never does.
+    let shared = client_config(ca.roots());
+    handshake(&shared, port).await;
+    handshake(&shared, port).await;
+    handshake(&shared, port).await;
+    assert_eq!(handshakes.full.load(Ordering::SeqCst), 3);
+    assert_eq!(handshakes.resumed.load(Ordering::SeqCst), 0);
+
+    // And the probe, sharing one context, shakes hands in full every time.
+    let ctx = CheckContext {
+        tls: shared,
+        ..check_context()
+    };
+    let monitor = Monitor {
+        host: Some("localhost".to_string()),
+        port: Some(i32::from(port)),
+        expiry_threshold_days: Some(14),
+        ..unsaved_monitor("ssl_expiry")
+    };
+    handshakes.full.store(0, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert_eq!(perform_check(&ctx, &monitor).await.status, CheckStatus::Up);
+    }
+    // The probe hangs up as soon as it has the certificate: let the server
+    // finish counting.
+    for _ in 0..100 {
+        if handshakes.full.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(handshakes.full.load(Ordering::SeqCst), 2);
+    assert_eq!(handshakes.resumed.load(Ordering::SeqCst), 0);
 }

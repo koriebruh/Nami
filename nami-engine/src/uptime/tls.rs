@@ -16,13 +16,17 @@ pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
-/// A client config trusting exactly `roots`.
+/// A client config trusting exactly `roots`. Session resumption is off: one
+/// config is shared by every check of a pass, and a resumed session skips
+/// verifying the certificate the server presents now, which is the whole point
+/// of an `ssl_expiry` check (see `HttpClients` for the same hazard).
 pub fn client_config(roots: RootCertStore) -> Arc<rustls::ClientConfig> {
-    let config = rustls::ClientConfig::builder_with_provider(provider())
+    let mut config = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .expect("the aws-lc-rs provider supports the default protocol versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
+    config.resumption = rustls::client::Resumption::disabled();
     Arc::new(config)
 }
 
@@ -81,6 +85,16 @@ fn describe_tls_error(error: &io::Error) -> String {
         }
         Some(rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer)) => {
             "certificate is not trusted (unknown issuer)".to_string()
+        }
+        Some(rustls::Error::InvalidCertificate(CertificateError::NotValidYetContext {
+            not_before,
+            ..
+        })) => format!(
+            "certificate not valid until {}",
+            date_of(not_before.as_secs() as i64)
+        ),
+        Some(rustls::Error::InvalidCertificate(CertificateError::NotValidYet)) => {
+            "certificate is not valid yet".to_string()
         }
         Some(rustls::Error::InvalidCertificate(other)) => {
             format!("certificate is not valid: {other}")
