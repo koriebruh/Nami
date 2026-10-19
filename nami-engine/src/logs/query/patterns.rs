@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::logs::{
-    query::search,
     query::{self, LogFilters, Sql, Window},
+    query::search,
 };
 use crate::{core::clickhouse::ClickHouse, core::error::AppError};
 
@@ -65,10 +65,7 @@ mod tests {
         // Grouping stays bounded and approximate past a million patterns (R-P2-10).
         assert_eq!(
             PATTERN_SETTINGS[2..],
-            [
-                ("max_rows_to_group_by", "1000000"),
-                ("group_by_overflow_mode", "any")
-            ]
+            [("max_rows_to_group_by", "1000000"), ("group_by_overflow_mode", "any")]
         );
     }
 }

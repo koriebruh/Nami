@@ -1,15 +1,6 @@
-use crate::{
-    core::error::AppError,
-    core::middleware::rbac::{CurrentUser, require_global_role, require_project_role},
-    core::state::AppState,
-    projects::model as project,
-};
-use axum::{
-    Json, Router,
-    extract::{Path, State},
-    routing::post,
-};
+use axum::{routing::post, Router, Json, extract::{State, Path}};
 use serde::Deserialize;
+use crate::{core::state::AppState, core::error::AppError, projects::model as project, core::middleware::rbac::{CurrentUser, require_global_role, require_project_role}};
 
 // axum 0.8 requires `{param}` path syntax, not the brief's pre-0.8 `:param`
 // syntax (panics at router-build time otherwise) — same issue as Task 10's
@@ -19,10 +10,7 @@ pub fn router() -> Router<AppState> {
         .route("/projects", post(create_project).get(list_projects))
         .route("/projects/{id}", axum::routing::get(get_project))
         .route("/projects/{id}/members", post(add_member))
-        .route(
-            "/projects/{id}/members/{user_id}",
-            axum::routing::delete(delete_member),
-        )
+        .route("/projects/{id}/members/{user_id}", axum::routing::delete(delete_member))
 }
 
 #[derive(Deserialize)]
@@ -45,8 +33,7 @@ async fn list_projects(
     State(state): State<AppState>,
     user: CurrentUser,
 ) -> Result<Json<Vec<project::Project>>, AppError> {
-    let projects =
-        project::list_projects_for_user(&state.db, user.id, user.global_role == "admin").await?;
+    let projects = project::list_projects_for_user(&state.db, user.id, user.global_role == "admin").await?;
     Ok(Json(projects))
 }
 
@@ -56,9 +43,7 @@ async fn get_project(
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<project::Project>, AppError> {
     require_project_role(&state.db, &user, id, "viewer").await?;
-    let project = project::find_by_id(&state.db, id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let project = project::find_by_id(&state.db, id).await?.ok_or(AppError::NotFound)?;
     Ok(Json(project))
 }
 

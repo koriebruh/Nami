@@ -1,17 +1,9 @@
-use crate::{
-    auth::{self, token_store, user},
-    core::error::AppError,
-    core::state::AppState,
-};
-use axum::{
-    Json, Router,
-    extract::{Path, Query, State},
-    routing::{get, post},
-};
-use oauth2::{AuthorizationCode, CsrfToken, Scope, TokenResponse};
+use axum::{routing::{get, post}, Router, Json, extract::{State, Query, Path}};
+use oauth2::{CsrfToken, Scope, AuthorizationCode, TokenResponse};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use tower_sessions::Session;
+use crate::{core::state::AppState, core::error::AppError, auth::{self, token_store, user}};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -57,10 +49,7 @@ async fn register(
         "message": "if this email is new, a verification link has been sent"
     }));
 
-    if user::find_by_email(&state.db, &payload.email)
-        .await?
-        .is_some()
-    {
+    if user::find_by_email(&state.db, &payload.email).await?.is_some() {
         return Ok(generic_response);
     }
 
@@ -122,10 +111,7 @@ async fn login(
         .await?
         .ok_or(AppError::Unauthorized)?;
 
-    let password_hash = user
-        .password_hash
-        .as_deref()
-        .ok_or(AppError::Unauthorized)?;
+    let password_hash = user.password_hash.as_deref().ok_or(AppError::Unauthorized)?;
     if !auth::password::verify_password(&payload.password, password_hash)? {
         return Err(AppError::Unauthorized);
     }
@@ -188,7 +174,10 @@ async fn logout(session: Session) -> Result<Json<Value>, AppError> {
     Ok(Json(json!({ "message": "logged out" })))
 }
 
-async fn me(State(state): State<AppState>, session: Session) -> Result<Json<Value>, AppError> {
+async fn me(
+    State(state): State<AppState>,
+    session: Session,
+) -> Result<Json<Value>, AppError> {
     let user_id: uuid::Uuid = session
         .get("user_id")
         .await
@@ -214,9 +203,7 @@ async fn me(State(state): State<AppState>, session: Session) -> Result<Json<Valu
         return Err(AppError::Unauthorized);
     }
 
-    Ok(Json(
-        json!({ "id": user.id, "email": user.email, "global_role": user.global_role }),
-    ))
+    Ok(Json(json!({ "id": user.id, "email": user.email, "global_role": user.global_role })))
 }
 
 /// Same staleness check as `me`: a session authenticated before the user's
@@ -268,9 +255,7 @@ async fn totp_setup(
         .execute(&state.db)
         .await?;
 
-    Ok(Json(
-        json!({ "provisioning_uri": auth::totp::provisioning_uri(&secret, &user.email) }),
-    ))
+    Ok(Json(json!({ "provisioning_uri": auth::totp::provisioning_uri(&secret, &user.email) })))
 }
 
 #[derive(Deserialize)]
@@ -288,9 +273,7 @@ async fn totp_enable(
         .bind(user_id)
         .fetch_one(&state.db)
         .await?;
-    let secret = user
-        .totp_secret
-        .ok_or_else(|| AppError::Validation("run setup first".into()))?;
+    let secret = user.totp_secret.ok_or_else(|| AppError::Validation("run setup first".into()))?;
 
     if !auth::totp::verify_code(&secret, &user.email, &payload.code) {
         return Err(AppError::Validation("invalid code".into()));
@@ -356,8 +339,7 @@ async fn forgot_password(
     State(state): State<AppState>,
     Json(payload): Json<ForgotPasswordRequest>,
 ) -> Result<Json<Value>, AppError> {
-    let generic_response =
-        Json(json!({ "message": "if this email exists, a reset link was sent" }));
+    let generic_response = Json(json!({ "message": "if this email exists, a reset link was sent" }));
 
     let Some(user) = user::find_by_email(&state.db, &payload.email).await? else {
         return Ok(generic_response);
@@ -370,11 +352,7 @@ async fn forgot_password(
     // failure propagate into a distinguishable error status.
     if let Err(e) = state
         .mailer
-        .send(
-            &user.email,
-            "Reset your Nami password",
-            format!("Reset: /auth/password/reset?token={raw_token}"),
-        )
+        .send(&user.email, "Reset your Nami password", format!("Reset: /auth/password/reset?token={raw_token}"))
         .await
     {
         tracing::error!(error = %e, "failed to send password reset email");
@@ -520,9 +498,13 @@ async fn oauth_callback(
         }
     };
 
-    let user =
-        user::find_or_create_oauth_user(&state.db, provider.as_str(), &provider_user_id, &email)
-            .await?;
+    let user = user::find_or_create_oauth_user(
+        &state.db,
+        provider.as_str(),
+        &provider_user_id,
+        &email,
+    )
+    .await?;
 
     // Rotate the session ID before promoting to a fully authenticated session,
     // mirroring `login`'s and `totp_verify`'s success paths. Without this, a

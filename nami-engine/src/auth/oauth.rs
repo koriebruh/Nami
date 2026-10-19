@@ -1,8 +1,8 @@
-use crate::core::config::Config;
 use oauth2::{
-    AuthUrl, ClientId, ClientSecret, EndpointNotSet, EndpointSet, RedirectUrl, TokenUrl,
-    basic::BasicClient,
+    basic::BasicClient, AuthUrl, ClientId, ClientSecret, EndpointNotSet, EndpointSet,
+    RedirectUrl, TokenUrl,
 };
+use crate::core::config::Config;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Provider {
@@ -44,7 +44,8 @@ impl Provider {
     pub fn client(
         &self,
         config: &Config,
-    ) -> BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet> {
+    ) -> BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>
+    {
         let (client_id, client_secret, auth_url, token_url) = match self {
             Provider::Google => (
                 &config.google_client_id,

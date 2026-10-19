@@ -1,20 +1,15 @@
-use axum::{
-    body::Body,
-    http::{Request, StatusCode, header},
-};
-use nami_engine::{auth, core::state::AppState};
-use serde_json::json;
+use axum::{body::Body, http::{Request, StatusCode, header}};
 use tower::ServiceExt;
+use nami_engine::{core::state::AppState, auth};
+use serde_json::json;
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState::for_test(pool);
-    nami_engine::core::router::with_fallback_connect_info(nami_engine::core::router::build_router(
-        state,
-    ))
-    .layer(nami_engine::core::router::configure_session_layer(
-        tower_sessions::MemoryStore::default(),
-        false,
-    ))
+    nami_engine::core::router::with_fallback_connect_info(nami_engine::core::router::build_router(state))
+        .layer(nami_engine::core::router::configure_session_layer(
+            tower_sessions::MemoryStore::default(),
+            false,
+        ))
 }
 
 #[sqlx::test]
@@ -40,9 +35,7 @@ async fn wrong_totp_code_never_creates_working_session(pool: sqlx::PgPool) {
                 .method("POST")
                 .uri("/auth/login")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({"email": "2fa@example.com", "password": "password123"}).to_string(),
-                ))
+                .body(Body::from(json!({"email": "2fa@example.com", "password": "password123"}).to_string()))
                 .unwrap(),
         )
         .await

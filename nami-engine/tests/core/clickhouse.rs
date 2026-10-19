@@ -6,7 +6,7 @@ use nami_engine::{
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CheckRow {
@@ -60,11 +60,7 @@ async fn insert_then_query_round_trips_uuids_datetimes_and_nulls() {
     let t0 = now_millis();
     let rows = vec![
         row(monitor_id, t0, None),
-        row(
-            monitor_id,
-            t0 + Duration::seconds(30),
-            Some("timeout after 10s"),
-        ),
+        row(monitor_id, t0 + Duration::seconds(30), Some("timeout after 10s")),
         row(Uuid::new_v4(), t0, None), // another monitor: must not come back
     ];
     ch.insert_rows("uptime_checks", &rows).await.unwrap();
@@ -113,11 +109,7 @@ async fn parameter_values_are_matched_literally_never_executed() {
         }
     };
 
-    assert_eq!(
-        count(hostile.to_string()).await,
-        1,
-        "value must round-trip byte-for-byte"
-    );
+    assert_eq!(count(hostile.to_string()).await, 1, "value must round-trip byte-for-byte");
     assert_eq!(
         count(hostile.replace("C:\\new", "C:new")).await,
         0,
@@ -125,16 +117,8 @@ async fn parameter_values_are_matched_literally_never_executed() {
     );
     // `+` stays a plus (not a space) and `%20` stays three literal characters
     // (not decoded a second time): each near-miss must differ from the stored value.
-    assert_eq!(
-        count(hostile.replace("a+b", "a b")).await,
-        0,
-        "`+` must not become a space"
-    );
-    assert_eq!(
-        count(hostile.replace("e%20f", "e f")).await,
-        0,
-        "`%20` must not be decoded"
-    );
+    assert_eq!(count(hostile.replace("a+b", "a b")).await, 0, "`+` must not become a space");
+    assert_eq!(count(hostile.replace("e%20f", "e f")).await, 0, "`%20` must not be decoded");
     let all: Vec<Count> = ch
         .query_rows("SELECT count() AS n FROM uptime_checks", &[])
         .await
@@ -206,10 +190,7 @@ async fn a_row_with_an_unknown_field_is_rejected_not_stored_with_defaults() {
     match error {
         ClickHouseError::Server { status, body } => {
             assert!((400..600).contains(&status), "status was {status}");
-            assert!(
-                body.contains("respnse_time_ms"),
-                "the error must name the field: {body:?}"
-            );
+            assert!(body.contains("respnse_time_ms"), "the error must name the field: {body:?}");
         }
         other => panic!("expected ClickHouseError::Server, got {other:?}"),
     }
@@ -217,10 +198,7 @@ async fn a_row_with_an_unknown_field_is_rejected_not_stored_with_defaults() {
         .query_rows("SELECT count() AS n FROM uptime_checks", &[])
         .await
         .unwrap();
-    assert_eq!(
-        stored[0].n, 0,
-        "the rejected row must not be stored with a defaulted column"
-    );
+    assert_eq!(stored[0].n, 0, "the rejected row must not be stored with a defaulted column");
     ch.drop_database().await.unwrap();
 }
 
@@ -241,11 +219,7 @@ async fn query_rows_is_read_only_so_ddl_and_writes_fail_on_the_read_path() {
         // `readonly=2` lets a request change other settings, never `readonly` itself.
         "SELECT 1 SETTINGS readonly = 0",
     ] {
-        match ch
-            .query_rows::<serde_json::Value>(sql, &[])
-            .await
-            .unwrap_err()
-        {
+        match ch.query_rows::<serde_json::Value>(sql, &[]).await.unwrap_err() {
             ClickHouseError::Server { body, .. } => {
                 assert!(body.contains("READONLY"), "{sql}: body was {body:?}");
             }
@@ -280,12 +254,7 @@ async fn query_rows_is_read_only_so_ddl_and_writes_fail_on_the_read_path() {
 #[tokio::test]
 async fn transport_errors_never_contain_parameter_values_or_credentials() {
     // Nothing listens on port 1, so the request fails before reaching a server.
-    let ch = ClickHouse::new(
-        "http://127.0.0.1:1",
-        "nami",
-        "hunter2-password",
-        "nami_guard_probe",
-    );
+    let ch = ClickHouse::new("http://127.0.0.1:1", "nami", "hunter2-password", "nami_guard_probe");
     let error = ch
         .query_rows::<serde_json::Value>(
             "SELECT {x:String}",
@@ -301,10 +270,7 @@ async fn transport_errors_never_contain_parameter_values_or_credentials() {
     // value; it must be stripped from both renderings (logs use either).
     for rendering in [error.to_string(), format!("{error:?}")] {
         for leaked in ["secret-param-value", "param_x", "hunter2-password"] {
-            assert!(
-                !rendering.contains(leaked),
-                "{leaked:?} leaked into {rendering:?}"
-            );
+            assert!(!rendering.contains(leaked), "{leaked:?} leaked into {rendering:?}");
         }
     }
 }
@@ -323,19 +289,12 @@ async fn credentials_travel_in_a_basic_auth_header_never_in_the_url() {
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert_eq!(
-        request
-            .headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok()),
+        request.headers.get("authorization").and_then(|v| v.to_str().ok()),
         Some("Basic bmFtaTpzM2NyZXQ="), // base64("nami:s3cret")
     );
     assert!(request.headers.get("x-clickhouse-key").is_none());
     assert!(request.headers.get("x-clickhouse-user").is_none());
-    assert!(
-        !request.url.as_str().contains("s3cret"),
-        "password in the URL: {}",
-        request.url
-    );
+    assert!(!request.url.as_str().contains("s3cret"), "password in the URL: {}", request.url);
 }
 
 /// The `name=value` pairs of the one request a mock server received.
@@ -494,10 +453,7 @@ async fn insert_rows_with_adds_its_settings_and_still_sends_the_ones_the_client_
     );
 }
 
-fn assert_invalid_identifier<T: std::fmt::Debug>(
-    result: Result<T, ClickHouseError>,
-    expected: &str,
-) {
+fn assert_invalid_identifier<T: std::fmt::Debug>(result: Result<T, ClickHouseError>, expected: &str) {
     match result {
         Err(ClickHouseError::InvalidIdentifier(name)) => assert_eq!(name, expected),
         other => panic!("expected InvalidIdentifier({expected:?}), got {other:?}"),
@@ -513,12 +469,12 @@ async fn invalid_identifiers_are_rejected_before_any_request_is_sent() {
     let any_row = || row(Uuid::new_v4(), now_millis(), None);
 
     let bad_names = [
-        "a\\b", // a backslash
-        "a.b",  // a dot (would address another database's table)
-        "a b",  // a space
-        "a;b",  // a statement separator
-        "",     // empty
-        "1abc", // leading digit
+        "a\\b",  // a backslash
+        "a.b",    // a dot (would address another database's table)
+        "a b",    // a space
+        "a;b",    // a statement separator
+        "",       // empty
+        "1abc",   // leading digit
         "a-b",
         "a`b",
         "a'b",
@@ -540,10 +496,7 @@ async fn invalid_identifiers_are_rejected_before_any_request_is_sent() {
         assert_invalid_identifier(ch.insert_rows("uptime_checks", &[any_row()]).await, bad);
         assert_invalid_identifier(ch.migrate().await, bad);
         assert_invalid_identifier(ch.execute("SELECT 1").await, bad);
-        assert_invalid_identifier(
-            ch.query_rows::<serde_json::Value>("SELECT 1", &[]).await,
-            bad,
-        );
+        assert_invalid_identifier(ch.query_rows::<serde_json::Value>("SELECT 1", &[]).await, bad);
     }
 
     // Passes `drop_database`'s test-prefix guard, so the identifier check is
@@ -558,19 +511,13 @@ async fn invalid_identifiers_are_rejected_before_any_request_is_sent() {
         .iter()
         .map(|request| request.url.to_string())
         .collect();
-    assert!(
-        received.is_empty(),
-        "requests reached the server: {received:?}"
-    );
+    assert!(received.is_empty(), "requests reached the server: {received:?}");
 }
 
 #[sqlx::test]
 async fn app_state_for_test_never_points_at_the_real_database(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool);
-    assert_ne!(
-        state.clickhouse.database(),
-        state.config.clickhouse_database
-    );
+    assert_ne!(state.clickhouse.database(), state.config.clickhouse_database);
     assert!(!state.clickhouse.database().starts_with("nami_test_"));
 }
 

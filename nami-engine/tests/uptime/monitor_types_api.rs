@@ -232,10 +232,7 @@ async fn ping_and_dns_hosts_follow_the_hardened_host_rules(pool: sqlx::PgPool) {
         }
     }
     let addresses = ["10.0.0.5", "::1", "2001:DB8:0:0::1", "[::1]"];
-    for (host, stored) in addresses
-        .iter()
-        .zip(["10.0.0.5", "::1", "2001:db8::1", "::1"])
-    {
+    for (host, stored) in addresses.iter().zip(["10.0.0.5", "::1", "2001:db8::1", "::1"]) {
         let (status, created) = c
             .create(json!({ "name": "ok", "check_type": "ping", "host": host }))
             .await;
