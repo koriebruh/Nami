@@ -71,6 +71,10 @@ pub const READ_SETTINGS: [(&str, &str); 2] = [
 /// refused with 429. A page load takes two (search and histogram).
 pub const MAX_QUERIES_PER_USER: usize = 4;
 
+/// Concurrent whole-row reads ([`entry`]) one user may have running (429
+/// past it); counted apart from searches.
+pub const MAX_ENTRY_READS_PER_USER: usize = 8;
+
 /// One log row as the API returns it.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LogEntry {

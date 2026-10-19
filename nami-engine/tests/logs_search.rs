@@ -866,7 +866,9 @@ async fn log_reads_are_capped_per_user(pool: sqlx::PgPool) {
             encode(&ts(Utc::now()))
         ),
     ];
-    for path in &paths {
+    // Entry reads (`paths[2]`) have their own cap, see
+    // `entry_reads_do_not_compete_with_searches`.
+    for path in &paths[..2] {
         assert_eq!(
             call(&app, "GET", path, Some(&viewer), None).await.0,
             StatusCode::TOO_MANY_REQUESTS,
@@ -888,5 +890,61 @@ async fn log_reads_are_capped_per_user(pool: sqlx::PgPool) {
         StatusCode::NOT_FOUND
     );
     assert_eq!(logs.query_slots.open(viewer_id), 0);
+    assert_eq!(logs.entry_slots.open(viewer_id), 0);
+    ch.drop_database().await.unwrap();
+}
+
+#[sqlx::test]
+async fn entry_reads_do_not_compete_with_searches(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let logs = state.logs.clone();
+    let public = public_app(state.clone());
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let (user, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    post_json(&public, &token, json!({ "message": "one" })).await;
+    let (_, page) = call(
+        &app,
+        "GET",
+        &format!("/projects/{project}/logs"),
+        Some(&viewer),
+        None,
+    )
+    .await;
+    let row = &page["logs"][0];
+    let entry = format!(
+        "/projects/{project}/logs/{}?dt={}",
+        row["id"].as_str().unwrap(),
+        encode(row["dt"].as_str().unwrap())
+    );
+
+    // Every search slot taken (a page, a histogram, a load-more, ...): entry reads still work.
+    let searches: Vec<_> = (0..nami_engine::logs::search::MAX_QUERIES_PER_USER)
+        .map(|_| nami_engine::logs::search::QueryPermit::acquire(&logs, user).unwrap())
+        .collect();
+    assert_eq!(
+        call(&app, "GET", &entry, Some(&viewer), None).await.0,
+        StatusCode::OK
+    );
+    drop(searches);
+
+    // Entry reads have their own cap.
+    let entries: Vec<_> = (0..nami_engine::logs::search::MAX_ENTRY_READS_PER_USER)
+        .map(|_| {
+            logs.entry_slots
+                .acquire(user, nami_engine::logs::search::MAX_ENTRY_READS_PER_USER)
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(
+        call(&app, "GET", &entry, Some(&viewer), None).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    drop(entries);
+    assert_eq!(
+        call(&app, "GET", &entry, Some(&viewer), None).await.0,
+        StatusCode::OK
+    );
     ch.drop_database().await.unwrap();
 }
