@@ -5,6 +5,7 @@ import {
 	engineFailure,
 	enginePath,
 	publicEngineUrl,
+	publicSyslogAddress,
 	redirectToLoginIfUnauthorized
 } from './engine';
 
@@ -360,5 +361,64 @@ describe('publicEngineUrl', () => {
 				expect(message, value).not.toContain('hunter2');
 			}
 		});
+	});
+});
+
+describe('publicSyslogAddress', () => {
+	const original = { syslog: process.env.PUBLIC_SYSLOG_ADDRESS, engine: process.env.PUBLIC_ENGINE_URL };
+	afterEach(() => {
+		for (const [key, value] of [
+			['PUBLIC_SYSLOG_ADDRESS', original.syslog],
+			['PUBLIC_ENGINE_URL', original.engine]
+		] as const) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	});
+
+	it('defaults to the public engine host on port 5140', () => {
+		delete process.env.PUBLIC_SYSLOG_ADDRESS;
+		process.env.PUBLIC_ENGINE_URL = 'https://engine.example.com';
+		expect(publicSyslogAddress()).toEqual({ host: 'engine.example.com', port: 5140 });
+		process.env.PUBLIC_ENGINE_URL = 'http://[::1]:8081';
+		expect(publicSyslogAddress()).toEqual({ host: '::1', port: 5140 });
+		process.env.PUBLIC_SYSLOG_ADDRESS = '  ';
+		expect(publicSyslogAddress()).toEqual({ host: '::1', port: 5140 });
+	});
+
+	it('uses PUBLIC_SYSLOG_ADDRESS when set', () => {
+		process.env.PUBLIC_SYSLOG_ADDRESS = 'logs.example.com:6514';
+		expect(publicSyslogAddress()).toEqual({ host: 'logs.example.com', port: 6514 });
+		process.env.PUBLIC_SYSLOG_ADDRESS = 'logs.example.com';
+		expect(publicSyslogAddress()).toEqual({ host: 'logs.example.com', port: 5140 });
+		process.env.PUBLIC_SYSLOG_ADDRESS = '10.0.0.5:514';
+		expect(publicSyslogAddress()).toEqual({ host: '10.0.0.5', port: 514 });
+		process.env.PUBLIC_SYSLOG_ADDRESS = '[2001:db8::1]:6514';
+		expect(publicSyslogAddress()).toEqual({ host: '2001:db8::1', port: 6514 });
+		process.env.PUBLIC_SYSLOG_ADDRESS = '[2001:db8::1]';
+		expect(publicSyslogAddress()).toEqual({ host: '2001:db8::1', port: 5140 });
+	});
+
+	it('refuses bad values without echoing them', () => {
+		for (const bad of [
+			'2001:db8::9',
+			'logs.example.com:0',
+			'logs.example.com:65536',
+			'logs.example.com:abc',
+			'a b',
+			'logs"; rm -rf /',
+			'tcp://logs.example.com:5140',
+			'user@logs.example.com',
+			'logs.example.com/path',
+			'logs.example.com\nx'
+		]) {
+			process.env.PUBLIC_SYSLOG_ADDRESS = bad;
+			expect(() => publicSyslogAddress(), bad).toThrow(/PUBLIC_SYSLOG_ADDRESS must be/);
+			try {
+				publicSyslogAddress();
+			} catch (e) {
+				expect(String(e)).not.toContain(bad);
+			}
+		}
 	});
 });

@@ -177,3 +177,27 @@ export function publicEngineUrl(): string {
 	// without its trailing slash(es).
 	return (url.origin + url.pathname).replace(/\/+$/, '');
 }
+
+/**
+ * Where syslog senders reach nami-engine's syslog listener, for the setup
+ * snippets: PUBLIC_SYSLOG_ADDRESS ("host" or "host:port", an IPv6 host in
+ * brackets), else the public engine host on the default port 5140. The host
+ * ends up inside a quoted rsyslog setting and is shown to every project
+ * member, so anything but a plain host name, IPv4 or IPv6 address and a port
+ * from 1 to 65535 is a configuration error. The message leaves the value out.
+ * The returned host has no IPv6 brackets (rsyslog's `target` takes it bare).
+ */
+export function publicSyslogAddress(): { host: string; port: number } {
+	const configured = (process.env.PUBLIC_SYSLOG_ADDRESS ?? '').trim();
+	if (configured === '') {
+		return { host: new URL(publicEngineUrl()).hostname.replace(/^\[|\]$/g, ''), port: 5140 };
+	}
+	const match = /^(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::(\d{1,5}))?$/.exec(configured);
+	const port = match?.[2] === undefined ? 5140 : Number(match[2]);
+	if (!match || port < 1 || port > 65535) {
+		throw new Error(
+			'PUBLIC_SYSLOG_ADDRESS must be a host name or IP address with an optional port, for example logs.example.com:5140 (an IPv6 address in brackets: [2001:db8::1]:5140)'
+		);
+	}
+	return { host: match[1].replace(/^\[|\]$/g, ''), port };
+}
