@@ -16,6 +16,7 @@ pub mod patterns;
 pub mod pipeline;
 pub mod pipeline_cache;
 pub mod query;
+pub mod saved_query;
 pub mod rate_limit;
 pub mod search;
 pub mod slots;
