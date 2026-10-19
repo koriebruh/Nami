@@ -9,6 +9,7 @@ use uuid::Uuid;
 use super::{
     normalize::{self, LogEvent},
     pattern,
+    pipeline::{CompiledPipeline, Outcome},
 };
 use crate::{
     clickhouse::{ClickHouse, ClickHouseError},
@@ -97,8 +98,8 @@ pub fn build_row(event: LogEvent, source: &IngestSource) -> LogRow {
 /// days a source may have) and a `dt` inside the window around `now`
 /// ([`normalize::clamp_to_accepted_range`]).
 ///
-/// Events are plain data (public fields) and later pipeline stages may
-/// rewrite them, so everything [`LogEvent::new`] and `from_json` guarantee is
+/// Events are plain data (public fields) and the source's pipeline
+/// ([`RowBatch::push`]) may have rewritten them, so everything [`LogEvent::new`] and `from_json` guarantee is
 /// enforced again here, and whatever path built the event, a stored row
 /// respects it:
 /// - the message and `fields` size caps, and the `dt` window;
@@ -151,18 +152,24 @@ pub fn build_row_at(event: LogEvent, source: &IngestSource, now: DateTime<Utc>) 
 /// (HTTP `ingest::build_batch`, the syslog batcher) turns events into rows
 /// with, so they all store the same rows under the same caps:
 ///
-/// normalized event -> (pipeline stages, a later sub-project: they will run
-/// here, on the event) -> pattern and row ([`build_row`], which enforces the
-/// message, fields, level, id and `dt` rules whatever built the event) ->
-/// counted against `max_stored_bytes` -> encoded with a cap
-/// ([`RowBatch::encode`] for a whole request, [`chunk_rows`] and
+/// normalized event -> the source's pipeline ([`CompiledPipeline::apply`]:
+/// drop, sample, remove, redact, rename; a dropped or sampled-out event is
+/// only counted, in [`RowBatch::pipeline_counts`]) -> pattern and row
+/// ([`build_row`], which enforces the message, fields, level, id and `dt`
+/// rules whatever built the event, so the pattern is computed from the
+/// redacted message) -> counted against `max_stored_bytes` -> encoded with a
+/// cap ([`RowBatch::encode`] for a whole request, [`chunk_rows`] and
 /// [`encode_run`] for frames that may be stored in several inserts).
 #[derive(Debug)]
 pub struct RowBatch {
     rows: Vec<LogRow>,
     stored: u64,
     max_stored_bytes: usize,
+    pipeline_counts: PipelineCounts,
 }
+
+/// Per source: (events dropped, events sampled out) by the pipeline.
+pub type PipelineCounts = HashMap<Uuid, (u64, u64)>;
 
 /// What a run of rows counts for, per source: (events, stored bytes).
 pub type SourceCounts = HashMap<Uuid, (u64, u64)>;
@@ -191,12 +198,31 @@ impl RowBatch {
             rows: Vec::with_capacity(capacity),
             stored: 0,
             max_stored_bytes,
+            pipeline_counts: PipelineCounts::new(),
         }
     }
 
-    /// Adds the row for `event` from `source`; [`StoredTooLarge`] (and the row
-    /// is not kept) once the rows would store more than the batch's cap.
-    pub fn push(&mut self, event: LogEvent, source: &IngestSource) -> Result<(), StoredTooLarge> {
+    /// Runs `pipeline` on `event` from `source`, then, when the event is kept,
+    /// adds its row; [`StoredTooLarge`] (and the row is not kept) once the
+    /// rows would store more than the batch's cap. A dropped or sampled-out
+    /// event is only counted ([`RowBatch::pipeline_counts`]).
+    pub fn push(
+        &mut self,
+        event: LogEvent,
+        source: &IngestSource,
+        pipeline: &CompiledPipeline,
+    ) -> Result<(), StoredTooLarge> {
+        let event = match pipeline.apply(event) {
+            Outcome::Keep(event) => event,
+            Outcome::Dropped => {
+                self.pipeline_counts.entry(source.id).or_default().0 += 1;
+                return Ok(());
+            }
+            Outcome::SampledOut => {
+                self.pipeline_counts.entry(source.id).or_default().1 += 1;
+                return Ok(());
+            }
+        };
         let row = build_row(event, source);
         let stored = self.stored + row.stored_bytes();
         if stored > self.max_stored_bytes as u64 {
@@ -209,6 +235,11 @@ impl RowBatch {
 
     pub fn rows(&self) -> &[LogRow] {
         &self.rows
+    }
+
+    /// What the pipeline left out, per source: (dropped, sampled out).
+    pub fn pipeline_counts(&self) -> &PipelineCounts {
+        &self.pipeline_counts
     }
 
     pub fn into_rows(self) -> Vec<LogRow> {
@@ -322,6 +353,10 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::logs::{
+        normalize::from_json,
+        pipeline::{compile, parse_rules},
+    };
 
     fn source(retention_days: i32) -> IngestSource {
         IngestSource {
@@ -329,7 +364,87 @@ mod tests {
             project_id: Uuid::new_v4(),
             retention_days,
             daily_byte_quota: None,
+            updated_at: Utc::now(),
         }
+    }
+
+    fn no_rules() -> CompiledPipeline {
+        CompiledPipeline::empty()
+    }
+
+    #[test]
+    fn the_pipeline_runs_between_the_event_and_the_row() {
+        let source = source(30);
+        let pipeline = compile(
+            &parse_rules(&json!([
+                {"type":"drop","match":{"field":"level","equals":"debug"}},
+                {"type":"redact","keys":["secret"],"regex":"tok_[a-z0-9]+"},
+                {"type":"sample","n":2,"match":{"message_regex":"^tick"}}
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+        let events = [
+            json!({"level":"debug","message":"noise"}),
+            json!({"message":"use tok_abc1 now","secret":"s3cr3t","nested":{"SECRET":"x"}}),
+            json!({"message":"tick 1"}),
+            json!({"message":"tick 2"}),
+        ]
+        .map(|v| from_json(v.as_object().unwrap().clone(), Utc::now()));
+        let mut batch = RowBatch::new(usize::MAX);
+        for event in events {
+            batch.push(event, &source, &pipeline).unwrap();
+        }
+        assert_eq!(batch.pipeline_counts()[&source.id], (1, 1));
+        let encoded = batch.encode(usize::MAX).unwrap();
+        assert_eq!(encoded.events, 2);
+        assert_eq!(encoded.per_source[&source.id].0, 2);
+        assert!(
+            !encoded.body.contains("tok_abc1") && !encoded.body.contains("s3cr3t"),
+            "{}",
+            encoded.body
+        );
+        assert!(
+            encoded.body.contains(r#""pattern":"use [REDACTED] now""#),
+            "{}",
+            encoded.body
+        );
+    }
+
+    #[test]
+    fn an_empty_pipeline_counts_nothing() {
+        let source = source(30);
+        let mut batch = RowBatch::new(usize::MAX);
+        batch.push(event_at(now()), &source, &no_rules()).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(batch.pipeline_counts().is_empty());
+    }
+
+    #[test]
+    fn redaction_that_grows_a_message_is_capped_again() {
+        let source = source(30);
+        let pipeline =
+            compile(&parse_rules(&json!([{"type":"redact","regex":"\\d"}])).unwrap()).unwrap();
+        let digits = "7".repeat(60 * 1024);
+        let event = from_json(
+            json!({ "message": digits, "f": "1".repeat(200 * 1024) })
+                .as_object()
+                .unwrap()
+                .clone(),
+            Utc::now(),
+        );
+        let mut batch = RowBatch::new(usize::MAX);
+        batch.push(event, &source, &pipeline).unwrap();
+        let encoded = batch.encode(usize::MAX).unwrap();
+        let row: Value = serde_json::from_str(encoded.body.lines().next().unwrap()).unwrap();
+        let message = row["message"].as_str().unwrap();
+        assert!(
+            message.len() <= normalize::MAX_MESSAGE_BYTES,
+            "{}",
+            message.len()
+        );
+        assert!(message.ends_with(normalize::TRUNCATION_MARKER));
+        assert!(row["fields"].as_str().unwrap().len() <= normalize::MAX_FIELDS_BYTES + 1024);
     }
 
     fn now() -> DateTime<Utc> {
@@ -382,9 +497,12 @@ mod tests {
             message: "m".repeat(len),
             ..event_at(now())
         };
-        batch.push(event(100), &source).unwrap();
-        batch.push(event(100), &source).unwrap();
-        assert_eq!(batch.push(event(100), &source), Err(StoredTooLarge));
+        batch.push(event(100), &source, &no_rules()).unwrap();
+        batch.push(event(100), &source, &no_rules()).unwrap();
+        assert_eq!(
+            batch.push(event(100), &source, &no_rules()),
+            Err(StoredTooLarge)
+        );
         assert_eq!(batch.len(), 2);
         let stored = batch.stored_bytes();
         assert_eq!(

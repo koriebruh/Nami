@@ -681,6 +681,7 @@ async fn list_rows_are_cut_and_the_entry_endpoint_returns_the_whole_row(pool: sq
         project_id,
         retention_days: 30,
         daily_byte_quota: None,
+        updated_at: chrono::Utc::now(),
     };
     let pad = "\u{1}".repeat(40_000);
     let base = (Utc::now() - Duration::minutes(5))

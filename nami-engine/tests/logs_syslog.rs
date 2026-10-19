@@ -757,3 +757,72 @@ async fn syslog_respects_the_encoded_insert_cap(pool: sqlx::PgPool) {
     );
     ch.drop_database().await.unwrap();
 }
+
+#[sqlx::test]
+async fn syslog_frames_go_through_the_pipeline(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let logs = state.logs.clone();
+    let project = seed_project(&pool).await;
+    let (source_id, token) = seed_source(&pool, project, "syslog").await;
+    source::set_pipeline(
+        &pool,
+        project,
+        source_id,
+        &json!([
+            {"type":"drop","match":{"message_regex":"^noise"}},
+            {"type":"redact","regex":"pw=\\S+"}
+        ]),
+    )
+    .await
+    .unwrap();
+    let handle = start(state).await;
+    let mut tcp = TcpStream::connect(handle.tcp_addr).await.unwrap();
+    for message in ["noise 1", "login pw=hunter2 ok"] {
+        tcp.write_all(format!("{}\n", frame(&token, message)).as_bytes())
+            .await
+            .unwrap();
+    }
+    rows_eventually(&ch, project, 1).await;
+    // Both frames were most likely in one batch; give a straggler time anyway.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let rows = stored_rows(&ch, project).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["message"], "login [REDACTED] ok");
+    assert!(!rows[0]["pattern"].as_str().unwrap().contains("hunter2"));
+    let pending = logs.usage.pending(source_id, Utc::now().date_naive());
+    assert_eq!((pending.events, pending.events_dropped), (1, 1));
+    assert_eq!(handle.stats.snapshot().accepted, 1);
+    ch.drop_database().await.unwrap();
+}
+
+#[sqlx::test]
+async fn syslog_frames_of_a_source_whose_pipeline_fails_are_dropped(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let project = seed_project(&pool).await;
+    let (source_id, token) = seed_source(&pool, project, "syslog").await;
+    let (_, other_token) = seed_source(&pool, project, "other").await;
+    sqlx::query(
+        "update sources set pipeline = '[{\"type\":\"redact\",\"regex\":\"(\"}]'::jsonb,
+                updated_at = clock_timestamp() where id = $1",
+    )
+    .bind(source_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let handle = start(state).await;
+    let mut tcp = TcpStream::connect(handle.tcp_addr).await.unwrap();
+    tcp.write_all(format!("{}\n", frame(&token, "pw=hunter2")).as_bytes())
+        .await
+        .unwrap();
+    let stats = stats_eventually(&handle, |s| s.store_failed >= 1).await;
+    assert_eq!(stats.store_failed, 1);
+    let mut other = TcpStream::connect(handle.tcp_addr).await.unwrap();
+    other
+        .write_all(format!("{}\n", frame(&other_token, "fine")).as_bytes())
+        .await
+        .unwrap();
+    let rows = rows_eventually(&ch, project, 1).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["message"], "fine", "other sources keep ingesting");
+    ch.drop_database().await.unwrap();
+}

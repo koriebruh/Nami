@@ -85,6 +85,9 @@ pub struct IngestSource {
     pub project_id: Uuid,
     pub retention_days: i32,
     pub daily_byte_quota: Option<i64>,
+    /// The key of the source's compiled pipeline in
+    /// `logs::pipeline_cache::PipelineCache` (every write moves it forward).
+    pub updated_at: DateTime<Utc>,
 }
 
 /// The user-editable fields of a source.
@@ -356,6 +359,18 @@ pub async fn get_pipeline(
         .await
 }
 
+/// The stored pipeline rules of a source and the `updated_at` they belong
+/// to (the ingest paths' cache key); `None` when the source is gone.
+pub async fn load_pipeline(
+    pool: &PgPool,
+    source_id: Uuid,
+) -> Result<Option<(serde_json::Value, DateTime<Utc>)>, sqlx::Error> {
+    sqlx::query_as("select pipeline, updated_at from sources where id = $1")
+        .bind(source_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// Replaces the rules (already validated by `logs::pipeline::compile`) and
 /// bumps `updated_at`; `None` when the project has no such source.
 pub async fn set_pipeline(
@@ -389,7 +404,7 @@ pub async fn ingest_source(
     source_id: Uuid,
 ) -> Result<Option<IngestSource>, sqlx::Error> {
     sqlx::query_as(
-        "select id, project_id, retention_days, daily_byte_quota from sources where id = $1 and project_id = $2",
+        "select id, project_id, retention_days, daily_byte_quota, updated_at from sources where id = $1 and project_id = $2",
     )
     .bind(source_id)
     .bind(project_id)
@@ -477,7 +492,7 @@ pub async fn find_by_token(
         return Ok(None);
     }
     sqlx::query_as(
-        "select id, project_id, retention_days, daily_byte_quota from sources where token_hash = $1",
+        "select id, project_id, retention_days, daily_byte_quota, updated_at from sources where token_hash = $1",
     )
     .bind(hash_token(token))
     .fetch_optional(pool)
@@ -498,7 +513,7 @@ pub async fn find_by_token_hashes(
         source: IngestSource,
     }
     let rows: Vec<Row> = sqlx::query_as(
-        "select token_hash, id, project_id, retention_days, daily_byte_quota from sources where token_hash = any($1)",
+        "select token_hash, id, project_id, retention_days, daily_byte_quota, updated_at from sources where token_hash = any($1)",
     )
     .bind(hashes)
     .fetch_all(pool)
