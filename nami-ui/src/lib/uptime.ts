@@ -288,6 +288,14 @@ export function isRedacted(m: Pick<Monitor, 'redacted'>): boolean {
 	return m.redacted === true;
 }
 
+function schemeOf(url: string): string | null {
+	try {
+		return new URL(url).protocol;
+	} catch {
+		return null;
+	}
+}
+
 function originOf(url: string | null): string | null {
 	try {
 		return url ? new URL(url).origin : null;
@@ -316,7 +324,7 @@ export function secretsMustBeReentered(edit: {
 	if (originOf(edit.storedUrl) === null || originOf(edit.storedUrl) !== originOf(edit.url.trim())) {
 		return SECRETS_ORIGIN_MESSAGE;
 	}
-	if (edit.storedVerifySsl && !edit.verifySsl && edit.url.trim().startsWith('https:')) {
+	if (edit.storedVerifySsl && !edit.verifySsl && schemeOf(edit.url.trim()) === 'https:') {
 		return SECRETS_TLS_MESSAGE;
 	}
 	return null;

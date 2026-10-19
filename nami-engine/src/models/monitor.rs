@@ -995,8 +995,7 @@ fn validate_dns(c: &mut MonitorConfig) -> Result<(), String> {
     let host = required_host(c)?;
     // An address has no records to look up (`169.254.169.254` would be down
     // forever with NXDOMAIN).
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    if bare.parse::<IpAddr>().is_ok() {
+    if is_ip_literal(&host) {
         return Err("host must be a domain name to look up".into());
     }
     c.host = Some(host);
@@ -1024,6 +1023,25 @@ fn validate_dns(c: &mut MonitorConfig) -> Result<(), String> {
     };
     c.expected_value = validate_expected_value(c.expected_value.take())?;
     Ok(())
+}
+
+/// Whether `host` names an address rather than a domain, in any spelling a
+/// resolver or URL parser would read as one: dotted, decimal (`2852039166`),
+/// hex or octal parts (`0xa9.0xfe.0xa9.0xfe`), a trailing dot, IPv6 with or
+/// without brackets, or a zone id (`fe80::1%en0`, which no name contains).
+fn is_ip_literal(host: &str) -> bool {
+    if host.contains('%') {
+        return true;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    matches!(
+        url::Host::parse(host),
+        Ok(url::Host::Ipv4(_) | url::Host::Ipv6(_))
+    )
 }
 
 /// ssl_expiry: a host, a port (default 443) and the days before expiry
@@ -1382,7 +1400,7 @@ fn secrets_stay_where_they_were(current: &Monitor, config: &MonitorConfig) -> Re
     let over_tls = config
         .url
         .as_deref()
-        .is_some_and(|u| u.starts_with("https:"));
+        .is_some_and(|u| reqwest::Url::parse(u).is_ok_and(|p| p.scheme() == "https"));
     if over_tls && current.verify_ssl && !config.verify_ssl {
         return Err("turning off certificate verification requires entering the header values and password again, or clearing them".into());
     }
@@ -2192,6 +2210,35 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error, "host must be a domain name to look up");
+        for host in [
+            "2852039166",
+            "0xa9.0xfe.0xa9.0xfe",
+            "0xa9fea9fe",
+            "169.254.169.254.",
+            "fe80::1%en0",
+            "127.1",
+        ] {
+            assert!(is_ip_literal(host), "{host}");
+            assert!(
+                validate(MonitorConfig {
+                    check_type: "dns".to_string(),
+                    host: Some(host.to_string()),
+                    ..MonitorConfig::from(&stored_monitor())
+                })
+                .unwrap_err()
+                .starts_with("host must be"),
+                "{host}"
+            );
+        }
+        for host in [
+            "example.com",
+            "example.com.",
+            "_dmarc.example.com",
+            "a1.b2",
+            "db.internal",
+        ] {
+            assert!(!is_ip_literal(host), "{host}");
+        }
         assert!(
             validate(MonitorConfig {
                 check_type: "dns".to_string(),

@@ -355,6 +355,9 @@ describe('secretsMustBeReentered', () => {
 	});
 	it('asks for them again when certificate checks are turned off over https', () => {
 		expect(secretsMustBeReentered({ ...edit, verifySsl: false })).toBe(SECRETS_TLS_MESSAGE);
+		expect(
+			secretsMustBeReentered({ ...edit, storedUrl: 'HTTPS://api.test/h', url: 'HTTPS://api.test/h', verifySsl: false })
+		).toBe(SECRETS_TLS_MESSAGE);
 		expect(secretsMustBeReentered({ ...edit, storedVerifySsl: false, verifySsl: false })).toBeNull();
 	});
 });

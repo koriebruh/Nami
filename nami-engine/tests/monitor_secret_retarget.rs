@@ -249,3 +249,22 @@ async fn a_monitor_whose_type_changes_drops_its_secrets_without_a_refusal(pool: 
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["has_auth_password"], false);
 }
+
+/// The scheme is case-insensitive: `HTTPS://` is https, and turning
+/// certificate checks off on it is refused like on `https://`.
+#[sqlx::test]
+async fn an_uppercase_https_scheme_is_still_https(pool: sqlx::PgPool) {
+    let s = setup(&pool, "https://example.com/health", true).await;
+    let (status, response) = s.patch(json!({ "url": "HTTPS://example.com/other" })).await;
+    assert_eq!(status, StatusCode::OK, "same origin: {response}");
+    let (status, response) = s.patch(json!({ "verify_ssl": false })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert_eq!(
+        response["error"],
+        "turning off certificate verification requires entering the header values and password again, or clearing them"
+    );
+    let (status, response) = s
+        .patch(json!({ "url": "HTTPS://example.com/x", "verify_ssl": false }))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+}
