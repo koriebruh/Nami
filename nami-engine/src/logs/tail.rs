@@ -1,9 +1,11 @@
 //! Live tail (`GET /projects/{id}/logs/tail`): Server-Sent Events of rows
 //! as they arrive.
 //!
-//! Every [`TailTimings::poll`] the engine reads the newest rows (at most
-//! [`TAIL_BATCH`]) with `dt` in the last [`TailTimings::lookback`] and sends
-//! the ones it has not sent yet as `event: log`, oldest first. Remembering
+//! Every [`TailTimings::poll`] the engine reads the ids of the newest rows
+//! (at most [`TAIL_BATCH`]) with `dt` in the last [`TailTimings::lookback`],
+//! then the list rows (`search::ENTRY_COLUMNS`, long messages cut) of only
+//! the ones it has not sent yet, and sends those as `event: log`, oldest
+//! first: a poll that finds nothing new reads ids and nothing else. Remembering
 //! sent ids instead of keeping only the last `(dt, id)` means a row that
 //! arrives late (a batching shipper's row whose `dt` is older than rows
 //! already shown) is still delivered, as long as its `dt` is within the
@@ -47,7 +49,7 @@ use crate::{
 };
 
 /// Most rows one poll reads; beyond that the newest are shown.
-pub const TAIL_BATCH: u32 = 1000;
+pub const TAIL_BATCH: u32 = 200;
 
 /// Rows dated further ahead than this are not tailed yet (ingest accepts a
 /// `dt` up to a day ahead; without an upper bound such rows would fill the
@@ -218,31 +220,67 @@ fn end_event(reason: &str) -> Event {
         .data(json!({ "reason": reason }).to_string())
 }
 
-/// The newest rows of the project matching `filters` with `dt >= since`.
-/// Same builder and the same read-only, time-limited client path as search.
-async fn fetch(
+#[derive(Debug, serde::Deserialize)]
+struct IdRow {
+    id: Uuid,
+    dt: DateTime<Utc>,
+}
+
+/// The ids (and `dt`) of the newest rows of the project matching `filters`
+/// with `dt` in `since..=until`, newest first. Same builder and the same
+/// read-only, time-limited client path as search.
+async fn fetch_ids(
     state: &AppState,
     project_id: Uuid,
     filters: &LogFilters,
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     batch: u32,
+) -> Result<Vec<IdRow>, AppError> {
+    let mut sql = Sql::new();
+    sql.push("SELECT id, dt FROM logs");
+    query::push_where(&mut sql, project_id, filters);
+    push_range(&mut sql, since, until);
+    sql.push(" ORDER BY dt DESC, id DESC LIMIT ")
+        .value("UInt32", batch.to_string());
+    state
+        .clickhouse
+        .query_rows_with(sql.text(), &sql.params(), &search::READ_SETTINGS)
+        .await
+        .map_err(search::user_error)
+}
+
+/// The list rows of `ids` (rows of the project with `dt` in
+/// `since..=until`), oldest first.
+async fn fetch_rows(
+    state: &AppState,
+    project_id: Uuid,
+    ids: &[Uuid],
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
 ) -> Result<Vec<LogEntry>, AppError> {
     let mut sql = Sql::new();
-    sql.push(ENTRY_COLUMNS);
-    query::push_where(&mut sql, project_id, filters);
+    sql.push(ENTRY_COLUMNS)
+        .push(" WHERE project_id = ")
+        .value("UUID", project_id.to_string());
+    push_range(&mut sql, since, until);
+    sql.push(" AND id IN (");
+    sql.list("UUID", ids);
+    sql.push(") ORDER BY dt, id");
+    let rows: Vec<RawEntry> = state
+        .clickhouse
+        .query_rows_with(sql.text(), &sql.params(), &search::READ_SETTINGS)
+        .await
+        .map_err(search::user_error)?;
+    Ok(rows.into_iter().map(LogEntry::from).collect())
+}
+
+fn push_range(sql: &mut Sql, since: DateTime<Utc>, until: DateTime<Utc>) {
     sql.push(" AND dt >= fromUnixTimestamp64Milli(")
         .value("Int64", since.timestamp_millis().to_string())
         .push(", 'UTC') AND dt <= fromUnixTimestamp64Milli(")
         .value("Int64", until.timestamp_millis().to_string())
-        .push(", 'UTC') ORDER BY dt DESC, id DESC LIMIT ")
-        .value("UInt32", batch.to_string());
-    let rows: Vec<RawEntry> = state
-        .clickhouse
-        .query_rows(sql.text(), &sql.params())
-        .await
-        .map_err(search::user_error)?;
-    Ok(rows.into_iter().map(LogEntry::from).collect())
+        .push(", 'UTC')");
 }
 
 enum SessionCheck {
@@ -363,24 +401,44 @@ pub async fn run(
         let since = now - lookback;
         let until = now + chrono::Duration::from_std(FUTURE_ALLOWANCE).unwrap_or_default();
         let polled = tokio::select! {
-            polled = fetch(&state, project_id, &filters, since, until, timings.batch) => polled,
+            polled = fetch_ids(&state, project_id, &filters, since, until, timings.batch) => polled,
             _ = tx.closed() => return,
         };
-        let rows = match polled {
-            Ok(rows) => rows,
+        let ids = match polled {
+            Ok(ids) => ids,
             Err(error) => {
                 tracing::warn!(error = ?error, "live tail poll failed");
                 continue;
             }
         };
-        for row in rows.into_iter().rev() {
-            if sent.contains(&row.id) {
+        let fresh: Vec<&IdRow> = ids.iter().filter(|row| !sent.contains(&row.id)).collect();
+        if !primed || fresh.is_empty() {
+            // Rows stored before the tail started are only remembered.
+            for row in fresh {
+                sent.insert(row.id, row.dt);
+            }
+            primed = true;
+            sent.prune(since, MAX_SENT_IDS);
+            continue;
+        }
+        let fresh_ids: Vec<Uuid> = fresh.iter().map(|row| row.id).collect();
+        let fetched = tokio::select! {
+            fetched = fetch_rows(&state, project_id, &fresh_ids, since, until) => fetched,
+            _ = tx.closed() => return,
+        };
+        let rows = match fetched {
+            Ok(rows) => rows,
+            Err(error) => {
+                // Not remembered: the next poll tries these rows again.
+                tracing::warn!(error = ?error, "live tail poll failed");
                 continue;
             }
+        };
+        // Remembered even when not returned (gone in between): asked once.
+        for row in fresh {
             sent.insert(row.id, row.dt);
-            if !primed {
-                continue;
-            }
+        }
+        for row in rows {
             let Ok(data) = serde_json::to_string(&row) else {
                 continue;
             };
@@ -389,7 +447,6 @@ pub async fn run(
                 return;
             }
         }
-        primed = true;
         sent.prune(since, MAX_SENT_IDS);
     }
 }

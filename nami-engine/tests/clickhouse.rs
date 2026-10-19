@@ -512,3 +512,58 @@ async fn app_state_for_test_never_points_at_the_real_database(pool: sqlx::PgPool
     assert_ne!(state.clickhouse.database(), state.config.clickhouse_database);
     assert!(!state.clickhouse.database().starts_with("nami_test_"));
 }
+
+#[derive(Debug, Deserialize)]
+struct Text {
+    s: String,
+}
+
+/// A response body over the client's cap is refused while it is read (with
+/// a declared length and without), instead of being buffered whole.
+#[tokio::test]
+async fn a_response_over_the_cap_is_refused() {
+    let ch = ClickHouse::create_test_database().await.unwrap();
+    let capped = ch.clone().with_max_response_bytes(10_000);
+    let small: Vec<Text> = capped
+        .query_rows("SELECT repeat('a', 100) AS s", &[])
+        .await
+        .unwrap();
+    assert_eq!(small[0].s.len(), 100);
+    let refused = capped
+        .query_rows::<Text>("SELECT repeat('a', 20000) AS s", &[])
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(ClickHouseError::ResponseTooLarge { limit: 10_000 })
+        ),
+        "{refused:?}"
+    );
+    // Many small rows add up the same way.
+    let refused = capped
+        .query_rows::<Text>("SELECT repeat('a', 100) AS s FROM numbers(1000)", &[])
+        .await;
+    assert!(
+        matches!(refused, Err(ClickHouseError::ResponseTooLarge { .. })),
+        "{refused:?}"
+    );
+    ch.drop_database().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_declared_length_over_the_cap_is_refused_before_reading() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(5000)))
+        .mount(&server)
+        .await;
+    let ch = ClickHouse::new(&server.uri(), "nami", "nami", "nami").with_max_response_bytes(4999);
+    let refused = ch.query_rows::<Text>("SELECT 1", &[]).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ClickHouseError::ResponseTooLarge { limit: 4999 })
+        ),
+        "{refused:?}"
+    );
+}

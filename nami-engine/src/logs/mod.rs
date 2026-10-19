@@ -29,8 +29,14 @@ pub struct LogsState {
     /// How many bodies of each source are decoded at once (see
     /// [`rate_limit::MAX_DECODES_PER_SOURCE`]).
     pub decode_shares: rate_limit::DecodeShares,
+    /// The same two limits per project (see
+    /// [`rate_limit::MAX_IN_FLIGHT_PER_PROJECT`]).
+    pub project_limits: rate_limit::ProjectLimits,
     pub usage: usage::UsageTracker,
     /// Live-tail timings (tests shorten them) and open-stream counts.
     pub tail: tail::TailTimings,
     pub tail_slots: tail::TailSlots,
+    /// Searches and histograms running per user (see
+    /// [`search::MAX_QUERIES_PER_USER`]).
+    pub query_slots: search::QuerySlots,
 }

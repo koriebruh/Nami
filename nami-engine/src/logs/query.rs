@@ -374,7 +374,8 @@ impl Sql {
             .collect()
     }
 
-    fn list<T: ToString>(&mut self, ty: &'static str, items: &[T]) {
+    /// Binds each of `items` and appends their placeholders, comma-separated.
+    pub fn list<T: ToString>(&mut self, ty: &'static str, items: &[T]) {
         for (i, item) in items.iter().enumerate() {
             if i > 0 {
                 self.push(", ");

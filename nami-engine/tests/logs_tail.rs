@@ -541,3 +541,62 @@ async fn future_dated_rows_do_not_starve_current_ones(pool: sqlx::PgPool) {
     );
     ch.drop_database().await.unwrap();
 }
+
+/// Security (memory amplification): the tail sends list rows, long messages
+/// cut and large fields left out, flagged `truncated`, and a poll reads only
+/// the rows it has not sent.
+#[sqlx::test]
+async fn tailed_rows_are_cut_like_list_rows(pool: sqlx::PgPool) {
+    use nami_engine::logs::search::{LIST_FIELDS_OMITTED, LIST_MESSAGE_CHARS};
+
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let state = AppState {
+        logs: fast(|_| {}),
+        ..state
+    };
+    let public = public_app(state.clone());
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let mut stream = SseStream::open(
+        &app,
+        &format!("/projects/{project}/logs/tail"),
+        Some(&viewer),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let pad = "\u{1}".repeat(40_000);
+    post_json(
+        &public,
+        &token,
+        json!([{ "message": "\u{1}".repeat(60_000), "pad": pad }, { "message": "small", "k": 1 }]),
+    )
+    .await;
+    let big = stream
+        .next_log(Duration::from_secs(5))
+        .await
+        .expect("a row");
+    let small = stream
+        .next_log(Duration::from_secs(5))
+        .await
+        .expect("a row");
+    assert_eq!(big["truncated"], true);
+    assert_eq!(
+        big["message"].as_str().unwrap().chars().count(),
+        LIST_MESSAGE_CHARS
+    );
+    assert_eq!(
+        big["fields"],
+        serde_json::from_str::<Value>(LIST_FIELDS_OMITTED).unwrap()
+    );
+    assert_eq!(small["truncated"], false);
+    assert_eq!(small["fields"], json!({ "k": 1 }));
+    assert_eq!(
+        stream.next(Duration::from_millis(700)).await,
+        None,
+        "nothing twice"
+    );
+    ch.drop_database().await.unwrap();
+}

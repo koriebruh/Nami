@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State, rejection::QueryRejection},
-    http::StatusCode,
+    http::{StatusCode, header},
     routing::{get, post},
 };
 use chrono::Utc;
@@ -16,6 +16,11 @@ use crate::{
     models::source::{self, CreateSourceRequest, PatchSourceRequest, Source, SourceWithToken},
     state::AppState,
 };
+
+/// Sent with every response that carries a token (create, reveal, rotate):
+/// no browser, proxy or BFF cache may keep it.
+const NO_STORE: NoStore = [(header::CACHE_CONTROL, "no-store")];
+type NoStore = [(header::HeaderName, &'static str); 1];
 
 // Viewers read sources but never their tokens; members create, edit, reveal
 // and rotate; admins delete.
@@ -57,19 +62,22 @@ async fn create_source(
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
     Json(payload): Json<CreateSourceRequest>,
-) -> Result<(StatusCode, Json<SourceWithToken>), AppError> {
+) -> Result<(StatusCode, NoStore, Json<SourceWithToken>), AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
     let config = source::validate(payload.into_config()).map_err(AppError::Validation)?;
-    let created = source::insert_source(&state.db, &state.cipher, project_id, &config)
-        .await
-        .map_err(|e| match &e {
-            // Global admins bypass membership: the project may not exist.
-            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
-                AppError::NotFound
+    let max = state.config.max_sources_per_project;
+    let created =
+        match source::create_source(&state.db, &state.cipher, project_id, &config, max).await? {
+            source::CreatedSource::Created(created) => created,
+            source::CreatedSource::ProjectFull => {
+                return Err(AppError::Conflict(format!(
+                    "a project may have at most {max} sources (MAX_SOURCES_PER_PROJECT)"
+                )));
             }
-            _ => AppError::Database(e),
-        })?;
-    Ok((StatusCode::CREATED, Json(created)))
+            // Global admins bypass membership: the project may not exist.
+            source::CreatedSource::NoProject => return Err(AppError::NotFound),
+        };
+    Ok((StatusCode::CREATED, NO_STORE, Json(created)))
 }
 
 async fn get_source(
@@ -113,24 +121,24 @@ async fn reveal_token(
     State(state): State<AppState>,
     user: CurrentUser,
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<(NoStore, Json<Value>), AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
     let token = source::reveal_token(&state.db, &state.cipher, project_id, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(json!({ "token": token })))
+    Ok((NO_STORE, Json(json!({ "token": token }))))
 }
 
 async fn rotate_token(
     State(state): State<AppState>,
     user: CurrentUser,
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<SourceWithToken>, AppError> {
+) -> Result<(NoStore, Json<SourceWithToken>), AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
     let rotated = source::rotate_token(&state.db, &state.cipher, project_id, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    Ok(Json(rotated))
+    Ok((NO_STORE, Json(rotated)))
 }
 
 #[derive(Debug, Deserialize)]

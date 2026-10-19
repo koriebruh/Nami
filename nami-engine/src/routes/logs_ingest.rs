@@ -28,8 +28,9 @@ use crate::{
 /// `Retry-After: 1` (shippers retry on their own), before any database work.
 /// A request holds its place from the token check until its work ends, also
 /// when the client has gone away (see `Work`), and one source may hold at
-/// most [`crate::logs::rate_limit::MAX_IN_FLIGHT_PER_SOURCE`] of them, so one
-/// token cannot take them all.
+/// most [`crate::logs::rate_limit::MAX_IN_FLIGHT_PER_SOURCE`] of them and one
+/// project at most [`crate::logs::rate_limit::MAX_IN_FLIGHT_PER_PROJECT`], so
+/// neither one token nor one project with many sources can take them all.
 ///
 /// The places bound the requests, and so the bodies *as received* (each up to
 /// [`ingest::MAX_BODY_BYTES`]); they do not bound what a body takes once it is
@@ -127,6 +128,7 @@ pub fn public_router(limits: IngestLimits) -> Router<AppState> {
 /// Order of checks, each cheaper than the next: the token's shape (401, no
 /// query) -> a free place (503, no query) -> the token (401) -> the rate limit
 /// (429 `rate_limited`) -> the source's requests in flight (429
+/// `too_many_in_flight`) -> the project's requests in flight (429
 /// `too_many_in_flight`) -> the quota (429 `quota_exceeded`) -> content type
 /// (415) -> body size and pace (413, 408) -> parse (400, 413 for too many
 /// events or too much decoded) -> store -> 202. Only events that were stored
@@ -166,6 +168,19 @@ async fn ingest_logs(
         state.logs.usage.record_rate_limited(source.id, today);
         return Err(IngestError::TooManyInFlight {
             limit: state.logs.in_flight.limit(),
+        });
+    };
+    // The project's cap too: however many sources it has, one project never
+    // holds more than its share of the endpoint's places.
+    let Some(project_in_flight) = state
+        .logs
+        .project_limits
+        .in_flight
+        .try_enter(source.project_id)
+    else {
+        state.logs.usage.record_rate_limited(source.id, today);
+        return Err(IngestError::ProjectTooManyInFlight {
+            limit: state.logs.project_limits.in_flight.limit(),
         });
     };
     if let Some(quota) = source.daily_byte_quota {
@@ -208,6 +223,7 @@ async fn ingest_logs(
         received_at,
         _place: place,
         _in_flight: in_flight,
+        _project_in_flight: project_in_flight,
     };
     let accepted = tokio::spawn(work.store(body, encoding))
         .await
@@ -234,6 +250,7 @@ struct Work {
     received_at: DateTime<Utc>,
     _place: OwnedSemaphorePermit,
     _in_flight: InFlightGuard,
+    _project_in_flight: InFlightGuard,
 }
 
 impl Work {
@@ -254,6 +271,7 @@ impl Work {
             self.received_at,
             &self.decodes,
             &self.logs.decode_shares,
+            &self.logs.project_limits.decode_shares,
         )
         .await?;
         if events > 0 {

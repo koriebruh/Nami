@@ -59,9 +59,12 @@ phases merge.
   and the uptime worker share:
   - at most 32 ingest requests run at once per engine instance; one that
     finds every place taken → `503` with `Retry-After: 1`, answered before
-    any database work. A source may have at most 4 requests in flight → `429`
-    `too_many_in_flight` (counted with the rate-limited requests), so one
-    token cannot take every place;
+    any database work. A source may have at most 4 requests in flight, and a
+    project at most 8 whatever its number of sources → `429`
+    `too_many_in_flight` (counted with the rate-limited requests), so neither
+    one token nor one project can take every place; a project has at most
+    `MAX_SOURCES_PER_PROJECT` sources (default 50, one more → 409) and at
+    most 2 bodies decoding at once;
   - at most 8 Postgres statements at once (never more than half the pool),
     so the API and the worker always find connections free;
   - the body must arrive at a pace: 5 s to start, then 64 KiB/s, 60 s at the
@@ -151,7 +154,7 @@ extraction → quota accounting → insert.
 
 ```sql
 CREATE TABLE IF NOT EXISTS logs (
-    id UUID,                          -- uuid v7, time-ordered tiebreaker
+    id UUID,                          -- uuid v7, halves swapped (below)
     project_id UUID,
     source_id UUID,
     dt DateTime64(3, 'UTC'),
@@ -176,6 +179,15 @@ TTL toDateTime(dt) + toIntervalDay(retention_days);
 Retention is per row (set from the source at ingest); changing a source's
 retention affects new rows only (documented in the UI).
 
+Row ids (ruling, final review of Part 1): an id is a UUIDv7 with its two
+64-bit halves swapped (`store::new_row_id`). ClickHouse compares `UUID`
+values by their second 8 bytes first, so a plain v7 would not sort in
+creation order inside `ORDER BY (project_id, dt, id)`; swapped, the
+timestamp and the high counter bits come first and ClickHouse's order is
+the generation order. Ids are opaque: nothing reads one back as a UUIDv7
+(a stored id does not parse as version 7 unless swapped back), they are
+only unique and ordered.
+
 ### Search
 
 `GET /projects/{id}/logs` with:
@@ -196,6 +208,16 @@ retention affects new rows only (documented in the UI).
   `pattern_hash` (repeatable),
 - `limit` (default 100, max 500), `cursor` (opaque `(dt, id)` keyset
   cursor, newest first).
+
+List rows (search pages and the live tail) are bounded whatever senders
+stored: the message is cut to 4096 characters and `fields` over 8 KiB are
+replaced by a marker object, with `truncated: true` on the row.
+`GET /projects/{id}/logs/{log_id}?dt=<RFC 3339>` (viewer, project-confined,
+404 when absent) returns one whole row for the explorer's expanded view.
+Log reads run with `max_result_bytes` (result_overflow_mode=throw) and the
+ClickHouse client refuses any response body over 32 MiB while reading it;
+one user may have at most 4 searches, histograms and entry reads running
+(→ 429).
 
 The project id is always bound from the path. Every value — including
 JSON path segments — is a ClickHouse query parameter; the SQL text is
@@ -221,8 +243,10 @@ ClickHouse `max_execution_time` 120 s; max 2 concurrent exports per user
 ### Live tail
 
 `GET /projects/{id}/logs/tail` (same filters minus window/cursor) →
-Server-Sent Events. The engine polls ClickHouse every 1 s for rows newer
-than the last `(dt, id)` sent, emits them as `event: log`, sends a comment
+Server-Sent Events. The engine polls ClickHouse every 1 s for the ids of
+the newest rows (at most 200) in a 60 s look-back, reads the list rows of
+only the ids it has not sent yet (late rows included), emits them as
+`event: log`, sends a comment
 keep-alive every 15 s, re-checks the session every 60 s (ends the stream
 if the session became invalid), and closes after 30 min (client
 reconnects). nami-ui proxies the stream through a `+server.ts` endpoint

@@ -5,6 +5,7 @@ import {
 	curlSnippet,
 	dockerSnippet,
 	engineParams,
+	entryHref,
 	explorerHref,
 	explorerParams,
 	fieldAt,
@@ -223,5 +224,16 @@ describe('histogram helpers', () => {
 		expect(bucketEnd({ start: '2026-10-13T10:00:00Z', count: 0, errors: 0, warnings: 0 }, 300)).toBe(
 			'2026-10-13T10:05:00.000Z'
 		);
+	});
+});
+
+describe('entryHref', () => {
+	it('points at the BFF entry endpoint with the row dt', () => {
+		expect(
+			entryHref('/projects/p/logs', {
+				id: '1c7f4f4e-7e3b-4d2f-8c8b-3a2e4d5c6b70',
+				dt: '2026-10-13T12:00:00.123Z'
+			})
+		).toBe('/projects/p/logs/entry/1c7f4f4e-7e3b-4d2f-8c8b-3a2e4d5c6b70?dt=2026-10-13T12%3A00%3A00.123Z');
 	});
 });

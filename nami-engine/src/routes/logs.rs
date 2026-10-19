@@ -8,7 +8,7 @@ use axum::{
     },
     routing::get,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tower_sessions::Session;
@@ -18,7 +18,7 @@ use crate::{
     error::AppError,
     logs::{
         query,
-        search::{self, Histogram, SearchPage},
+        search::{self, Histogram, LogEntry, QueryPermit, SearchPage},
         tail,
     },
     middleware::rbac::{CurrentUser, require_project_role},
@@ -32,6 +32,7 @@ pub fn router() -> Router<AppState> {
         .route("/projects/{id}/logs", get(search_logs))
         .route("/projects/{id}/logs/histogram", get(log_histogram))
         .route("/projects/{id}/logs/tail", get(tail_logs))
+        .route("/projects/{id}/logs/{log_id}", get(log_entry))
 }
 
 /// `GET /projects/{id}/logs?from&to&source_id*&level*&q&in_fields&filter*
@@ -45,6 +46,9 @@ async fn search_logs(
     require_project_role(&state.db, &user, project_id, "viewer").await?;
     let params = query::parse_search(&query::query_pairs(raw.as_deref()), Utc::now())
         .map_err(AppError::Validation)?;
+    // Held until the response is built, or dropped with the handler when the
+    // client goes away (ClickHouse cancels the query then).
+    let _slot = QueryPermit::acquire(&state.logs, user.id)?;
     Ok(Json(
         search::search(&state.clickhouse, project_id, &params).await?,
     ))
@@ -61,9 +65,35 @@ async fn log_histogram(
     let pairs = query::query_pairs(raw.as_deref());
     let window = query::parse_window(&pairs, Utc::now()).map_err(AppError::Validation)?;
     let filters = query::parse_filters(&pairs).map_err(AppError::Validation)?;
+    let _slot = QueryPermit::acquire(&state.logs, user.id)?;
     Ok(Json(
         search::histogram(&state.clickhouse, project_id, &window, &filters).await?,
     ))
+}
+
+/// `GET /projects/{id}/logs/{log_id}?dt=<RFC 3339>`: one whole row (list
+/// rows cut long messages and leave out large fields, see
+/// `search::ENTRY_COLUMNS`). `dt` is the row's own, as listed. 404 when the
+/// project has no such row (a row of another project included).
+async fn log_entry(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, log_id)): Path<(Uuid, Uuid)>,
+    RawQuery(raw): RawQuery,
+) -> Result<Json<LogEntry>, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    let pairs = query::query_pairs(raw.as_deref());
+    let dt = pairs
+        .iter()
+        .find(|(key, _)| key == "dt")
+        .and_then(|(_, value)| DateTime::parse_from_rfc3339(value).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok_or_else(|| AppError::Validation("dt must be an RFC 3339 timestamp".to_string()))?;
+    let _slot = QueryPermit::acquire(&state.logs, user.id)?;
+    search::entry(&state.clickhouse, project_id, log_id, dt)
+        .await?
+        .map(Json)
+        .ok_or(AppError::NotFound)
 }
 
 /// Server-Sent Events of new rows matching the search filters (no window,

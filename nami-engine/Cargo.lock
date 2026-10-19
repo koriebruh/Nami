@@ -1864,6 +1864,8 @@ dependencies = [
  "hickory-resolver",
  "hkdf 0.13.0",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "lettre",
  "oauth2",
  "password-hash",

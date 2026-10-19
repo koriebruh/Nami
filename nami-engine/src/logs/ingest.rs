@@ -124,6 +124,10 @@ pub enum IngestError {
     /// `rate_limit::MAX_IN_FLIGHT_PER_SOURCE`).
     #[error("too many requests in flight for this source")]
     TooManyInFlight { limit: usize },
+    /// The source's project already has its share of requests in flight
+    /// (`rate_limit::MAX_IN_FLIGHT_PER_PROJECT`).
+    #[error("too many requests in flight for this project")]
+    ProjectTooManyInFlight { limit: usize },
     /// The body did not arrive at the pace of [`BodyPace`].
     #[error("timed out waiting for the request body")]
     RequestTimeout,
@@ -196,6 +200,16 @@ impl IntoResponse for IngestError {
                 json!({
                     "error": format!(
                         "too many requests in flight for this source: at most {limit} at once"
+                    ),
+                    "code": "too_many_in_flight"
+                }),
+                Some(1),
+            ),
+            IngestError::ProjectTooManyInFlight { limit } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({
+                    "error": format!(
+                        "too many requests in flight for this project: at most {limit} at once"
                     ),
                     "code": "too_many_in_flight"
                 }),
@@ -376,12 +390,13 @@ pub async fn read_body(
 }
 
 /// A place for decoding a body: one of the engine's few
-/// (`routes::logs_ingest::IngestLimits::decodes`) and one of its source's
-/// ([`DecodeShares`]). Given back when dropped.
+/// (`routes::logs_ingest::IngestLimits::decodes`), one of its source's and one
+/// of its project's ([`DecodeShares`]). Given back when dropped.
 #[derive(Debug)]
 pub struct DecodePlace {
     _engine: OwnedSemaphorePermit,
     _source: DecodeShare,
+    _project: DecodeShare,
 }
 
 /// A batch of events as the ingest path sends it on: the rows as the body of
@@ -403,7 +418,8 @@ pub struct Prepared {
 /// Turns a body into what to send to ClickHouse for `source`: decompress,
 /// parse, normalize ([`build_rows`]) and encode the insert body
 /// ([`store::encode_logs`]), on a blocking thread, with a place of `decodes`
-/// (and one of the source's `shares`) held for as long as that runs. The work
+/// (and one of the source's `shares` and of its project's `project_shares`)
+/// held for as long as that runs. The work
 /// is CPU-bound (about 50 ms for a typical batch of 10,000 events, up to a
 /// second for one of large messages) and takes memory in proportion (see
 /// [`budget`]): on an async worker it would stall every other request that
@@ -422,9 +438,12 @@ pub async fn prepare(
     received_at: DateTime<Utc>,
     decodes: &Arc<Semaphore>,
     shares: &DecodeShares,
+    project_shares: &DecodeShares,
 ) -> Result<Prepared, IngestError> {
-    // The source's own gate first, so that what it has beyond its share waits
-    // there and not in the queue for the engine's places.
+    // The project's and the source's own gates first, so that what they have
+    // beyond their shares waits there and not in the queue for the engine's
+    // places.
+    let project_share = project_shares.acquire(source.project_id).await;
     let share = shares.acquire(source.id).await;
     let engine = decodes
         .clone()
@@ -434,6 +453,7 @@ pub async fn prepare(
     let place = DecodePlace {
         _engine: engine,
         _source: share,
+        _project: project_share,
     };
     let source = source.clone();
     tokio::task::spawn_blocking(move || {
@@ -476,9 +496,8 @@ pub fn build_batch(
     source: &IngestSource,
     received_at: DateTime<Utc>,
 ) -> Result<Batch, IngestError> {
-    let rows = build_rows(body, encoding, source, received_at)?;
-    let bytes = rows.iter().map(LogRow::stored_bytes).sum();
-    let encoded = match store::encode_logs(&rows, MAX_ENCODED_BYTES) {
+    let rows = row_batch(body, encoding, source, received_at, MAX_ENCODED_BYTES)?;
+    let encoded = match rows.encode(MAX_ENCODED_BYTES) {
         Ok(encoded) => encoded,
         Err(ClickHouseError::TooLarge { .. }) => return Err(stored_too_large()),
         Err(error) => {
@@ -487,9 +506,9 @@ pub fn build_batch(
         }
     };
     Ok(Batch {
-        body: encoded,
-        events: rows.len(),
-        bytes,
+        body: encoded.body,
+        events: encoded.events,
+        bytes: encoded.bytes,
     })
 }
 
@@ -513,20 +532,29 @@ pub fn build_rows_within(
     received_at: DateTime<Utc>,
     max_stored_bytes: usize,
 ) -> Result<Vec<LogRow>, IngestError> {
+    Ok(row_batch(body, encoding, source, received_at, max_stored_bytes)?.into_rows())
+}
+
+/// Decodes `body` and turns its events into rows with the shared step
+/// ([`store::RowBatch`]), refused with a 413 as soon as they store more than
+/// `max_stored_bytes`.
+fn row_batch(
+    body: Bytes,
+    encoding: BodyEncoding,
+    source: &IngestSource,
+    received_at: DateTime<Utc>,
+    max_stored_bytes: usize,
+) -> Result<store::RowBatch, IngestError> {
     let events = decode_events(body, encoding)?;
-    let mut rows = Vec::with_capacity(events.len());
-    let mut stored = 0u64;
+    let mut batch = store::RowBatch::with_capacity(events.len(), max_stored_bytes);
     // Each event is dropped as its row is made: the values it held go as the
     // rows grow.
     for object in events {
-        let row = store::build_row(normalize::from_json(object, received_at), source);
-        stored += row.stored_bytes();
-        if stored > max_stored_bytes as u64 {
-            return Err(stored_too_large());
-        }
-        rows.push(row);
+        batch
+            .push(normalize::from_json(object, received_at), source)
+            .map_err(|store::StoredTooLarge| stored_too_large())?;
     }
-    Ok(rows)
+    Ok(batch)
 }
 
 /// Decompresses (when gzip) and parses a body into event objects.
@@ -902,6 +930,7 @@ pub fn seconds_until_utc_midnight(now: DateTime<Utc>) -> u64 {
 mod tests {
     use super::*;
     use crate::logs::budget::{ARRAY_BYTES, KEY_BYTES, MAP_BYTES, MAX_DECODED_BYTES, STRING_BYTES};
+    use crate::logs::rate_limit::ProjectLimits;
     use std::io::Write;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -1399,6 +1428,12 @@ mod tests {
                 None,
             ),
             (
+                IngestError::ProjectTooManyInFlight { limit: 8 },
+                429,
+                Some("1"),
+                None,
+            ),
+            (
                 IngestError::QuotaExceeded {
                     retry_after_seconds: 777,
                 },
@@ -1506,6 +1541,7 @@ mod tests {
             Utc::now(),
             &Arc::new(Semaphore::new(1)),
             &DecodeShares::default(),
+            &DecodeShares::default(),
         )
         .await
         .unwrap();
@@ -1526,10 +1562,19 @@ mod tests {
         let source = source();
         let decodes = Arc::new(Semaphore::new(1));
         let shares = DecodeShares::default();
+        let projects = ProjectLimits::default().decode_shares;
         let body = Bytes::from_static(br#"[{"message":"one","a":1},{"message":"two"}]"#);
-        let prepared = prepare(body.clone(), JSON, &source, Utc::now(), &decodes, &shares)
-            .await
-            .unwrap();
+        let prepared = prepare(
+            body.clone(),
+            JSON,
+            &source,
+            Utc::now(),
+            &decodes,
+            &shares,
+            &projects,
+        )
+        .await
+        .unwrap();
         assert_eq!(prepared.events, 2);
         assert_eq!(prepared.body.lines().count(), 2);
         assert!(prepared.body.ends_with('\n'));
@@ -1554,6 +1599,7 @@ mod tests {
             Utc::now(),
             &decodes,
             &shares,
+            &projects,
         )
         .await
         .unwrap();
@@ -1567,21 +1613,38 @@ mod tests {
         let source = source();
         let decodes = Arc::new(Semaphore::new(1));
         let shares = DecodeShares::default();
+        let projects = ProjectLimits::default().decode_shares;
         let good = Bytes::from_static(br#"{"message":"m"}"#);
 
         let held = decodes.clone().acquire_owned().await.unwrap();
         let waiting = tokio::time::timeout(
             Duration::from_millis(150),
-            prepare(good.clone(), JSON, &source, Utc::now(), &decodes, &shares),
+            prepare(
+                good.clone(),
+                JSON,
+                &source,
+                Utc::now(),
+                &decodes,
+                &shares,
+                &projects,
+            ),
         )
         .await;
         assert!(waiting.is_err(), "no place is free: it waits");
         assert_eq!(shares.count(source.id), 0, "and its share goes with it");
         drop(held);
 
-        prepare(good, JSON, &source, Utc::now(), &decodes, &shares)
-            .await
-            .unwrap();
+        prepare(
+            good,
+            JSON,
+            &source,
+            Utc::now(),
+            &decodes,
+            &shares,
+            &projects,
+        )
+        .await
+        .unwrap();
         assert_eq!(decodes.available_permits(), 1, "given back after a success");
         assert_eq!(shares.count(source.id), 0);
         let bad = prepare(
@@ -1591,6 +1654,7 @@ mod tests {
             Utc::now(),
             &decodes,
             &shares,
+            &projects,
         )
         .await;
         assert!(matches!(bad, Err(IngestError::BadRequest(_))));
@@ -1606,12 +1670,21 @@ mod tests {
         let (busy, other) = (source(), source());
         let decodes = Arc::new(Semaphore::new(4));
         let shares = DecodeShares::new(1);
+        let projects = ProjectLimits::default().decode_shares;
         let good = Bytes::from_static(br#"{"message":"m"}"#);
 
         let share = shares.acquire(busy.id).await;
         let waiting = tokio::time::timeout(
             Duration::from_millis(150),
-            prepare(good.clone(), JSON, &busy, Utc::now(), &decodes, &shares),
+            prepare(
+                good.clone(),
+                JSON,
+                &busy,
+                Utc::now(),
+                &decodes,
+                &shares,
+                &projects,
+            ),
         )
         .await;
         assert!(waiting.is_err(), "the source's only place is taken");
@@ -1621,13 +1694,87 @@ mod tests {
             "no engine place was held meanwhile"
         );
 
-        prepare(good.clone(), JSON, &other, Utc::now(), &decodes, &shares)
-            .await
-            .unwrap();
+        prepare(
+            good.clone(),
+            JSON,
+            &other,
+            Utc::now(),
+            &decodes,
+            &shares,
+            &projects,
+        )
+        .await
+        .unwrap();
         drop(share);
-        prepare(good, JSON, &busy, Utc::now(), &decodes, &shares)
+        prepare(good, JSON, &busy, Utc::now(), &decodes, &shares, &projects)
             .await
             .unwrap();
+    }
+
+    /// The project's gate: two sources of one project that already has its
+    /// share decoding wait, while a source of another project does not.
+    #[tokio::test]
+    async fn a_project_cannot_decode_more_bodies_at_once_than_its_share() {
+        let first = source();
+        let sibling = IngestSource {
+            id: uuid::Uuid::new_v4(),
+            ..first.clone()
+        };
+        let stranger = source();
+        let decodes = Arc::new(Semaphore::new(4));
+        let shares = DecodeShares::default();
+        let projects = DecodeShares::new(1);
+        let good = Bytes::from_static(br#"{"message":"m"}"#);
+
+        let held = projects.acquire(first.project_id).await;
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(150),
+            prepare(
+                good.clone(),
+                JSON,
+                &sibling,
+                Utc::now(),
+                &decodes,
+                &shares,
+                &projects,
+            ),
+        )
+        .await;
+        assert!(waiting.is_err(), "the project's only place is taken");
+        assert_eq!(decodes.available_permits(), 4);
+        prepare(
+            good.clone(),
+            JSON,
+            &stranger,
+            Utc::now(),
+            &decodes,
+            &shares,
+            &projects,
+        )
+        .await
+        .unwrap();
+        drop(held);
+        prepare(
+            good,
+            JSON,
+            &sibling,
+            Utc::now(),
+            &decodes,
+            &shares,
+            &projects,
+        )
+        .await
+        .unwrap();
+        assert_eq!(projects.tracked(), 0);
+        let defaults = ProjectLimits::default();
+        assert_eq!(
+            defaults.in_flight.limit(),
+            crate::logs::rate_limit::MAX_IN_FLIGHT_PER_PROJECT
+        );
+        assert_eq!(
+            defaults.decode_shares.limit(),
+            crate::logs::rate_limit::MAX_DECODES_PER_PROJECT
+        );
     }
 
     /// A body that is large when encoded keeps its place until it has been
@@ -1638,6 +1785,7 @@ mod tests {
         let source = source();
         let decodes = Arc::new(Semaphore::new(2));
         let shares = DecodeShares::default();
+        let projects = ProjectLimits::default().decode_shares;
         let events = |count: usize| {
             let events: Vec<Value> = (0..count)
                 .map(|n| json!({ "message": format!("{n} {}", "x".repeat(60_000)) }))
@@ -1645,17 +1793,33 @@ mod tests {
             Bytes::from(serde_json::to_vec(&events).unwrap())
         };
 
-        let small = prepare(events(20), JSON, &source, Utc::now(), &decodes, &shares)
-            .await
-            .unwrap();
+        let small = prepare(
+            events(20),
+            JSON,
+            &source,
+            Utc::now(),
+            &decodes,
+            &shares,
+            &projects,
+        )
+        .await
+        .unwrap();
         assert!(small.body.len() < LARGE_BODY_BYTES);
         assert!(small.place.is_none());
         assert_eq!(decodes.available_permits(), 2);
         assert_eq!(shares.count(source.id), 0);
 
-        let large = prepare(events(180), JSON, &source, Utc::now(), &decodes, &shares)
-            .await
-            .unwrap();
+        let large = prepare(
+            events(180),
+            JSON,
+            &source,
+            Utc::now(),
+            &decodes,
+            &shares,
+            &projects,
+        )
+        .await
+        .unwrap();
         assert!(large.body.len() > LARGE_BODY_BYTES, "{}", large.body.len());
         assert!(large.place.is_some());
         assert_eq!(decodes.available_permits(), 1, "the engine's place is kept");

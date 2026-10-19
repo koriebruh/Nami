@@ -5,9 +5,10 @@ use nami_engine::{
     db, email,
     logs::LogsState,
     router,
+    serve::{ServeLimits, serve},
     state::AppState,
 };
-use std::{future::IntoFuture, net::SocketAddr, sync::Arc};
+use std::sync::Arc;
 use tower_sessions_sqlx_store::PostgresStore;
 
 #[tokio::main]
@@ -103,8 +104,9 @@ async fn main() {
 
     // Two listeners. The API (`PORT`) is private: nami-ui is its only client,
     // and it trusts the client address nami-ui forwards. The public listener
-    // (`PUBLIC_PORT`) serves only the endpoints outside clients call, such as
-    // heartbeat pings, and is the only one to expose.
+    // (`PUBLIC_PORT`) serves only the endpoints outside clients call without
+    // a session (heartbeat pings and log ingest) and is the only HTTP port to
+    // expose. Both have a header deadline and a connection cap (`serve`).
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .unwrap_or_else(|e| panic!("failed to bind PORT {port}: {e}"));
@@ -113,17 +115,8 @@ async fn main() {
         .unwrap_or_else(|e| panic!("failed to bind PUBLIC_PORT {public_port}: {e}"));
     tracing::info!("API listening on port {port} (private: only nami-ui may reach it)");
     tracing::info!("public endpoints listening on port {public_port}");
-    tokio::try_join!(
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .into_future(),
-        axum::serve(
-            public_listener,
-            public_app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .into_future(),
-    )
-    .expect("a listener failed");
+    tokio::join!(
+        serve(listener, app, ServeLimits::API),
+        serve(public_listener, public_app, ServeLimits::PUBLIC),
+    );
 }

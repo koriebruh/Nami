@@ -200,6 +200,15 @@ pub async fn insert_source(
     project_id: Uuid,
     c: &SourceConfig,
 ) -> Result<SourceWithToken, sqlx::Error> {
+    insert_source_in(pool, cipher, project_id, c).await
+}
+
+async fn insert_source_in<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    cipher: &Cipher,
+    project_id: Uuid,
+    c: &SourceConfig,
+) -> Result<SourceWithToken, sqlx::Error> {
     // The id is chosen here, not by the database, because the sealed token is
     // bound to it.
     let id = Uuid::new_v4();
@@ -217,9 +226,51 @@ pub async fn insert_source(
     .bind(c.daily_byte_quota)
     .bind(hash_token(&token))
     .bind(cipher.encrypt(&token_context(id), token.as_bytes()))
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
     Ok(SourceWithToken { source, token })
+}
+
+/// What [`create_source`] did.
+pub enum CreatedSource {
+    Created(SourceWithToken),
+    /// The project already has `max_sources` sources; nothing was created.
+    ProjectFull,
+    /// There is no such project.
+    NoProject,
+}
+
+/// [`insert_source`] for the API: refused once the project has `max_sources`
+/// sources (`MAX_SOURCES_PER_PROJECT`). Creations in one project take turns
+/// on the project's row (`for no key update`, which still lets other tables'
+/// foreign keys reference it), so concurrent requests cannot pass the cap
+/// together.
+pub async fn create_source(
+    pool: &PgPool,
+    cipher: &Cipher,
+    project_id: Uuid,
+    c: &SourceConfig,
+    max_sources: i64,
+) -> Result<CreatedSource, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let project: Option<(Uuid,)> =
+        sqlx::query_as("select id from projects where id = $1 for no key update")
+            .bind(project_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if project.is_none() {
+        return Ok(CreatedSource::NoProject);
+    }
+    let (count,): (i64,) = sqlx::query_as("select count(*) from sources where project_id = $1")
+        .bind(project_id)
+        .fetch_one(&mut *tx)
+        .await?;
+    if count >= max_sources {
+        return Ok(CreatedSource::ProjectFull);
+    }
+    let created = insert_source_in(&mut *tx, cipher, project_id, c).await?;
+    tx.commit().await?;
+    Ok(CreatedSource::Created(created))
 }
 
 pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Source>, sqlx::Error> {
