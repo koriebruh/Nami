@@ -9,6 +9,7 @@
 		{ href: `/projects/${data.project.id}/heartbeats`, label: 'Heartbeats' },
 		{ href: `/projects/${data.project.id}/incidents`, label: 'Incidents' },
 		{ href: `/projects/${data.project.id}/logs`, label: 'Logs' },
+		{ href: `/projects/${data.project.id}/maintenance`, label: 'Maintenance' },
 		{ href: `/projects/${data.project.id}/settings`, label: 'Settings' }
 	]);
 </script>
