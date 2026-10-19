@@ -42,7 +42,7 @@ use super::{
 };
 use crate::{
     error::AppError,
-    models::{incident, monitor::Monitor},
+    models::{incident, maintenance, monitor::Monitor},
     state::AppState,
 };
 
@@ -127,6 +127,14 @@ struct LockedMonitor {
 /// Timestamps come from the engine's clock, so engines sharing a database
 /// are expected to keep their clocks in step.
 ///
+/// Inside a maintenance window covering the monitor (project-wide or scoped
+/// to it) only `last_checked_at` moves, so the stale-outcome guard keeps
+/// working: no status or counter change (neither counter advances toward a
+/// transition), no incident opened or resolved, no transition. An incident
+/// already open stays open, and can resolve once the window is over. Coverage
+/// is judged at the outcome's `checked_at` (when its check started, the same
+/// instant the stale guard compares), not at the time it is applied.
+///
 /// The cause stored in the incident and sent in the alert is the check's
 /// error with control characters replaced by spaces (see
 /// [`alerts::sanitize_cause`]).
@@ -154,6 +162,24 @@ pub async fn apply_outcome(
         .last_checked_at
         .is_some_and(|last| last >= outcome.checked_at)
     {
+        return Ok(None);
+    }
+    if maintenance::monitor_in_maintenance(
+        &mut *tx,
+        state.project_id,
+        monitor.id,
+        outcome.checked_at,
+    )
+    .await?
+    {
+        // The check itself is recorded (ClickHouse history, last_checked_at);
+        // the state machine stands still until the window ends.
+        sqlx::query("update monitors set last_checked_at = $2 where id = $1")
+            .bind(monitor.id)
+            .bind(outcome.checked_at)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         return Ok(None);
     }
 

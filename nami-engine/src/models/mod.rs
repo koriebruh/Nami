@@ -1,5 +1,6 @@
 pub mod heartbeat;
 pub mod incident;
+pub mod maintenance;
 pub mod monitor;
 pub mod monitor_request;
 pub mod project;
@@ -22,28 +23,37 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
-/// Name rule shared by monitors and heartbeats: trimmed, 1-200 characters,
-/// no control characters (names end up in alert email subjects) and none of
-/// the invisible or text-direction characters that let a name render as
-/// something it is not (see `is_invisible_or_bidi_char`).
+/// Name rule shared by monitors and heartbeats: [`validate_label`] for the
+/// field `name`.
 pub fn validate_name(raw: &str) -> Result<String, String> {
+    validate_label("name", raw)
+}
+
+/// Rule for any short label (monitor and heartbeat names, maintenance window
+/// titles): trimmed, 1-200 characters, no control characters (labels end up
+/// in alert email subjects) and none of the invisible or text-direction
+/// characters that let a label render as something it is not (see
+/// `is_invisible_or_bidi_char`). `field` names the label in the message.
+pub fn validate_label(field: &str, raw: &str) -> Result<String, String> {
     // Checked on the raw input, before trimming: U+2028 and U+2029 are
     // whitespace, so `trim` would otherwise drop them at the edges instead
     // of rejecting them.
     if raw.chars().any(is_invisible_or_bidi_char) {
-        return Err("name must not contain invisible or text-direction characters".into());
+        return Err(format!(
+            "{field} must not contain invisible or text-direction characters"
+        ));
     }
-    let name = raw.trim();
-    if name.is_empty() {
-        return Err("name is required".into());
+    let label = raw.trim();
+    if label.is_empty() {
+        return Err(format!("{field} is required"));
     }
-    if name.chars().count() > 200 {
-        return Err("name must be at most 200 characters".into());
+    if label.chars().count() > 200 {
+        return Err(format!("{field} must be at most 200 characters"));
     }
-    if name.chars().any(char::is_control) {
-        return Err("name must not contain control characters".into());
+    if label.chars().any(char::is_control) {
+        return Err(format!("{field} must not contain control characters"));
     }
-    Ok(name.to_string())
+    Ok(label.to_string())
 }
 
 /// Format, separator and blank characters that change how text renders, or
@@ -207,6 +217,28 @@ mod tests {
         for c in ['\u{200C}', '\u{200D}', 'a', '/', '\u{e9}'] {
             assert!(!super::is_invisible_or_bidi_char(c), "U+{:04X}", c as u32);
         }
+    }
+
+    #[test]
+    fn other_labels_name_their_field_in_the_message() {
+        use super::validate_label;
+        assert_eq!(validate_label("title", " Deploy ").unwrap(), "Deploy");
+        assert_eq!(
+            validate_label("title", " ").unwrap_err(),
+            "title is required"
+        );
+        assert_eq!(
+            validate_label("title", "a\u{202E}b").unwrap_err(),
+            "title must not contain invisible or text-direction characters"
+        );
+        assert_eq!(
+            validate_label("title", "a\nb").unwrap_err(),
+            "title must not contain control characters"
+        );
+        assert_eq!(
+            validate_label("title", &"x".repeat(201)).unwrap_err(),
+            "title must be at most 200 characters"
+        );
     }
 
     #[test]

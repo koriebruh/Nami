@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::alerts::{Subject, Transition, TransitionKind};
-use crate::models::incident;
+use crate::models::{incident, maintenance};
 
 #[derive(Debug, PartialEq)]
 pub enum PingOutcome {
@@ -41,8 +41,11 @@ pub fn is_well_formed_token(token: &str) -> bool {
 /// (so a heartbeat deleted, or its token rotated, in between is unknown too:
 /// once a rotation has committed, the old token records nothing).
 ///
-/// Paused heartbeats keep accepting pings — `last_ping_at` stays fresh — but
-/// their state is frozen: no status change, no incident change, no alert.
+/// Paused heartbeats, and heartbeats a project-wide maintenance window covers
+/// (judged at the transaction's `now()`, the instant `last_ping_at` records),
+/// keep accepting pings — `last_ping_at` stays fresh, so resuming, or the
+/// window ending, does not immediately trip the sweep — but their state is
+/// frozen: no status change, no incident change, no alert.
 pub async fn record_ping(pool: &PgPool, token: &str) -> Result<PingOutcome, sqlx::Error> {
     if !is_well_formed_token(token) {
         return Ok(PingOutcome::UnknownToken);
@@ -56,17 +59,18 @@ pub async fn record_ping(pool: &PgPool, token: &str) -> Result<PingOutcome, sqlx
         return Ok(PingOutcome::UnknownToken);
     }
     let mut tx = pool.begin().await?;
-    let row: Option<(Uuid, Uuid, String, String, bool)> = sqlx::query_as(
-        "select id, project_id, name, current_status, paused from heartbeats where token = $1 for update",
+    let row: Option<(Uuid, Uuid, String, String, bool, DateTime<Utc>)> = sqlx::query_as(
+        "select id, project_id, name, current_status, paused, now()
+         from heartbeats where token = $1 for update",
     )
     .bind(token)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((id, project_id, name, status, paused)) = row else {
+    let Some((id, project_id, name, status, paused, now)) = row else {
         return Ok(PingOutcome::UnknownToken);
     };
 
-    if paused {
+    if paused || maintenance::heartbeat_in_maintenance(&mut *tx, project_id, now).await? {
         sqlx::query("update heartbeats set last_ping_at = now() where id = $1")
             .bind(id)
             .execute(&mut *tx)
@@ -123,14 +127,25 @@ macro_rules! due_at {
 /// skipped, not waited for: the next sweep takes it, and no sweep can be stuck
 /// behind one row, delaying every other heartbeat. Two concurrent sweeps take
 /// different heartbeats, so none is flipped (or alerted on) twice.
+///
+/// Heartbeats of a project inside a project-wide maintenance window (judged at
+/// the transaction's `now()`, the instant the UPDATE compares against) are left
+/// as they are; once the window is over, the next sweep judges them as usual.
 pub async fn sweep_overdue(pool: &PgPool, limit: i64) -> Result<Vec<Transition>, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    // now() is the transaction's start time: the same instant the UPDATE uses.
+    let now: DateTime<Utc> = sqlx::query_scalar("select now()")
+        .fetch_one(&mut *tx)
+        .await?;
+    let in_maintenance =
+        maintenance::projects_with_heartbeats_in_maintenance(&mut *tx, now).await?;
     let overdue: Vec<(Uuid, Uuid, String, i32, i32)> = sqlx::query_as(concat!(
         "update heartbeats set current_status = 'down'
          where id in (
              select id from heartbeats
              where not paused
                and current_status <> 'down'
+               and project_id <> all($2)
                and ",
         due_at!(),
         " < now()
@@ -143,12 +158,9 @@ pub async fn sweep_overdue(pool: &PgPool, limit: i64) -> Result<Vec<Transition>,
          returning id, project_id, name, period_seconds, grace_seconds"
     ))
     .bind(limit)
+    .bind(&in_maintenance)
     .fetch_all(&mut *tx)
     .await?;
-    // now() is the transaction's start time: the same instant the UPDATE used.
-    let now: DateTime<Utc> = sqlx::query_scalar("select now()")
-        .fetch_one(&mut *tx)
-        .await?;
 
     let mut transitions = Vec::new();
     for (id, project_id, name, period, grace) in overdue {
