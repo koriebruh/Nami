@@ -91,7 +91,7 @@ async fn main() {
     ));
 
     // Every instance that ingests logs adds its usage counters to Postgres.
-    tokio::spawn(nami_engine::logs::usage::run_forever(state.clone()));
+    tokio::spawn(nami_engine::logs::ingest::usage::run_forever(state.clone()));
 
     // A public ingress like PUBLIC_PORT: off unless SYSLOG_ENABLED=true.
     if state.config.syslog_enabled {

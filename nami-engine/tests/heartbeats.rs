@@ -19,9 +19,9 @@ use common::{
 use nami_engine::{
     core::email::Mailer,
     core::state::AppState,
-    logs::rate_limit::TokenBuckets,
-    models::incident,
-    routes::heartbeats::{
+    incidents::model as incident,
+    logs::ingest::rate_limit::TokenBuckets,
+    uptime::heartbeat::routes::{
         MAX_PING_BODIES_IN_FLIGHT, MAX_PING_BODIES_PER_PROJECT, MAX_PING_BODY_BYTES,
         MAX_PINGS_IN_FLIGHT, PING_BODY_TIMEOUT, PING_BURST, PING_SLOT_WAIT,
     },

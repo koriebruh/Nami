@@ -15,7 +15,7 @@
 //!
 //! The AES-GCM associated data is `version || context`, where `context` names
 //! the column and the row the value belongs to (e.g.
-//! `"monitors.auth_password:<monitor id>"`, see `models::monitor_request`): a
+//! `"monitors.auth_password:<monitor id>"`, see `uptime::monitor::request`): a
 //! value sealed for one column cannot be opened as another, a value copied
 //! onto another row does not open there, and the version byte is
 //! authenticated along with the data. A value with an unknown version, or too

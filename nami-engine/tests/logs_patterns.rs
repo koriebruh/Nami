@@ -185,8 +185,8 @@ async fn patterns_share_the_per_user_query_slots(pool: sqlx::PgPool) {
     let app = app(state);
     let project = seed_project(&pool).await;
     let (user_id, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
-    let held: Vec<_> = (0..nami_engine::logs::search::MAX_QUERIES_PER_USER)
-        .map(|_| nami_engine::logs::search::QueryPermit::acquire(&logs, user_id).unwrap())
+    let held: Vec<_> = (0..nami_engine::logs::query::search::MAX_QUERIES_PER_USER)
+        .map(|_| nami_engine::logs::query::search::QueryPermit::acquire(&logs, user_id).unwrap())
         .collect();
     let uri = format!("/projects/{project}/logs/patterns");
     assert_eq!(

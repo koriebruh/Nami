@@ -15,8 +15,8 @@ use hickory_resolver::proto::{
     rr::{Name, RData, Record, RecordType, rdata},
 };
 use nami_engine::{
-    models::monitor::Monitor,
     uptime::checker::{CheckOutcome, CheckStatus, MAX_ERROR_CHARS, perform_check},
+    uptime::monitor::model::Monitor,
 };
 
 const NOT_ALLOWED: &str = "destination not allowed";

@@ -11,8 +11,8 @@ use std::{
 
 use common::{check_context, unsaved_monitor as monitor};
 use nami_engine::{
-    models::monitor::Monitor,
     uptime::checker::{CheckStatus, MAX_BODY_BYTES, MAX_ERROR_CHARS, perform_check},
+    uptime::monitor::model::Monitor,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::{

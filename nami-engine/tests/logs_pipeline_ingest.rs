@@ -252,8 +252,8 @@ async fn the_quota_counts_bytes_after_the_pipeline(pool: sqlx::PgPool) {
     ch.drop_database().await.unwrap();
 }
 
-fn ingest_source(id: uuid::Uuid) -> nami_engine::models::source::IngestSource {
-    nami_engine::models::source::IngestSource {
+fn ingest_source(id: uuid::Uuid) -> nami_engine::logs::source::model::IngestSource {
+    nami_engine::logs::source::model::IngestSource {
         id,
         project_id: uuid::Uuid::new_v4(),
         retention_days: 30,
@@ -264,14 +264,14 @@ fn ingest_source(id: uuid::Uuid) -> nami_engine::models::source::IngestSource {
 
 #[sqlx::test]
 async fn a_source_deleted_before_its_pipeline_is_read_fails_closed(pool: sqlx::PgPool) {
-    let cache = nami_engine::logs::pipeline_cache::PipelineCache::default();
+    let cache = nami_engine::logs::ingest::pipeline_cache::PipelineCache::default();
     let result = cache
         .for_source(&pool, &ingest_source(uuid::Uuid::new_v4()), None)
         .await;
     assert!(
         matches!(
             result,
-            Err(nami_engine::logs::pipeline_cache::PipelineLoadError::Gone)
+            Err(nami_engine::logs::ingest::pipeline_cache::PipelineLoadError::Gone)
         ),
         "{result:?}"
     );
@@ -280,7 +280,7 @@ async fn a_source_deleted_before_its_pipeline_is_read_fails_closed(pool: sqlx::P
 
 #[tokio::test]
 async fn a_database_error_reading_the_pipeline_fails_closed() {
-    let cache = nami_engine::logs::pipeline_cache::PipelineCache::default();
+    let cache = nami_engine::logs::ingest::pipeline_cache::PipelineCache::default();
     let result = cache
         .for_source(
             &unreachable_pool(),
@@ -291,7 +291,7 @@ async fn a_database_error_reading_the_pipeline_fails_closed() {
     assert!(
         matches!(
             result,
-            Err(nami_engine::logs::pipeline_cache::PipelineLoadError::Database(_))
+            Err(nami_engine::logs::ingest::pipeline_cache::PipelineLoadError::Database(_))
         ),
         "{result:?}"
     );

@@ -20,7 +20,7 @@ use nami_engine::{
     core::state::AppState,
     logs::{
         LogsState,
-        tail::{MAX_TAILS_PER_USER, TAIL_BATCH, TailTimings},
+        query::tail::{MAX_TAILS_PER_USER, TAIL_BATCH, TailTimings},
     },
 };
 use serde_json::{Value, json};
@@ -547,7 +547,7 @@ async fn future_dated_rows_do_not_starve_current_ones(pool: sqlx::PgPool) {
 /// the rows it has not sent.
 #[sqlx::test]
 async fn tailed_rows_are_cut_like_list_rows(pool: sqlx::PgPool) {
-    use nami_engine::logs::search::{LIST_FIELDS_OMITTED, LIST_MESSAGE_CHARS};
+    use nami_engine::logs::query::search::{LIST_FIELDS_OMITTED, LIST_MESSAGE_CHARS};
 
     let (state, ch) = state_with_clickhouse(&pool).await;
     let state = AppState {

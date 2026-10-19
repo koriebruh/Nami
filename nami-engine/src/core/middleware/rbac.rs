@@ -1,4 +1,4 @@
-use crate::{core::error::AppError, core::state::AppState, models};
+use crate::{auth::user, core::error::AppError, core::state::AppState};
 use axum::{extract::FromRequestParts, http::request::Parts};
 use tower_sessions::Session;
 
@@ -36,7 +36,7 @@ pub async fn user_from_session(
         .map_err(|_| AppError::Unauthorized)?
         .ok_or(AppError::Unauthorized)?;
 
-    // Same staleness check as `routes::auth::me`/`current_user_id`: a
+    // Same staleness check as `auth::routes::me`/`current_user_id`: a
     // session authenticated before the user's last password change must
     // not be usable to identify the current user here either — this
     // extractor is the shared mechanism every RBAC-guarded route uses,
@@ -48,7 +48,7 @@ pub async fn user_from_session(
         .map_err(|_| AppError::Unauthorized)?
         .ok_or(AppError::Unauthorized)?;
 
-    let user: models::user::User = sqlx::query_as("select * from users where id = $1")
+    let user: user::User = sqlx::query_as("select * from users where id = $1")
         .bind(user_id)
         .fetch_optional(&state.db)
         .await?
@@ -57,7 +57,7 @@ pub async fn user_from_session(
     if auth_at < user.password_changed_at {
         // `.flush()` not `.delete()`: delete only removes the server-side
         // row and leaves a stale cookie on the client until its Max-Age
-        // (same reasoning as `logout` in `routes::auth`). Flush does both.
+        // (same reasoning as `logout` in `auth::routes`). Flush does both.
         session.flush().await.ok();
         return Err(AppError::Unauthorized);
     }

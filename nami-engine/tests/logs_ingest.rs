@@ -22,14 +22,14 @@ use nami_engine::{
     core::clickhouse::ClickHouse,
     core::router::{build_public_router, build_public_router_with_ingest_limits},
     core::state::AppState,
+    logs::ingest::routes::IngestLimits,
+    logs::source::model::{self as source, SourceConfig},
     logs::{
         LogsState,
         ingest::BodyPace,
-        normalize::{FIELDS_TRUNCATED_KEY, MAX_MESSAGE_BYTES, TRUNCATION_MARKER},
-        rate_limit::{DecodeShares, InFlight, TokenBuckets},
+        ingest::normalize::{FIELDS_TRUNCATED_KEY, MAX_MESSAGE_BYTES, TRUNCATION_MARKER},
+        ingest::rate_limit::{DecodeShares, InFlight, TokenBuckets},
     },
-    models::source::{self, SourceConfig},
-    routes::logs_ingest::IngestLimits,
 };
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
@@ -1597,8 +1597,10 @@ async fn tokens_never_appear_in_log_output(pool: sqlx::PgPool) {
 /// another project served.
 #[sqlx::test]
 async fn one_project_cannot_hold_every_place_with_many_sources(pool: sqlx::PgPool) {
-    use nami_engine::logs::rate_limit::{MAX_IN_FLIGHT_PER_PROJECT, MAX_IN_FLIGHT_PER_SOURCE};
-    use nami_engine::routes::logs_ingest::MAX_INGEST_IN_FLIGHT;
+    use nami_engine::logs::ingest::rate_limit::{
+        MAX_IN_FLIGHT_PER_PROJECT, MAX_IN_FLIGHT_PER_SOURCE,
+    };
+    use nami_engine::logs::ingest::routes::MAX_INGEST_IN_FLIGHT;
     use tokio::io::AsyncWriteExt;
 
     let (state, ch) = state_with_clickhouse(&pool).await;

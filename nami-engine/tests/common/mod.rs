@@ -17,11 +17,11 @@ use chrono::{DateTime, Utc};
 use nami_engine::{
     core::crypto::{Cipher, SecretString, TEST_KEY},
     core::state::AppState,
-    models::{
-        monitor::Monitor,
-        monitor_request::{RequestHeader, seal_headers, seal_password, seal_proxy_password},
-    },
     uptime::checker::{CheckContext, CheckOutcome, CheckStatus},
+    uptime::monitor::{
+        model::Monitor,
+        request::{RequestHeader, seal_headers, seal_password, seal_proxy_password},
+    },
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;

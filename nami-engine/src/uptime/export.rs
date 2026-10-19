@@ -59,8 +59,8 @@ use crate::{
     core::error::AppError,
     core::middleware::rbac::{CurrentUser, require_project_role},
     core::state::AppState,
-    logs::slots::UserSlots,
-    models::monitor,
+    logs::query::slots::UserSlots,
+    uptime::monitor::model as monitor,
 };
 
 /// Longest range one export may cover (`uptime_checks` keeps 180 days).

@@ -6,10 +6,10 @@ use std::time::{Duration, Instant};
 
 use common::{check_context, tls, unsaved_monitor};
 use nami_engine::{
-    models::monitor::Monitor,
+    uptime::monitor::model::Monitor,
     uptime::{
+        checker::tls::client_config,
         checker::{CheckContext, CheckOutcome, CheckStatus, perform_check},
-        tls::client_config,
     },
 };
 use tokio::{io::AsyncWriteExt, net::TcpListener};

@@ -9,7 +9,7 @@ use axum::{
 };
 use nami_engine::{
     core::clickhouse::ClickHouse,
-    models::source::{self, SourceConfig},
+    logs::source::model::{self as source, SourceConfig},
 };
 use serde_json::Value;
 use tower::ServiceExt;

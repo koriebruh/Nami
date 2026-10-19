@@ -14,3 +14,4 @@ pub mod middleware;
 pub mod router;
 pub mod serve;
 pub mod state;
+pub mod validate;

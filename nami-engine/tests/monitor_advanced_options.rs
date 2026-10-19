@@ -6,7 +6,7 @@ mod common;
 
 use axum::{Router, http::HeaderValue, http::StatusCode};
 use common::{LogCapture, call, seed_project, test_cipher, user_with_role};
-use nami_engine::models::monitor_request::open_proxy_password;
+use nami_engine::uptime::monitor::request::open_proxy_password;
 use serde_json::{Value, json};
 use uuid::Uuid;
 

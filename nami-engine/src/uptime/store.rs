@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::checker::{CheckOutcome, CheckStatus};
 use crate::{
     core::clickhouse::{ClickHouse, ClickHouseError},
-    models::monitor::Monitor,
+    uptime::monitor::model::Monitor,
 };
 
 /// One row of `uptime_checks`; also the JSON shape of

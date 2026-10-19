@@ -1,4 +1,4 @@
-// The incidents table and its helpers (`models::incident`).
+// The incidents table and its helpers (`incidents::model`).
 // Requires `docker compose up -d postgres`.
 mod common;
 
@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use common::{seed_http_monitor, seed_project};
-use nami_engine::models::incident::{open_for_monitor, resolve_for_monitor};
+use nami_engine::incidents::model::{open_for_monitor, resolve_for_monitor};
 use sqlx::PgPool;
 use uuid::Uuid;
 

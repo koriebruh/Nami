@@ -52,7 +52,7 @@ pub const EXPORT_MAX_EXECUTION_SECS: u64 = 120;
 /// timeout replaces the client's 30 s one; it covers connecting, the headers
 /// and reading the whole body, but is only checked while the body is polled
 /// (the export task has its own deadline for a reader that stops). 5 s over
-/// `logs::export::EXPORT_DEADLINE`, so the task's deadline comes first.
+/// `logs::query::export::EXPORT_DEADLINE`, so the task's deadline comes first.
 pub const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(155);
 
 /// The largest response body the client reads from ClickHouse; a larger one
@@ -60,7 +60,7 @@ pub const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(155);
 /// this, before more of it is read. Every request is bounded by it, also one
 /// whose SQL bounds its rows, so a mistake in a query costs an error, never
 /// the engine's memory (the log reads also set `max_result_bytes`, see
-/// `logs::search::READ_SETTINGS`).
+/// `logs::query::search::READ_SETTINGS`).
 pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Idempotent DDL applied by [`ClickHouse::migrate`], in order. Table names
@@ -77,7 +77,7 @@ const MIGRATIONS: [&str; 3] = [
 ) ENGINE = MergeTree
 ORDER BY (monitor_id, checked_at)
 TTL toDateTime(checked_at) + INTERVAL 180 DAY",
-    // Log events (see `logs::store`). `retention_days` is copied from the
+    // Log events (see `logs::ingest::store`). `retention_days` is copied from the
     // source onto each row at ingest, so the TTL is per row; `pattern_hash`
     // is derived by ClickHouse and never inserted.
     "CREATE TABLE IF NOT EXISTS logs (
@@ -101,7 +101,7 @@ TTL toDateTime(checked_at) + INTERVAL 180 DAY",
 PARTITION BY toYYYYMMDD(dt)
 ORDER BY (project_id, dt, id)
 TTL toDateTime(dt) + toIntervalDay(retention_days)",
-    // Every heartbeat ping (see `uptime::pings`): kind, exit code and the
+    // Every heartbeat ping (see `uptime::heartbeat::pings`): kind, exit code and the
     // sanitized output the job sent.
     "CREATE TABLE IF NOT EXISTS heartbeat_pings (
     heartbeat_id UUID,

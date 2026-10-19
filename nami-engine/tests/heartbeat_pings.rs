@@ -14,8 +14,8 @@ use common::{
 use nami_engine::{
     core::state::AppState,
     uptime::{
+        heartbeat::pings::{HeartbeatPingRow, insert_ping},
         heartbeat::{MAX_OUTPUT_BYTES, PingKind, SUCCESS_OUTPUT_MAX, TRUNCATED_MARKER},
-        pings::{HeartbeatPingRow, insert_ping},
     },
 };
 use serde_json::{Value, json};
@@ -158,7 +158,7 @@ async fn success_output_is_kept_to_one_kib_and_failure_output_to_ten(pool: sqlx:
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
-    let rows = nami_engine::uptime::pings::recent_pings(&ch, project, id, 10)
+    let rows = nami_engine::uptime::heartbeat::pings::recent_pings(&ch, project, id, 10)
         .await
         .unwrap();
     assert_eq!(rows.len(), 4);

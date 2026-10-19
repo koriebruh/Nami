@@ -35,7 +35,7 @@ pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_PUBLIC_CONNECTIONS: usize = 512;
 
 /// Open connections of the private API (`PORT`): nami-ui is its only client,
-/// with its connection pool and up to `logs::tail::MAX_TAILS_GLOBAL`
+/// with its connection pool and up to `logs::query::tail::MAX_TAILS_GLOBAL`
 /// streams.
 pub const MAX_API_CONNECTIONS: usize = 512;
 

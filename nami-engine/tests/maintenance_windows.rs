@@ -11,7 +11,7 @@ use common::{
 };
 use nami_engine::{
     core::state::AppState,
-    models::monitor::Monitor,
+    uptime::monitor::model::Monitor,
     uptime::{
         alerts::TransitionKind,
         checker::{CheckOutcome, CheckStatus},

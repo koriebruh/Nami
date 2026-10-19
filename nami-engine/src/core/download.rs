@@ -1,5 +1,5 @@
 //! Pieces shared by the streamed file downloads (the uptime check export,
-//! `uptime::export`, and the log export, `logs::export`): the spreadsheet
+//! `uptime::export`, and the log export, `logs::query::export`): the spreadsheet
 //! formula guard and quoting for CSV cells, the per-project download slots
 //! and a response body that can end with an
 //! error instead of cleanly.
@@ -61,7 +61,7 @@ pub fn project_busy(max: usize) -> Response {
 
 /// Per-project download counts: the same counter as the per-user one,
 /// keyed by project id.
-pub type ProjectSlots = crate::logs::slots::UserSlots;
+pub type ProjectSlots = crate::logs::query::slots::UserSlots;
 
 /// 503: every download slot of the instance is taken.
 pub fn instance_busy() -> Response {

@@ -1,29 +1,16 @@
-//! Log management: turning ingested events into rows (`normalize`,
-//! per-source rules in `pipeline`, compiled once per source version in
-//! `pipeline_cache`, `pattern`), storing them in ClickHouse (`store`), and
-//! HTTP ingestion (`ingest`, `msgpack`, with the `budget` that caps what a
-//! body may decode to) with its per-source limits (`rate_limit`) and usage accounting
-//! (`usage`), syslog ingestion over TCP and UDP (`syslog`), and search
-//! (`query`, `search`, `patterns`), the live tail (`tail`) and the streamed
-//! export (`export`).
-pub mod budget;
-pub mod export;
+//! Log management: sources and their pipelines (`source`), saved views
+//! (`view`), ingestion (`ingest`: HTTP bodies, normalization, per-source
+//! pipelines, rate limits, storage in ClickHouse and usage accounting),
+//! syslog ingestion over TCP and UDP (`syslog`), and reading (`query`:
+//! search, patterns, the live tail and the streamed export).
 pub mod ingest;
-pub mod msgpack;
-pub mod normalize;
-pub mod pattern;
-pub mod patterns;
-pub mod pipeline;
-pub mod pipeline_cache;
 pub mod query;
-pub mod rate_limit;
-pub mod saved_query;
-pub mod search;
-pub mod slots;
-pub mod store;
+pub mod source;
 pub mod syslog;
-pub mod tail;
-pub mod usage;
+pub mod view;
+
+use ingest::{pipeline_cache, rate_limit, usage};
+use query::{export, search, slots, tail};
 
 /// In-memory state of the ingest paths, one per engine instance: rate
 /// limits, requests in flight and unflushed usage counters are local to the

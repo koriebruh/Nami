@@ -9,9 +9,9 @@ use common::{
 use nami_engine::{
     core::crypto::{Cipher, DecryptError, SecretString, TEST_KEY},
     core::state::AppState,
-    models::{
-        monitor::{CreateMonitorRequest, Monitor, MonitorView, PatchMonitorRequest},
-        monitor_request::{RequestHeader, open_headers, open_password},
+    uptime::monitor::{
+        model::{CreateMonitorRequest, Monitor, MonitorView, PatchMonitorRequest},
+        request::{RequestHeader, open_headers, open_password},
     },
 };
 use serde_json::{Value, json};

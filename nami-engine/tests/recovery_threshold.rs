@@ -7,7 +7,7 @@ use common::{
     settled_mail, state_with_clickhouse, test_app, unique_email, user_with_role,
 };
 use nami_engine::{
-    models::monitor::Monitor,
+    uptime::monitor::model::Monitor,
     uptime::{
         alerts::TransitionKind,
         checker::CheckStatus,

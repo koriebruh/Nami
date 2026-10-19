@@ -12,8 +12,8 @@ use common::{
 use nami_engine::{
     core::clickhouse::ClickHouse,
     core::state::AppState,
+    logs::source::model::{self as source, SourceConfig},
     logs::syslog::{self, SyslogConfig, SyslogHandle, SyslogStatsSnapshot},
-    models::source::{self, SourceConfig},
 };
 use serde_json::{Value, json};
 use tokio::{

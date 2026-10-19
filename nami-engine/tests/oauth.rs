@@ -315,7 +315,7 @@ async fn oauth_callback_conflicts_with_existing_password_account_same_email(pool
 
 #[sqlx::test]
 async fn find_or_create_oauth_user_does_not_duplicate_on_repeat_login(pool: sqlx::PgPool) {
-    let first = nami_engine::models::user::find_or_create_oauth_user(
+    let first = nami_engine::auth::user::find_or_create_oauth_user(
         &pool,
         "google",
         "google-456",
@@ -324,7 +324,7 @@ async fn find_or_create_oauth_user_does_not_duplicate_on_repeat_login(pool: sqlx
     .await
     .unwrap();
 
-    let second = nami_engine::models::user::find_or_create_oauth_user(
+    let second = nami_engine::auth::user::find_or_create_oauth_user(
         &pool,
         "google",
         "google-456",
@@ -349,7 +349,7 @@ async fn find_or_create_oauth_user_does_not_duplicate_on_repeat_login(pool: sqlx
 /// or `POST /projects` is 403 for everyone forever with no in-app recovery.
 #[sqlx::test]
 async fn first_oauth_user_becomes_global_admin(pool: sqlx::PgPool) {
-    let user = nami_engine::models::user::find_or_create_oauth_user(
+    let user = nami_engine::auth::user::find_or_create_oauth_user(
         &pool,
         "google",
         "google-first",
@@ -366,12 +366,12 @@ async fn first_oauth_user_becomes_global_admin(pool: sqlx::PgPool) {
 #[sqlx::test]
 async fn second_oauth_user_stays_member(pool: sqlx::PgPool) {
     let hash = nami_engine::auth::password::hash_password("password123").unwrap();
-    let first = nami_engine::models::user::insert_user(&pool, "pw-first@example.com", &hash)
+    let first = nami_engine::auth::user::insert_user(&pool, "pw-first@example.com", &hash)
         .await
         .unwrap();
     assert_eq!(first.global_role, "admin");
 
-    let second = nami_engine::models::user::find_or_create_oauth_user(
+    let second = nami_engine::auth::user::find_or_create_oauth_user(
         &pool,
         "google",
         "google-second",

@@ -15,9 +15,9 @@ use common::{
 use nami_engine::{
     core::crypto::{Cipher, SecretString},
     core::state::AppState,
-    models::{
-        monitor::Monitor,
-        monitor_request::{RequestHeader, seal_headers, seal_password},
+    uptime::monitor::{
+        model::Monitor,
+        request::{RequestHeader, seal_headers, seal_password},
     },
     uptime::{
         checker::{CONFIG_DECRYPT_ERROR, CheckContext, CheckStatus, MAX_REDIRECTS, perform_check},

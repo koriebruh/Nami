@@ -1,6 +1,6 @@
 pub mod auth;
 pub mod core;
+pub mod incidents;
 pub mod logs;
-pub mod models;
-pub mod routes;
+pub mod projects;
 pub mod uptime;

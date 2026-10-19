@@ -8,8 +8,8 @@ use common::{
     with_proxy,
 };
 use nami_engine::{
-    models::monitor::Monitor,
     uptime::checker::{CONFIG_DECRYPT_ERROR, CheckStatus, DESTINATION_NOT_ALLOWED, perform_check},
+    uptime::monitor::model::Monitor,
 };
 use uuid::Uuid;
 use wiremock::{

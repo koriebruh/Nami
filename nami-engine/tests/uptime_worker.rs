@@ -18,7 +18,7 @@ use nami_engine::{
     core::clickhouse::ClickHouse,
     core::email::Mailer,
     core::state::AppState,
-    models::monitor::Monitor,
+    uptime::monitor::model::Monitor,
     uptime::{
         alert_throttle::ALERT_FLAP_WINDOW,
         alerts::{Transition, TransitionKind, notify_transition, send_deferred},

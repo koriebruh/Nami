@@ -661,12 +661,12 @@ async fn get_raw(
 /// entry endpoint returns one whole row, confined to the project.
 #[sqlx::test]
 async fn list_rows_are_cut_and_the_entry_endpoint_returns_the_whole_row(pool: sqlx::PgPool) {
+    use nami_engine::logs::source::model::IngestSource;
     use nami_engine::logs::{
-        normalize::LogEvent,
-        search::{LIST_FIELDS_OMITTED, LIST_MESSAGE_CHARS},
-        store,
+        ingest::normalize::LogEvent,
+        ingest::store,
+        query::search::{LIST_FIELDS_OMITTED, LIST_MESSAGE_CHARS},
     };
-    use nami_engine::models::source::IngestSource;
 
     let (state, ch) = state_with_clickhouse(&pool).await;
     let app = app(state);
@@ -847,7 +847,7 @@ async fn list_rows_are_cut_and_the_entry_endpoint_returns_the_whole_row(pool: sq
 /// frees its slot.
 #[sqlx::test]
 async fn log_reads_are_capped_per_user(pool: sqlx::PgPool) {
-    use nami_engine::logs::search::{MAX_QUERIES_PER_USER, QueryPermit};
+    use nami_engine::logs::query::search::{MAX_QUERIES_PER_USER, QueryPermit};
 
     let (state, ch) = state_with_clickhouse(&pool).await;
     let logs = state.logs.clone();
@@ -921,8 +921,8 @@ async fn entry_reads_do_not_compete_with_searches(pool: sqlx::PgPool) {
     );
 
     // Every search slot taken (a page, a histogram, a load-more, ...): entry reads still work.
-    let searches: Vec<_> = (0..nami_engine::logs::search::MAX_QUERIES_PER_USER)
-        .map(|_| nami_engine::logs::search::QueryPermit::acquire(&logs, user).unwrap())
+    let searches: Vec<_> = (0..nami_engine::logs::query::search::MAX_QUERIES_PER_USER)
+        .map(|_| nami_engine::logs::query::search::QueryPermit::acquire(&logs, user).unwrap())
         .collect();
     assert_eq!(
         call(&app, "GET", &entry, Some(&viewer), None).await.0,
@@ -931,10 +931,13 @@ async fn entry_reads_do_not_compete_with_searches(pool: sqlx::PgPool) {
     drop(searches);
 
     // Entry reads have their own cap.
-    let entries: Vec<_> = (0..nami_engine::logs::search::MAX_ENTRY_READS_PER_USER)
+    let entries: Vec<_> = (0..nami_engine::logs::query::search::MAX_ENTRY_READS_PER_USER)
         .map(|_| {
             logs.entry_slots
-                .acquire(user, nami_engine::logs::search::MAX_ENTRY_READS_PER_USER)
+                .acquire(
+                    user,
+                    nami_engine::logs::query::search::MAX_ENTRY_READS_PER_USER,
+                )
                 .unwrap()
         })
         .collect();

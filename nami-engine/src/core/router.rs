@@ -25,8 +25,8 @@ use tower_governor::{
 use tower_sessions::{Expiry, SessionManagerLayer, SessionStore, cookie::SameSite};
 
 use crate::{
-    core::error::AppError, core::state::AppState, logs::rate_limit::TokenBuckets, routes,
-    routes::logs_ingest::IngestLimits,
+    auth, core::error::AppError, core::state::AppState, incidents, logs,
+    logs::ingest::rate_limit::TokenBuckets, logs::ingest::routes::IngestLimits, projects, uptime,
 };
 
 /// Wraps `rate_limited_router()` with the real governor config: per-IP
@@ -70,19 +70,19 @@ fn rate_limited_with_governor(router: Router<AppState>) -> Router<AppState> {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(crate::core::health::router())
-        .merge(routes::auth::router())
+        .merge(auth::routes::router())
         .merge(rate_limited_with_governor(
-            routes::auth::rate_limited_router(),
+            auth::routes::rate_limited_router(),
         ))
-        .merge(routes::projects::router())
-        .merge(routes::sources::router())
-        .merge(routes::monitors::router())
-        .merge(routes::incidents::router())
-        .merge(routes::heartbeats::router())
-        .merge(routes::maintenance::router())
-        .merge(routes::monitor_groups::router())
-        .merge(routes::logs::router())
-        .merge(routes::log_views::router())
+        .merge(projects::routes::router())
+        .merge(logs::source::routes::router())
+        .merge(uptime::monitor::routes::router())
+        .merge(incidents::routes::router())
+        .merge(uptime::heartbeat::routes::router())
+        .merge(uptime::maintenance::routes::router())
+        .merge(uptime::group::routes::router())
+        .merge(logs::query::routes::router())
+        .merge(logs::view::routes::router())
         .layer(middleware::from_fn(require_json_body))
         .with_state(state)
 }
@@ -133,8 +133,8 @@ fn declares_json(headers: &HeaderMap) -> bool {
 /// endpoint (later the OTLP and Sentry ones) and a `/health` that does not
 /// touch the database. None of the API is served here, so the public port can
 /// be exposed to cron jobs, log shippers and other machines without exposing
-/// the API with it. Pings share [`routes::heartbeats::MAX_PINGS_IN_FLIGHT`]
-/// places, ingest requests [`routes::logs_ingest::MAX_INGEST_IN_FLIGHT`]. The
+/// the API with it. Pings share [`uptime::heartbeat::routes::MAX_PINGS_IN_FLIGHT`]
+/// places, ingest requests [`logs::ingest::routes::MAX_INGEST_IN_FLIGHT`]. The
 /// JSON-only guard of the API (`require_json_body`) does not apply here:
 /// ingest takes NDJSON and MessagePack, gzipped, and the token in the
 /// `Authorization` header (never a cookie) is its credential.
@@ -177,15 +177,17 @@ pub fn build_public_router_with_ingest_limits(state: AppState, limits: IngestLim
 }
 
 fn default_ping_slots() -> Arc<Semaphore> {
-    Arc::new(Semaphore::new(routes::heartbeats::MAX_PINGS_IN_FLIGHT))
+    Arc::new(Semaphore::new(
+        uptime::heartbeat::routes::MAX_PINGS_IN_FLIGHT,
+    ))
 }
 
-/// One token bucket per heartbeat: [`routes::heartbeats::PINGS_PER_SECOND`],
-/// burst [`routes::heartbeats::PING_BURST`].
+/// One token bucket per heartbeat: [`uptime::heartbeat::routes::PINGS_PER_SECOND`],
+/// burst [`uptime::heartbeat::routes::PING_BURST`].
 fn default_ping_limits() -> Arc<TokenBuckets> {
     Arc::new(TokenBuckets::new(
-        routes::heartbeats::PINGS_PER_SECOND,
-        routes::heartbeats::PING_BURST,
+        uptime::heartbeat::routes::PINGS_PER_SECOND,
+        uptime::heartbeat::routes::PING_BURST,
     ))
 }
 
@@ -197,8 +199,11 @@ fn build_public_router_with_limits(
 ) -> Router {
     Router::new()
         .merge(crate::core::health::public_router())
-        .merge(routes::heartbeats::public_router(ping_slots, ping_limits))
-        .merge(routes::logs_ingest::public_router(ingest_limits))
+        .merge(uptime::heartbeat::routes::public_router(
+            ping_slots,
+            ping_limits,
+        ))
+        .merge(logs::ingest::routes::public_router(ingest_limits))
         .with_state(state)
 }
 
@@ -213,7 +218,7 @@ fn build_public_router_with_limits(
 /// `with_same_site(SameSite::Lax)`.
 ///
 /// Lax (not tower-sessions' own default of Strict) is a deliberate choice,
-/// not an oversight: the OAuth login flow (`routes/auth.rs`'s
+/// not an oversight: the OAuth login flow (`auth/routes.rs`'s
 /// `oauth_callback`) requires the session holding `oauth_csrf` to survive a
 /// cross-site-originated top-level GET redirect from Google/GitHub back to
 /// this app — Strict blocks cookies on exactly that kind of navigation, Lax

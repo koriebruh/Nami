@@ -6,12 +6,12 @@ use axum::{
     http::{HeaderValue, Request, StatusCode, header},
 };
 use common::{call, seed_project, test_cipher, user_with_role};
-use nami_engine::models::monitor::{self, CreateMonitorRequest};
-use nami_engine::models::monitor_request::{open_headers, open_password};
 use nami_engine::uptime::import::{
     IMPORT_LOCK_CLASS, ImportDefaults, ImportFormat, MAX_ENTRIES, MAX_IMPORT_BODY_BYTES,
     MAX_IMPORT_REQUEST_BYTES, ParseError, UNREADABLE_ENTRY, existing_key, parse,
 };
+use nami_engine::uptime::monitor::model::{self as monitor, CreateMonitorRequest};
+use nami_engine::uptime::monitor::request::{open_headers, open_password};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;

@@ -19,7 +19,7 @@ use nami_engine::{
     core::state::AppState,
     logs::{
         LogsState,
-        export::{ExportLimits, MAX_EXPORTS_PER_INSTANCE},
+        query::export::{ExportLimits, MAX_EXPORTS_PER_INSTANCE},
     },
 };
 use serde_json::{Value, json};

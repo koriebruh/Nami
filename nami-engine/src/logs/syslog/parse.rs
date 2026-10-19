@@ -9,7 +9,7 @@ use std::fmt;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::{Map, Value};
 
-use crate::logs::normalize::{LogEvent, in_accepted_range, level_from_number};
+use crate::logs::ingest::normalize::{LogEvent, in_accepted_range, level_from_number};
 
 /// The structured-data element that carries the source token:
 /// `[nami token="<source token>"]`. It is never stored.

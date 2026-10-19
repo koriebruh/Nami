@@ -1,0 +1,3 @@
+//! Incidents opened by monitors and heartbeats (`model`) and their routes.
+pub mod model;
+pub mod routes;

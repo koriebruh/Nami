@@ -9,7 +9,7 @@ use common::{
 use nami_engine::{
     auth::token::hash_token,
     core::crypto::{Cipher, TEST_KEY},
-    models::source::{self, TOKEN_CONTEXT},
+    logs::source::model::{self as source, TOKEN_CONTEXT},
 };
 use serde_json::{Value, json};
 use uuid::Uuid;

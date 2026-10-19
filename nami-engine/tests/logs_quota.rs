@@ -16,11 +16,11 @@ use common::{
 };
 use nami_engine::{
     core::state::AppState,
+    logs::source::model::SourceConfig,
     logs::{
         LogsState,
-        usage::{self, UsageCounters},
+        ingest::usage::{self, UsageCounters},
     },
-    models::source::SourceConfig,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;

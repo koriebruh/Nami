@@ -17,10 +17,10 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::models::{
-    heartbeat,
-    maintenance::{self, MaintenanceWindow, Span},
-    monitor,
+use crate::uptime::{
+    heartbeat::model as heartbeat,
+    maintenance::model::{self as maintenance, MaintenanceWindow, Span},
+    monitor::model as monitor,
 };
 
 /// The longest range a report covers (three years).

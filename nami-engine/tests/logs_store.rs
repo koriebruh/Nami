@@ -3,11 +3,11 @@
 use chrono::{DateTime, Duration, Utc};
 use nami_engine::{
     core::clickhouse::{ClickHouse, ClickHouseError},
-    logs::{
+    logs::ingest::{
         normalize,
         store::{self, LogRow},
     },
-    models::source::IngestSource,
+    logs::source::model::IngestSource,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
