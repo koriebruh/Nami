@@ -71,4 +71,23 @@ describe('heartbeatPayloadFromForm', () => {
 		);
 		expect(result).toEqual({ ok: true, payload: { name: 'Backup', period_seconds: 60, grace_seconds: 10 } });
 	});
+
+	it('sends a group on create and omits a blank one', () => {
+		const g = '0b9d1f6c-5a3e-4c2f-9d47-6e8a1c3b7f25';
+		expect(heartbeatPayloadFromForm(form({ name: 'B', period_seconds: '60', group_id: g }))).toEqual({
+			ok: true,
+			payload: { name: 'B', period_seconds: 60, group_id: g }
+		});
+		expect(heartbeatPayloadFromForm(form({ name: 'B', period_seconds: '60', group_id: '' }))).toEqual({
+			ok: true,
+			payload: { name: 'B', period_seconds: 60 }
+		});
+	});
+
+	it('sends null for a blank group on edit, so the heartbeat is ungrouped', () => {
+		expect(heartbeatPayloadFromForm(form({ name: 'B', period_seconds: '60', group_id: '' }), 'edit')).toEqual({
+			ok: true,
+			payload: { name: 'B', period_seconds: 60, group_id: null }
+		});
+	});
 });

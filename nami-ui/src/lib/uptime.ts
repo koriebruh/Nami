@@ -126,6 +126,8 @@ export type Incident = {
 	status: 'open' | 'resolved';
 	started_at: string;
 	resolved_at: string | null;
+	/** Job output a failing heartbeat reported; plain text, already truncated by the engine. */
+	details: string | null;
 };
 
 export type Heartbeat = {
@@ -144,6 +146,17 @@ export type Heartbeat = {
 	last_ping_at: string | null;
 	created_at: string;
 	in_maintenance: boolean;
+	group_id: string | null;
+};
+
+/** One ping a heartbeat received; `output` is plain text, never markup. */
+export type HeartbeatPing = {
+	heartbeat_id: string;
+	project_id: string;
+	received_at: string;
+	kind: 'success' | 'fail';
+	exit_code: number | null;
+	output: string;
 };
 
 /** The URL a cron job pings: straight to nami-engine, not through this BFF. */
@@ -167,6 +180,20 @@ export function shellQuote(value: string): string {
  */
 export function pingCommand(url: string): string {
 	return `curl -fsS -m 10 --retry 3 ${shellQuote(url)}`;
+}
+
+/** The URL that reports the job as failed right away. */
+export function failUrl(url: string): string {
+	return `${url}/fail`;
+}
+
+/**
+ * A command that runs the job, then reports its exit code and output. The
+ * output goes in on stdin (`@-`), never as `--data-binary "$out"`: output that
+ * starts with `@` would make curl upload a local file of that name.
+ */
+export function exitCodeCommand(url: string): string {
+	return `out=$(your-job 2>&1); code=$?; printf '%s' "$out" | curl -fsS -m 10 --data-binary @- ${shellQuote(url)}/$code`;
 }
 
 /** Compact period: 86400 -> "1d", 5400 -> "1h 30m", 90 -> "1m 30s". */
@@ -338,7 +365,7 @@ export type MonitorSection<M> = { group: MonitorGroup | null; monitors: M[] };
  * Empty sections are dropped. A monitor whose group is unknown (e.g. just
  * deleted) counts as ungrouped.
  */
-export function groupMonitors<M extends Pick<Monitor, 'group_id'>>(
+export function groupMonitors<M extends { group_id: string | null }>(
 	monitors: M[],
 	groups: MonitorGroup[]
 ): MonitorSection<M>[] {

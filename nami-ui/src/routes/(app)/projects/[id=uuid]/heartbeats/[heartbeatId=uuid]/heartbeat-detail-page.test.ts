@@ -5,7 +5,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 import { HEARTBEAT_ID, PROJECT_ID } from '#lib/server/fake-event';
-import type { Heartbeat } from '#lib/uptime';
+import type { Heartbeat, HeartbeatPing, MonitorGroup } from '#lib/uptime';
 import Page from './+page.svelte';
 
 const TOKEN = 'c'.repeat(64);
@@ -25,15 +25,18 @@ function heartbeat(overrides: Partial<Heartbeat> = {}): Heartbeat {
 		last_ping_at: '2026-10-13T10:00:00Z',
 		created_at: '2026-10-12T10:00:00Z',
 		in_maintenance: false,
+		group_id: null,
 		...overrides
 	};
 }
 
-function renderPage(hb: Heartbeat, form: unknown = null) {
+function renderPage(hb: Heartbeat, form: unknown = null, pings: HeartbeatPing[] = [], groups: MonitorGroup[] = []) {
 	const data = {
 		user: { id: 'u', email: 'a@b.test', global_role: 'member' },
 		project: { id: PROJECT_ID, name: 'Demo', slug: 'demo' },
 		heartbeat: hb,
+		pings,
+		groups,
 		engineUrl: ENGINE
 	};
 	return render(Page, { props: { params: { id: PROJECT_ID, heartbeatId: HEARTBEAT_ID }, data, form } as never });
@@ -51,7 +54,7 @@ describe('heartbeat detail page: ping URL', () => {
 	it('shows a member the ping URL and a crontab line that uses it', () => {
 		const { body } = renderPage(heartbeat());
 		expect(body).toContain(`<code class="block flex-1`);
-		expect(body.split(PING).length - 1).toBe(2); // the URL itself, and inside the crontab line
+		expect(body.split(PING).length - 1).toBe(4); // the URL, the crontab line, the fail URL and the exit-code command
 		// The command quotes the URL; the URL block above it is the plain URL.
 		expect(body).toContain(`0 3 * * * /usr/local/bin/backup.sh &amp;&amp; curl -fsS -m 10 --retry 3 '${PING}'`);
 		expect(body).toContain(`select-all">${PING}</code>`);
@@ -184,5 +187,63 @@ describe('heartbeat detail page: maintenance', () => {
 	it('shows the badge while a window covers the heartbeat', () => {
 		expect(renderPage(heartbeat({ in_maintenance: true })).body).toContain('Maintenance');
 		expect(renderPage(heartbeat()).body).not.toContain('Maintenance');
+	});
+});
+
+describe('heartbeat detail page: failure examples', () => {
+	it('shows /fail and the exit-code command to members only', () => {
+		const member = renderPage(heartbeat()).body;
+		expect(member).toContain(`${PING}/fail`);
+		expect(member).toContain('curl -fsS -m 10 --data-binary @-');
+		const viewer = renderPage(heartbeat({ token: null })).body;
+		expect(viewer).not.toContain('/fail');
+		expect(viewer).not.toContain('--data-binary');
+	});
+});
+
+describe('heartbeat detail page: recent pings', () => {
+	const ping = (overrides: Partial<HeartbeatPing> = {}): HeartbeatPing => ({
+		heartbeat_id: HEARTBEAT_ID,
+		project_id: PROJECT_ID,
+		received_at: '2026-10-13T10:00:00Z',
+		kind: 'fail',
+		exit_code: 2,
+		output: '<script>alert(1)</script>\nbackup failed',
+		...overrides
+	});
+
+	it('shows output as text, never as markup', () => {
+		const { body } = renderPage(heartbeat(), null, [ping()]);
+		expect(body).toContain('&lt;script>alert(1)&lt;/script>');
+		expect(body).not.toContain('<script>alert(1)</script>');
+		expect(body).toContain('exit code 2');
+		expect(body).toContain('2026-10-13 10:00:00 UTC');
+	});
+
+	it('has no output block for a ping without output, and says so when there are none', () => {
+		const { body } = renderPage(heartbeat(), null, [ping({ kind: 'success', exit_code: null, output: '' })]);
+		expect(body).toContain('Success');
+		expect(body).not.toContain('>Output<');
+		expect(renderPage(heartbeat()).body).toContain('No pings received yet.');
+	});
+});
+
+describe('heartbeat detail page: group', () => {
+	const groups: MonitorGroup[] = [
+		{ id: 'g1', project_id: PROJECT_ID, name: 'Backups', position: 0, created_at: '2026-10-13T00:00:00Z' },
+		{ id: 'g2', project_id: PROJECT_ID, name: 'Reports', position: 1, created_at: '2026-10-13T00:00:00Z' }
+	];
+
+	it('offers this project\'s groups with the saved one selected', () => {
+		const { body } = renderPage(heartbeat({ group_id: 'g2' }), null, [], groups);
+		expect(body).toContain('name="group_id"');
+		expect(body).toContain('>No group<');
+		expect(body).toMatch(/<option value="g2" selected[^>]*>Reports</);
+		expect(body).not.toMatch(/<option value="g1" selected/);
+	});
+
+	it('keeps the saved group when the groups did not load', () => {
+		const { body } = renderPage(heartbeat({ group_id: 'g2' }));
+		expect(body).toMatch(/<input type="hidden" name="group_id" value="g2"/);
 	});
 });

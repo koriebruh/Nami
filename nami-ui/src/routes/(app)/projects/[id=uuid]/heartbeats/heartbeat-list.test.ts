@@ -4,6 +4,12 @@ import { actions, load } from './+page.server';
 
 const heartbeatsPath = `/projects/${PROJECT_ID}/heartbeats`;
 
+/** The heartbeats call and the groups call answer differently. */
+const answer = (heartbeats: unknown, groups: unknown, groupsStatus = 200) => (url: URL) =>
+	url.pathname.endsWith('/monitor-groups')
+		? new Response(JSON.stringify(groups), { status: groupsStatus })
+		: new Response(JSON.stringify(heartbeats), { status: 200 });
+
 type Scenario = [name: string, engine: Parameters<typeof fakeEvent>[0], rejection: { status: number } | null];
 
 describe('heartbeat list load', () => {
@@ -19,19 +25,28 @@ describe('heartbeat list load', () => {
 	it('returns the heartbeats with the engine URL that ping URLs are built on', async () => {
 		process.env.PUBLIC_ENGINE_URL = 'https://engine.example.com/';
 		const heartbeats = [{ id: HEARTBEAT_ID, name: 'Backup', token: 'a'.repeat(64) }];
-		const { event, calls } = fakeEvent({ body: JSON.stringify(heartbeats) });
-		expect(await load(event)).toEqual({ heartbeats, engineUrl: 'https://engine.example.com' });
-		expect(calls()).toEqual([{ method: 'GET', path: heartbeatsPath, search: '', body: undefined }]);
+		const { event, calls } = fakeEvent({ respond: answer(heartbeats, []) });
+		expect(await load(event)).toEqual({ heartbeats, groups: [], engineUrl: 'https://engine.example.com' });
+		expect(calls()).toEqual([
+			{ method: 'GET', path: heartbeatsPath, search: '', body: undefined },
+			{ method: 'GET', path: `/projects/${PROJECT_ID}/monitor-groups`, search: '', body: undefined }
+		]);
 	});
 
 	// The engine leaves the ping token out (null) for a viewer. The load passes
 	// that on as it is: it never makes up a token, and never drops the field.
 	it('passes a null token (a viewer) through untouched', async () => {
 		const heartbeats = [{ id: HEARTBEAT_ID, name: 'Backup', token: null }];
-		const { event } = fakeEvent({ body: JSON.stringify(heartbeats) });
+		const { event } = fakeEvent({ respond: answer(heartbeats, []) });
 		const data = await load(event);
-		expect(data).toEqual({ heartbeats, engineUrl: 'http://localhost:8081' });
+		expect(data).toEqual({ heartbeats, groups: [], engineUrl: 'http://localhost:8081' });
 		expect(data).toHaveProperty('heartbeats.0.token', null);
+	});
+
+	it('returns the project groups, and an empty list when they cannot be loaded', async () => {
+		const groups = [{ id: 'g1', name: 'Backups' }];
+		expect(await load(fakeEvent({ respond: answer([], groups) }).event)).toMatchObject({ groups });
+		expect(await load(fakeEvent({ respond: answer([], { error: 'forbidden' }, 403) }).event)).toMatchObject({ groups: [] });
 	});
 
 	it('keeps a 403 a 403', async () => {
@@ -57,7 +72,10 @@ describe('heartbeat list load', () => {
 	it('keeps a hostile id inside one path segment', async () => {
 		const { event, calls } = fakeEvent({ params: { id: '../auth/me?' }, body: '[]' });
 		await load(event);
-		expect(calls().map((call) => call.path + call.search)).toEqual(['/projects/..%2Fauth%2Fme%3F/heartbeats']);
+		expect(calls().map((call) => call.path + call.search)).toEqual([
+			'/projects/..%2Fauth%2Fme%3F/heartbeats',
+			'/projects/..%2Fauth%2Fme%3F/monitor-groups'
+		]);
 	});
 
 	// The page carries the ping token, in its markup and in the data sent with

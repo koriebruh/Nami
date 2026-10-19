@@ -18,6 +18,7 @@ function incident(overrides: Partial<Incident> = {}): Incident {
 		status: 'resolved',
 		started_at: '2026-10-13T10:00:00Z',
 		resolved_at: '2026-10-13T10:01:11Z',
+		details: null,
 		...overrides
 	};
 }
@@ -91,5 +92,14 @@ describe('incidents page', () => {
 
 	it('sets the page title', () => {
 		expect(renderPage([]).head).toContain('Incidents · Demo');
+	});
+
+	it('shows job output as escaped text in a details block, and none without it', () => {
+		const { body } = renderPage([incident({ details: '<script>alert(1)</script>\nbackup failed' })]);
+		expect(body).toContain('<details>');
+		expect(body).toContain('Job output');
+		expect(body).toContain('&lt;script>alert(1)&lt;/script>');
+		expect(body).not.toContain('<script>alert(1)</script>');
+		expect(renderPage([incident({ details: null })]).body).not.toContain('<details');
 	});
 });

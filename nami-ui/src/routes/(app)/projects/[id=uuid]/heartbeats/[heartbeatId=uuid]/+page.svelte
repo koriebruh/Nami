@@ -2,9 +2,10 @@
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import { refreshAll } from '$app/navigation';
 	import CopyButton from '#lib/components/CopyButton.svelte';
+	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
-	import { formatSeconds, formatUtc, pingCommand, pingUrl, timeAgo } from '#lib/uptime';
+	import { exitCodeCommand, failUrl, formatSeconds, formatUtc, pingCommand, pingUrl, timeAgo } from '#lib/uptime';
 	import type { PageProps } from './$types';
 
 	let { data, form }: PageProps = $props();
@@ -22,6 +23,8 @@
 	const base = $derived(`/projects/${data.project.id}/heartbeats/${data.heartbeat.id}`);
 	// The engine sends no token to a viewer: no ping URL and no command then.
 	const url = $derived(data.heartbeat.token ? pingUrl(data.engineUrl, data.heartbeat.token) : null);
+	const failEndpoint = $derived(url ? failUrl(url) : null);
+	const exitCommand = $derived(url ? exitCodeCommand(url) : null);
 	const cron = $derived(url ? `0 3 * * * /usr/local/bin/backup.sh && ${pingCommand(url)}` : null);
 
 	// The settings inputs read these three instead of `data`. Every 30 s refresh
@@ -30,6 +33,7 @@
 	const savedName = $derived(data.heartbeat.name);
 	const savedPeriod = $derived(data.heartbeat.period_seconds);
 	const savedGrace = $derived(data.heartbeat.grace_seconds);
+	const savedGroup = $derived(data.heartbeat.group_id ?? '');
 
 	// The buttons stay disabled from a submit until its result is applied, so a
 	// double click cannot send an action twice. They are in the `submitButton`
@@ -168,6 +172,26 @@
 				<CopyButton value={cron} />
 			</div>
 
+			{#if failEndpoint && exitCommand}
+				<div class="space-y-3 border-t border-border pt-4">
+					<h4 class="text-sm font-medium text-ink">Report a failure</h4>
+					<p class="text-sm text-muted">
+						Request the fail URL when a run goes wrong to open an incident right away, without waiting for the grace period.
+					</p>
+					<div role="group" aria-label="Fail URL" class="flex items-center gap-2">
+						<code class="block flex-1 rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs break-all text-ink-2 select-all">{failEndpoint}</code>
+						<CopyButton value={failEndpoint} />
+					</div>
+					<p class="pt-2 text-sm text-muted">
+						Or report the job's exit code (0 is a success, anything else a failure) with its output as the request body:
+					</p>
+					<div role="group" aria-label="Exit code command" class="flex items-start gap-2">
+						<pre class="block flex-1 rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap text-ink-2 select-all">{exitCommand}</pre>
+						<CopyButton value={exitCommand} />
+					</div>
+				</div>
+			{/if}
+
 			<div class="space-y-3 border-t border-border pt-4">
 				<div class="flex flex-wrap items-center gap-3">
 					<form method="POST" action="?/rotate" use:enhance={confirmRotate}>
@@ -200,6 +224,36 @@
 			</div>
 		{:else}
 			<p class="text-sm text-muted">Ping URL is visible to project members.</p>
+		{/if}
+	</div>
+
+	<div class="card" aria-labelledby="pings-title">
+		<div class="border-b border-border px-5 py-4 sm:px-6">
+			<h3 id="pings-title" class="card-title">Recent pings</h3>
+		</div>
+		{#if data.pings.length === 0}
+			<EmptyState icon="heartbeat" message="No pings received yet." />
+		{:else}
+			<ul class="divide-y divide-border">
+				{#each data.pings as ping (ping.received_at + ping.kind + (ping.exit_code ?? ''))}
+					<li class="space-y-2 px-5 py-3 sm:px-6">
+						<div class="flex flex-wrap items-center gap-3 text-sm">
+							<span class="badge {ping.kind === 'fail' ? 'badge-danger' : 'badge-success'}">
+								{ping.kind === 'fail' ? 'Fail' : 'Success'}
+							</span>
+							<span class="text-ink-2">{formatUtc(ping.received_at)}</span>
+							{#if ping.exit_code !== null}<span class="text-xs text-muted">exit code {ping.exit_code}</span>{/if}
+						</div>
+						{#if ping.output}
+							<!-- Output is text from the job: interpolated, never markup. -->
+							<details>
+								<summary class="cursor-pointer text-xs text-primary">Output</summary>
+								<pre class="mt-2 max-h-64 overflow-auto rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs break-all whitespace-pre-wrap text-ink-2">{ping.output}</pre>
+							</details>
+						{/if}
+					</li>
+				{/each}
+			</ul>
 		{/if}
 	</div>
 
@@ -251,6 +305,20 @@
 						class={input}
 					/>
 				</div>
+				{#if data.groups.length > 0}
+					<div class="sm:col-span-3 sm:max-w-sm">
+						<label for="hb-group" class={label}>Group</label>
+						<select id="hb-group" name="group_id" class="select">
+							<option value="">No group</option>
+							{#each data.groups as group (group.id)}
+								<option value={group.id} selected={group.id === savedGroup}>{group.name}</option>
+							{/each}
+						</select>
+					</div>
+				{:else if savedGroup}
+					<!-- Groups did not load: keep the heartbeat's group instead of ungrouping it. -->
+					<input type="hidden" name="group_id" value={savedGroup} />
+				{/if}
 				{@render submitButton('Save', primaryButton)}
 				<p id="hb-hint" class="text-xs text-muted sm:col-span-4">
 					Period: at least 30, grace: 0 or more, both at most 2678400 (31 days).

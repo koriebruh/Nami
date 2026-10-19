@@ -8,6 +8,8 @@ import {
 	formatSeconds,
 	formatUptime,
 	formatUtc,
+	exitCodeCommand,
+	failUrl,
 	groupMonitors,
 	isRedacted,
 	secretsMustBeReentered,
@@ -134,7 +136,8 @@ describe('statusSince', () => {
 		cause: null,
 		status,
 		started_at: started,
-		resolved_at: resolved
+		resolved_at: resolved,
+		details: null
 	});
 	const history = [
 		incident('resolved', '2026-10-05T00:00:00Z', '2026-10-05T01:00:00Z'),
@@ -359,5 +362,26 @@ describe('secretsMustBeReentered', () => {
 			secretsMustBeReentered({ ...edit, storedUrl: 'HTTPS://api.test/h', url: 'HTTPS://api.test/h', verifySsl: false })
 		).toBe(SECRETS_TLS_MESSAGE);
 		expect(secretsMustBeReentered({ ...edit, storedVerifySsl: false, verifySsl: false })).toBeNull();
+	});
+});
+
+describe('heartbeat failure examples', () => {
+	it('builds the fail URL and an exit-code command that reports output', () => {
+		const url = 'https://engine.example.com/api/v1/heartbeat/' + 'a'.repeat(64);
+		expect(failUrl(url)).toBe(url + '/fail');
+		expect(exitCodeCommand(url)).toBe(
+			`out=$(your-job 2>&1); code=$?; printf '%s' "$out" | curl -fsS -m 10 --data-binary @- '${url}'/$code`
+		);
+		// Never `--data-binary "$out"`: output starting with @ would make curl upload a local file.
+		expect(exitCodeCommand(url)).not.toContain('--data-binary "$out"');
+	});
+
+	it('groups heartbeats like monitors', () => {
+		const group = { id: 'g1', project_id: 'p', name: 'Backups', position: 0, created_at: '2026-10-13T00:00:00Z' };
+		const sections = groupMonitors([{ group_id: 'g1' }, { group_id: null }], [group]);
+		expect(sections.map((s) => [s.group?.name ?? null, s.monitors.length])).toEqual([
+			['Backups', 1],
+			[null, 1]
+		]);
 	});
 });
