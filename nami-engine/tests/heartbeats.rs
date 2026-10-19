@@ -3407,3 +3407,115 @@ async fn a_missed_deadline_soon_after_a_recovery_reopens_the_incident(pool: sqlx
     assert_eq!(incidents[0].1, "Nightly backup missed its heartbeat");
     assert_eq!(details_of(&pool, id).await, vec![None]);
 }
+
+/// A heartbeat stored with a stray tag character in its name can still be
+/// paused; a new name with one is refused.
+#[sqlx::test]
+async fn a_heartbeat_with_a_stored_stray_tag_character_can_be_paused(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (id, _) = seed_heartbeat(&pool, project, "legacy\u{E0041}", 3600, 60, 0).await;
+    let item = format!("/projects/{project}/heartbeats/{id}");
+    let (status, body) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "paused": true })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["paused"], true);
+    let (status, _) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "name": "stray\u{E0041}" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An instance without the uptime worker (API only) still sends the DOWN its
+/// flap control held back for a ping it received, once the window is over;
+/// a project-wide maintenance window stops it.
+#[sqlx::test]
+async fn a_held_down_is_sent_without_the_worker(pool: sqlx::PgPool) {
+    use nami_engine::uptime::{alert_throttle::ALERT_FLAP_WINDOW, alerts::run_deferred_alerts};
+    let mut state = AppState::for_test(pool.clone());
+    state.config.uptime_worker_enabled = false;
+    let public = unthrottled_public(state.clone());
+    let (project, recipient) = project_with_recipient(&pool).await;
+    let (_, token) = seed_heartbeat(&pool, project, "Flaky job", 3600, 60, 0).await;
+    for path in ["fail", "0", "fail"] {
+        let (status, _, _) = ping_with(
+            &public,
+            &format!("/api/v1/heartbeat/{token}/{path}"),
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(
+        settled_mail(&recipient, 2).await.len(),
+        2,
+        "the second DOWN is held"
+    );
+
+    // The loop every instance runs; the skew stands for the window passing.
+    let deferred = tokio::spawn(run_deferred_alerts(
+        state.clone(),
+        Duration::from_millis(50),
+        ALERT_FLAP_WINDOW,
+    ));
+    let mail = settled_mail(&recipient, 3).await;
+    deferred.abort();
+    let subjects: Vec<&str> = mail.iter().map(|(subject, _)| subject.as_str()).collect();
+    assert_eq!(
+        subjects,
+        vec![
+            "[Nami] Flaky job is DOWN",
+            "[Nami] Flaky job is back UP",
+            "[Nami] Flaky job is DOWN"
+        ]
+    );
+}
+
+/// A heartbeat's held-back DOWN is dropped while a project-wide maintenance
+/// window covers it.
+#[sqlx::test]
+async fn a_held_heartbeat_down_is_dropped_during_maintenance(pool: sqlx::PgPool) {
+    use nami_engine::uptime::{alert_throttle::ALERT_FLAP_WINDOW, alerts::send_deferred};
+    let state = AppState::for_test(pool.clone());
+    let public = unthrottled_public(state.clone());
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_heartbeat(&pool, project, "Flaky job", 3600, 60, 0).await;
+    for path in ["fail", "0", "fail"] {
+        let (status, _, _) = ping_with(
+            &public,
+            &format!("/api/v1/heartbeat/{token}/{path}"),
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    sqlx::query(
+        "insert into maintenance_windows (project_id, title, kind, starts_at, ends_at)
+         values ($1, 'maintenance', 'once', now() - interval '5 minutes', now() + interval '1 hour')",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // The alert tasks of the pings may still be running: wait for the held DOWN.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let later = || std::time::Instant::now() + ALERT_FLAP_WINDOW;
+    while state.alert_throttle.due(later()).is_empty() {
+        assert!(Instant::now() < deadline, "the DOWN was never held");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(send_deferred(&state, later()).await, 0);
+    assert!(state.alert_throttle.due(later()).is_empty());
+}

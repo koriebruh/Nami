@@ -3,13 +3,13 @@
 //! policies, webhook/Slack/Telegram/Discord channels) without touching the
 //! worker.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use super::{alert_throttle::Decision, checker::is_unsafe_in_text, heartbeat::sanitize_output};
-use crate::state::AppState;
+use crate::{models::maintenance, state::AppState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionKind {
@@ -64,16 +64,21 @@ pub async fn notify_transition(state: &AppState, transition: &Transition) {
     deliver(state, transition).await;
 }
 
+/// How often every instance sends the DOWN emails its flap control held back
+/// ([`run_deferred_alerts`]).
+pub const DEFERRED_ALERT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Sends the DOWN emails the flap control held back whose window has passed
-/// by `now`, for subjects that are still down (unpaused, and not deleted).
-/// The worker's sweep loop calls it every sweep. Returns how many went out.
+/// by `now`, for subjects that are still down (they exist, are not paused,
+/// are down, and no maintenance window covers them). Returns how many went
+/// out.
 pub async fn send_deferred(state: &AppState, now: Instant) -> usize {
     let mut sent = 0;
     for transition in state.alert_throttle.due(now) {
-        let still_down = match still_down(&state.db, transition.subject).await {
+        let still_down = match still_down(&state.db, &transition).await {
             Ok(down) => down,
             Err(e) => {
-                tracing::error!(error = %e, subject = ?transition.subject, "could not check a deferred alert; retried next sweep");
+                tracing::error!(error = %e, subject = ?transition.subject, "could not check a deferred alert; retried shortly");
                 continue;
             }
         };
@@ -88,9 +93,29 @@ pub async fn send_deferred(state: &AppState, now: Instant) -> usize {
     sent
 }
 
-/// Whether the subject exists, is not paused and is down.
-async fn still_down(pool: &sqlx::PgPool, subject: Subject) -> Result<bool, sqlx::Error> {
-    let (sql, id) = match subject {
+/// Runs [`send_deferred`] every `interval`, forever, judging the window at
+/// `Instant::now() + skew` (`Duration::ZERO` in production; tests pass the
+/// window to stand for its passing). Every engine instance runs this, worker
+/// or not: the flap control lives in the process that received the ping or
+/// ran the check, so that process must also send what it held back. Cheap
+/// when nothing is pending: one lock and a scan of the subjects.
+pub async fn run_deferred_alerts(state: AppState, interval: Duration, skew: Duration) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let now = Instant::now() + skew;
+        if !state.alert_throttle.due(now).is_empty() {
+            send_deferred(&state, now).await;
+        }
+    }
+}
+
+/// Whether the transition's subject still exists, is not paused, is down,
+/// and is not covered by a maintenance window (project-wide, or scoped to
+/// the monitor) right now.
+async fn still_down(pool: &sqlx::PgPool, transition: &Transition) -> Result<bool, sqlx::Error> {
+    let (sql, id) = match transition.subject {
         Subject::Monitor(id) => (
             "select exists (select 1 from monitors where id = $1 and not paused and current_status = 'down')",
             id,
@@ -100,7 +125,20 @@ async fn still_down(pool: &sqlx::PgPool, subject: Subject) -> Result<bool, sqlx:
             id,
         ),
     };
-    sqlx::query_scalar(sql).bind(id).fetch_one(pool).await
+    let down: bool = sqlx::query_scalar(sql).bind(id).fetch_one(pool).await?;
+    if !down {
+        return Ok(false);
+    }
+    let now = Utc::now();
+    let in_maintenance = match transition.subject {
+        Subject::Monitor(id) => {
+            maintenance::monitor_in_maintenance(pool, transition.project_id, id, now).await?
+        }
+        Subject::Heartbeat(_) => {
+            maintenance::heartbeat_in_maintenance(pool, transition.project_id, now).await?
+        }
+    };
+    Ok(!in_maintenance)
 }
 
 /// Emails every member of the transition's project (see

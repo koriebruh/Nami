@@ -1,6 +1,6 @@
 //! Flap control for alert emails: at most one DOWN email and one recovery
-//! email per subject (monitor or heartbeat) per [`ALERT_FLAP_WINDOW`], without
-//! ever leaving the members with a stale picture.
+//! email per subject (monitor or heartbeat) per [`ALERT_FLAP_WINDOW`], while
+//! keeping the members' picture current (see the restart caveat below).
 //!
 //! The rules, per subject, in [`AlertThrottle::decide`]:
 //!
@@ -13,17 +13,19 @@
 //!   already a recovery (nothing to correct).
 //! - A pending DOWN still pending once the window since the last DOWN email
 //!   has passed is sent then ([`AlertThrottle::due`] and
-//!   [`AlertThrottle::confirm_deferred`], driven by the worker's sweep loop
-//!   through `alerts::send_deferred`), after checking that the subject is
-//!   still down. A subject that stays down is therefore always reported,
-//!   at most one window late.
+//!   [`AlertThrottle::confirm_deferred`], driven by `alerts::run_deferred_alerts`,
+//!   which every engine instance runs, worker or not), after checking that
+//!   the subject is still down, unpaused and outside maintenance.
 //!
 //! So a subject that flaps without pause costs each member at most one
-//! DOWN + recovery pair per window, and the members' last email always
-//! matches the subject's state (within one window).
+//! DOWN + recovery pair per window, and a subject that stays down is
+//! reported at most one window late, as long as the process that held the
+//! DOWN back keeps running.
 //!
 //! State is in memory, per engine process, like the ping rate limits. A
-//! restart forgets it: the first transition after a restart is sent.
+//! restart forgets it: the first transition after a restart is sent, and a
+//! DOWN held back at the moment of a restart is lost (the subject shows as
+//! down in the UI, but no email goes out for that outage).
 
 use std::{
     collections::HashMap,

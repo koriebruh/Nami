@@ -13,9 +13,7 @@
 //!   the pass's own task, so a slow or hung ClickHouse delays nothing either.
 //! - Heartbeats (the sweep loop): every [`SWEEP_INTERVAL`] the worker records
 //!   that it is alive, making up for an outage before (see
-//!   [`heartbeat::note_worker_alive`]), sweeps the overdue heartbeats and
-//!   sends the DOWN alerts the flap control held back whose window is over
-//!   ([`alerts::send_deferred`]).
+//!   [`heartbeat::note_worker_alive`]), and sweeps the overdue heartbeats.
 //!   Nothing a check does can delay it.
 //! - Alerts are sent by background tasks ([`Notifications`]), so a slow SMTP
 //!   server delays neither loop.
@@ -724,21 +722,6 @@ async fn sweep_tick(state: AppState, notifications: Notifications, starting: boo
     }
     if let Err(e) = sweep_pass(&state, &notifications).await {
         tracing::error!(error = ?e, "heartbeat sweep failed");
-    }
-    // DOWN emails the flap control held back (monitors and heartbeats alike),
-    // sent in the background like every other alert.
-    let deferred_state = state.clone();
-    if !state
-        .alert_throttle
-        .due(std::time::Instant::now())
-        .is_empty()
-        && !notifications.spawn(async move {
-            alerts::send_deferred(&deferred_state, std::time::Instant::now()).await;
-        })
-    {
-        tracing::error!(
-            "deferred alerts not sent this sweep: too many alert batches are still sending"
-        );
     }
     true
 }
