@@ -369,7 +369,8 @@ mod tests {
         assert_eq!(runs, vec![0..2, 2..3, 4..5]);
         assert_eq!(oversized, 1);
         let (runs, oversized) = chunk_rows(&rows, usize::MAX).unwrap();
-        assert_eq!((runs, oversized), (vec![0..5], 0));
+        assert_eq!((runs.len(), oversized), (1, 0));
+        assert_eq!(runs[0], 0..5);
         assert_eq!(chunk_rows(&[], 10).unwrap(), (vec![], 0));
     }
 
