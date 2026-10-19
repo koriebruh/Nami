@@ -1,7 +1,10 @@
 // Requires `docker compose up -d postgres mailpit`.
 mod common;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
@@ -15,7 +18,9 @@ use common::{
 };
 use nami_engine::{
     email::Mailer,
+    logs::rate_limit::TokenBuckets,
     models::incident,
+    routes::heartbeats::{MAX_PING_BODY_BYTES, MAX_PINGS_IN_FLIGHT, PING_BODY_TIMEOUT, PING_BURST},
     state::AppState,
     uptime::{
         alerts::{Subject, Transition, TransitionKind},
@@ -24,6 +29,7 @@ use nami_engine::{
     },
 };
 use serde_json::{Value, json};
+use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -528,6 +534,29 @@ async fn ping_raw(app: &Router, method: &str, token: &str) -> (StatusCode, Heade
     (parts.status, parts.headers, body.to_vec())
 }
 
+/// POST `body` to a ping path with no session; returns status, headers, JSON.
+async fn ping_with(public: &Router, path: &str, body: Vec<u8>) -> (StatusCode, HeaderMap, Value) {
+    ping_body(public, path, Body::from(body)).await
+}
+
+/// POST any `body` to a ping path with no session; returns status, headers,
+/// JSON.
+async fn ping_body(public: &Router, path: &str, body: Body) -> (StatusCode, HeaderMap, Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/x-www-form-urlencoded") // what curl --data-binary sends
+        .body(body)
+        .unwrap();
+    let (parts, body) = public.clone().oneshot(request).await.unwrap().into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+    (
+        parts.status,
+        parts.headers,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 /// Whoever pings a token it holds learns nothing about the heartbeat: the same
 /// 200 and the same bytes whether it is pending, up, down or paused, and no
 /// session or cookie is ever created.
@@ -642,6 +671,35 @@ async fn no_token_ever_reaches_a_log_line(pool: sqlx::PgPool) {
         call(&app, "GET", &item, Some(&member), None).await.0,
         StatusCode::OK
     );
+    // Failure and exit-code pings, with and without a body, and an unknown
+    // token on the failure route.
+    let patch = Some(json!({ "paused": false }));
+    assert_eq!(
+        call(&app, "PATCH", &item, Some(&member), patch).await.0,
+        StatusCode::OK
+    );
+    for (path, body) in [
+        (format!("{ping}/fail"), b"backup failed: disk full".to_vec()),
+        (format!("{ping}/3"), vec![]),
+        (format!("{ping}/0"), vec![]),
+    ] {
+        assert_eq!(
+            ping_with(&public, &path, body).await.0,
+            StatusCode::OK,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        ping_with(
+            &public,
+            &format!("/api/v1/heartbeat/{unknown}/fail"),
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(settled_mail(&recipient, 4).await.len(), 4);
 
     let lines = log.lines();
     let all = lines.join("\n");
@@ -1691,6 +1749,44 @@ async fn ping_replies_are_never_cacheable(pool: sqlx::PgPool) {
             "{label}"
         );
     }
+    // The failure and exit-code routes, a bad suffix (400) and a heartbeat
+    // over its rate limit (429).
+    let limits = Arc::new(TokenBuckets::new(0.000_1, 2.0));
+    let limited = nami_engine::router::build_public_router_with_ping_limits(
+        AppState::for_test(pool.clone()),
+        Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT)),
+        limits,
+    );
+    for (label, path, expected) in [
+        (
+            "fail",
+            format!("/api/v1/heartbeat/{token}/fail"),
+            StatusCode::OK,
+        ),
+        (
+            "exit code",
+            format!("/api/v1/heartbeat/{token}/1"),
+            StatusCode::OK,
+        ),
+        (
+            "bad suffix",
+            format!("/api/v1/heartbeat/{token}/nope"),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "rate limited",
+            format!("/api/v1/heartbeat/{token}/0"),
+            StatusCode::TOO_MANY_REQUESTS,
+        ),
+    ] {
+        let (status, headers, _) = ping_with(&limited, &path, vec![]).await;
+        assert_eq!(status, expected, "{label}");
+        assert_eq!(
+            headers.get("cache-control").map(|v| v.to_str().unwrap()),
+            Some("no-store"),
+            "{label}"
+        );
+    }
 }
 
 /// An unknown token costs one plain lookup: the locking statement, which only
@@ -2402,4 +2498,402 @@ async fn a_ping_holds_its_place_while_it_waits_for_the_database(pool: sqlx::PgPo
     assert_eq!(first.await.unwrap(), StatusCode::OK);
     let (status, _, _) = ping_raw(&public, "POST", &other).await;
     assert_eq!(status, StatusCode::OK, "the place was given back");
+}
+
+// ---------------------------------------------------------------------------
+// Failure and exit-code pings, ping bodies and the per-heartbeat rate limit
+// (NAMI-UP-20).
+// ---------------------------------------------------------------------------
+
+#[sqlx::test]
+async fn a_fail_ping_takes_the_heartbeat_down_at_once_and_a_success_ping_recovers_it(
+    pool: sqlx::PgPool,
+) {
+    let public = common::test_public_app(pool.clone());
+    let (project, recipient) = project_with_recipient(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
+
+    let (status, _, body) =
+        ping_with(&public, &format!("/api/v1/heartbeat/{token}/fail"), vec![]).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
+    assert_eq!(heartbeat_state(&pool, id).await, ("down".to_string(), true));
+    // incidents_of: (status, title, cause), oldest first.
+    let incidents = incidents_of(&pool, id).await;
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].0, "open");
+    assert_eq!(incidents[0].1, "Nightly backup reported a failure");
+    assert_eq!(
+        incidents[0].2.as_deref(),
+        Some("Heartbeat reported failure")
+    );
+
+    let (status, _, _) = ping_with(&public, &format!("/api/v1/heartbeat/{token}/0"), vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(heartbeat_state(&pool, id).await.0, "up");
+    assert_eq!(incidents_of(&pool, id).await[0].0, "resolved");
+    let mail = settled_mail(&recipient, 2).await;
+    assert_eq!(mail[0].0, "[Nami] Nightly backup is DOWN");
+    assert!(
+        // Mailpit hands the text part back with CRLF line endings.
+        mail[0]
+            .1
+            .replace("\r\n", "\n")
+            .contains("Cause: Heartbeat reported failure\n"),
+        "{}",
+        mail[0].1
+    );
+    assert_eq!(mail[1].0, "[Nami] Nightly backup is back UP");
+}
+
+#[sqlx::test]
+async fn a_non_zero_exit_code_is_a_failure_naming_the_code(pool: sqlx::PgPool) {
+    let public = common::test_public_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
+
+    let (status, _, body) =
+        ping_with(&public, &format!("/api/v1/heartbeat/{token}/137"), vec![]).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({ "ok": true })));
+    assert_eq!(heartbeat_state(&pool, id).await.0, "down");
+    let cause = Some("Heartbeat reported failure (exit code 137)".to_string());
+    assert_eq!(incidents_of(&pool, id).await[0].2, cause);
+
+    // A second failure while down: still one incident, still naming 137.
+    let (status, _, _) = ping_with(&public, &format!("/api/v1/heartbeat/{token}/2"), vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    let incidents = incidents_of(&pool, id).await;
+    assert_eq!(incidents.len(), 1);
+    assert_eq!(incidents[0].0, "open");
+    assert_eq!(incidents[0].2, cause);
+}
+
+#[sqlx::test]
+async fn a_signal_that_is_neither_fail_nor_an_integer_is_400(pool: sqlx::PgPool) {
+    let public = common::test_public_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
+
+    for suffix in ["FAIL", "1.5", "2147483648", "ok", "fail%20"] {
+        let (status, _, body) = ping_with(
+            &public,
+            &format!("/api/v1/heartbeat/{token}/{suffix}"),
+            vec![],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{suffix}");
+        assert_eq!(
+            body["error"], "the last path segment must be fail or an exit code",
+            "{suffix}"
+        );
+    }
+    assert_eq!(
+        heartbeat_state(&pool, id).await,
+        ("pending".to_string(), false)
+    );
+}
+
+#[sqlx::test]
+async fn fail_and_exit_code_routes_answer_404_for_unknown_or_malformed_tokens(pool: sqlx::PgPool) {
+    let public = common::test_public_app(pool.clone());
+    let unknown = "f".repeat(64);
+    let upper = "F".repeat(64);
+    for path in [
+        format!("/api/v1/heartbeat/{unknown}/fail"),
+        format!("/api/v1/heartbeat/{unknown}/1"),
+        "/api/v1/heartbeat/not-a-token/fail".to_string(),
+        format!("/api/v1/heartbeat/{upper}/0"),
+    ] {
+        let (status, _, body) = ping_with(&public, &path, vec![]).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(body, json!({ "error": "not found" }), "{path}");
+    }
+}
+
+#[sqlx::test]
+async fn fail_pings_during_maintenance_or_pause_change_nothing_but_last_ping_at(
+    pool: sqlx::PgPool,
+) {
+    let public = common::test_public_app(pool.clone());
+    let (project, recipient) = project_with_recipient(&pool).await;
+    let (a, token_a) = seed_heartbeat(&pool, project, "A", 3600, 60, 0).await;
+    let (b, token_b) = seed_heartbeat(&pool, project, "B", 3600, 60, 0).await;
+    sqlx::query("update heartbeats set current_status = 'up' where project_id = $1")
+        .bind(project)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("update heartbeats set paused = true where id = $1")
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let window: Uuid = sqlx::query_scalar(
+        "insert into maintenance_windows (project_id, monitor_id, title, kind, starts_at, ends_at)
+         values ($1, null, 'maintenance', 'once', now() - interval '1 hour', now() + interval '1 hour')
+         returning id",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    for token in [&token_a, &token_b] {
+        let (status, _, _) =
+            ping_with(&public, &format!("/api/v1/heartbeat/{token}/fail"), vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    for id in [a, b] {
+        assert_eq!(heartbeat_state(&pool, id).await, ("up".to_string(), true));
+        assert!(incidents_of(&pool, id).await.is_empty());
+    }
+    assert!(settled_mail(&recipient, 0).await.is_empty());
+
+    sqlx::query("delete from maintenance_windows where id = $1")
+        .bind(window)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("update heartbeats set paused = false where id = $1")
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for token in [&token_a, &token_b] {
+        let (status, _, _) =
+            ping_with(&public, &format!("/api/v1/heartbeat/{token}/0"), vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    for id in [a, b] {
+        assert_eq!(heartbeat_state(&pool, id).await.0, "up");
+        assert!(incidents_of(&pool, id).await.is_empty());
+    }
+}
+
+#[sqlx::test]
+async fn ping_bodies_over_one_mebibyte_are_413_and_change_nothing(pool: sqlx::PgPool) {
+    let public = common::test_public_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Nightly backup", 3600, 60, 0).await;
+    let path = format!("/api/v1/heartbeat/{token}/fail");
+    let too_large = json!({ "error": "ping body too large (max 1 MiB)" });
+
+    let (status, _, body) = ping_with(&public, &path, vec![b'x'; MAX_PING_BODY_BYTES + 1]).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::PAYLOAD_TOO_LARGE, too_large.clone())
+    );
+    assert_eq!(
+        heartbeat_state(&pool, id).await,
+        ("pending".to_string(), false)
+    );
+
+    // The same size, chunked: no length is declared, the cap applies while
+    // the body streams in.
+    let chunks = [vec![b'x'; 600 * 1024], vec![b'x'; 600 * 1024]]
+        .map(|chunk| Ok::<_, std::io::Error>(axum::body::Bytes::from(chunk)));
+    let streamed = Body::from_stream(tokio_stream::iter(chunks));
+    let (status, _, body) = ping_body(&public, &path, streamed).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::PAYLOAD_TOO_LARGE, too_large.clone())
+    );
+    assert_eq!(
+        heartbeat_state(&pool, id).await,
+        ("pending".to_string(), false)
+    );
+
+    // A declared length over the cap is refused before anything is read.
+    let request = Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header("content-length", (MAX_PING_BODY_BYTES + 1).to_string())
+        .body(Body::empty())
+        .unwrap();
+    let response = public.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        heartbeat_state(&pool, id).await,
+        ("pending".to_string(), false)
+    );
+
+    let (status, _, _) = ping_with(&public, &path, vec![b'x'; MAX_PING_BODY_BYTES]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(heartbeat_state(&pool, id).await, ("down".to_string(), true));
+}
+
+/// A body that fails the test if anyone reads it.
+fn unreadable_body() -> Body {
+    use tokio_stream::StreamExt;
+    Body::from_stream(tokio_stream::iter([()]).map(
+        |()| -> Result<axum::body::Bytes, std::io::Error> {
+            panic!("a ping body was read that should not have been")
+        },
+    ))
+}
+
+#[sqlx::test]
+async fn no_body_is_read_for_an_unknown_token(pool: sqlx::PgPool) {
+    let slots = Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT));
+    let public = nami_engine::router::build_public_router_with_ping_slots(
+        AppState::for_test(pool.clone()),
+        slots.clone(),
+    );
+    let unknown = format!("/api/v1/heartbeat/{}/fail", "e".repeat(64));
+
+    let (status, _, body) = ping_body(&public, &unknown, unreadable_body()).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::NOT_FOUND, json!({ "error": "not found" }))
+    );
+
+    // With every ping slot held, an unknown well-formed token is 503, not
+    // 404: the lookup still needs a slot.
+    let _held = slots
+        .clone()
+        .acquire_many_owned(MAX_PINGS_IN_FLIGHT as u32)
+        .await
+        .unwrap();
+    let (status, headers, _) = ping_body(&public, &unknown, unreadable_body()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(headers["retry-after"], "1");
+}
+
+#[sqlx::test]
+async fn one_body_per_heartbeat_is_read_at_a_time(pool: sqlx::PgPool) {
+    // One database place: the slow body must not hold it while it arrives,
+    // or B's ping below would be 503.
+    let public = nami_engine::router::build_public_router_with_ping_slots(
+        AppState::for_test(pool.clone()),
+        Arc::new(Semaphore::new(1)),
+    );
+    let project = seed_project(&pool).await;
+    let (a, token_a) = seed_heartbeat(&pool, project, "A", 3600, 60, 0).await;
+    let (_, token_b) = seed_heartbeat(&pool, project, "B", 3600, 60, 0).await;
+    let path_a = format!("/api/v1/heartbeat/{token_a}/fail");
+
+    // A body that never finishes: one chunk, then the sender stays open.
+    let (sender, receiver) =
+        tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+    sender
+        .send(Ok(axum::body::Bytes::from_static(b"still running")))
+        .await
+        .unwrap();
+    let slow = tokio::spawn({
+        let public = public.clone();
+        let path_a = path_a.clone();
+        let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver));
+        async move { ping_body(&public, &path_a, body).await }
+    });
+    // The first chunk was taken: the slow ping is reading its body.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sender.capacity() == 0 {
+        assert!(Instant::now() < deadline, "the slow body was never read");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let (status, headers, body) = ping_with(&public, &path_a, b"again".to_vec()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers["retry-after"], "1");
+    assert_eq!(body, json!({ "error": "too many requests" }));
+    let (status, _, _) = ping_with(
+        &public,
+        &format!("/api/v1/heartbeat/{token_b}/fail"),
+        b"x".to_vec(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "other heartbeats are unaffected, and no database place is held during the body read"
+    );
+
+    // The slow body runs out of time: 408, and the heartbeat is unchanged.
+    tokio::time::pause();
+    tokio::time::advance(PING_BODY_TIMEOUT + Duration::from_secs(1)).await;
+    let (status, _, body) = slow.await.unwrap();
+    tokio::time::resume();
+    assert_eq!(
+        (status, body),
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            json!({ "error": "ping body not received in time" })
+        )
+    );
+    drop(sender);
+    assert_eq!(
+        heartbeat_state(&pool, a).await,
+        ("pending".to_string(), false)
+    );
+}
+
+#[sqlx::test]
+async fn more_than_the_burst_of_pings_per_heartbeat_is_429(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    // A refill rate of ~0 makes the test independent of how fast pings run.
+    let limits = Arc::new(TokenBuckets::new(0.000_1, PING_BURST));
+    let public = nami_engine::router::build_public_router_with_ping_limits(
+        state,
+        Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT)),
+        limits,
+    );
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_heartbeat(&pool, project, "A", 3600, 60, 0).await;
+    let (_, other) = seed_heartbeat(&pool, project, "B", 3600, 60, 0).await;
+    for n in 0..10 {
+        let path = if n % 2 == 0 {
+            format!("/api/v1/heartbeat/{token}")
+        } else {
+            format!("/api/v1/heartbeat/{token}/fail")
+        };
+        assert_eq!(
+            ping_with(&public, &path, vec![]).await.0,
+            StatusCode::OK,
+            "ping {n}"
+        );
+    }
+    let (status, headers, body) =
+        ping_with(&public, &format!("/api/v1/heartbeat/{token}/0"), vec![]).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers["retry-after"], "1");
+    assert_eq!(headers["cache-control"], "no-store");
+    assert_eq!(body, json!({ "error": "too many requests" }));
+    // Buckets are per heartbeat: another token is unaffected; an unknown token stays 404.
+    assert_eq!(
+        ping_with(&public, &format!("/api/v1/heartbeat/{other}"), vec![])
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        ping_with(
+            &public,
+            &format!("/api/v1/heartbeat/{}", "e".repeat(64)),
+            vec![]
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// A heartbeat over its rate limit is turned away before its body is read.
+#[sqlx::test]
+async fn the_rate_limit_is_checked_before_any_body_is_read(pool: sqlx::PgPool) {
+    let limits = Arc::new(TokenBuckets::new(0.000_1, 1.0));
+    let public = nami_engine::router::build_public_router_with_ping_limits(
+        AppState::for_test(pool.clone()),
+        Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT)),
+        limits,
+    );
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_heartbeat(&pool, project, "A", 3600, 60, 0).await;
+    let path = format!("/api/v1/heartbeat/{token}/fail");
+
+    // The only token of the bucket.
+    assert_eq!(ping_with(&public, &path, vec![]).await.0, StatusCode::OK);
+
+    let (status, headers, body) = ping_body(&public, &path, unreadable_body()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers["retry-after"], "1");
+    assert_eq!(body, json!({ "error": "too many requests" }));
 }

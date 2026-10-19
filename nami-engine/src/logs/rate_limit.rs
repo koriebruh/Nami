@@ -94,6 +94,30 @@ impl TokenBuckets {
             false
         }
     }
+    /// How many buckets are kept now.
+    pub fn len(&self) -> usize {
+        self.buckets
+            .lock()
+            .expect("rate limiter lock poisoned")
+            .len()
+    }
+
+    /// Whether no bucket is kept.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drops every bucket that has refilled to `burst` by `now`. Such a bucket
+    /// behaves exactly like a missing one (a new bucket starts full), so this
+    /// changes no answer; it only bounds the map for callers whose keys are
+    /// many and short-lived.
+    pub fn prune_full(&self, now: Instant) {
+        let mut buckets = self.buckets.lock().expect("rate limiter lock poisoned");
+        buckets.retain(|_, bucket| {
+            let elapsed = now.saturating_duration_since(bucket.updated).as_secs_f64();
+            bucket.tokens + elapsed * self.rate < self.burst
+        });
+    }
 }
 
 /// How many requests each source has in flight, capped at a maximum.
@@ -342,6 +366,32 @@ mod tests {
             limiter.try_acquire_at(b, t0),
             "another source is unaffected"
         );
+    }
+
+    #[test]
+    fn pruning_drops_only_full_buckets() {
+        let limiter = TokenBuckets::new(1.0, 2.0);
+        let (drained, refilled) = (Uuid::new_v4(), Uuid::new_v4());
+        let t0 = Instant::now();
+        assert!(limiter.try_acquire_at(refilled, t0));
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(limiter.try_acquire_at(drained, t1));
+        assert!(limiter.try_acquire_at(drained, t1));
+        assert_eq!(limiter.len(), 2);
+
+        // At t1 the first key has refilled to the burst, the second is empty.
+        limiter.prune_full(t1);
+        assert_eq!(limiter.len(), 1, "only the drained bucket survives");
+        assert!(!limiter.try_acquire_at(drained, t1), "still drained");
+
+        // A removed key behaves like a fresh, full bucket.
+        assert!(limiter.try_acquire_at(refilled, t1));
+        assert!(limiter.try_acquire_at(refilled, t1));
+        assert!(!limiter.try_acquire_at(refilled, t1));
+
+        // Once everything has refilled, nothing is kept.
+        limiter.prune_full(t1 + Duration::from_secs(60));
+        assert!(limiter.is_empty());
     }
 
     #[test]
