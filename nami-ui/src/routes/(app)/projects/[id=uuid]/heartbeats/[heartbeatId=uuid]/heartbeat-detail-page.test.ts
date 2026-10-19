@@ -158,8 +158,8 @@ describe('heartbeat detail page: what an action leaves in `form`', () => {
 	// card of the control that was used, as an alert.
 	it('puts an error beside the control that failed', () => {
 		const message = 'forbidden';
-		const at = (action: string) => card(renderPage(heartbeat(), { action, message }).body, `role="alert" class="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">${message}`);
-		const atRotate = card(renderPage(heartbeat(), { action: 'rotate', message }).body, `role="alert" class="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">${message}`);
+		const at = (action: string) => card(renderPage(heartbeat(), { action, message }).body, `role="alert" class="mt-4 alert alert-danger">${message}`);
+		const atRotate = card(renderPage(heartbeat(), { action: 'rotate', message }).body, `role="alert" class="alert alert-danger">${message}`);
 		expect(at('pause')).toBe('header');
 		expect(at('resume')).toBe('header');
 		expect(at('delete')).toBe('header');

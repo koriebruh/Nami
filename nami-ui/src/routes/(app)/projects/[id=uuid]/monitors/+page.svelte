@@ -80,7 +80,7 @@
 						<td>
 							<a
 								href="/projects/{data.project.id}/monitors/{monitor.id}"
-								class="font-medium text-ink hover:text-primary">{monitor.name}</a
+								class="font-medium whitespace-nowrap text-ink hover:text-primary">{monitor.name}</a
 							>
 						</td>
 						<td class="whitespace-nowrap">{CHECK_TYPE_LABELS[monitor.check_type]}</td>

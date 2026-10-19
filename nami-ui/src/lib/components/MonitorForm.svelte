@@ -153,12 +153,11 @@
 		};
 	};
 
-	const input =
-		'w-full rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:border-teal-500/50 focus:ring-2 focus:ring-teal-500/50 focus:outline-none disabled:opacity-60';
-	const label = 'mb-1.5 block text-sm font-medium text-neutral-300';
-	const hint = 'mt-1 text-xs text-neutral-500';
-	const radio = 'flex items-center gap-2 text-sm text-neutral-300';
-	const section = 'space-y-4 rounded-lg border border-[#262626] p-4';
+	const input = 'input';
+	const label = 'label';
+	const hint = 'hint';
+	const radio = 'flex items-center gap-2 text-sm text-ink-2';
+	const section = 'space-y-4 rounded-card border border-border bg-surface-2/60 p-4 sm:p-5';
 </script>
 
 <!-- use:enhance keeps the typed values and the selected type on a
@@ -173,12 +172,12 @@
      authority: it counts bytes, the browser counts UTF-16 units. -->
 <form method="POST" use:enhance={submit} class="space-y-5">
 	{#if message}
-		<div role="alert" class="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">
+		<div role="alert" class="alert alert-danger">
 			{message}
 		</div>
 	{/if}
 	{#if masked}
-		<div class="rounded-md border border-sky-500/30 bg-sky-500/10 px-3 py-2 text-sm text-sky-300">
+		<div class="alert border-info-ink/25 bg-info-soft text-info-ink">
 			Parts of this monitor (URL secrets, request body, username, UDP payload) are hidden for your role, so it is shown
 			read-only.
 		</div>
@@ -247,7 +246,7 @@
 						class={input}
 					/>
 					{#if secretsReason}
-						<p class="mt-1 text-xs text-amber-400" role="status">{secretsReason}: see Custom headers and Basic auth below.</p>
+						<p class="mt-1 text-xs text-warning-ink" role="status">{secretsReason}: see Custom headers and Basic auth below.</p>
 					{/if}
 				</div>
 			</div>
@@ -282,8 +281,8 @@
 				class={section}
 				open={!!(monitor && (monitor.request_headers.length || monitor.auth_username || monitor.request_body)) || undefined}
 			>
-				<summary class="cursor-pointer text-sm font-medium text-neutral-200">Request options</summary>
-				<p class="text-xs text-neutral-500">
+				<summary class="cursor-pointer text-sm font-medium text-ink">Request options</summary>
+				<p class="text-xs text-muted">
 					With custom headers, basic auth or URL credentials, a redirect to another origin (another host or port, or
 					http to https) is not followed and the monitor goes Down: point the monitor at the final URL. Basic auth and
 					URL credentials cannot be combined.
@@ -307,7 +306,7 @@
 				<fieldset class="space-y-2">
 					<legend class={label}>Custom headers</legend>
 					{#if editing}
-						<p class="text-xs text-neutral-500">
+						<p class="text-xs text-muted">
 							{#if monitor?.request_headers.length}
 								Stored: {monitor.request_headers.map((h) => h.name).join(', ')}. Values are never shown.
 							{:else}
@@ -520,7 +519,7 @@
 					<input id="recovery_threshold" name="recovery_threshold" type="number" min="1" max="10" defaultValue={monitor?.recovery_threshold ?? 1} class={input} />
 				</div>
 				<!-- The engine rejects a timeout that is not shorter than the interval. -->
-				<p id="timeout-hint" class="text-xs text-neutral-500 sm:col-span-4">
+				<p id="timeout-hint" class="text-xs text-muted sm:col-span-4">
 					Timeout must be less than the interval. {editing
 						? 'Empty fields keep the current value.'
 						: 'Empty fields use the default shown.'}
@@ -547,11 +546,10 @@
 			<button
 				type="submit"
 				disabled={submitting}
-				class="rounded-md bg-teal-500 px-4 py-2 text-sm font-medium text-neutral-950 transition-colors hover:bg-teal-400 focus:ring-2 focus:ring-teal-500/50 focus:ring-offset-2 focus:ring-offset-[#141414] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-			>
+				class="btn btn-primary">
 				{submitLabel}
 			</button>
 		{/if}
-		<a href={cancelHref} class="text-sm text-neutral-500 hover:text-neutral-300">{masked ? 'Back' : 'Cancel'}</a>
+		<a href={cancelHref} class="text-sm text-muted hover:text-ink-2">{masked ? 'Back' : 'Cancel'}</a>
 	</div>
 {/snippet}

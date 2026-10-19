@@ -76,10 +76,9 @@
 		};
 	};
 
-	const input =
-		'w-full rounded-md border border-[#262626] bg-[#0a0a0a] px-3 py-2 text-sm text-neutral-100 placeholder-neutral-600 focus:border-teal-500/50 focus:ring-2 focus:ring-teal-500/50 focus:outline-none';
-	const label = 'mb-1.5 block text-sm font-medium text-neutral-300';
-	const choice = 'flex items-center gap-2 text-sm text-neutral-300';
+	const input = 'input';
+	const label = 'label';
+	const choice = 'flex items-center gap-2 text-sm text-ink-2';
 </script>
 
 <!-- Initial values go through defaultValue/defaultChecked (or a binding),
@@ -87,7 +86,7 @@
 {#key generation}
 <form method="POST" {action} use:enhance={submit} class="space-y-4">
 	{#if message}
-		<div role="alert" class="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">{message}</div>
+		<div role="alert" class="alert alert-danger">{message}</div>
 	{/if}
 
 	<div class="grid gap-4 sm:grid-cols-2">
@@ -160,7 +159,7 @@
 				</datalist>
 			</div>
 		</div>
-		<p class="text-xs text-neutral-500">An end at or before the start runs past midnight into the next day.</p>
+		<p class="text-xs text-muted">An end at or before the start runs past midnight into the next day.</p>
 	{/if}
 
 	{@render actions()}
@@ -172,10 +171,9 @@
 		<button
 			type="submit"
 			disabled={submitting}
-			class="rounded-md bg-teal-500 px-4 py-2 text-sm font-medium text-neutral-950 transition-colors hover:bg-teal-400 focus:ring-2 focus:ring-teal-500/50 focus:ring-offset-2 focus:ring-offset-[#141414] focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-		>
+			class="btn btn-primary">
 			{submitLabel}
 		</button>
-		{#if cancelHref}<a href={cancelHref} class="text-sm text-neutral-500 hover:text-neutral-300">Cancel</a>{/if}
+		{#if cancelHref}<a href={cancelHref} class="text-sm text-muted hover:text-ink-2">Cancel</a>{/if}
 	</div>
 {/snippet}

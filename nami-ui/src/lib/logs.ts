@@ -380,28 +380,28 @@ export function formatLogTime(iso: string): string {
 	return new Date(iso).toISOString().slice(0, 23).replace('T', ' ');
 }
 
-/** Badge classes per level; the badge text always names the level. */
+/** Badge classes per level (design tokens, AA text on its tint); the badge text always names the level. */
 export function levelClasses(level: string): string {
 	switch (level) {
 		case 'trace':
-			return 'bg-neutral-500/10 text-neutral-500';
+			return 'bg-paused-soft text-muted';
 		case 'debug':
-			return 'bg-neutral-400/10 text-neutral-400';
+			return 'bg-paused-soft text-paused-ink';
 		case 'info':
-			return 'bg-sky-400/10 text-sky-300';
+			return 'bg-info-soft text-info-ink';
 		case 'notice':
-			return 'bg-teal-400/10 text-teal-300';
+			return 'bg-primary-soft text-primary';
 		case 'warn':
-			return 'bg-amber-400/10 text-amber-300';
+			return 'bg-warning-soft text-warning-ink';
 		case 'error':
-			return 'bg-red-500/10 text-red-300';
+			return 'bg-danger-soft text-danger-ink';
 		case 'critical':
 		case 'alert':
 		case 'emergency':
 		case 'fatal':
-			return 'bg-rose-500/20 font-semibold text-rose-200';
+			return 'bg-danger-ink font-semibold text-white';
 		default:
-			return 'bg-neutral-500/10 text-neutral-400';
+			return 'bg-paused-soft text-paused-ink';
 	}
 }
 
