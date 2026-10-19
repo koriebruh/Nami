@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024 (Axum 0.8, SQLx 0.9 runtime queries, tokio, reqwest 0.13, `regex` 1.13, `tokio-stream` 0.1). One crate becomes a direct dependency: `regex-syntax` (already in `Cargo.lock` as a dependency of `regex`; `cargo add regex-syntax@<locked version>` in Task 10). No other new crates. Postgres 17, ClickHouse 26.9, SvelteKit 3 + Svelte 5 runes + Tailwind 4, vitest.
 
-**Spec:** `docs/superpowers/specs/2026-10-13-log-management-design.md` (including "Parity additions (2026-10-13)"). Part 1 plan: `docs/superpowers/plans/2026-10-13-log-management-part1.md`. Roadmap: `docs/superpowers/roadmap.md` §3. Part 1 ledger and fix-wave brief: `.superpowers/sdd/2026-10-13-log-management-part1/progress.md`, `.../logs-p1-fixwave.md`.
+**Spec:** `docs/superpowers/specs/2026-10-13-log-management-design.md` (including "Parity additions (2026-10-13)"). Part 1 plan: `docs/superpowers/plans/2026-10-13-log-management-part1.md`. Roadmap: `docs/superpowers/roadmap.md` §3. Part 1 rulings, limits and deferred items: `docs/superpowers/decisions/2026-10-13-log-management-part1.md` (the committed record; the scratch ledger under `.superpowers/sdd/` is local only and is not a source of truth).
 
 **When to start:** now. The Logs Part 1 final-review fix wave merged as `94f9362` (PR #50) while this plan was being written, and the plan is aligned to that merged code. The table below lists what each task takes from it. Task 11 is the only task that depends on the shared event→row step.
 
@@ -30,7 +30,12 @@ Implementers still check each row against `main` before starting the task that u
 
 **Verification status:** this plan was **not** replayed on a scratch copy. That differs from Part 1. Planning ran docs-only, with Docker left untouched. The code blocks are written against `main` `94f9362` as read on 2026-10-19 and have not been compiled. Implementers run every step, treat a failing compile in a given block as drift to fix minimally, and keep the tests' assertions.
 
-**Execution:** per CLAUDE.md. Use one worktree per task under `.worktrees/NAMI-LOG-<n>/`, branched from the latest `origin/main`, with the branch named under each task heading. Commit with Conventional Commits, then run the task review, open the PR, and auto-merge on a clean review (pre-authorized for sub-projects 2-11). Tasks are sequential (each consumes earlier interfaces), with two exceptions: T9 and T10 are independent of each other, and T13 is independent of T10-T12. How changes are written down: new files appear in full where the code decides something (security-relevant logic, SQL, migrations, proxies). Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body. Tests always appear in full. Engine tests need `docker compose up -d postgres clickhouse mailpit` (never restart running containers). Build with `CARGO_PROFILE_DEV_DEBUG=0` and the shared `CARGO_TARGET_DIR=/Users/mitengineer/development/nami/.worktrees/.cargo-target` (ledger ruling).
+**Plan review (2026-10-19).** Every signature this plan uses was spot-checked against `94f9362` (`store`, `query`, `search`, `clickhouse`, `tail`, `routes/logs*.rs`, `models/source.rs`, `models/incident.rs`, `models/maintenance.rs`, `uptime/alerts.rs`, `uptime/worker.rs`, the test helpers in `tests/common`, `tests/logs_*.rs`, `tests/migrations.rs`, and nami-ui's `engine.ts`, `log-proxy.ts`, `fake-event.ts`, `lib/logs.ts`, the tail proxy and the explorer). Fixed in this revision (each fix is in the task it belongs to):
+- Drift that would not compile or would fail: `tests/migrations.rs` has no `mod common;` (migration tests now seed with SQL); `store.rs`'s test helper is `source(retention_days)`, not `test_source()`; the tail proxy test's `fakeEvent` returns `{ event, controller }`; `Prepared` (not only `Batch`) must carry the pipeline counts; `new Response('', { status: 204 })` throws (null-body status); `cargo test` takes one test-name filter (several go after `--`); a 64 KiB + 1 message is truncated by `from_json` before the pipeline sees it; `updated_at` strings do not compare lexicographically (chrono prints 0, 3 or 6 fraction digits); `"garbage\r\nx"` panics in the request builder; `99999999999999999999` is not a `u64` and the engine answers 400; T13 needs T10's `query::parse_path`, so it is not independent of T10.
+- Security: regex memory budget per pipeline and in the cache (R-P2-26); compile and preview run off the async runtime; regex redaction also covers numbers (R-P2-5); every write to `sources` bumps `updated_at` monotonically (R-P2-6); export ends at a deadline even when the client stops reading, has a per-instance cap, and never writes a ClickHouse exception line into the file (R-P2-12, R-P2-13, R-P2-15); the alert worker shares one evaluation budget across passes, skips evaluations of an edited alert, records `last_error`, and opens and resolves incidents through one seam (R-P2-18, R-P2-19, R-P2-27); project-wide maintenance windows hold log alerts (R-P2-18, a ruling the controller may reverse); `Last-Event-ID` is length-capped before decoding (R-P2-20).
+- Coverage: the LOG-8 deferred items the first draft missed (error display, `<pre>` wrapping, a11y, a live-tail lifecycle test) are in T15 (R-P2-21). Part 1 deferred items without a target are listed in R-P2-22.
+
+**Execution:** per CLAUDE.md. Use one worktree per task under `.worktrees/NAMI-LOG-<n>/`, branched from the latest `origin/main`, with the branch named under each task heading. Commit with Conventional Commits, then run the task review, open the PR, and auto-merge on a clean review (pre-authorized for sub-projects 2-11). Tasks are sequential (each consumes earlier interfaces). Dependencies: T9 and T10 are independent of each other. T11 needs T10. T12 needs T9 (`slots`) and T10 (`query::parse_path`). T13 needs T10 (`parse_path`) only, so it may run beside T11/T12. T14 needs T13. T15's engine half is independent, but its UI half edits `log-proxy.ts` and `lib/logs.ts` like T12 and T17, so it lands after T12 (or rebases onto it). T16 needs T10 (and T11 for its walkthrough). T17 needs T9, T12, T13 and T15. T18 needs T14 and T16 (`relayJsonPost`). How changes are written down: new files appear in full where the code decides something (security-relevant logic, SQL, migrations, proxies). Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body. Tests always appear in full. Engine tests need `docker compose up -d postgres clickhouse mailpit` (never restart running containers). Build with `CARGO_PROFILE_DEV_DEBUG=0` and the shared `CARGO_TARGET_DIR=/Users/mitengineer/development/nami/.worktrees/.cargo-target` (ledger ruling).
 
 Engine test command, used by every task below (substitute the test binary):
 
@@ -38,6 +43,8 @@ Engine test command, used by every task below (substitute the test binary):
 cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami CARGO_PROFILE_DEV_DEBUG=0 \
   CARGO_TARGET_DIR=/Users/mitengineer/development/nami/.worktrees/.cargo-target cargo test --test <binary>
 ```
+
+Unit tests use the same environment with `--lib` instead of `--test <binary>`. `cargo test` accepts **one** test-name filter before `--`. Several filters go after it: `cargo test --lib -- logs::export clickhouse::`.
 
 UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `svelte-check found 0 errors and 0 warnings`).
 
@@ -51,11 +58,11 @@ UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `sv
 - RBAC: two levels, as in CLAUDE.md. An authorization failure is **403**, never 404. An id from another project inside an accessible project path is **404**. A `source_id` from another project matches nothing in reads, and is rejected with 400 when stored in a view or an alert.
 - Roles per feature: viewers read pipelines, patterns, export, views, alerts and usage. Members edit pipelines (PUT, test), create/edit/delete views and create/edit alerts. **Admins delete alerts** (as monitors). Ingestion is token only.
 - Every state-changing engine request carries a JSON body (`router::require_json_body`, already global). Every request body is parsed by a `deny_unknown_fields` struct.
-- Pipeline (spec): at most **50** rules per source, replaced as a whole. Match is `{"field": path, "equals": value}` or `{"message_regex": pattern}`. Kinds are `drop`, `remove_fields`, `redact` (`keys` case-insensitive at any depth → `"[REDACTED]"`, `regex` over `message` and every string value of `fields`), `rename` (overwrites the target; a missing source is a no-op), and `sample` (`n` 2-10000, keep the 1st, (n+1)th, … per rule per engine instance). The first matching `drop` ends processing. Redaction runs before pattern extraction and storage. The test endpoint takes at most **100** sample events and stores nothing.
+- Pipeline (spec): at most **50** rules per source, replaced as a whole. Match is `{"field": path, "equals": value}` or `{"message_regex": pattern}`. Kinds are `drop`, `remove_fields`, `redact` (`keys` case-insensitive at any depth → `"[REDACTED]"`, `regex` over `message` and every string value of `fields`), `rename` (overwrites the target; a missing source is a no-op), and `sample` (`n` 2-10000, keep the 1st, (n+1)th, … per rule per engine instance). The first matching `drop` ends processing. Redaction runs before pattern extraction and storage. The test endpoint takes at most **100** sample events and stores nothing. Regex budget (R-P2-26): each regex compiles with `size_limit` and `dfa_size_limit` of **256 KiB**, and a pipeline holds at most **20** regexes. Compiling rules and running the preview are CPU work and go to `spawn_blocking`, never an async worker.
 - Patterns (spec): `GET /projects/{id}/logs/patterns` (search filters and window) returns the top **100** patterns by count as `{pattern_hash, pattern, count, first_seen, last_seen}`. `pattern_hash` is a decimal string.
-- Export (spec): `GET /projects/{id}/logs/export?format=csv|ndjson` (viewer, same filters and window as search) streams newest-first up to **100,000** rows, then stops. `X-Nami-Export-Limit: 100000`. NDJSON rows carry every stored column. CSV has `dt, level, source, message, trace_id` plus at most **10** `columns` field paths, extracted server-side. CSV is RFC 4180, and a cell starting with `=`, `+`, `-`, `@`, tab or CR gets a leading `'`. ClickHouse `max_execution_time` is **120 s**. At most **2** concurrent exports per user (third → 429).
+- Export (spec): `GET /projects/{id}/logs/export?format=csv|ndjson` (viewer, same filters and window as search) streams newest-first up to **100,000** rows, then stops. `X-Nami-Export-Limit: 100000`. NDJSON rows carry every stored column. CSV has `dt, level, source, message, trace_id` plus at most **10** `columns` field paths, extracted server-side. CSV is RFC 4180, and a cell starting with `=`, `+`, `-`, `@`, tab or CR gets a leading `'`. ClickHouse `max_execution_time` is **120 s**. At most **2** concurrent exports per user (third → 429) and **8** per engine instance (ninth → 429). An export task ends at a **150 s** deadline even when its client stops reading (R-P2-13), so a stalled download cannot hold a slot.
 - Saved views (spec): Postgres `log_views` (project, name, query JSON with the search parameters and picked columns, created_by). Members create/edit/delete, viewers read.
-- Log alerts (spec): Postgres `log_alerts` with `threshold` (count), `comparison` (`gt` | `lt`), `window_seconds` (**60-86400**), `interval_seconds` (**>= 60**), `enabled`, `state` (`ok` | `alerting`), `last_evaluated_at`, `next_evaluation_at`. The worker claims due alerts atomically. A met condition while `ok` → `alerting`, opens an incident (`incidents.log_alert_id`) and notifies through `alerts::notify_transition`. A cleared condition while `alerting` → `ok` and resolves the incident.
+- Log alerts (spec): Postgres `log_alerts` with `threshold` (count), `comparison` (`gt` | `lt`), `window_seconds` (**60-86400**), `interval_seconds` (**>= 60**), `enabled`, `state` (`ok` | `alerting`), `last_evaluated_at`, `next_evaluation_at`. The worker claims due alerts atomically. A met condition while `ok` → `alerting`, opens an incident (`incidents.log_alert_id`) and notifies through `alerts::notify_transition`. A cleared condition while `alerting` → `ok` and resolves the incident. While a **project-wide** maintenance window is in effect, the alert's state machine stands still, as for heartbeats (R-P2-18). Incidents are opened and resolved only through `logs::alerts::{open_alert_incident, resolve_alert_incident}` (R-P2-27).
 - Outbound requests: none of this plan's features makes one. Alert notifications go only through `alerts::notify_transition` (email today). When the Incident Management sub-project adds webhook/Slack channels to that function, it applies their link-local and private-address refusal (`uptime::checker::is_forbidden_destination`). Log alerts must never call a sender directly.
 - Crypto: no new secrets. Source tokens keep their per-row AAD (`sources.token:{id}`). The pipeline never touches the token.
 - nami-ui: every engine call goes through `callEngine` with `enginePath`. Route params use the `[id=uuid]`/`[...Id=uuid]` matchers and are checked with `isUuid` before reaching an engine path. Failed calls render through `engineFailure`/`engineErrorMessage`. A 401 redirects to `/login`. Deletes are two-step (a JS `confirm()` plus a `confirm=yes` field, and a bare POST asks first). Streams (export, tail) are relayed as bodies and never read or buffered in the BFF. Only allow-listed query keys and headers pass. Modules under `#lib/server` are never imported by components. Times are shown in UTC. Tokens never appear in a URL.
@@ -68,6 +75,10 @@ UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `sv
 - **A pipeline edit must reach ingestion without a restart, and a source whose stored rules no longer compile must not leak.** A redact rule that silently stops applying is a data leak, so ingestion for that source fails closed: HTTP 500 and syslog frames dropped, with nothing stored → Task 11 (`a_pipeline_change_applies_to_the_next_request`, `a_stored_pipeline_that_does_not_compile_fails_closed`).
 - **An export that ends early must say so.** Byte cap, mid-stream ClickHouse error or line cap: the file must end with an explicit error trailer, never just stop as if complete. A window holding more than 100,000 rows exports the newest 100,000, and the UI warns first → Task 12 (`hitting_the_byte_cap_ends_with_an_error_trailer`, `the_row_cap_holds_and_is_announced`), Task 17 (`warns before a truncated export`).
 - **A ClickHouse outage during alert evaluation must not resolve (or open) incidents.** An evaluation that fails leaves the state, the incident and `last_evaluated_at` unchanged, and the alert is retried at its next interval → Task 14 (`a_failed_count_changes_nothing`).
+- **A redact regex must catch a secret whatever JSON type carries it.** A card number sent as a JSON number is as secret as one sent as a string → Task 10 (`redact_by_regex_rewrites_the_message_and_every_string_value`, numbers case).
+- **A pipeline must not cost unbounded memory or block the runtime.** At most 20 regexes of at most 256 KiB compiled each, a bounded cache, compile and preview in `spawn_blocking` → Task 10 (`a_pipeline_holds_at_most_twenty_regexes`), Task 11 (cache bound).
+- **A download that stops being read must not hold an export slot.** The export task ends at its deadline whatever the client does → Task 12 (`a_stalled_export_gives_its_slot_back_at_the_deadline`).
+- **An alert edited during an evaluation must not fire on its old settings** → Task 14 (`an_evaluation_of_an_edited_alert_is_dropped`).
 - **A saved view with a relative preset must reopen relative** ("last 1 h" means the hour before opening, not the hour when it was saved). A view naming a source that was later deleted must still open → Task 13 (`a_relative_view_stays_relative_and_a_deleted_source_is_kept`), Task 17 (`view state round-trips and stays relative`).
 
 ## Decisions the spec leaves open (rulings)
@@ -76,27 +87,29 @@ UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `sv
 - **R-P2-2 Rule wire format.** The spec names rules by kind. On the wire a rule is one flat object with a `type` key: `{"type":"drop","match":{...}}`, `{"type":"remove_fields","paths":[...]}`, `{"type":"redact","keys":[...],"regex":"..."}`, `{"type":"rename","from":"a","to":"b"}`, `{"type":"sample","n":10,"match":{...}}`. A key the kind does not use → 400. Errors name the rule by 0-based index: `rules[3]: regex must be at most 256 characters`.
 - **R-P2-3 Paths in rules.** Paths follow the search filter syntax (1-5 segments of `^[A-Za-z0-9_-]{1,64}$`). In `match.field` and `rename`, the single-segment paths `level` and `message` address the normalized values (spec). `rename` from `message` moves the message into a field and leaves the message empty. Renaming to `message` sets it (a non-string becomes its JSON text). Renaming to `level` goes through `normalize::level_from_name`, so an unknown name gives `info`. `remove_fields` addresses `fields` only, and `level`/`message` there → 400 (use `rename` or `redact`). `redact.keys` are key *names* (1-64 characters, no control characters, at most 50) and never paths. Redaction never changes `level`. At most 50 paths per `remove_fields`.
 - **R-P2-4 `equals` comparison** follows search's `eq`: a string field compares unquoted, any other JSON value by its JSON text (`200` matches `200` and `"200"`). A missing field never matches. `equals` is a string, number or boolean (≤ 1,024 characters of text), or 400.
-- **R-P2-5 Redaction regex** must not match the empty string (400). Without that guard, a regex like `a*` would put a marker between every character. Replacement is applied to `message` and to string values at any depth of `fields` (array elements included). Keys are never rewritten.
-- **R-P2-6 Cache and freshness (stricter than the spec's "checked at most every 10 s").** `IngestSource` gains `updated_at`, which both token lookups already read in the same query. The cache entry is used only when its `updated_at` equals the source's, so an edit applies to the very next request on every instance. A miss loads `sources.pipeline` (one indexed query, under the ingest query semaphore for HTTP) and compiles it. At most 4,096 entries; the cache is cleared when full. Sample counters live in the compiled rules, so they restart after an edit.
+- **R-P2-5 Redaction regex** must not match the empty string (400). Without that guard, a regex like `a*` would put a marker between every character. Replacement is applied to `message` and to string values at any depth of `fields` (array elements included). A **number** at any depth is matched on its JSON text, and a number with a match becomes the replaced text as a string (`{"card": 4111111111111111}` with `\d{16}` stores `{"card": "[REDACTED]"}`). Booleans and nulls are left alone. Keys are never rewritten. Rules run top to bottom, so a value moved by a later `rename` is only covered by a redact rule that comes after it. The editor's help text says so (Task 16).
+- **R-P2-6 Cache and freshness (stricter than the spec's "checked at most every 10 s").** `IngestSource` gains `updated_at`, which both token lookups already read in the same query. The cache entry is used only when its `updated_at` equals the source's, so an edit applies to the very next request on every instance (syslog looks its sources up per batch and has no source cache, so this holds there too). A miss loads `sources.pipeline` (one indexed query, under the ingest query semaphore for HTTP; the permit is released before compiling) and compiles it in `spawn_blocking`. At most **1,024** entries; the cache is cleared when full. Sample counters live in the compiled rules, so they restart after an edit. Every write to `sources` (`set_pipeline`, `update_in_project`, `rotate_token`) sets `updated_at = greatest(clock_timestamp(), updated_at + interval '1 microsecond')`, so the value only ever grows and a cache key can never come back to an older rule set. Today `update_in_project` and `rotate_token` use `now()` (transaction start), which can go backwards under row-lock waits.
 - **R-P2-7 Fail closed.** Stored rules were validated by the same compiler. If they no longer compile (a future change) or fail to load, the source's events are not stored: HTTP returns 500 `internal error` (logged with the source id, never the token), and syslog frames are dropped and counted as `store_failed`. Silently skipping a `redact` rule would leak data.
 - **R-P2-8 What `accepted` counts.** `202 {"accepted": N}` counts stored rows, after the pipeline. Dropped and sampled-out events are counted in `source_usage_daily.events_dropped` / `events_sampled_out` (columns from Part 1) and are never in `accepted`. The response shape is unchanged. Usage `bytes` and the quota count stored bytes after the pipeline (spec order: pipeline before quota accounting).
 - **R-P2-9 Test endpoint.** `POST /projects/{id}/sources/{source_id}/pipeline/test` is member-only (it is the editor's preview). It runs `normalize::from_json`, then the submitted rules with fresh sample counters, then `store::build_row_at` with the source's real retention. It returns exactly what would be stored, without ids. The body is limited to axum's default 2 MiB.
 - **R-P2-10 Patterns query cost.** Settings are `READ_SETTINGS` plus `max_rows_to_group_by=1000000` and `group_by_overflow_mode=any`. Beyond one million distinct patterns in a window, counts become approximate instead of failing. The UI notes "counts are approximate for very large windows". Each request holds one per-user query slot.
 - **R-P2-11 Pattern IPv6 over-match (deferred from Part 1).** An IPv6 candidate becomes `<ip>` only when it parses, has an address group (as today), and either has at least two non-empty groups, starts with `::`, or is a single four-character group followed by `::` (`fe80::`). So `5::` and `12::` stay text, while `::1`, `fe80::` and `2001:db8::` stay `<ip>`. Only new rows change. Existing rows keep their stored pattern, so a pattern may appear in both forms during the retention period (documented in the PR).
-- **R-P2-12 Export transport.** A new `ClickHouse::stream_rows_with` posts without `wait_end_of_query` (rows flow as ClickHouse produces them). It sends `max_execution_time=120`, `readonly=2`, `cancel_http_readonly_queries_on_client_close=1` and `http_write_exception_in_output_format=1`, and uses a per-request timeout of 150 s (reqwest's per-request timeout replaces the client's 30 s). `http_write_exception_in_output_format` joins `RESERVED_SETTINGS`. A non-2xx answer is read through the capped reader and mapped by `search::user_error` *before* any response header is sent, so an invalid RE2 is a 400, not a broken file. After that, an error can only be reported in the body. It ends the stream with a trailer: NDJSON `{"_nami_export_error":"<reason>"}`, CSV a last record `# export stopped early: <reason>`.
-- **R-P2-13 Export caps.** `MAX_EXPORT_ROWS = 100_000` (also the SQL `LIMIT`), `MAX_EXPORT_BYTES = 512 MiB` written, `MAX_EXPORT_LINE_BYTES = 4 MiB` per ClickHouse line. A stored row is at most 64 KiB of message plus 256 KiB of fields; JSON escaping makes that at most about 2 MiB. Reaching the row cap ends the file normally. The UI warned first, and the header tells API clients. Reaching the byte or line cap writes the trailer. The output channel holds 16 chunks. A client that stops reading blocks the task, which ends when the client disconnects or when the 150 s request deadline passes.
+- **R-P2-12 Export transport.** A new `ClickHouse::stream_rows_with` posts without `wait_end_of_query` (rows flow as ClickHouse produces them). It sends `max_execution_time=120`, `readonly=2`, `cancel_http_readonly_queries_on_client_close=1` and `http_write_exception_in_output_format=1`, and uses a per-request timeout of 150 s (reqwest's per-request timeout replaces the client's 30 s). It sends no `max_result_bytes` (the export's own caps bound it, R-P2-13). `http_write_exception_in_output_format` joins `RESERVED_SETTINGS`. A non-2xx answer is read through the capped reader and mapped by `search::user_error` *before* any response header is sent, so an invalid RE2 is a 400, not a broken file. After that, an error can only be reported in the body. It ends the stream with a trailer: NDJSON `{"_nami_export_error":"<reason>"}`, CSV a last record `# export stopped early: <reason>`. How ClickHouse marks a mid-stream error differs by version (a `{"exception":…}` line, or an `__exception__` block on newer servers, or a cut connection). The export therefore does not look for one shape. Every line must start with the first selected column's key (`{"id":` for NDJSON, `{"dt":` for CSV). A line that does not is never written to the file and ends it with the "query failed" trailer. A transport error ends it with the "interrupted" trailer.
+- **R-P2-13 Export caps.** `MAX_EXPORT_ROWS = 100_000` (also the SQL `LIMIT`), `MAX_EXPORT_BYTES = 512 MiB` written, `MAX_EXPORT_LINE_BYTES = 4 MiB` per ClickHouse line. A stored row is at most 64 KiB of message plus 256 KiB of fields; JSON escaping makes that at most about 2 MiB. Reaching the row cap ends the file normally. The UI warned first, and the header tells API clients. Reaching the byte or line cap writes the trailer. The output channel holds 16 chunks. **Deadline:** the streaming task has an overall deadline, `ExportLimits.deadline` (150 s, the same as the request timeout). Every `next_line` and every `tx.send` runs under `timeout_at(deadline, ..)`, so a client that stays connected but stops reading cannot hold the slot. reqwest's own timeout is only checked while the body is polled, so it would not end such a task. At the deadline the task tries the trailer for at most 1 s, then returns. A client that disconnects ends the task at once (`tx.closed()` / a failed send), which drops the ClickHouse response, and ClickHouse cancels the query (`cancel_http_readonly_queries_on_client_close`).
 - **R-P2-14 Export columns.** The repeatable key is `columns` (spec wording), up to 10 search-syntax paths, extracted in ClickHouse with the same text expression as `eq` filters (strings unquoted, other values as JSON text, missing → empty cell). The CSV `source` column is the source's name from Postgres, mapped once before streaming (at most `MAX_SOURCES_PER_PROJECT` names). A row of a since-deleted source shows its id. `Content-Disposition: attachment; filename="nami-logs-<to as %Y%m%dT%H%M%SZ>.<csv|ndjson>"` contains no user text.
-- **R-P2-15 Per-user slots for entry reads and exports.** A new counter, `logs::slots::UserSlots` (Task 9), separate from the fix wave's 4 search/histogram slots. Exports hold one of 2 per user, with the permit moved into the streaming task, so a slot is held for exactly as long as the stream runs. Entry reads hold one of 8 per user (R-P2-23). The duplication with `search::QuerySlots` is left for the security wave to fold if it wants.
+- **R-P2-15 Per-user slots for entry reads and exports.** A new counter, `logs::slots::UserSlots` (Task 9), separate from the fix wave's 4 search/histogram slots. Exports hold one of 2 per user and one of `MAX_EXPORTS_PER_INSTANCE = 8` in total (`UserSlots::acquire_capped(user, per_user, total)`, which counts a running total beside the per-user map), with the permit moved into the streaming task, so a slot is held for exactly as long as the stream runs (at most the deadline, R-P2-13). Each export runs a ClickHouse query for up to 120 s with no result-size setting, so without the total a crowd of users could fill ClickHouse with exports. Entry reads hold one of 8 per user (R-P2-23). The duplication with `search::QuerySlots` is left for the security wave to fold if it wants.
 - **R-P2-16 UI export warning.** The browser downloads through a plain link, so it cannot read `X-Nami-Export-Limit` before the download. The UI therefore holds `EXPORT_ROW_LIMIT = 100_000` and compares it with the histogram total before starting. An engine test pins the header to 100000 and a UI test pins the constant. A `HEAD` probe was rejected: axum answers HEAD by running the GET handler, which would start an export.
 - **R-P2-17 Query shape shared by views and alerts.** `LogQuery { q, in_fields, levels, source_ids, filters, pattern_hashes }`. `filters` items are the explorer's `{path, op, value?}` objects. It is validated by converting to query pairs and running Part 1's `query::parse_filters`, so it is identical to search validation. `ViewQuery` adds `range` (`15m|1h|6h|24h|7d|custom`, default `1h`), `from`/`to` (custom only, from < to, ≤ 31 days) and `columns` (≤ 10 paths). Alerts store a `LogQuery`. Stored `source_ids` must belong to the project when written (400). A source deleted later just matches nothing. Names go through `models::validate_label("name", ..)`. View names are unique per project (409). At most **200** views and **100** alerts per project (409), to bound the evaluation load.
-- **R-P2-18 Alert semantics.** The window is `[now − window_seconds, now]` at evaluation. `gt` fires when `count > threshold`, `lt` when `count < threshold`. `lt` needs `threshold >= 1` (400), because `lt 0` can never fire. Thresholds go up to 10^12. A PATCH sets `next_evaluation_at = now()` so an edit takes effect at once. Disabling an `alerting` alert sets `ok` and resolves its open incident without a notification. Deleting an alert deletes its incidents (FK cascade, same as monitors). Maintenance windows do not apply to log alerts (they are monitor-scoped). A stale evaluation is skipped: one that started no later than `last_evaluated_at`. A failed count changes nothing. Incident title: `Log alert: <name>`. Cause: `<count> matching events in the last <window> (threshold: > <n>)`, or `< <n>` for `lt`.
-- **R-P2-19 Alert worker.** `logs::alerts::run_forever` runs where the uptime worker runs (`UPTIME_WORKER_ENABLED`). It ticks every 5 s, claims up to 50 due alerts per tick (`for update skip locked`, rescheduled `interval_seconds` ahead in the claiming statement), evaluates at most 8 at once, and sends notifications through a `Notifications` of its own. Counts use `READ_SETTINGS` and the 25 s query limit.
-- **R-P2-20 Live-tail resume (deferred from Part 1).** Every `event: log` carries `id: <Cursor::encode()>` (opaque, `(dt, id)`). On connect, a `Last-Event-ID` header holding a valid cursor dated within the last **5 minutes** makes the first poll send the rows after that cursor (oldest first, at most `TAIL_BATCH`), instead of only remembering them. A cursor that is malformed, older or in the future is ignored (normal start). Late rows dated at or before the cursor that arrived during the gap are not replayed (documented). nami-ui forwards `Last-Event-ID` only when it matches `^[A-Za-z0-9_-]{1,128}$`.
-- **R-P2-21 Explorer fixes (deferred from Part 1).** The tail effect depends only on the derived tail query string and the `live` flag, so changing columns or the tab does not restart it. "Load more" carries a generation number and an `AbortController`. Navigation aborts it, and a response from an older generation is discarded. Live rows are validated (`isLogEntry`), deduplicated by id and capped at `LIVE_ROW_CAP`. Turning live off clears them.
-- **R-P2-22 Not in Part 2.** Graceful shutdown and per-IP HTTP limits go to Platform (Part 1 ruling). Alert no-data handling, confirmation periods and per-series incidents go to Metrics (spec). Alert routing through escalation policies goes to Incident Management (roadmap §4). The "View trace" link waits for Traces (spec).
+- **R-P2-18 Alert semantics.** The window is `[now − window_seconds, now]` at evaluation. `gt` fires when `count > threshold`, `lt` when `count < threshold`. `lt` needs `threshold >= 1` (400), because `lt 0` can never fire. Thresholds go up to 10^12. A PATCH sets `next_evaluation_at = now()` so an edit takes effect at once. Disabling an `alerting` alert sets `ok` and resolves its open incident without a notification. Deleting an alert deletes its incidents (FK cascade, same as monitors). **Maintenance (ruling, reversible by the controller):** a *project-wide* maintenance window (`monitor_id` null) in effect at `started_at` holds the alert's state machine, as it holds heartbeats: the count, `last_count` and `last_evaluated_at` are recorded, but `state` does not change, no incident opens or resolves, and nothing is sent. The first evaluation after the window applies the transition normally. A monitor-scoped window does not apply. Reason: a project-wide window means "the whole project is under planned work", and log volume and error counts are what planned work changes most. Paging on them would make project-wide windows useless. The check is `models::maintenance::active_windows(&mut *tx, project_id, started_at).await?.covers_heartbeats()` (project-wide windows only). Add a `covers_project()` alias with that body so the call reads right. **Stale evaluations** are skipped: one that started no later than `last_evaluated_at`, or one whose claimed `updated_at` differs from the row's (the alert was edited while it ran, so its count used old settings; the PATCH already made the alert due again). A failed count changes nothing except `last_error` / `last_error_at` (a fixed, user-safe text: the `AppError::Validation` message from `search::user_error`, else `"the log store is unavailable"`), so an alert whose query keeps failing is visible in the UI instead of silently never evaluating. A successful evaluation clears `last_error`. Incident title: `Log alert: <name>`. Cause: `<count> matching events in the last <window> (threshold: > <n>)`, or `< <n>` for `lt`.
+- **R-P2-19 Alert worker.** `logs::alerts::run_forever` runs where the uptime worker runs (`UPTIME_WORKER_ENABLED`). It ticks every 5 s and claims due alerts with `for update skip locked`, rescheduled `interval_seconds` ahead in the claiming statement. Several engine instances can therefore run it at once: each alert is claimed by one of them per interval. Evaluations share one `Arc<Semaphore>` of `MAX_ALERT_EVALUATIONS = 8` across every pass of the instance (passes overlap when ClickHouse is slow). A tick claims at most `min(ALERT_CLAIM_BATCH = 50, available permits)` alerts, and none when no permit is free, so an alert is never claimed (and pushed one interval ahead) without capacity to evaluate it. Notifications go through a `Notifications` of its own. Per-evaluation budget: one `count()` under `READ_SETTINGS` and the client's 25 s `max_execution_time`, holding one permit. Alert storms are bounded by the state machine (an email only on a transition), the unique open incident per alert, `interval_seconds >= 60` (a flapping alert sends at most one email per interval) and 100 alerts per project. Confirmation periods arrive with Metrics' shared evaluator.
+- **R-P2-20 Live-tail resume (deferred from Part 1).** Every `event: log` carries `id: <Cursor::encode()>` (opaque, `(dt, id)`). On connect, a `Last-Event-ID` header holding a valid cursor dated within the last **5 minutes** makes the first poll send the rows after that cursor (oldest first, at most `TAIL_BATCH`), instead of only remembering them. A cursor that is malformed, longer than 128 bytes (checked before decoding), older or in the future is ignored (normal start). The cursor is untrusted input and changes only two things: the lower `dt` bound of the first poll (never more than 5 minutes back) and a bound flag column. The project comes from the path, the filters from the query string, and the replay is capped at `TAIL_BATCH` rows, so a forged cursor cannot reach another project's rows or read more than a normal poll. When the resume poll fails, the next poll tries the resume again (resume ends only with the first poll that succeeds). With more than `TAIL_BATCH` rows after the cursor, the newest `TAIL_BATCH` are replayed and the older part of the gap is lost. Late rows dated at or before the cursor that arrived during the gap are not replayed either (both documented). nami-ui forwards `Last-Event-ID` only when it matches `^[A-Za-z0-9_-]{1,128}$`. The explorer leaves reconnects to `EventSource` (it closes the stream only on `end: session`), so the browser's own reconnect after the 30-minute `end: timeout` carries the header.
+- **R-P2-21 Explorer fixes (deferred from Part 1).** The tail effect depends only on the derived tail query string and the `live` flag, so changing columns or the tab does not restart it. "Load more" carries a generation number and an `AbortController`. Navigation aborts it, and a response from an older generation is discarded. Live rows are validated (`isLogEntry`), deduplicated by id and capped at `LIVE_ROW_CAP`. Turning live off clears them. The rest of the LOG-8 deferred line is also Part 2: a failed histogram or sources call shows a message instead of looking empty (`histogramError`, `sourcesError` from the load), `<pre>` fields wrap (`whitespace-pre-wrap break-words`), the live status is announced (`role="status" aria-live="polite"`), the results/patterns tabs are a labelled `nav`, and the live-tail lifecycle gets a test. For that test the EventSource handling moves out of `+page.svelte` into `nami-ui/src/lib/live-tail.ts` (`startLiveTail`), which takes the `EventSource` constructor as a parameter, so vitest drives it with a fake.
+- **R-P2-22 Not in Part 2.** Graceful shutdown and per-IP HTTP limits go to Platform (Part 1 ruling). Alert no-data handling, confirmation periods and per-series incidents go to Metrics (spec). Alert routing through escalation policies goes to Incident Management (roadmap §4). The "View trace" link waits for Traces (spec). Part 1 deferred items that the decisions log gives no target stay open, and the Part 2 final review decides each one: LOG-3 (2-permit large-body semaphore, `shrink_to_fit` on the prefix result, memory-test baseline, aggregate encoded bodies awaiting ClickHouse), LOG-4 (unreachable UDP oversize branch on IPv4), LOG-5 (numeric `eq` compares text, Rust pre-check stricter than RE2, `user_error` substring matching, paging window not in the cursor, about 32 histogram buckets at 31 days, empty `contains` matches all), LOG-6 (no test for `MAX_UNKNOWN_CHECKS`), LOG-7 (viewers see Reveal/Rotate, token panel and snippet a11y, rsyslog template token unescaped, no component tests). When Traces adds OTLP logs, its events must reach `RowBatch::push` with `trace_id`/`span_id` already checked (`normalize::checked_id`), so an invalid id is in `fields` before redaction runs (today `build_row` moves it after the pipeline; HTTP and syslog are unaffected because `from_json` checks ids and syslog sets none).
 - **R-P2-23 Entry reads get their own cap (controller follow-up from the fix wave).** One explorer page load takes 2 of the 4 query slots (search + histogram). A load-more and two expanded rows would then hit 429. `GET /projects/{id}/logs/{log_id}` therefore stops taking a `QueryPermit` and takes one of `MAX_ENTRY_READS_PER_USER = 8` entry slots instead. An entry read reads one granule by `dt` and `id` under `READ_SETTINGS`, so 8 at once cost little. The spec line "at most 4 searches, histograms and entry reads" becomes "at most 4 searches and histograms, and 8 entry reads", changed in the same PR (Task 9).
 - **R-P2-24 Syslog row chunking off the runtime (controller follow-up).** The batcher calls `store::chunk_rows` (which JSON-encodes every row to measure it) on the async task. Task 11 moves it into the blocking task that builds the `RowBatch`. That task returns the rows, the runs and the oversized count together, and only the per-run encode and the insert stay as they are.
 - **R-P2-25 A tail poll reads only new rows, pinned by a counter (controller follow-up).** `LogsState.tail_stats: tail::TailStats { id_polls: AtomicU64, rows_fetched: AtomicU64 }` counts id polls and list rows read by `fetch_rows`. Task 15's test asserts that 10 polls over 100 old rows read exactly the 2 new rows. The counters are cheap and are also what a later metrics endpoint would export.
+- **R-P2-26 Regex budget per pipeline.** Each pipeline regex compiles with `RegexBuilder::size_limit(REGEX_SIZE_LIMIT)` and `dfa_size_limit(REGEX_DFA_SIZE_LIMIT)`, both **256 KiB**. A pipeline holds at most `MAX_REGEXES = 20` regexes (`message_regex` and `redact.regex` together). The error names the rule holding the 21st: `rules[i]: a pipeline may hold at most 20 regular expressions`. A pattern over the size limit gets `"regex is too complex (compiled size limit)"` (`regex::Error::CompiledTooBig`), any other error `"regex is not a valid regular expression"`. Neither echoes the pattern. Bound: a cached pipeline holds at most 20 × 256 KiB of programs, plus one lazy-DFA cache of at most 256 KiB per regex per thread using it at once. Ingest decoding is capped at 4 threads, the preview at one blocking task per request. With the cache at 1,024 entries that is a bounded worst case. The spec's line "compiled once per rule-set version with a size limit" gains "at most 20 per pipeline" (Task 10). CPU stays bounded: a request decodes at most 50 MiB of values, each regex scans it once in linear time, and the decode places (4, at most 2 per project) bound how many such scans run at once.
+- **R-P2-27 One seam for log-alert incidents.** The Incident Management sub-project (next) replaces how incidents open and notify (escalation policies, severities, `source = 'log_alert'`). Log alerts touch incidents only through two functions in `logs::alerts`: `open_alert_incident(conn, alert, count, at) -> Result<Option<Transition>, sqlx::Error>` (calls `incident::open_for_log_alert` and builds the `Down` transition) and `resolve_alert_incident(conn, alert_id, project_id, name, at, notify: bool) -> Result<Option<Transition>, sqlx::Error>` (calls `incident::resolve_for_log_alert`, returns the `Recovered` transition only when `notify`). `apply_evaluation` and `models::log_alert::update` (disable) call these and nothing else. Transitions still leave only through `uptime::alerts::notify_transition`, so swapping in the unified incident API is a change to those two functions.
 
 ## Roadmap §3 coverage (verified against `main` 95940ee, which already ticks Part 1's items)
 
@@ -148,11 +161,13 @@ nami-engine/
     logs/saved_query.rs                T13 LogQuery, ViewQuery
     logs/alerts.rs                     T14 claim, count, apply, worker loop
     logs/tail.rs                       T15 event ids, resume, TailStats
-    models/source.rs                   T10 pipeline read/write; T11 IngestSource.updated_at
+    models/source.rs                   T10 pipeline read/write, monotonic updated_at; T11 IngestSource.updated_at
+    models/maintenance.rs              T14 ActiveWindows::covers_project alias
     models/log_view.rs                 T13
     models/log_alert.rs                T14
     models/incident.rs                 T14 open/resolve_for_log_alert, list joins log_alerts
     uptime/alerts.rs                   T14 Subject::LogAlert + render
+    uptime/worker.rs                   T14 spawn_alerts made pub(crate)
     routes/sources.rs                  T10 pipeline GET/PUT/test
     routes/logs_ingest.rs              T11 pipeline lookup before Work
     routes/logs.rs                     T9 patterns; T12 export; T15 Last-Event-ID
@@ -170,6 +185,7 @@ nami-engine/
 
 nami-ui/src/
   lib/logs.ts (+ test)                 T15 isLogEntry, mergeLiveRows; T17 tab/pattern state, view <-> state, export href
+  lib/live-tail.ts (+ test)            T15 startLiveTail (EventSource lifecycle, testable with a fake)
   lib/pipeline.ts (+ test)             T16 rule types, drafts, sample parsing
   lib/log-alerts.ts (+ test)           T18 types, describeCondition
   lib/server/log-proxy.ts (+ test)     T12 EXPORT_PARAMS; T15 lastEventIdHeader
@@ -469,6 +485,8 @@ pub async fn top_patterns(ch: &ClickHouse, project_id: Uuid, window: &Window, fi
 
 Add a unit test `pattern_settings_extend_the_read_settings` asserting that `PATTERN_SETTINGS[..2] == search::READ_SETTINGS`. If `READ_SETTINGS` grew in the merged fix wave, build `PATTERN_SETTINGS` to contain all of it.
 
+The `toString(pattern_hash) AS pattern_hash` alias shadows the column in `WHERE` and `GROUP BY`, as it already does in `search::ENTRY_COLUMNS`. ClickHouse compares the `pattern_hash IN ({p:UInt64})` filter with the alias by converting the bound numbers, which Part 1's `pattern_hash` search test pins. Grouping by the text form groups exactly as by the number. Keep the alias (the API field is `pattern_hash`), and keep `patterns_are_counted_ranked_and_confined_to_the_project`'s hash-filter assertion, which would catch a change in that behaviour.
+
 Route in `routes/logs.rs`, registered **before** `/projects/{id}/logs/{log_id}` (axum matches literal segments before captures, but keep it adjacent for readers):
 
 ```rust
@@ -506,7 +524,7 @@ fn slots_cap_each_user_and_come_back_on_drop() {
 }
 ```
 
-Append to `tests/logs_search.rs` (reuse its `fixture`; the fixture's `viewer` cookie belongs to a user whose id the test needs, so either return the id from `fixture` or create a second viewer here with `user_with_role`):
+Append to `tests/logs_search.rs` (it needs no `fixture`; every import it uses, and the file's `encode` helper, are already there):
 
 ```rust
 #[sqlx::test]
@@ -574,7 +592,7 @@ Branch `feat/NAMI-LOG-10-pipeline-rules`, worktree `.worktrees/NAMI-LOG-10/`.
 
 **Files:**
 - Create: `nami-engine/migrations/0042_add_sources_pipeline.sql`, `nami-engine/src/logs/pipeline.rs`
-- Modify: `nami-engine/src/logs/query.rs` (extract `pub fn parse_path`), `nami-engine/src/logs/mod.rs`, `nami-engine/src/models/source.rs` (pipeline read/write), `nami-engine/src/routes/sources.rs` (3 routes), `nami-engine/tests/migrations.rs`
+- Modify: `nami-engine/src/logs/query.rs` (extract `pub fn parse_path`), `nami-engine/src/logs/mod.rs`, `nami-engine/src/models/source.rs` (pipeline read/write, `ingest_source`, monotonic `updated_at` in `update_in_project` and `rotate_token`), `nami-engine/src/routes/sources.rs` (3 routes), `nami-engine/tests/migrations.rs`, `docs/superpowers/specs/2026-10-13-log-management-design.md` (the regex line gains "at most 20 per pipeline", R-P2-26)
 - Test: `nami-engine/tests/logs_pipeline_api.rs` (+ unit tests in `pipeline.rs`)
 
 **Interfaces:**
@@ -588,7 +606,9 @@ pub fn parse_path(raw: &str) -> Result<Vec<String>, String>; // the filter path 
 // logs::pipeline
 pub const MAX_RULES: usize = 50;
 pub const MAX_REGEX_CHARS: usize = 256;
-pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
+pub const REGEX_SIZE_LIMIT: usize = 256 * 1024;      // R-P2-26
+pub const REGEX_DFA_SIZE_LIMIT: usize = 256 * 1024;  // R-P2-26
+pub const MAX_REGEXES: usize = 20;                   // per pipeline, R-P2-26
 pub const MAX_RULE_ITEMS: usize = 50;      // paths of remove_fields, keys of redact
 pub const MAX_KEY_CHARS: usize = 64;
 pub const MAX_EQUALS_CHARS: usize = 1024;
@@ -646,6 +666,9 @@ pub async fn get_pipeline(pool: &PgPool, project_id: Uuid, source_id: Uuid)
 /// Replaces the rules and bumps `updated_at`; `None` when the project has no such source.
 pub async fn set_pipeline(pool: &PgPool, project_id: Uuid, source_id: Uuid, rules: &serde_json::Value)
     -> Result<Option<DateTime<Utc>>, sqlx::Error>;
+/// The ingest view of one source of the project (the preview builds rows with it).
+pub async fn ingest_source(pool: &PgPool, project_id: Uuid, source_id: Uuid)
+    -> Result<Option<IngestSource>, sqlx::Error>;
 ```
 
 - Routes (in `routes::sources::router`): `GET /projects/{id}/sources/{source_id}/pipeline` (viewer) → `{"rules": [...], "updated_at": "..."}`. `PUT` the same path (member), body `{"rules": [...]}` → 200 with the same shape. `POST /projects/{id}/sources/{source_id}/pipeline/test` (member), body `{"rules": [...], "events": [{...}]}` → `{"results": [{"outcome": "kept", "event": {dt, level, message, fields, trace_id, span_id, pattern}} | {"outcome": "dropped"} | {"outcome": "sampled_out"}]}`.
@@ -665,13 +688,24 @@ alter table sources
         check (jsonb_typeof(pipeline) = 'array' and jsonb_array_length(pipeline) <= 50);
 ```
 
-Add to `tests/migrations.rs` (style of the existing source-table test):
+Add to `tests/migrations.rs`. That file has no `mod common;` (it tests the schema with plain SQL), so the test seeds its rows with SQL too. The `seed_source_row` helper is reused by the T13 and T14 migration tests:
 
 ```rust
+/// A project and one source in it, inserted with plain SQL (no engine code).
+async fn seed_source_row(pool: &sqlx::PgPool) -> (uuid::Uuid, uuid::Uuid) {
+    let project: uuid::Uuid = sqlx::query_scalar(
+        "insert into projects (name, slug) values ('p', gen_random_uuid()::text) returning id")
+        .fetch_one(pool).await.unwrap();
+    let source: uuid::Uuid = sqlx::query_scalar(
+        "insert into sources (project_id, name, token_hash, token_enc)
+         values ($1, 'api', md5(gen_random_uuid()::text), '\\x00'::bytea) returning id")
+        .bind(project).fetch_one(pool).await.unwrap();
+    (project, source)
+}
+
 #[sqlx::test]
 async fn sources_have_an_empty_pipeline_by_default_and_reject_non_arrays(pool: sqlx::PgPool) {
-    let project = common::seed_project(&pool).await;
-    let (source, _) = common::logs::seed_source(&pool, project, "api").await;
+    let (_, source) = seed_source_row(&pool).await;
     let pipeline: serde_json::Value = sqlx::query_scalar("select pipeline from sources where id = $1")
         .bind(source).fetch_one(&pool).await.unwrap();
     assert_eq!(pipeline, serde_json::json!([]));
@@ -686,7 +720,7 @@ async fn sources_have_an_empty_pipeline_by_default_and_reject_non_arrays(pool: s
 }
 ```
 
-(`tests/migrations.rs` may need `#[path]`/`mod common;` as the file already has. Follow its header.)
+(Check `uuid` and `serde_json` are usable from that test binary: both are regular dependencies of the crate, so they are.)
 
 - [ ] **Step 2: Run it to verify it fails, then passes after the migration file exists**
 
@@ -772,11 +806,19 @@ fn redact_by_regex_rewrites_the_message_and_every_string_value() {
     let e = kept(p.apply(event(json!({
         "message":"card 4111-1111-1111-1111 declined",
         "card":{"number":"4111-1111-1111-1111","n":[ "4111-1111-1111-1111" ]},
-        "amount": 41111111
+        "amount": 41111111,
+        "ok": true
     }))));
     assert_eq!(e.message, "card [REDACTED] declined");
     assert_eq!(e.fields["card"], json!({"number":"[REDACTED]","n":["[REDACTED]"]}));
-    assert_eq!(e.fields["amount"], json!(41111111), "non-strings are left alone");
+    assert_eq!(e.fields["amount"], json!(41111111), "a number without a match is left alone");
+    assert_eq!(e.fields["ok"], json!(true));
+
+    // R-P2-5: a number is matched on its JSON text; one with a match becomes a string.
+    let p = rules(json!([{"type":"redact","regex":"\\d{16}"}]));
+    let e = kept(p.apply(event(json!({"message":"m","card":4111111111111111_u64,"deep":[{"pan":5500000000000004_u64}]}))));
+    assert_eq!(e.fields["card"], json!("[REDACTED]"));
+    assert_eq!(e.fields["deep"], json!([{"pan":"[REDACTED]"}]));
 }
 
 #[test]
@@ -851,8 +893,23 @@ fn a_regex_that_matches_the_empty_string_is_rejected() {
 }
 
 #[test]
+fn a_pipeline_holds_at_most_twenty_regexes() {
+    let at_limit: Vec<Value> = (0..MAX_REGEXES).map(|n| json!({"type":"redact","regex":format!("secret{n}")})).collect();
+    assert!(compile(&parse_rules(&Value::Array(at_limit.clone())).unwrap()).is_ok());
+    let mut over = at_limit;
+    over.push(json!({"type":"drop","match":{"message_regex":"x"}}));
+    let error = rejected(Value::Array(over));
+    assert_eq!(error.index, MAX_REGEXES, "{error}");
+    assert!(error.message.contains("20"), "{error}");
+    // A pattern whose compiled program passes the size limit is refused, without echoing it.
+    let huge = rejected(json!([{"type":"redact","regex":"\\w{200}\\w{50}"}]));
+    assert!(huge.message.contains("too complex") && !huge.message.contains("\\w"), "{huge}");
+}
+
+#[test]
 fn catastrophic_patterns_run_in_linear_time() {
-    let message = format!("{}!", "a".repeat(64 * 1024));
+    // 64 KiB exactly: `from_json` truncates anything longer before the pipeline sees it.
+    let message = format!("{}!", "a".repeat(64 * 1024 - 1));
     let p = rules(json!([
         {"type":"drop","match":{"message_regex":"(a+)+$"}},
         {"type":"redact","regex":"(a|aa)+b"}
@@ -911,24 +968,29 @@ fn compile_regex(pattern: &str) -> Result<Regex, String> {
     if pattern.chars().count() > MAX_REGEX_CHARS {
         return Err(format!("regex must be at most {MAX_REGEX_CHARS} characters"));
     }
-    let regex = RegexBuilder::new(pattern)
+    // Neither message echoes the pattern: a regex can carry a secret's shape.
+    RegexBuilder::new(pattern)
         .size_limit(REGEX_SIZE_LIMIT)
-        .dfa_size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
         .build()
-        .map_err(|_| "regex is not a valid regular expression".to_string())?;
-    Ok(regex)
+        .map_err(|error| match error {
+            regex::Error::CompiledTooBig(_) => "regex is too complex (compiled size limit)".to_string(),
+            _ => "regex is not a valid regular expression".to_string(),
+        })
 }
 ```
 
+`compile` counts the regexes it compiles (`message_regex` and `redact.regex`) and fails on the rule holding number `MAX_REGEXES + 1`: `"a pipeline may hold at most 20 regular expressions"`.
+
 Rules for `compile` (each failure is `PipelineError { index, message }`):
 - `parse_rules`: not an array → index 0, `"rules must be a JSON array"`. More than `MAX_RULES` → index 50, `"at most 50 rules"`. Each element is deserialized on its own with `serde_json::from_value::<Rule>`, so an unknown `type` or key reports that element's index, with serde's message (it names the field).
-- Per kind, the allowed keys: `drop`: `match` (required). `remove_fields`: `paths` (1..=50, else `"remove_fields needs 1 to 50 paths"`). `redact`: `keys` (≤ 50) and/or `regex`, at least one present, else `"redact needs keys or regex"`. `rename`: `from`, `to` (both required). `sample`: `n` (required, in `SAMPLE_RANGE`, message `"n must be between 2 and 10000"`), `match` optional. A key that is present but unused by the kind → `"<key> is not used by <kind> rules"`.
+- Per kind, the allowed keys: `drop`: `match` (required, else `"drop needs a match"`). `remove_fields`: `paths` (1..=50, else `"remove_fields needs 1 to 50 paths"`). `redact`: `keys` (≤ 50) and/or `regex`, at least one present, else `"redact needs keys or regex"`. `rename`: `from`, `to` (both required). `sample`: `n` (required, in `SAMPLE_RANGE`, message `"n must be between 2 and 10000"`), `match` optional. A key that is present but unused by the kind → `"<key> is not used by <kind> rules"`.
 - `match`: exactly one of (`field` + `equals`) or `message_regex`, else `"match needs either field and equals, or message_regex"`. `equals` is a string, number or bool, ≤ `MAX_EQUALS_CHARS` of text. Its comparison text is the string itself or the JSON text otherwise.
 - Paths go through `query::parse_path`. In `match.field`/`rename`, the exact strings `level` / `message` become `Target::Level`/`Target::Message`. In `remove_fields`, they are rejected: `"level and message cannot be removed; use rename or redact"`.
 - `redact.keys`: 1..=64 chars, no `char::is_control`, else `"redact key must be 1-64 characters without control characters"`. Stored lowercased (`to_lowercase`).
 - `redact.regex`: `compile_regex`, then reject when the pattern can match an empty string anywhere: `regex_syntax::Parser::new().parse(pattern)` and `hir.properties().minimum_len() == Some(0)` → `"redact regex must not match the empty string"`. A check like `is_match("")` is not enough: `\b` does not match `""` but matches zero-width between words. `message_regex` uses `compile_regex` only. A drop condition may match empty. Defense in depth: the redact replacement skips zero-width matches (it iterates `find_iter` and replaces only `m.start() < m.end()`), so a stored rule from before this check can never insert markers between characters.
 
-`apply` walks the steps top to bottom: `Drop` → `Outcome::Dropped` on match. `Sample` (when its condition matches, or always without one) → `if counter.fetch_add(1, Ordering::Relaxed) % n != 0 { return SampledOut }`. `Remove` deletes each path from `event.fields` (walk objects; a non-object or missing step is a no-op; delete the last key). `Redact` with keys → recursive walk over `fields` (objects and arrays), replacing the value of every object key whose `to_lowercase()` is in `keys` by `Value::String(REDACTED.into())`. With a regex → `regex.replace_all(&event.message, REDACTED)` and the same over every `Value::String` at any depth, assigning only when the result is `Cow::Owned`. `Rename` → `take(from)` then `put(to, value)`. `take`: Level → `std::mem::replace(&mut event.level, "info".into())` as `Value::String`; Message → `mem::take(&mut event.message)`; Field → remove from fields (missing → stop, no-op). `put`: Level → `normalize::level_from_name(text)`; Message → string or JSON text; Field → walk/create objects, replacing a non-object intermediate with `{}`, then insert. Recursion depth is bounded by the decoders (≤ 128 levels).
+`apply` walks the steps top to bottom: `Drop` → `Outcome::Dropped` on match. `Sample` (when its condition matches, or always without one) → `if counter.fetch_add(1, Ordering::Relaxed) % n != 0 { return SampledOut }`. `Remove` deletes each path from `event.fields` (walk objects; a non-object or missing step is a no-op; delete the last key). `Redact` with keys → recursive walk over `fields` (objects and arrays), replacing the value of every object key whose `to_lowercase()` is in `keys` by `Value::String(REDACTED.into())`. With a regex → the zero-width-skipping replacement over `event.message` and over every `Value::String` at any depth, assigning only when something was replaced, and over the JSON text of every `Value::Number` at any depth: a number with a match is replaced by `Value::String(<replaced text>)` (R-P2-5). `Rename` → `take(from)` then `put(to, value)`. `take`: Level → `std::mem::replace(&mut event.level, "info".into())` as `Value::String`; Message → `mem::take(&mut event.message)`; Field → remove from fields (missing → stop, no-op). `put`: Level → `normalize::level_from_name(text)`; Message → string or JSON text; Field → walk/create objects, replacing a non-object intermediate with `{}`, then insert. Recursion depth is bounded by the decoders (≤ 128 levels).
 
 `Debug for CompiledPipeline` prints `CompiledPipeline { rules: <n> }`. Never print patterns. A regex can hold a secret's shape.
 
@@ -963,13 +1025,18 @@ async fn members_replace_the_rules_and_viewers_read_them(pool: sqlx::PgPool) {
     let (status, empty) = call(&app, "GET", &uri, Some(&viewer), None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(empty["rules"], json!([]));
-    let before: String = empty["updated_at"].as_str().unwrap().to_string();
+    // Parsed, not compared as text: chrono prints 0, 3 or 6 fraction digits.
+    let at = |v: &serde_json::Value| chrono::DateTime::parse_from_rfc3339(v["updated_at"].as_str().unwrap()).unwrap();
+    let before = at(&empty);
 
     let rules = json!([{"type":"redact","keys":["password"]},{"type":"sample","n":10}]);
     let (status, saved) = call(&app, "PUT", &uri, Some(&member), Some(json!({ "rules": rules }))).await;
     assert_eq!(status, StatusCode::OK, "{saved}");
     assert_eq!(saved["rules"], rules);
-    assert!(saved["updated_at"].as_str().unwrap() > before.as_str(), "updated_at is bumped");
+    assert!(at(&saved) > before, "updated_at is bumped");
+    // Saving the same rules again still moves updated_at forward (R-P2-6).
+    let (_, again) = call(&app, "PUT", &uri, Some(&member), Some(json!({ "rules": rules }))).await;
+    assert!(at(&again) > at(&saved));
     assert_eq!(call(&app, "GET", &uri, Some(&viewer), None).await.1["rules"], rules);
 
     let body = Some(json!({ "rules": [] }));
@@ -1093,10 +1160,12 @@ pub async fn set_pipeline(pool: &PgPool, project_id: Uuid, source_id: Uuid, rule
 }
 ```
 
+In the same file, `update_in_project` and `rotate_token` change `updated_at = now()` to the same `greatest(clock_timestamp(), updated_at + interval '1 microsecond')` (R-P2-6: `now()` is the transaction start, so a patch that waited on the row lock could write an older `updated_at` than a pipeline save that committed meanwhile). `sources_api` keeps passing unchanged. `ingest_source` is `select id, project_id, retention_days, daily_byte_quota from sources where id = $1 and project_id = $2` (Task 11 adds `updated_at` to it with the other two lookups).
+
 Routes (`routes/sources.rs`), with request bodies `#[serde(deny_unknown_fields)] struct PipelineBody { rules: serde_json::Value }` and `struct PipelineTestBody { rules: serde_json::Value, events: Vec<serde_json::Value> }`:
 - GET: `require_project_role(viewer)`, then `get_pipeline`. `None` → `AppError::NotFound`.
-- PUT: `require_project_role(member)`, then `pipeline::parse_rules` + `compile` (error → `AppError::Validation(e.to_string())`), then `set_pipeline` with `serde_json::to_value(&parsed)` (the canonical form). `None` → 404.
-- POST test: `require_project_role(member)`, then load the source as `IngestSource` scoped to the project (404 otherwise; reuse or add `models::source::ingest_source(pool, project_id, source_id)`). `events.len() > MAX_TEST_EVENTS` → 400 `"at most 100 sample events"`. Compile the rules (400). For each event, a non-object → 400 `"events[i] must be a JSON object"`; otherwise `from_json(object, now)`, then `apply`, then on `Keep`, `store::build_row_at(event, &source, now)` and serialize `{dt, level, message, fields: <parsed object>, trace_id, span_id, pattern}`.
+- PUT: `require_project_role(member)`, then `pipeline::parse_rules` + `compile` in `spawn_blocking` (error → `AppError::Validation(e.to_string())`), then `set_pipeline` with `serde_json::to_value(&parsed)` (the canonical form). `None` → 404.
+- POST test: `require_project_role(member)`, then `models::source::ingest_source(pool, project_id, source_id)` (404 when absent). `events.len() > MAX_TEST_EVENTS` → 400 `"at most 100 sample events"`. A non-object event → 400 `"events[i] must be a JSON object"` (checked before any CPU work). Then one `spawn_blocking` task compiles the rules (400) and, for each event, runs `from_json(object, now)`, `apply`, and on `Keep` `store::build_row_at(event, &source, now)`, serializing `{dt, level, message, fields: <parsed object>, trace_id, span_id, pattern}`. Up to 100 events of 2 MiB against 20 regexes is real CPU, which must not run on an async worker.
 
 - [ ] **Step 10: Run the tests to verify they pass**
 
@@ -1110,7 +1179,8 @@ Run: engine command (all), `cargo clippy --all-targets -- -D warnings`.
 ```bash
 git add nami-engine/Cargo.toml nami-engine/Cargo.lock nami-engine/migrations/0042_add_sources_pipeline.sql nami-engine/src/logs/pipeline.rs \
   nami-engine/src/logs/query.rs nami-engine/src/logs/mod.rs nami-engine/src/models/source.rs \
-  nami-engine/src/routes/sources.rs nami-engine/tests/logs_pipeline_api.rs nami-engine/tests/migrations.rs
+  nami-engine/src/routes/sources.rs nami-engine/tests/logs_pipeline_api.rs nami-engine/tests/migrations.rs \
+  docs/superpowers/specs/2026-10-13-log-management-design.md
 git commit -m "feat(engine): ingest pipeline rules with validation and preview API (NAMI-LOG-10)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -1139,7 +1209,7 @@ pub async fn load_pipeline(pool: &PgPool, source_id: Uuid)
     -> Result<Option<(serde_json::Value, DateTime<Utc>)>, sqlx::Error>;
 
 // logs::pipeline_cache
-pub const MAX_CACHED_PIPELINES: usize = 4096;
+pub const MAX_CACHED_PIPELINES: usize = 1024;   // R-P2-6, R-P2-26
 #[derive(Debug, Default)] pub struct PipelineCache { /* Mutex<HashMap<Uuid, (DateTime<Utc>, Arc<CompiledPipeline>)>> */ }
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineLoadError { #[error("database error: {0}")] Database(#[from] sqlx::Error),
@@ -1149,7 +1219,10 @@ impl PipelineCache {
     pub fn get(&self, source_id: Uuid, updated_at: DateTime<Utc>) -> Option<Arc<CompiledPipeline>>;
     pub fn put(&self, source_id: Uuid, updated_at: DateTime<Utc>, pipeline: Arc<CompiledPipeline>);
     /// get, or load + compile + put (stored at the `updated_at` the load returned).
-    pub async fn for_source(&self, pool: &PgPool, source: &IngestSource)
+    /// `db_permits` (HTTP: `IngestLimits::queries`; syslog: `None`) guards only
+    /// the Postgres read; the compile runs in `spawn_blocking` after the permit
+    /// is released.
+    pub async fn for_source(&self, pool: &PgPool, source: &IngestSource, db_permits: Option<&Semaphore>)
         -> Result<Arc<CompiledPipeline>, PipelineLoadError>;
 }
 
@@ -1169,8 +1242,8 @@ impl RowBatch {
     pub fn pipeline_counts(&self) -> &PipelineCounts;
 }
 // logs::ingest: build_batch / build_rows_within / prepare gain `pipeline: &CompiledPipeline`
-// (prepare: `Arc<CompiledPipeline>`, moved into its blocking task); `Batch` gains
-// `pipeline: PipelineCounts`.
+// (prepare: `Arc<CompiledPipeline>`, moved into its blocking task); `Batch` and
+// `Prepared` both gain `pipeline: PipelineCounts` (Work::store reads it from `Prepared`).
 ```
 
 - [ ] **Step 1: Re-read the shared step on the current `main`**
@@ -1210,12 +1283,12 @@ fn the_cache_is_cleared_when_full() {
 
 (`pub fn len(&self) -> usize` is added for this test.)
 
-In `store.rs` `mod tests`:
+In `store.rs` `mod tests` (the module's helper is `source(retention_days)`; add `use crate::logs::{normalize::{self, from_json}, pipeline::{compile, parse_rules, CompiledPipeline}}; use serde_json::json;` as far as they are not imported yet):
 
 ```rust
 #[test]
 fn the_pipeline_runs_between_the_event_and_the_row() {
-    let source = test_source();
+    let source = source(30);
     let pipeline = compile(&parse_rules(&json!([
         {"type":"drop","match":{"field":"level","equals":"debug"}},
         {"type":"redact","keys":["secret"],"regex":"tok_[a-z0-9]+"},
@@ -1242,7 +1315,7 @@ fn the_pipeline_runs_between_the_event_and_the_row() {
 
 #[test]
 fn redaction_that_grows_a_message_is_capped_again() {
-    let source = test_source();
+    let source = source(30);
     let pipeline = compile(&parse_rules(&json!([{"type":"redact","regex":"\\d"}])).unwrap()).unwrap();
     let digits = "7".repeat(60 * 1024);
     let event = from_json(json!({ "message": digits, "f": "1".repeat(200 * 1024) }).as_object().unwrap().clone(), Utc::now());
@@ -1257,7 +1330,7 @@ fn redaction_that_grows_a_message_is_capped_again() {
 }
 ```
 
-(`test_source()` builds an `IngestSource` with `updated_at: Utc::now()`. Reuse `store.rs`'s existing test helper and add the field.)
+(`source(30)` is `store.rs`'s existing helper. It gains `updated_at: Utc::now()` with the struct.)
 
 In `usage.rs`:
 
@@ -1280,9 +1353,9 @@ Expected: compile errors (`PipelineCache`, `record_pipeline` and the new `push` 
 
 - [ ] **Step 4: Implement the cache, the model change, the step change and the usage counter**
 
-- `IngestSource` gains `updated_at`. Both `find_by_token` and `find_by_token_hashes` add `updated_at` to their select lists. Update every `IngestSource { .. }` literal in tests (`updated_at: Utc::now()`).
+- `IngestSource` gains `updated_at`. `find_by_token`, `find_by_token_hashes` and T10's `ingest_source` add `updated_at` to their select lists (`IngestSource` is a `FromRow`; the hashes query flattens it). Update every `IngestSource { .. }` literal in tests (`updated_at: Utc::now()`).
 - `load_pipeline`: `select pipeline, updated_at from sources where id = $1`.
-- `PipelineCache::for_source`: on `get` hit return it. Otherwise `load_pipeline` → `None` (source deleted meanwhile) → `Arc::new(CompiledPipeline::empty())` and nothing cached. `Some((rules, at))` → `parse_rules` + `compile` (an error → `PipelineLoadError::Invalid(e.to_string())`), then `put(source.id, at, ..)` and return. `put` clears the map first when it already holds `MAX_CACHED_PIPELINES` entries.
+- `PipelineCache::for_source`: on `get` hit return it. Otherwise `load_pipeline` (holding a permit of `db_permits` when given, released right after the query) → `None` (source deleted meanwhile) → `Arc::new(CompiledPipeline::empty())` and nothing cached. `Some((rules, at))` → `parse_rules` + `compile` inside `tokio::task::spawn_blocking` (an error → `PipelineLoadError::Invalid(e.to_string())`; a join error → `Invalid` too, so the source fails closed), then `put(source.id, at, ..)` and return. `put` clears the map first when it already holds `MAX_CACHED_PIPELINES` entries.
 - `RowBatch::push`: `match pipeline.apply(event)`: `Keep(event)` → the existing body (`build_row`, stored cap). `Dropped` / `SampledOut` → bump `pipeline_counts[source.id]`, no row, `Ok(())`. An empty pipeline costs nothing (`apply` on no steps returns `Keep` at once). Every caller of `push` passes a pipeline. Tests and other callers with no rules pass `&CompiledPipeline::empty()`.
 - `UsageTracker::record_pipeline` → `record` with `events_dropped`/`events_sampled_out`.
 
@@ -1469,8 +1542,8 @@ Expected: FAIL. Rules are stored but not applied (secrets present, `accepted` 5)
 
 - [ ] **Step 8: Wire the pipeline into both paths**
 
-- HTTP (`routes/logs_ingest.rs`): after the quota check and before building `Work`, load the pipeline under the same Postgres semaphore the quota read uses: `let pipeline = { let _query = limits.queries.acquire().await; state.logs.pipelines.for_source(&state.db, &source).await }`. `Err(e)` → `tracing::error!(error = %e, source_id = %source.id, "log pipeline unavailable")` and `IngestError::Internal`. The `Arc<CompiledPipeline>` moves into `Work` and from there into `prepare`/`build_batch` (a new parameter `pipeline: Arc<CompiledPipeline>`, moved into the blocking task). In `Work::store`, after a successful insert (or with zero rows), record `record_pipeline(source.id, day, dropped, sampled_out)` next to `record_accepted`. The `202` count is the stored events (R-P2-8).
-- Syslog batcher (`Batcher::store`): after the source lookup and the rate/quota filters, collect the distinct sources of the batch and resolve each with `state.logs.pipelines.for_source` (one `load_pipeline` per cache miss). Frames of a source whose pipeline fails are removed from `allowed` and counted as `store_failed`, with one rate-limited warning (`self.warnings.warn`, never frame content). The blocking build task receives a `HashMap<Uuid, Arc<CompiledPipeline>>` and calls `rows.push(event, &source, &pipelines[&source.id])`. R-P2-24: the same blocking task then runs `store::chunk_rows(rows.rows(), max_bytes)` and returns `(Arc<RowBatch>, runs, oversized, budget)`, so no row is serialized on the async task any more. The per-run `encode_run` + insert loop is unchanged. `record_pipeline` is recorded per source from `rows.pipeline_counts()` once the runs are done (the counts do not depend on the inserts).
+- HTTP (`routes/logs_ingest.rs`): after the body is read and before building `Work`, resolve the pipeline, with the Postgres read under the same semaphore the quota read uses: `let pipeline = state.logs.pipelines.for_source(&state.db, &source, Some(&limits.queries)).await`. `Err(e)` → `tracing::error!(error = %e, source_id = %source.id, "log pipeline unavailable")` and `IngestError::Internal`. The `Arc<CompiledPipeline>` moves into `Work` and from there into `prepare`/`build_batch` (a new parameter `pipeline: Arc<CompiledPipeline>`, moved into the blocking task). In `Work::store`, after a successful insert (or with zero rows, when every event was dropped or sampled out: no insert is sent then), record `record_pipeline(source.id, day, dropped, sampled_out)` from `Prepared::pipeline`, next to `record_accepted`. A failed insert records neither (the client retries). The `202` count is the stored events (R-P2-8).
+- Syslog batcher (`Batcher::store`): after the source lookup and the rate/quota filters, collect the distinct sources of the batch and resolve each with `state.logs.pipelines.for_source(&state.db, &source, None)` (one `load_pipeline` per cache miss). Frames of a source whose pipeline fails are removed from `allowed` and counted as `store_failed`, with one rate-limited warning (`self.warnings.warn`, never frame content). The blocking build task receives a `HashMap<Uuid, Arc<CompiledPipeline>>` and calls `rows.push(event, &source, &pipelines[&source.id])`. R-P2-24: the same blocking task then runs `store::chunk_rows(rows.rows(), max_bytes)` and returns `(Arc<RowBatch>, runs, oversized, budget)`, so no row is serialized on the async task any more. The per-run `encode_run` + insert loop is unchanged. `record_pipeline` is recorded per source from `rows.pipeline_counts()` once the runs are done (the counts do not depend on the inserts).
 - Add a syslog unit test `rows_are_chunked_inside_the_blocking_build` that asserts on the factored function. Extract the build closure into `fn build_and_chunk(allowed, pipelines, max_bytes) -> Result<Built, ClickHouseError>` and test it directly: 3 frames of which one is larger than `max_bytes` give 2 rows in runs and `oversized == 1`.
 - Update the order-of-checks doc comment on `ingest_logs` and the module doc of `logs/mod.rs` (add `pipeline`, `pipeline_cache`).
 
@@ -1496,7 +1569,7 @@ Branch `feat/NAMI-LOG-12-log-export`, worktree `.worktrees/NAMI-LOG-12/`.
 **Files:**
 - Modify: `nami-engine/src/clickhouse.rs` (`send` split out of `post`, `stream_rows_with`, `RowStream`, `ClickHouseError::LineTooLong`, `EXPORT_MAX_EXECUTION_SECS`, `STREAM_REQUEST_TIMEOUT`, reserved setting)
 - Create: `nami-engine/src/logs/export.rs`
-- Modify: `nami-engine/src/logs/query.rs` (`pub fn push_field_text`, `pub(crate) fn last`/`values`), `nami-engine/src/logs/mod.rs` (`export_slots`, `export_limits`), `nami-engine/src/models/source.rs` (`names_for_project`), `nami-engine/src/routes/logs.rs` (route), `nami-engine/tests/clickhouse.rs` (reserved list)
+- Modify: `nami-engine/src/logs/query.rs` (`pub fn push_field_text`, `pub(crate) fn last`/`values`), `nami-engine/src/logs/slots.rs` (`acquire_capped`, total count), `nami-engine/src/logs/mod.rs` (`export_slots`, `export_limits`), `nami-engine/src/models/source.rs` (`names_for_project`), `nami-engine/src/routes/logs.rs` (route), `nami-engine/tests/clickhouse.rs` (reserved list), `docs/superpowers/specs/2026-10-13-log-management-design.md` (Export: "and 8 per engine instance"; the task ends at its 150 s deadline)
 - Create (UI): `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/export/+server.ts`, `.../logs/export/server.test.ts`
 - Modify (UI): `nami-ui/src/lib/server/log-proxy.ts` (+ test): `EXPORT_PARAMS`
 - Test: `nami-engine/tests/logs_export.rs` (+ unit tests in `export.rs`, `clickhouse.rs`)
@@ -1509,7 +1582,7 @@ Branch `feat/NAMI-LOG-12-log-export`, worktree `.worktrees/NAMI-LOG-12/`.
 // clickhouse
 pub const EXPORT_MAX_EXECUTION_SECS: u64 = 120;
 pub const STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
-pub struct RowStream { /* response, buffer, scanned, max_line, finished */ }
+pub struct RowStream { /* response, buffer: Vec<u8>, start, scanned, max_line, finished */ }
 impl RowStream { pub async fn next_line(&mut self) -> Result<Option<Vec<u8>>, ClickHouseError>; }
 impl ClickHouse {
     pub async fn stream_rows_with(&self, sql: &str, params: &[(&str, String)],
@@ -1522,12 +1595,14 @@ pub const MAX_EXPORT_ROWS: u64 = 100_000;
 pub const MAX_EXPORT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_EXPORT_LINE_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EXPORTS_PER_USER: usize = 2;
+pub const MAX_EXPORTS_PER_INSTANCE: usize = 8;                       // R-P2-15
+pub const EXPORT_DEADLINE: Duration = Duration::from_secs(150);      // R-P2-13
 pub const MAX_EXPORT_COLUMNS: usize = 10;
 pub const EXPORT_CHUNK_BYTES: usize = 64 * 1024;
 pub const EXPORT_LIMIT_HEADER: &str = "x-nami-export-limit";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ExportFormat { Csv, Ndjson }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExportLimits { pub rows: u64, pub bytes: u64, pub line_bytes: usize } // Default = the consts
+pub struct ExportLimits { pub rows: u64, pub bytes: u64, pub line_bytes: usize, pub deadline: Duration } // Default = the consts
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExportParams { pub window: Window, pub filters: LogFilters, pub format: ExportFormat, pub columns: Vec<Vec<String>> }
 pub fn parse_export(pairs: &[(String, String)], now: DateTime<Utc>) -> Result<ExportParams, String>;
@@ -1539,6 +1614,11 @@ pub async fn stream(rows: RowStream, params: ExportParams, sources: HashMap<Uuid
     limits: ExportLimits, tx: mpsc::Sender<Result<Bytes, std::convert::Infallible>>);
 
 // logs::LogsState gains `pub export_slots: Arc<slots::UserSlots>`, `pub export_limits: export::ExportLimits`
+// logs::slots
+impl UserSlots {
+    /// As `acquire`, and also refused (429) once `total` permits of every user are out.
+    pub fn acquire_capped(self: &Arc<Self>, user_id: Uuid, per_user: usize, total: usize) -> Result<UserPermit, AppError>;
+}
 // models::source
 pub async fn names_for_project(pool: &PgPool, project_id: Uuid) -> Result<HashMap<Uuid, String>, sqlx::Error>;
 // logs::query
@@ -1623,7 +1703,22 @@ fn file_names_carry_no_user_text() {
 
 #[test]
 fn the_default_limits_are_the_spec_values() {
-    assert_eq!(ExportLimits::default(), ExportLimits { rows: 100_000, bytes: 512 * 1024 * 1024, line_bytes: 4 * 1024 * 1024 });
+    assert_eq!(ExportLimits::default(), ExportLimits {
+        rows: 100_000, bytes: 512 * 1024 * 1024, line_bytes: 4 * 1024 * 1024, deadline: Duration::from_secs(150),
+    });
+}
+```
+
+`src/logs/slots.rs` `mod tests` (append):
+
+```rust
+#[test]
+fn a_total_caps_every_user_together() {
+    let slots = Arc::new(UserSlots::default());
+    let held: Vec<_> = (0..3).map(|_| slots.acquire_capped(Uuid::new_v4(), 2, 3).unwrap()).collect();
+    assert!(matches!(slots.acquire_capped(Uuid::new_v4(), 2, 3), Err(AppError::RateLimited)));
+    drop(held);
+    assert!(slots.acquire_capped(Uuid::new_v4(), 2, 3).is_ok());
 }
 ```
 
@@ -1666,7 +1761,7 @@ Also add `"http_write_exception_in_output_format"` to `RESERVED_SETTINGS` (lengt
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cargo test --lib logs::export clickhouse::` (engine command).
+Run: `cargo test --lib -- logs::export logs::slots clickhouse::` (engine environment).
 Expected: compile errors (items missing).
 
 - [ ] **Step 3: Implement the ClickHouse stream**
@@ -1677,31 +1772,43 @@ Split `post` into `send(&self, pairs, body, timeout: Option<Duration>) -> Result
 impl RowStream {
     /// The next non-empty line, without its newline; `None` at the end of the
     /// result. A line longer than `max_line` is refused without reading on.
+    ///
+    /// Lines are taken from `buffer[start..]` by moving `start`, never by
+    /// draining the front of the Vec per line (a chunk holding thousands of
+    /// short lines would be shifted thousands of times). The consumed front
+    /// is dropped once per chunk, before the next one is appended.
     pub async fn next_line(&mut self) -> Result<Option<Vec<u8>>, ClickHouseError> {
         loop {
-            if let Some(offset) = self.buffer[self.scanned..].iter().position(|b| *b == b'\n') {
-                let end = self.scanned + offset;
-                if end > self.max_line {
+            let from = self.start + self.scanned;
+            if let Some(offset) = self.buffer[from..].iter().position(|b| *b == b'\n') {
+                let end = from + offset;
+                if end - self.start > self.max_line {
                     return Err(ClickHouseError::LineTooLong { limit: self.max_line });
                 }
-                let mut line: Vec<u8> = self.buffer.drain(..=end).collect();
+                let line = self.buffer[self.start..end].to_vec();
+                self.start = end + 1;
                 self.scanned = 0;
-                line.pop();
                 if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
                 return Ok(Some(line));
             }
-            self.scanned = self.buffer.len();
-            if self.buffer.len() > self.max_line {
+            self.scanned = self.buffer.len() - self.start;
+            if self.scanned > self.max_line {
                 return Err(ClickHouseError::LineTooLong { limit: self.max_line });
             }
             if self.finished {
-                return Ok((!self.buffer.iter().all(u8::is_ascii_whitespace))
-                    .then(|| std::mem::take(&mut self.buffer)));
+                let rest = self.buffer.split_off(self.start);
+                self.start = 0;
+                self.scanned = 0;
+                return Ok((!rest.iter().all(u8::is_ascii_whitespace)).then_some(rest));
             }
             match self.response.chunk().await? {
-                Some(chunk) => self.buffer.extend_from_slice(&chunk),
+                Some(chunk) => {
+                    self.buffer.drain(..self.start);
+                    self.start = 0;
+                    self.buffer.extend_from_slice(&chunk);
+                }
                 None => self.finished = true,
             }
         }
@@ -1726,9 +1833,9 @@ const COLUMN_ALIASES: [&str; MAX_EXPORT_COLUMNS] =
   The CSV variant is `CSV_SELECT`, then for each column `", "` + `push_field_text` + `COLUMN_ALIASES[i]`, then `" FROM logs"`. Both variants then take `push_where`, `push_window` and `" ORDER BY dt DESC, id DESC LIMIT "` + `value("UInt64", limit)`.
 - `push_csv_field`: guard first (a leading `=`, `+`, `-`, `@`, `\t`, `\r` → prepend `'`), then quote when the guarded value contains `"`, `,`, `\r` or `\n` (inner `"` doubled). `csv_record` joins with `,` and ends with `\r\n`.
 - `file_name`: `format!("nami-logs-{}.{}", to.format("%Y%m%dT%H%M%SZ"), ext)`.
-- `stream(..)`: CSV first writes the header record `dt, level, source, message, trace_id, <each column path joined by .>`. Then it loops on `tokio::select! { line = rows.next_line() => line, _ = tx.closed() => return }`:
+- `stream(..)`: `let deadline = Instant::now() + limits.deadline`. CSV first writes the header record `dt, level, source, message, trace_id, <each column path joined by .>` (through `push_csv_field`, so the formula guard covers it: a column path may start with `-`). Then it loops on `tokio::select! { line = timeout_at(deadline, rows.next_line()) => line, _ = tx.closed() => return }`. A timeout → trailer `"the export reached its time limit: narrow the time window or add filters"`. Every `tx.send` is `timeout_at(deadline, tx.send(..))`, and a timeout or a closed channel returns at once (the client is gone or not reading, R-P2-13). The final trailer send gets at most 1 s past the deadline.
   - `Ok(None)` → end.
-  - A line starting with `{"exception"` (after leading whitespace) → `tracing::warn!` with at most its first 200 bytes, trailer `"the query failed while streaming: narrow the time window or add filters"`.
+  - A line that does not start with the first selected column's key (`{"id":` NDJSON, `{"dt":` CSV) → never written. `tracing::warn!` with at most its first 200 bytes, then trailer `"the query failed while streaming: narrow the time window or add filters"`. This covers ClickHouse's `{"exception":…}` line, the `__exception__` block of newer servers, and anything else unexpected (R-P2-12).
   - `Err(LineTooLong)` → trailer `"a row is larger than an export may carry"`.
   - Another `Err` → `tracing::warn!`, trailer `"the export was interrupted: try again or narrow the time window"`.
   - A line → NDJSON: the line verbatim + `\n`. CSV: parse as `serde_json::Map`, take `dt`, `level`, `source_id` (mapped through `sources`, falling back to the id), `message`, `trace_id`, `c0..` as strings (missing → empty), and write `csv_record`. A line that does not parse → the "interrupted" trailer.
@@ -1736,11 +1843,11 @@ const COLUMN_ALIASES: [&str; MAX_EXPORT_COLUMNS] =
   - Output accumulates in a buffer that is sent (`tx.send(Ok(Bytes))`) at `EXPORT_CHUNK_BYTES` and at the end. A failed send → return.
   - Trailer: NDJSON `{"_nami_export_error":"<reason>"}\n`. CSV `csv_record(&["# export stopped early: <reason>"])`. The trailer is always sent, even past the byte cap.
 - `names_for_project`: `select id, name from sources where project_id = $1` into a map.
-- Route handler `export_logs`, in this order: `require_project_role(viewer)` → `parse_export` (400) → `state.logs.export_slots.acquire(user.id, MAX_EXPORTS_PER_USER)` (429) → `names_for_project` → `export_sql(.., limits.rows)` → `stream_rows_with(.., &[], limits.line_bytes)` mapped by `search::user_error` (400/500 before any byte is sent) → `mpsc::channel(16)` → spawn `stream`, holding the permit (`let _permit = permit;`) → `Response` with `Body::from_stream(ReceiverStream::new(rx))` and the headers `content-type` (`text/csv; charset=utf-8` | `application/x-ndjson`), `content-disposition: attachment; filename="<file_name>"`, `x-nami-export-limit: <limits.rows>`, `cache-control: no-store`, `x-content-type-options: nosniff`, `x-accel-buffering: no`.
+- Route handler `export_logs`, in this order: `require_project_role(viewer)` → `parse_export` (400) → `state.logs.export_slots.acquire_capped(user.id, MAX_EXPORTS_PER_USER, MAX_EXPORTS_PER_INSTANCE)` (429) → `names_for_project` → `export_sql(.., limits.rows)` → `stream_rows_with(.., &[], limits.line_bytes)` mapped by `search::user_error` (400/500 before any byte is sent) → `mpsc::channel(16)` → spawn `stream`, holding the permit (`let _permit = permit;`) → `Response` with `Body::from_stream(ReceiverStream::new(rx))` and the headers `content-type` (`text/csv; charset=utf-8` | `application/x-ndjson`), `content-disposition: attachment; filename="<file_name>"`, `x-nami-export-limit: <limits.rows>`, `cache-control: no-store`, `x-content-type-options: nosniff`, `x-accel-buffering: no`.
 
 - [ ] **Step 5: Run the unit tests to verify they pass**
 
-Run: `cargo test --lib logs::export clickhouse::` (engine command).
+Run: `cargo test --lib -- logs::export logs::slots clickhouse::` (engine environment).
 Expected: PASS.
 
 - [ ] **Step 6: Write the failing integration tests** (`nami-engine/tests/logs_export.rs`)
@@ -1893,6 +2000,27 @@ async fn a_third_concurrent_export_is_refused(pool: sqlx::PgPool) {
     common::logs::eventually("an export slot comes back", Duration::from_secs(5), || logs.export_slots.open(user) < 2).await;
     assert_eq!(get(&app, &uri, &viewer).await.status(), StatusCode::OK);
     drop(second);
+    ch.drop_database().await.unwrap();
+}
+
+#[sqlx::test]
+async fn a_stalled_export_gives_its_slot_back_at_the_deadline(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let limits = ExportLimits { deadline: Duration::from_secs(1), ..ExportLimits::default() };
+    let logs = Arc::new(LogsState { export_limits: limits, ..LogsState::default() });
+    let state = AppState { logs: logs.clone(), ..state };
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (source, _) = seed_source(&pool, project, "api").await;
+    let (user, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    plant(&ch, project, source, 100_000).await;
+    let uri = format!("/projects/{project}/logs/export?format=ndjson&{}", window());
+    // Connected but never read: the channel fills and the task waits on its send.
+    let stalled = get(&app, &uri, &viewer).await;
+    assert_eq!(stalled.status(), StatusCode::OK);
+    assert_eq!(logs.export_slots.open(user), 1);
+    common::logs::eventually("the deadline frees the slot", Duration::from_secs(5), || logs.export_slots.open(user) == 0).await;
+    drop(stalled);
     ch.drop_database().await.unwrap();
 }
 
@@ -2097,6 +2225,7 @@ Expected: green; svelte-check 0/0.
 
 ```bash
 git add nami-engine/src nami-engine/tests/logs_export.rs nami-engine/tests/clickhouse.rs \
+  docs/superpowers/specs/2026-10-13-log-management-design.md \
   nami-ui/src/lib/server/log-proxy.ts nami-ui/src/lib/server/log-proxy.test.ts \
   "nami-ui/src/routes/(app)/projects/[id=uuid]/logs/export"
 git commit -m "feat: streamed CSV/NDJSON log export with caps, proxied by nami-ui (NAMI-LOG-12)
@@ -2107,7 +2236,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ---
 ### Task 13 (NAMI-LOG-13): Saved views and the shared query shape
 
-Branch `feat/NAMI-LOG-13-saved-views`, worktree `.worktrees/NAMI-LOG-13/`. Independent of T10-T12.
+Branch `feat/NAMI-LOG-13-saved-views`, worktree `.worktrees/NAMI-LOG-13/`. Needs T10 (`query::parse_path`). Independent of T11 and T12.
 
 **Files:**
 - Create: `nami-engine/migrations/0043_create_log_views.sql`, `nami-engine/src/logs/saved_query.rs`, `nami-engine/src/models/log_view.rs`, `nami-engine/src/routes/log_views.rs`
@@ -2149,7 +2278,9 @@ pub struct ViewQuery {
     #[serde(default = "default_range")] pub range: String,                 // "1h"
     #[serde(default, skip_serializing_if = "Option::is_none")] pub from: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")] pub to: Option<DateTime<Utc>>,
-    /* q, in_fields, levels, source_ids, filters, pattern_hashes: same as LogQuery */
+    /* q, in_fields, levels, source_ids, filters, pattern_hashes: same fields and attributes as
+       LogQuery, written out. Not `#[serde(flatten)]`: serde does not support
+       `deny_unknown_fields` together with `flatten`. */
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub columns: Vec<String>,
 }
 impl ViewQuery {
@@ -2195,7 +2326,7 @@ create table log_views (
 );
 ```
 
-Test in `tests/migrations.rs`: `log_views_names_are_unique_per_project`. Insert two views with one name in one project → the second fails with code `23505`. The same name in another project succeeds.
+Test in `tests/migrations.rs`: `log_views_names_are_unique_per_project`. Seed two projects with T10's `seed_source_row` (plain SQL; the file has no `mod common`). Insert two views with one name in one project → the second fails with code `23505`. The same name in another project succeeds. Add `"log_views"` to the table list of `all_tables_exist`.
 
 Run: engine command with `--test migrations`. Expected: FAIL, then PASS once the file exists.
 
@@ -2385,7 +2516,7 @@ Branch `feat/NAMI-LOG-14-log-alerts`, worktree `.worktrees/NAMI-LOG-14/`.
 
 **Files:**
 - Create: `nami-engine/migrations/0044_create_log_alerts.sql`, `nami-engine/src/models/log_alert.rs`, `nami-engine/src/logs/alerts.rs`, `nami-engine/src/routes/log_alerts.rs`
-- Modify: `nami-engine/src/models/incident.rs` (open/resolve for log alerts, list join + `log_alert_id`), `nami-engine/src/uptime/alerts.rs` (`Subject::LogAlert`, render), `nami-engine/src/main.rs` (spawn), `nami-engine/src/logs/mod.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/tests/migrations.rs`
+- Modify: `nami-engine/src/models/incident.rs` (open/resolve for log alerts, list join + `log_alert_id`), `nami-engine/src/uptime/alerts.rs` (`Subject::LogAlert`, render), `nami-engine/src/uptime/worker.rs` (`spawn_alerts` → `pub(crate)`), `nami-engine/src/models/maintenance.rs` (`ActiveWindows::covers_project`), `nami-engine/src/main.rs` (spawn), `nami-engine/src/logs/mod.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/tests/migrations.rs`, `docs/superpowers/specs/2026-10-13-log-management-design.md` (Log alerts: the project-wide maintenance sentence, `last_error`)
 - Test: `nami-engine/tests/log_alerts.rs` (+ unit tests in `alerts.rs` (uptime) and `logs/alerts.rs`)
 
 **Interfaces:**
@@ -2413,6 +2544,7 @@ pub struct LogAlert { pub id: Uuid, pub project_id: Uuid, pub name: String,
     pub query: sqlx::types::Json<LogQuery>, pub threshold: i64, pub comparison: String,
     pub window_seconds: i32, pub interval_seconds: i32, pub enabled: bool, pub state: String,
     pub last_evaluated_at: Option<DateTime<Utc>>, pub last_count: Option<i64>,
+    pub last_error: Option<String>, pub last_error_at: Option<DateTime<Utc>>,
     pub next_evaluation_at: DateTime<Utc>, pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>, pub updated_at: DateTime<Utc> }
 #[derive(Debug, Clone, PartialEq)]
@@ -2428,14 +2560,27 @@ pub const ALERT_CLAIM_BATCH: i64 = 50;
 pub const MAX_ALERT_EVALUATIONS: usize = 8;
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct DueAlert { pub id: Uuid, pub project_id: Uuid, pub name: String, pub query: sqlx::types::Json<LogQuery>,
-    pub threshold: i64, pub comparison: String, pub window_seconds: i32 }
+    pub threshold: i64, pub comparison: String, pub window_seconds: i32,
+    /// As claimed: an evaluation is dropped when the row's differs (edited meanwhile, R-P2-18).
+    pub updated_at: DateTime<Utc> }
 pub fn condition_met(comparison: &str, count: u64, threshold: i64) -> bool;
 pub fn describe(alert: &DueAlert, count: u64) -> String;   // the incident cause, R-P2-18
 pub async fn claim_due_alerts(pool: &PgPool, limit: i64) -> Result<Vec<DueAlert>, sqlx::Error>;
 pub async fn count_matches(ch: &ClickHouse, project_id: Uuid, filters: &LogFilters, window: &Window) -> Result<u64, AppError>;
 pub async fn apply_evaluation(pool: &PgPool, alert: &DueAlert, count: u64, started_at: DateTime<Utc>)
     -> Result<Option<Transition>, sqlx::Error>;
+/// A failed count: only `last_error` / `last_error_at` change (R-P2-18).
+pub async fn record_failure(pool: &PgPool, alert_id: Uuid, message: &str) -> Result<(), sqlx::Error>;
+/// The incident seam (R-P2-27): the only code that opens or resolves a log-alert incident.
+pub async fn open_alert_incident(conn: &mut PgConnection, alert: &DueAlert, count: u64, at: DateTime<Utc>)
+    -> Result<Option<Transition>, sqlx::Error>;
+pub async fn resolve_alert_incident(conn: &mut PgConnection, alert_id: Uuid, project_id: Uuid, name: &str,
+    at: DateTime<Utc>, notify: bool) -> Result<Option<Transition>, sqlx::Error>;
+/// One pass with its own budget of MAX_ALERT_EVALUATIONS (tests); `run_forever` uses `run_pass_with`
+/// and one semaphore shared by every pass.
 pub async fn run_pass(state: &AppState, notifications: &Notifications) -> Result<usize, AppError>;
+pub async fn run_pass_with(state: &AppState, notifications: &Notifications, budget: &Arc<Semaphore>)
+    -> Result<usize, AppError>;
 /// run_pass, then waits for its notifications (tests).
 pub async fn evaluate_due_alerts(state: &AppState) -> Result<usize, AppError>;
 pub async fn run_forever(state: AppState);
@@ -2466,6 +2611,9 @@ create table log_alerts (
     state text not null default 'ok' check (state in ('ok', 'alerting')),
     last_evaluated_at timestamptz,
     last_count bigint,
+    -- Why the last evaluation failed (fixed, user-safe text); null after a success.
+    last_error text,
+    last_error_at timestamptz,
     next_evaluation_at timestamptz not null default now(),
     created_by uuid references users(id) on delete set null,
     created_at timestamptz not null default now(),
@@ -2483,7 +2631,7 @@ create unique index incidents_one_open_per_log_alert on incidents (log_alert_id)
 create index incidents_log_alert_idx on incidents (log_alert_id) where log_alert_id is not null;
 ```
 
-Test in `tests/migrations.rs`: `log_alerts_allow_one_open_incident_each`. Insert an alert, insert an open incident for it, and expect a second open insert to fail with `23505`. Expect `comparison = 'lt'` with `threshold = 0` to be refused by the check.
+Test in `tests/migrations.rs`: `log_alerts_allow_one_open_incident_each`. Seed a project with `seed_source_row` (plain SQL). Insert an alert, insert an open incident for it (`insert into incidents (project_id, log_alert_id, title) values ($1, $2, 't')`), and expect a second open insert to fail with `23505`. Expect `comparison = 'lt'` with `threshold = 0` to be refused by the check. Add `"log_alerts"` to the table list of `all_tables_exist`.
 
 Run: engine command with `--test migrations`. FAIL → add the file → PASS.
 
@@ -2539,7 +2687,7 @@ fn the_cause_names_count_window_and_threshold() {
 
 (`describe` writes the window as `N h` when it divides by 3600, `N min` when it divides by 60, otherwise `N s`.)
 
-Run: `cargo test --lib uptime::alerts logs::alerts` (engine command). Expected: FAIL to compile, then PASS after Step 3.
+Run: `cargo test --lib -- uptime::alerts logs::alerts` (engine environment). Expected: FAIL to compile, then PASS after Step 3.
 
 - [ ] **Step 3: Implement `Subject::LogAlert`, its rendering, `condition_met` and `describe`**
 
@@ -2707,9 +2855,64 @@ async fn a_failed_count_changes_nothing(pool: sqlx::PgPool) {
     alerts::evaluate_due_alerts(&broken).await.unwrap();
     assert_eq!(alert_row(&pool, &id).await, ("alerting".to_string(), Some(3)));
     assert_eq!(incidents(&pool, &id).await[0].0, "open");
-    let after: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("select last_evaluated_at from log_alerts where id = $1::uuid")
-        .bind(&id).fetch_one(&pool).await.unwrap();
+    let (after, error): (Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
+        sqlx::query_as("select last_evaluated_at, last_error from log_alerts where id = $1::uuid")
+            .bind(&id).fetch_one(&pool).await.unwrap();
     assert_eq!(after, evaluated);
+    // Only the failure itself is recorded, as a fixed text (never ClickHouse's own message).
+    assert_eq!(error.as_deref(), Some("the log store is unavailable"));
+    make_due(&pool, &id).await;
+    alerts::evaluate_due_alerts(&state).await.unwrap();
+    let error: Option<String> = sqlx::query_scalar("select last_error from log_alerts where id = $1::uuid")
+        .bind(&id).fetch_one(&pool).await.unwrap();
+    assert_eq!(error, None, "a successful evaluation clears it");
+    ch.drop_database().await.unwrap();
+}
+
+#[sqlx::test]
+async fn a_project_wide_maintenance_window_holds_the_alert_state(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let public = public_app(state.clone());
+    let app = app(state.clone());
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let (_, email, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, created) = call(&app, "POST", &format!("/projects/{project}/log-alerts"), Some(&member), Some(alert_body("Deploy"))).await;
+    let id = created["id"].as_str().unwrap().to_string();
+    sqlx::query("insert into maintenance_windows (project_id, title, kind, starts_at, ends_at)
+                 values ($1, 'deploy', 'once', now() - interval '1 minute', now() + interval '1 hour')")
+        .bind(project).execute(&pool).await.unwrap();
+    post_json(&public, &token, json!(vec![json!({"level":"error","message":"boom"}); 3])).await;
+    alerts::evaluate_due_alerts(&state).await.unwrap();
+    assert_eq!(alert_row(&pool, &id).await, ("ok".to_string(), Some(3)), "counted, but the state stands still");
+    assert!(incidents(&pool, &id).await.is_empty());
+
+    sqlx::query("delete from maintenance_windows where project_id = $1").bind(project).execute(&pool).await.unwrap();
+    make_due(&pool, &id).await;
+    alerts::evaluate_due_alerts(&state).await.unwrap();
+    assert_eq!(alert_row(&pool, &id).await.0, "alerting", "the first evaluation after the window applies");
+    assert_eq!(settled_mail(&email, 1).await.len(), 1);
+    ch.drop_database().await.unwrap();
+}
+
+#[sqlx::test]
+async fn an_evaluation_of_an_edited_alert_is_dropped(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let app = app(state.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, created) = call(&app, "POST", &format!("/projects/{project}/log-alerts"), Some(&member),
+        Some(json!({ "name": "Quiet", "query": {}, "threshold": 1, "comparison": "lt", "window_seconds": 300, "interval_seconds": 60 }))).await;
+    let id = created["id"].as_str().unwrap().to_string();
+    let claimed = alerts::claim_due_alerts(&pool, 10).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    // Edited while the count runs: the old settings ("< 1") must not open an incident.
+    let (status, _) = call(&app, "PATCH", &format!("/projects/{project}/log-alerts/{id}"), Some(&member), Some(json!({"name": "Renamed"}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let applied = alerts::apply_evaluation(&pool, &claimed[0], 0, chrono::Utc::now()).await.unwrap();
+    assert!(applied.is_none());
+    assert_eq!(alert_row(&pool, &id).await, ("ok".to_string(), None));
+    assert!(incidents(&pool, &id).await.is_empty());
     ch.drop_database().await.unwrap();
 }
 
@@ -2776,7 +2979,7 @@ pub async fn claim_due_alerts(pool: &PgPool, limit: i64) -> Result<Vec<DueAlert>
              limit $1
              for update skip locked
          )
-         returning a.id, a.project_id, a.name, a.query, a.threshold, a.comparison, a.window_seconds",
+         returning a.id, a.project_id, a.name, a.query, a.threshold, a.comparison, a.window_seconds, a.updated_at",
     )
     .bind(limit)
     .fetch_all(pool)
@@ -2789,23 +2992,30 @@ pub async fn claim_due_alerts(pool: &PgPool, limit: i64) -> Result<Vec<DueAlert>
 `apply_evaluation` (one transaction):
 
 ```rust
-// Locked row; a deleted or disabled alert, or a stale evaluation, changes nothing.
-let row: Option<(String, bool, Option<DateTime<Utc>>)> = sqlx::query_as(
-    "select state, enabled, last_evaluated_at from log_alerts where id = $1 for update")
+// Locked row; a deleted, disabled or edited alert, or a stale evaluation, changes nothing.
+let row: Option<(String, bool, Option<DateTime<Utc>>, DateTime<Utc>)> = sqlx::query_as(
+    "select state, enabled, last_evaluated_at, updated_at from log_alerts where id = $1 for update")
     .bind(alert.id).fetch_optional(&mut *tx).await?;
-let Some((state, enabled, last)) = row else { return Ok(None) };
-if !enabled || last.is_some_and(|last| last >= started_at) { return Ok(None) }
+let Some((state, enabled, last, updated_at)) = row else { return Ok(None) };
+if !enabled || updated_at != alert.updated_at || last.is_some_and(|last| last >= started_at) {
+    return Ok(None);
+}
+// A project-wide maintenance window holds the state machine (R-P2-18).
+let held = maintenance::active_windows(&mut *tx, alert.project_id, started_at).await?.covers_project();
 let met = condition_met(&alert.comparison, count, alert.threshold);
-let next_state = if met { "alerting" } else { "ok" };
-sqlx::query("update log_alerts set state = $2, last_count = $3, last_evaluated_at = $4 where id = $1")
+let next_state = if held { state.as_str() } else if met { "alerting" } else { "ok" };
+sqlx::query("update log_alerts set state = $2, last_count = $3, last_evaluated_at = $4, last_error = null,
+             last_error_at = null where id = $1")
     .bind(alert.id).bind(next_state).bind(count as i64).bind(started_at).execute(&mut *tx).await?;
 ```
 
-Then: `met && state == "ok"` → `open_for_log_alert(.., &format!("Log alert: {}", alert.name), Some(&describe(alert, count)), started_at)` and `Transition { kind: Down, subject: Subject::LogAlert(alert.id), .. }`. `!met && state == "alerting"` → `resolve_for_log_alert` and a `Recovered` transition. Otherwise `None`. Commit.
+Then, unless `held`: `met && state == "ok"` → `open_alert_incident(&mut tx, alert, count, started_at)`. `!met && state == "alerting"` → `resolve_alert_incident(&mut tx, alert.id, alert.project_id, &alert.name, started_at, true)`. Otherwise `None`. Commit. The seam (R-P2-27): `open_alert_incident` calls `incident::open_for_log_alert(conn, project_id, alert.id, &format!("Log alert: {}", alert.name), Some(&describe(alert, count)), at)` and returns `Transition { kind: Down, subject: Subject::LogAlert(alert.id), project_id, name, cause, at }`. `resolve_alert_incident` calls `incident::resolve_for_log_alert` and returns the `Recovered` transition only when `notify`. No other code path calls the two `incident::*_for_log_alert` functions. `ActiveWindows::covers_project` is a new alias of `covers_heartbeats` in `models/maintenance.rs` (project-wide windows only).
 
-`run_pass`: `claim_due_alerts(.., ALERT_CLAIM_BATCH)` then, for each alert, under a `Semaphore::new(MAX_ALERT_EVALUATIONS)` and in a `JoinSet`: take `started_at = Utc::now()`, convert `alert.query.to_filters()` (a stored query that no longer validates is logged and skipped), set the window `[started_at − window_seconds, started_at]`, then `count_matches`. Any error → `tracing::warn!(alert_id, error)` and skip (no state change, R-P2-18). Otherwise `apply_evaluation`. Transitions are handed to `notifications.spawn(..)`, which calls `notify_transition` for each, as `uptime::worker::spawn_alerts` does (make that helper `pub(crate)` and reuse it). Returns the number of alerts claimed. `run_forever`: an interval of `ALERT_TICK` with `MissedTickBehavior::Delay`, each pass spawned so that a panic is logged and not fatal (as `run_checks`). `main.rs` spawns it inside the `uptime_worker_enabled` branch, logging `"log alert worker started"`.
+`record_failure`: `update log_alerts set last_error = $2, last_error_at = now() where id = $1` (nothing else).
 
-`models::log_alert::update` (transaction): lock the row (`for update`, scoped to the project, absent → `None`), merge and validate in the handler before the call, then write every field, `updated_at = now()` and `next_evaluation_at = now()`. When `enabled` becomes false and `state = 'alerting'`, set `state = 'ok'` and `resolve_for_log_alert(.., now)` in the same transaction, with no transition. `create` follows `log_view::create` (cap `MAX_LOG_ALERTS_PER_PROJECT`, 409 `"a project may have at most 100 log alerts"`). `validate`: `validate_label("name", ..)`. `comparison ∈ {gt, lt}`. `threshold ∈ 0..=MAX_THRESHOLD`, and `>= 1` for `lt` (`"lt needs a threshold of at least 1"`). `window_seconds ∈ WINDOW_RANGE`, `interval_seconds ∈ INTERVAL_RANGE`, and `query.to_filters()` must pass. The handler also calls `check_sources`.
+`run_pass_with(state, notifications, budget)`: `let free = budget.available_permits().min(ALERT_CLAIM_BATCH as usize)`; `free == 0` → return 0 without claiming. Otherwise `claim_due_alerts(.., free as i64)` then, for each alert, in a `JoinSet`, holding an owned permit of `budget` (`acquire_owned`, which may briefly wait when another pass took permits meanwhile): take `started_at = Utc::now()`, convert `alert.query.to_filters()` (a stored query that no longer validates → `record_failure(.., "the alert's query is no longer valid")` and skip), set the window `[started_at − window_seconds, started_at]`, then `count_matches`. An error → `tracing::warn!(alert_id, error)`, `record_failure` with the `AppError::Validation` message or `"the log store is unavailable"`, and no state change (R-P2-18). Otherwise `apply_evaluation`. `run_pass` is `run_pass_with` over a fresh `Arc::new(Semaphore::new(MAX_ALERT_EVALUATIONS))`. Transitions are handed to `notifications.spawn(..)`, which calls `notify_transition` for each, as `uptime::worker::spawn_alerts` does (make that helper `pub(crate)` and reuse it). Returns the number of alerts claimed. `run_forever`: one `Arc<Semaphore>` of `MAX_ALERT_EVALUATIONS` and one `Notifications` for its lifetime, an interval of `ALERT_TICK` with `MissedTickBehavior::Delay`, each pass (`run_pass_with` over the shared semaphore) spawned so that a panic is logged and not fatal (as `run_checks`). `main.rs` spawns it inside the `uptime_worker_enabled` branch, logging `"log alert worker started"`.
+
+`models::log_alert::update` (transaction): lock the row (`for update`, scoped to the project, absent → `None`), merge and validate in the handler before the call, then write every field, `updated_at = now()` and `next_evaluation_at = now()`. When `enabled` becomes false and `state = 'alerting'`, set `state = 'ok'` and call `logs::alerts::resolve_alert_incident(.., now, false)` in the same transaction (no transition). `create` follows `log_view::create` (cap `MAX_LOG_ALERTS_PER_PROJECT`, 409 `"a project may have at most 100 log alerts"`). `validate`: `validate_label("name", ..)`. `comparison ∈ {gt, lt}`. `threshold ∈ 0..=MAX_THRESHOLD`, and `>= 1` for `lt` (`"lt needs a threshold of at least 1"`). `window_seconds ∈ WINDOW_RANGE`, `interval_seconds ∈ INTERVAL_RANGE`, and `query.to_filters()` must pass. The handler also calls `check_sources`.
 
 Preview handler: `require_project_role(viewer)` → `window_seconds ∈ WINDOW_RANGE` (400) → `query.to_filters()` (400) → `check_sources` → `QueryPermit::acquire` (429) → `count_matches` over `[now − window, now]` → `{count, from, to}`.
 
@@ -2819,7 +3029,8 @@ Expected: PASS.
 - [ ] **Step 8: Full engine suite + clippy, then commit**
 
 ```bash
-git add nami-engine/migrations/0044_create_log_alerts.sql nami-engine/src nami-engine/tests/log_alerts.rs nami-engine/tests/migrations.rs
+git add nami-engine/migrations/0044_create_log_alerts.sql nami-engine/src nami-engine/tests/log_alerts.rs nami-engine/tests/migrations.rs \
+  docs/superpowers/specs/2026-10-13-log-management-design.md
 git commit -m "feat(engine): log alerts with incident and email notifications (NAMI-LOG-14)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -2832,7 +3043,8 @@ Branch `feat/NAMI-LOG-15-tail-resume`, worktree `.worktrees/NAMI-LOG-15/`.
 
 **Files:**
 - Modify: `nami-engine/src/logs/tail.rs` (event ids, `RESUME_WINDOW`, `resume_cursor`, first-poll resume, `TailStats`), `nami-engine/src/logs/mod.rs` (`LogsState.tail_stats`), `nami-engine/src/routes/logs.rs` (read `Last-Event-ID`)
-- Modify (UI): `nami-ui/src/lib/server/log-proxy.ts` (+ test) `lastEventIdHeader`; `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/tail/+server.ts` (+ `server.test.ts`); `nami-ui/src/lib/logs.ts` (+ test) `isLogEntry`, `mergeLiveRows`, `tailKey`; `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/+page.svelte`
+- Modify (UI): `nami-ui/src/lib/server/log-proxy.ts` (+ test) `lastEventIdHeader`; `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/tail/+server.ts` (+ `server.test.ts`); `nami-ui/src/lib/logs.ts` (+ test) `isLogEntry`, `mergeLiveRows`, `tailKey`; `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/+page.svelte`, `+page.server.ts`, `explorer.test.ts` (histogram/sources errors)
+- Create (UI): `nami-ui/src/lib/live-tail.ts` (+ `live-tail.test.ts`), R-P2-21
 - Test: `nami-engine/tests/logs_tail.rs` (helper extension + 3 tests), unit tests in `tail.rs`
 
 **Interfaces:**
@@ -2879,6 +3091,7 @@ fn only_recent_well_formed_cursors_resume() {
     assert!(resume_cursor(Some(&at(-chrono::Duration::minutes(6))), now).is_none(), "too old");
     assert!(resume_cursor(Some(&at(chrono::Duration::minutes(5))), now).is_none(), "in the future");
     assert!(resume_cursor(Some("not a cursor"), now).is_none());
+    assert!(resume_cursor(Some(&"A".repeat(129)), now).is_none(), "over 128 bytes: not even decoded");
     assert!(resume_cursor(None, now).is_none());
 }
 ```
@@ -2930,9 +3143,11 @@ async fn an_unusable_last_event_id_starts_a_normal_tail(pool: sqlx::PgPool) {
     post_json(&public, &foreign, json!({ "message": "theirs" })).await;
     let old = nami_engine::logs::query::Cursor {
         dt_ms: (Utc::now() - chrono::Duration::minutes(10)).timestamp_millis(), id: Uuid::nil() }.encode();
-    for header in ["garbage\r\nx", old.as_str()] {
-        let Ok(mut stream) = SseStream::open_with(&app, &format!("/projects/{project}/logs/tail"), Some(&viewer), Some(header)).await
-        else { continue }; // a header hyper refuses to build is fine too
+    let long = "A".repeat(4096);
+    for header in ["garbage", long.as_str(), old.as_str()] {
+        let mut stream = SseStream::open_with(&app, &format!("/projects/{project}/logs/tail"), Some(&viewer), Some(header))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         post_json(&public, &token, json!({ "message": "new" })).await;
         assert_eq!(stream.next_log(Duration::from_secs(5)).await.unwrap()["message"], "new",
@@ -2942,7 +3157,7 @@ async fn an_unusable_last_event_id_starts_a_normal_tail(pool: sqlx::PgPool) {
 }
 ```
 
-(If building a request with `"garbage\r\nx"` panics in `http`, use `"garbage"` instead. The point is a value that is not a cursor.)
+(A header with CR/LF cannot be built at all: `http` refuses it, so `"garbage"` stands for "not a cursor", and the 4 KiB value checks the length cap before decoding.)
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -2963,7 +3178,7 @@ sql.push("SELECT id, dt, toBool((dt, id) > (fromUnixTimestamp64Milli(")
     .push(")) AS after FROM logs");
 ```
 
-  It is followed by the usual `push_where` / range / `ORDER BY dt DESC, id DESC LIMIT batch`. Rows with `after` are fresh: fetch them with `fetch_rows` and send them oldest first. All others are remembered. Then `primed = true` and polling continues as before. The tuple comparison runs in ClickHouse, whose `UUID` order is the ids' generation order (swapped halves, Part 1 ruling). Rust's `Uuid` ordering is different and must not be used for this.
+  It is followed by the usual `push_where` / range / `ORDER BY dt DESC, id DESC LIMIT batch`. Rows with `after` are fresh: fetch them with `fetch_rows(.., since = cursor dt, until)` and send them oldest first. All others are remembered. Then `primed = true`, `resume = None`, and polling continues as before. When the resume poll (ids or rows) fails, `resume` is kept and the next tick tries it again. `resume_cursor` returns `None` for a header over 128 bytes before calling `Cursor::decode`. The tuple comparison runs in ClickHouse, whose `UUID` order is the ids' generation order (swapped halves, Part 1 ruling). Rust's `Uuid` ordering is different and must not be used for this.
 - Update the module doc (resume, its 5-minute window, at most `TAIL_BATCH` rows replayed, late rows at or before the cursor not replayed).
 
 - [ ] **Step 4: Run them to verify they pass**
@@ -3027,8 +3242,12 @@ describe('lastEventIdHeader', () => {
 it('forwards a valid Last-Event-ID and nothing else from the browser', async () => {
 	const fetchMock = vi.fn().mockResolvedValue(new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } }));
 	const url = `http://ui.test/projects/${PROJECT}/logs/tail`;
-	const event = fakeEvent(fetchMock, url);
-	event.request = new Request(url, { headers: { cookie: 'id=session', 'last-event-id': 'abc_DEF-1', 'x-other': 'no' } });
+	// This file's fakeEvent returns { event, controller }.
+	const { event, controller } = fakeEvent(fetchMock, url);
+	event.request = new Request(url, {
+		headers: { cookie: 'id=session', 'last-event-id': 'abc_DEF-1', 'x-other': 'no' },
+		signal: controller.signal
+	});
 	await GET(event);
 	const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
 	expect(headers.get('last-event-id')).toBe('abc_DEF-1');
@@ -3036,7 +3255,7 @@ it('forwards a valid Last-Event-ID and nothing else from the browser', async () 
 });
 ```
 
-(Reuse the file's existing `fakeEvent`/`PROJECT`. If `callEngine` builds its own `Headers`, assert on what it sends.)
+(Reuse the file's existing `fakeEvent`/`PROJECT`. `callEngine` copies `init.headers` into a fresh `Headers` and passes it on, so the assertion reads what the engine really receives.)
 
 `lib/logs.test.ts`:
 
@@ -3068,10 +3287,93 @@ describe('live rows', () => {
 
 (`LogEntry.truncated` is optional in the UI type since the fix wave. `isLogEntry` accepts it absent or boolean.)
 
+`lib/live-tail.test.ts` (the lifecycle test LOG-8 deferred, R-P2-21):
+
+```ts
+import { describe, expect, it } from 'vitest';
+import { startLiveTail, type LiveStatus } from './live-tail';
+
+class FakeEventSource {
+	static CLOSED = 2;
+	static last: FakeEventSource;
+	readyState = 0;
+	closed = false;
+	onopen: (() => void) | null = null;
+	onerror: (() => void) | null = null;
+	listeners = new Map<string, (event: MessageEvent) => void>();
+	constructor(public url: string) {
+		FakeEventSource.last = this;
+	}
+	addEventListener(type: string, listener: (event: MessageEvent) => void) {
+		this.listeners.set(type, listener);
+	}
+	close() {
+		this.closed = true;
+		this.readyState = FakeEventSource.CLOSED;
+	}
+	emit(type: string, data: unknown) {
+		this.listeners.get(type)?.({ data: typeof data === 'string' ? data : JSON.stringify(data) } as MessageEvent);
+	}
+}
+
+const row = (id: string) => ({
+	id, source_id: 'c13bc10a-d17f-443b-8976-c6d9b54e2798', dt: '2026-10-19T08:00:00.000Z', level: 'info',
+	message: id, fields: {}, trace_id: '', span_id: '', pattern_hash: '1'
+});
+
+function start() {
+	const seen: { status: LiveStatus[]; rows: string[][]; notice: (string | null)[] } = { status: [], rows: [], notice: [] };
+	const stop = startLiveTail('/p/logs/tail?level=error', {
+		EventSourceImpl: FakeEventSource as unknown as typeof EventSource,
+		cap: 2,
+		onStatus: (status, notice) => {
+			seen.status.push(status);
+			seen.notice.push(notice);
+		},
+		onRows: (rows) => seen.rows.push(rows.map((r) => r.id))
+	});
+	return { seen, stop, source: FakeEventSource.last };
+}
+
+describe('startLiveTail', () => {
+	it('connects, validates, dedupes and caps live rows', () => {
+		const { seen, source } = start();
+		expect(source.url).toBe('/p/logs/tail?level=error');
+		expect(seen.status.at(-1)).toBe('connecting');
+		source.onopen?.();
+		expect(seen.status.at(-1)).toBe('live');
+		source.emit('log', row('a'));
+		source.emit('log', { id: 'broken' });
+		source.emit('log', 'not json');
+		source.emit('log', row('a'));
+		source.emit('log', row('b'));
+		source.emit('log', row('c'));
+		expect(seen.rows.at(-1)).toEqual(['c', 'b']);
+	});
+
+	it('lets the browser reconnect after a timeout but stops for a dead session', () => {
+		const first = start();
+		first.source.emit('end', { reason: 'timeout' });
+		expect(first.source.closed).toBe(false);
+		expect(first.seen.status.at(-1)).toBe('reconnecting');
+		const second = start();
+		second.source.emit('end', { reason: 'session' });
+		expect(second.source.closed).toBe(true);
+		expect(second.seen.status.at(-1)).toBe('ended');
+	});
+
+	it('stops cleanly', () => {
+		const { stop, source } = start();
+		stop();
+		expect(source.closed).toBe(true);
+	});
+});
+```
+
 - [ ] **Step 6: Run them to verify they fail**
 
-Run: `cd nami-ui && npx vitest run src/lib src/routes/\(app\)/projects/\[id=uuid\]/logs/tail`.
-Expected: FAIL (exports missing).
+Run: `cd nami-ui && npx vitest run src/lib src/routes/\(app\)/projects/\[id=uuid\]/logs`.
+Expected: FAIL (exports and `lib/live-tail.ts` missing).
 
 - [ ] **Step 7: Implement the UI changes**
 
@@ -3080,9 +3382,10 @@ Expected: FAIL (exports missing).
 - `isLogEntry`: an object with string `id`, `source_id`, `dt`, `level`, `message`, `trace_id`, `span_id`, `pattern_hash`, and `fields` an object.
 - `mergeLiveRows`: `[...incoming].reverse()` concatenated with `existing`, keeping the first occurrence of each id, sliced to `cap`.
 - `tailKey(state)`: `tailParams(state).toString()`.
+- `lib/live-tail.ts`: `export type LiveStatus = 'connecting' | 'live' | 'reconnecting' | 'ended'` and `startLiveTail(url, { EventSourceImpl = EventSource, cap = LIVE_ROW_CAP, onStatus(status, notice), onRows(rows) }): () => void`. It holds the live rows itself and moves today's `$effect` body there unchanged in behaviour: `log` events parsed, kept only when `isLogEntry`, merged with `mergeLiveRows(rows, [row], cap)` and handed to `onRows`; `end` with `session` closes and reports `ended`, any other `end` reports `reconnecting` and leaves the reconnect to `EventSource` (which resends `Last-Event-ID`); `onerror` as today, comparing `readyState` with `EventSourceImpl.CLOSED`; `pagehide` closes (registered only when `typeof window !== 'undefined'`: vitest runs in Node). The returned function removes the `pagehide` listener and closes the stream.
 - `+page.svelte`:
-  - `const liveKey = $derived(data.state.live ? tailKey(data.state) : null)`. The tail `$effect` reads only `liveKey` (`null` → close the stream, clear live rows, status `off`). EventSource already resends `Last-Event-ID` on its own reconnects.
-  - Incoming `log` events are parsed, kept only when `isLogEntry`, and merged with `mergeLiveRows(liveRows, [row], LIVE_ROW_CAP)`.
+  - `const liveKey = $derived(data.state.live ? tailKey(data.state) : null)`. The tail `$effect` reads only `liveKey` (`null` → status `off`, live rows cleared) and otherwise returns `startLiveTail(\`${path}/tail?${liveKey}\`, { onStatus, onRows })` as its cleanup.
+  - LOG-8 leftovers: `+page.server.ts` returns `histogramError` and `sourcesError` (`engineErrorMessage` on a failed call, else null) and the page shows them where the chart and the source picker would be. Field `<pre>` blocks get `whitespace-pre-wrap break-words`. The live status line gets `role="status" aria-live="polite"`. Append to `explorer.test.ts`: a 500 histogram and a 500 sources call give `histogramError`/`sourcesError` strings and the page data still loads.
   - "Load more": `let generation = 0; let controller: AbortController | null = null;`. An `$effect` that reads `data.logs` (a new navigation) runs `generation += 1; controller?.abort(); extraRows = []; nextCursor = data.nextCursor`. `loadMore` captures `const mine = generation`, creates a controller, passes `signal`, and drops the result if `mine !== generation`. An `AbortError` is silent.
 
 - [ ] **Step 8: Run all checks; do a manual walkthrough; commit**
@@ -3123,6 +3426,7 @@ export type Match = { field?: string; equals?: string; message_regex?: string };
 export type Rule = { type: RuleKind; match?: Match; paths?: string[]; keys?: string[]; regex?: string; from?: string; to?: string; n?: number };
 export const MAX_RULES = 50;
 export const MAX_REGEX_CHARS = 256;
+export const MAX_REGEXES = 20;
 export const MAX_TEST_EVENTS = 100;
 export type RuleDraft = { type: RuleKind; matchMode: 'none' | 'field' | 'regex'; field: string; equals: string;
   messageRegex: string; paths: string; keys: string; regex: string; from: string; to: string; n: string };
@@ -3232,7 +3536,7 @@ Expected: FAIL (module missing).
 
 - [ ] **Step 3: Implement `lib/pipeline.ts` and `usageBars`**
 
-Client checks mirror the engine (path rule = `isFieldPath`, regex length ≤ 256, `n` 2-10000, ≤ 50 keys/paths, `level`/`message` not removable). Regex validity is left to the engine; the preview shows its 400. `paths` and `keys` drafts are comma- or newline-separated. `parseSampleEvents`: trimmed text; `[`… → `JSON.parse` array; `{`… → try one object, else split lines and parse each non-empty line. Every element must be a plain object, and there are at most `MAX_TEST_EVENTS`. `describeRule` texts: `Drop when <field> = <value>` / `Drop when message matches /<re>/` / `Remove <paths>` / `Redact keys <keys>` + ` and /<re>/` / `Rename <from> → <to>` / `Keep 1 in <n> events` (+ ` when …`).
+Client checks mirror the engine (path rule = `isFieldPath`, regex length ≤ 256, at most 20 regexes in the whole list (`MAX_REGEXES`, shown on the "Add rule" button state), `n` 2-10000, ≤ 50 keys/paths, `level`/`message` not removable). Regex validity is left to the engine; the preview shows its 400. `paths` and `keys` drafts are comma- or newline-separated. `parseSampleEvents`: trimmed text; `[`… → `JSON.parse` array; `{`… → try one object, else split lines and parse each non-empty line. Every element must be a plain object, and there are at most `MAX_TEST_EVENTS`. `describeRule` texts: `Drop when <field> = <value>` / `Drop when message matches /<re>/` / `Remove <paths>` / `Redact keys <keys>` + ` and /<re>/` / `Rename <from> → <to>` / `Keep 1 in <n> events` (+ ` when …`).
 
 - [ ] **Step 4: Run them to verify they pass**
 
@@ -3399,7 +3703,7 @@ export async function relayJsonPost(event: RequestEvent, path: string): Promise<
 - "Sample events" textarea (prefilled with two example events) and a "Preview" panel. Preview runs automatically 500 ms after the last change (when the drafts and the samples are valid) with `fetch(previewUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ rules, events }) })`. An in-flight preview is aborted by the next one. Each result is shown as a badge (`kept` / `dropped` / `sampled out`) with the stored event pretty-printed. An engine error is shown above the results, mapping `rules[i]` to "Rule i+1". Sample counters restart on each preview, which the panel states.
 - All values render as text (no `{@html}`).
 
-`+page.svelte`: the title `Pipeline · <source name>`, a short help text in spec order ("Rules run top to bottom after parsing and size caps, before patterns and storage; edits reach ingestion on the next request; redacted values are never stored"), the editor, and a form posting `?/save` with `use:enhance` and a submit guard.
+`+page.svelte`: the title `Pipeline · <source name>`, a short help text in spec order ("Rules run top to bottom after parsing and size caps, before patterns and storage; edits reach ingestion on the next request; redacted values are never stored; a redact rule covers what is there at its position, so put it after any rename that moves a secret"), the editor, and a form posting `?/save` with `use:enhance` and a submit guard.
 
 Source detail page: the `load` asks for `usage?days=30`, `today = usage.at(-1) ?? null`, and also returns `usage`. A "Pipeline" link goes to `./<sourceId>/pipeline`. `UsageChart.svelte` (props `days: DailyUsage[]`) draws two rows of 30 bars (events per day, bytes per day, `formatBytes`). Each bar has a `title` tooltip with the UTC date, events, bytes, dropped, sampled out and rejected. A visually hidden `<table>` repeats the data for screen readers. Colors: events `#2dd4bf`, bytes `#737373`, as in the Part 1 chart palette.
 
@@ -3438,7 +3742,11 @@ Branch `feat/NAMI-LOG-17-explorer-p2`, worktree `.worktrees/NAMI-LOG-17/`.
 // lib/logs.ts
 export type ExplorerTab = 'results' | 'patterns';
 // ExplorerState gains: tab: ExplorerTab (URL `tab=patterns`; default results) and
-// patterns: string[] (URL `pattern`, repeatable, /^\d{1,20}$/, at most 100, deduplicated)
+// patterns: string[] (URL `pattern`, repeatable, at most 100, deduplicated; `isPatternHash`:
+// /^\d{1,20}$/ and BigInt(value) <= 18446744073709551615n, the engine's u64 range)
+export function isPatternHash(value: string): boolean;
+// explorerParams appends `tab` (only when 'patterns') and then each `pattern` after `col`
+// and before `live`.
 export type PatternCount = { pattern_hash: string; pattern: string; count: number; first_seen: string; last_seen: string };
 export const EXPORT_ROW_LIMIT = 100_000;
 export type ExportFormat = 'csv' | 'ndjson';
@@ -3459,12 +3767,15 @@ export function stateFromViewQuery(query: ViewQuery): ExplorerState;  // through
 ```ts
 describe('explorer state, part 2', () => {
 	it('reads the tab and pattern filters from the URL', () => {
-		const state = parseExplorerState(new URLSearchParams('tab=patterns&pattern=123&pattern=123&pattern=x&pattern=99999999999999999999'));
+		// 18446744073709551615 is u64::MAX; one more is not a pattern hash (the engine would answer 400).
+		const state = parseExplorerState(new URLSearchParams(
+			'tab=patterns&pattern=123&pattern=123&pattern=x&pattern=18446744073709551615&pattern=18446744073709551616'
+		));
 		expect(state.tab).toBe('patterns');
-		expect(state.patterns).toEqual(['123', '99999999999999999999']);
+		expect(state.patterns).toEqual(['123', '18446744073709551615']);
 		expect(parseExplorerState(new URLSearchParams('tab=weird')).tab).toBe('results');
-		expect(explorerParams(state).toString()).toBe('tab=patterns&pattern=123&pattern=99999999999999999999');
-		expect(tailParams(state).getAll('pattern_hash')).toEqual(['123', '99999999999999999999']);
+		expect(explorerParams(state).toString()).toBe('tab=patterns&pattern=123&pattern=18446744073709551615');
+		expect(tailParams(state).getAll('pattern_hash')).toEqual(['123', '18446744073709551615']);
 	});
 
 	it('builds export links with the absolute window and the picked columns', () => {
@@ -3554,7 +3865,8 @@ describe('explorer, part 2', () => {
 		const bare = fakeEvent({ form: { view_id: VIEW } });
 		expect(await actions.deleteView(bare.event)).toEqual({ confirmDeleteView: VIEW });
 		expect(bare.calls()).toHaveLength(0);
-		const confirmed = fakeEvent({ form: { view_id: VIEW, confirm: 'yes' }, status: 204, body: '' });
+		// `new Response('', { status: 204 })` throws (204 is a null-body status): answer with a null body.
+		const confirmed = fakeEvent({ form: { view_id: VIEW, confirm: 'yes' }, respond: () => new Response(null, { status: 204 }) });
 		expect(await actions.deleteView(confirmed.event)).toEqual({ deletedView: true });
 		const forged = fakeEvent({ form: { view_id: '../../sources', confirm: 'yes' } });
 		expect(await actions.deleteView(forged.event)).toMatchObject({ status: 400 });
@@ -3572,7 +3884,7 @@ Expected: FAIL.
 
 - [ ] **Step 5: Implement the load, actions, proxy and components**
 
-- `+page.server.ts`: on `state.tab === 'patterns'`, call `${base}/logs/patterns` + `pickLogParams(filters, PATTERN_PARAMS)` (`PATTERN_PARAMS = [...FILTER_PARAMS, 'from', 'to']`) instead of the search, and return `patterns` (with `patternsError` from `engineErrorMessage` on a 400/429). Views come from `${base}/log-views` (non-fatal, `[]` on failure). Actions:
+- `+page.server.ts`: on `state.tab === 'patterns'`, call `${base}/logs/patterns` + `pickLogParams(filters, PATTERN_PARAMS)` (`PATTERN_PARAMS = [...FILTER_PARAMS, 'from', 'to']`) instead of the search, and return `patterns` (with `patternsError` from `engineErrorMessage` on a 400/429). Views come from `${base}/log-views` (non-fatal, `[]` on failure), requested **after** the existing calls so the first test's `const [search, histogram, sources] = calls()` still holds. Actions:
   - `saveView`: `name` and `state`. `state` is the explorer query string, re-parsed with `parseExplorerState` and turned into a view query by `viewQueryFromState`. The engine is sent `{name, query}`.
   - `updateView`: `view_id` (`isUuid`, else `fail(400)`) and `state` → PATCH `{query}`.
   - `deleteView`: `view_id` (`isUuid`) and `confirm=yes`, else return `{ confirmDeleteView: id }` → DELETE.
@@ -3619,7 +3931,8 @@ Branch `feat/NAMI-LOG-18-alerts-ui`, worktree `.worktrees/NAMI-LOG-18/`.
 export type LogAlertQuery = { q?: string; in_fields?: boolean; levels?: LogLevel[]; source_ids?: string[]; filters?: FieldFilter[]; pattern_hashes?: string[] };
 export type LogAlert = { id: string; name: string; query: LogAlertQuery; threshold: number; comparison: 'gt' | 'lt';
   window_seconds: number; interval_seconds: number; enabled: boolean; state: 'ok' | 'alerting';
-  last_evaluated_at: string | null; last_count: number | null; next_evaluation_at: string };
+  last_evaluated_at: string | null; last_count: number | null; last_error: string | null;
+  last_error_at: string | null; next_evaluation_at: string };
 export const WINDOW_PRESETS: { seconds: number; label: string }[];   // 1, 5, 15 min, 1, 6, 24 h
 export const INTERVAL_PRESETS: { seconds: number; label: string }[]; // 1, 5, 15 min, 1 h
 export function formatSeconds(seconds: number): string;              // "5 min", "1 h", "90 s"
@@ -3701,7 +4014,7 @@ describe('logAlertPayloadFromForm', () => {
 
 - [ ] **Step 2: Run them to verify they fail; implement; run them to verify they pass**
 
-Run: `cd nami-ui && npx vitest run src/lib/log-alerts.test.ts src/lib/server/log-alert-form.test.ts`. FAIL → implement → PASS. Export `parseFilter` from `lib/logs.ts` for the form parser (it already exists, unexported). Single-valued keys read the last value. The name is trimmed (1-200 characters). The threshold is a non-negative integer ≤ 10^12, and `lt` needs ≥ 1. The window is 60-86400, the interval 60-86400. Levels must be in `LEVELS`. Sources must pass `isUuid`. Filters go through `parseFilter` (at most 10). Patterns match `/^\d{1,20}$/`.
+Run: `cd nami-ui && npx vitest run src/lib/log-alerts.test.ts src/lib/server/log-alert-form.test.ts`. FAIL → implement → PASS. Export `parseFilter` from `lib/logs.ts` for the form parser (it already exists, unexported). Single-valued keys read the last value. The name is trimmed (1-200 characters). The threshold is a non-negative integer ≤ 10^12, and `lt` needs ≥ 1. The window is 60-86400, the interval 60-86400. Levels must be in `LEVELS`. Sources must pass `isUuid`. Filters go through `parseFilter` (at most 10). Patterns go through T17's `isPatternHash` (u64 range).
 
 - [ ] **Step 3: Write the failing route tests**
 
@@ -3733,7 +4046,7 @@ Implementation notes:
   - enabled checkbox;
   - query section: search text, "also search fields", level checkboxes, source checkboxes, field filters (repeatable rows of path/op/value, serialized into `filter` inputs as JSON), and active pattern chips (`pattern` inputs).
 - The live preview count: 500 ms after the last change, a debounced `fetch(previewUrl, POST {query, window_seconds})` with abort-previous. It shows "N matching events in the last <window>", and "would trigger now" when `describeCondition` holds. 429 → "Too many queries; the preview will retry."
-- List page: name, state badge (`alerting` red `#d03b3b`, `ok` neutral), condition text, last count, last evaluated (UTC), and a disabled badge. "New alert" button.
+- List page: name, state badge (`alerting` red `#d03b3b`, `ok` neutral), condition text, last count, last evaluated (UTC), a disabled badge, and `last_error` (as text, with its UTC time) when set, so an alert that cannot evaluate is visible. "New alert" button.
 - Detail page: the form (update), a two-step delete, and a link to the alert's incidents (`/projects/<id>/incidents`).
 - Explorer: a "Create alert from this search" link → `/projects/<id>/logs/alerts/new?` + `explorerParams(state)`.
 - Layout: sections `Explorer | Sources | Alerts`.
@@ -3762,12 +4075,12 @@ Per CLAUDE.md, every sub-project ends with a dedicated security review and fix w
 
 1. **Whole-Part-2 review (opus)** over the Logs Part 2 range (merge parent of NAMI-LOG-9 … NAMI-LOG-18), with engine + UI suites green and a live walkthrough of every feature as admin, member and viewer.
 2. **Security focus list for that review** (each item names the test that should already pin it; a gap is a finding):
-   - Pipeline: ReDoS (`catastrophic_patterns_run_in_linear_time`), empty-match and growth (`a_regex_that_matches_the_empty_string_is_rejected`, `redaction_that_grows_a_message_is_capped_again`), redaction completeness across message/fields/pattern/nested/mixed-case on HTTP and syslog (`a_redacted_value_never_reaches_clickhouse`, `syslog_frames_go_through_the_pipeline`), fail-closed (`a_stored_pipeline_that_does_not_compile_fails_closed`), cache freshness across instances (R-P2-6), preview stores nothing, regex text never logged (`Debug for CompiledPipeline`).
+   - Pipeline: ReDoS (`catastrophic_patterns_run_in_linear_time`), empty-match and growth (`a_regex_that_matches_the_empty_string_is_rejected`, `redaction_that_grows_a_message_is_capped_again`), redaction completeness across message/fields/pattern/nested/mixed-case on HTTP and syslog (`a_redacted_value_never_reaches_clickhouse`, `syslog_frames_go_through_the_pipeline`), fail-closed (`a_stored_pipeline_that_does_not_compile_fails_closed`), redaction of numbers (R-P2-5), the regex budget and cache bound (`a_pipeline_holds_at_most_twenty_regexes`, R-P2-26), compile and preview off the runtime, cache freshness across instances with monotonic `updated_at` (R-P2-6), preview stores nothing, regex text never logged or echoed in errors (`Debug for CompiledPipeline`, `compile_regex` messages).
    - Query safety: every new SQL text (`patterns.rs`, `export.rs`, `alerts.rs`, the tail resume query) is built only from `&'static str` fragments. Grep for `format!` near `Sql`. RESERVED_SETTINGS gains `http_write_exception_in_output_format`, and the drift test covers it.
-   - Read budgets: patterns hold a query slot and use `READ_SETTINGS`-based settings. Export holds its own slot, streams with row/byte/line caps, never buffers in the engine or the BFF, and the BFF forwards only allow-listed headers. Alert counts use `READ_SETTINGS`. The per-project source cap bounds the export's name map.
+   - Read budgets: patterns hold a query slot and use `READ_SETTINGS`-based settings. Export holds its own slot (2 per user, 8 per instance), streams with row/byte/line caps and a deadline that holds when the client stops reading (`a_stalled_export_gives_its_slot_back_at_the_deadline`), never writes a ClickHouse exception line into the file, never buffers in the engine or the BFF, and the BFF forwards only allow-listed headers. Alert counts use `READ_SETTINGS`. The per-project source cap bounds the export's name map.
    - Confinement: patterns, export, preview and alert counts never read another project's rows. Views and alerts reject foreign `source_ids`. Every id inside a project path is 404 when foreign. Roles: viewer/member/admin per the Global Constraints, 403 never 404.
    - Export output: the CSV formula guard on every cell (header included), RFC 4180 quoting, fixed `Content-Disposition`, `nosniff`, `no-store`.
-   - Alerts: atomic claim (`overlapping_passes_evaluate_each_alert_once`), outage safety (`a_failed_count_changes_nothing`), email header-injection safety for alert names (`log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert`), the evaluation-load bound (100 alerts per project, 8 concurrent, 25 s query limit). No outbound call other than `notify_transition`.
+   - Alerts: atomic claim (`overlapping_passes_evaluate_each_alert_once`), outage safety (`a_failed_count_changes_nothing`), email header-injection safety for alert names (`log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert`), the evaluation-load bound (100 alerts per project, 8 concurrent across every pass of an instance, claims never beyond free capacity, 25 s query limit), edited-alert evaluations dropped (`an_evaluation_of_an_edited_alert_is_dropped`), project-wide maintenance holding the state (`a_project_wide_maintenance_window_holds_the_alert_state`), `last_error` carrying only fixed text, incidents only through the R-P2-27 seam. No outbound call other than `notify_transition`.
    - UI: JSON relays refuse cross-origin and non-JSON. Tail `Last-Event-ID` is validated. No `{@html}` on log, pattern, view or alert text. Two-step deletes. `[id=uuid]`/`isUuid` on every new id.
-3. **Fix wave** on `fix/NAMI-LOG-part2-final-review` for every Important finding and for the Minor findings the reviewer marks fix-now. Then a scoped re-review, merge, the roadmap §3 ticks (the open items, see "Roadmap §3 coverage") and a decisions log `docs/superpowers/decisions/2026-10-13-log-management-part2.md` recording R-P2-1 … R-P2-25 (same format as the Part 1 log).
+3. **Fix wave** on `fix/NAMI-LOG-part2-final-review` for every Important finding and for the Minor findings the reviewer marks fix-now. Then a scoped re-review, merge, the roadmap §3 ticks (the open items, see "Roadmap §3 coverage") and a decisions log `docs/superpowers/decisions/2026-10-13-log-management-part2.md` recording R-P2-1 … R-P2-27 (same format as the Part 1 log).
 4. **Known follow-ups and accepted risks to carry, not fix here:** fold `search::QuerySlots` and `slots::UserSlots` into one type (R-P2-15). The 512-connection caps (`serve::MAX_PUBLIC_CONNECTIONS`, `MAX_API_CONNECTIONS`) are global per listener: one client holding many connections can fill the public listener for everyone until the header deadline drops them. Per-IP limits and graceful shutdown → Platform. Alert no-data/confirmation periods → Metrics' shared evaluator. Escalation routing → Incident Management. "View trace" → Traces.
