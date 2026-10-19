@@ -149,3 +149,24 @@ pub async fn serve_https_counting(cert_and_key: CertAndKey, handshakes: Arc<Hand
     });
     port
 }
+
+/// A TLS server that sends `banner` right after the handshake, like an
+/// IMAPS/POP3S/SMTPS server greeting its client. Returns its port.
+pub async fn serve_tls_banner(cert_and_key: CertAndKey, banner: &'static str) -> u16 {
+    let acceptor = acceptor(cert_and_key);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                if let Ok(mut tls) = acceptor.accept(stream).await {
+                    let _ = tls.write_all(banner.as_bytes()).await;
+                    // Hold the connection open while the client reads.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
+        }
+    });
+    port
+}
