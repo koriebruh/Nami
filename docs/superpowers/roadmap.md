@@ -47,17 +47,17 @@ Also out of scope (ruled 2026-10-13):
 - [x] Uptime % (24 h / 7 d / 30 d), response-time history chart, check log
 - [x] UI for all of the above, auto-refresh
 
-### Phase 2
+### Phase 2 — done (PRs #28, #33-#35, #37, #40, #41, #44, #46-#48, security fix wave #58; decisions: `docs/superpowers/decisions/2026-10-13-uptime-phase2.md`)
 
-- [ ] Monitor types: ping (ICMP), DNS record, SSL certificate expiry, domain expiry
-- [ ] Monitor types: SMTP, POP3, IMAP, UDP
-- [ ] Request config: method, custom headers, body, basic auth, follow
+- [x] Monitor types: ping (ICMP), DNS record, SSL certificate expiry, domain expiry
+- [x] Monitor types: SMTP, POP3, IMAP, UDP
+- [x] Request config: method, custom headers, body, basic auth, follow
       redirects toggle, SSL-verification toggle, expected status range
-- [ ] Recovery threshold
-- [ ] Maintenance windows (suppress incidents/alerts during a window)
-- [ ] Recurring maintenance windows
-- [ ] Monitor groups
-- [ ] UI for all of the above
+- [x] Recovery threshold
+- [x] Maintenance windows (suppress incidents/alerts during a window)
+- [x] Recurring maintenance windows
+- [x] Monitor groups
+- [x] UI for all of the above
 
 ### Phase 3
 
