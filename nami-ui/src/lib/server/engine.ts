@@ -141,10 +141,13 @@ export async function engineFailure(response: Response, fallback: string) {
 
 /**
  * nami-engine's public listener (its PUBLIC_PORT, 8081 by default) as your
- * cron jobs reach it, for heartbeat ping URLs. Pings go straight to the engine
- * (cron jobs are not browser sessions), but never to the API port this BFF
- * calls (ENGINE_URL), which stays private: the public listener serves the
- * ping endpoint and nothing of the API.
+ * cron jobs and log shippers reach it, for heartbeat ping URLs and log source
+ * setup snippets. Pings and log ingest (`POST /api/v1/logs`) go straight to
+ * the engine (cron jobs and shippers are not browser sessions), but never to
+ * the API port this BFF calls (ENGINE_URL), which stays private: the public
+ * listener serves those sessionless endpoints and nothing of the API. Syslog
+ * ingest, when enabled, is a separate public ingress on its own port (see
+ * `publicSyslogAddress`).
  *
  * An empty or blank `PUBLIC_ENGINE_URL` (`PUBLIC_ENGINE_URL=` in an env file)
  * counts as unset. Anything else must be an absolute http(s) URL, a base that
