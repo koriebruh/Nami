@@ -127,7 +127,8 @@ extraction → quota accounting → insert.
     with a deterministic per-rule counter per engine instance (the 1st,
     (n+1)th, … are kept); without `match` it applies to every event.
 - Regexes use the `regex` crate (linear time, no backtracking), max 256
-  chars, compiled once per rule-set version with a size limit; invalid
+  chars, compiled once per rule-set version with a size limit (256 KiB
+  program, 256 KiB lazy-DFA cache), at most 20 per pipeline; invalid
   patterns are rejected at write time.
 - The compiled rule set is cached per source and reloaded when
   `sources.updated_at` changes (checked at most every 10 s), so edits

@@ -294,6 +294,12 @@ pub async fn find_in_project(
 }
 
 /// Merge-validate-write under the row's lock; bumps `updated_at`.
+///
+/// Every write to `sources` moves `updated_at` forward and never back
+/// (`greatest(clock_timestamp(), updated_at + 1 µs)`, R-P2-6): the ingest
+/// paths key their compiled pipeline cache on it, and `now()` (the
+/// transaction start) could be older than a pipeline save that committed
+/// while this one waited on the row lock.
 pub async fn update_in_project(
     pool: &PgPool,
     project_id: Uuid,
@@ -319,7 +325,8 @@ pub async fn update_in_project(
     let c = validate(patch.apply_to(base)).map_err(AppError::Validation)?;
     let updated: Source = sqlx::query_as(
         "update sources
-         set name = $3, platform = $4, retention_days = $5, daily_byte_quota = $6, updated_at = now()
+         set name = $3, platform = $4, retention_days = $5, daily_byte_quota = $6,
+             updated_at = greatest(clock_timestamp(), updated_at + interval '1 microsecond')
          where id = $1 and project_id = $2
          returning *",
     )
@@ -333,6 +340,61 @@ pub async fn update_in_project(
     .await?;
     tx.commit().await?;
     Ok(Some(updated))
+}
+
+/// The stored pipeline rules of one source of the project and its
+/// `updated_at`; `None` when the project has no such source.
+pub async fn get_pipeline(
+    pool: &PgPool,
+    project_id: Uuid,
+    source_id: Uuid,
+) -> Result<Option<(serde_json::Value, DateTime<Utc>)>, sqlx::Error> {
+    sqlx::query_as("select pipeline, updated_at from sources where id = $1 and project_id = $2")
+        .bind(source_id)
+        .bind(project_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Replaces the rules (already validated by `logs::pipeline::compile`) and
+/// bumps `updated_at`; `None` when the project has no such source.
+pub async fn set_pipeline(
+    pool: &PgPool,
+    project_id: Uuid,
+    source_id: Uuid,
+    rules: &serde_json::Value,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    // clock_timestamp(), not now(): two writes in one transaction would
+    // otherwise share an updated_at and the cache could keep the older rules.
+    // The `greatest` keeps it growing even if the clock steps back.
+    sqlx::query_scalar(
+        "update sources
+         set pipeline = $3,
+             updated_at = greatest(clock_timestamp(), updated_at + interval '1 microsecond')
+         where id = $1 and project_id = $2
+         returning updated_at",
+    )
+    .bind(source_id)
+    .bind(project_id)
+    .bind(rules)
+    .fetch_optional(pool)
+    .await
+}
+
+/// The ingest view of one source of the project (the pipeline preview
+/// builds rows with it).
+pub async fn ingest_source(
+    pool: &PgPool,
+    project_id: Uuid,
+    source_id: Uuid,
+) -> Result<Option<IngestSource>, sqlx::Error> {
+    sqlx::query_as(
+        "select id, project_id, retention_days, daily_byte_quota from sources where id = $1 and project_id = $2",
+    )
+    .bind(source_id)
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Deleting a source stops its ingestion at once; its rows age out by TTL.
@@ -391,7 +453,8 @@ pub async fn rotate_token(
 ) -> Result<Option<SourceWithToken>, sqlx::Error> {
     let token = new_token();
     let source: Option<Source> = sqlx::query_as(
-        "update sources set token_hash = $3, token_enc = $4, updated_at = now()
+        "update sources set token_hash = $3, token_enc = $4,
+         updated_at = greatest(clock_timestamp(), updated_at + interval '1 microsecond')
          where id = $1 and project_id = $2
          returning *",
     )
