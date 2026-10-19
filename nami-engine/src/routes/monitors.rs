@@ -2,9 +2,10 @@ use std::{collections::HashMap, time::Duration};
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::StatusCode,
-    routing::get,
+    response::{IntoResponse, Response},
+    routing::{get, post},
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,9 @@ use crate::{
     state::AppState,
     uptime::{
         availability::{self, Availability, RangeQuery},
+        import::{
+            self, ImportReport, ImportRequest, MAX_IMPORT_BODY_BYTES, MAX_IMPORT_REQUEST_BYTES,
+        },
         store::{self, MonitorStats, UptimeCheckRow},
     },
 };
@@ -46,12 +50,18 @@ const MAX_CHECKS_LIMIT: u32 = 500;
 // ClickHouse lookup, so a caller without access gets 403 whether or not the
 // monitor exists. Extractors run before the handler body, so a malformed path
 // or query string (`?limit=abc`) is a 400 even for such a caller; that
-// reveals nothing about the project.
+// reveals nothing about the project. The same goes for the import body
+// (`Json<ImportRequest>`, up to `MAX_IMPORT_REQUEST_BYTES`): a malformed one
+// is a 400 (an unknown `format` a 422) before the role check.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
             "/projects/{id}/monitors",
             get(list_monitors).post(create_monitor),
+        )
+        .route(
+            "/projects/{id}/monitors/import",
+            post(import_monitors).layer(DefaultBodyLimit::max(MAX_IMPORT_REQUEST_BYTES)),
         )
         .route(
             "/projects/{id}/monitors/{monitor_id}",
@@ -169,6 +179,33 @@ async fn create_monitor(
         StatusCode::CREATED,
         Json(view_one(&state, created, ProjectReader::Member).await?),
     ))
+}
+
+/// `POST .../monitors/import`: a URL list, Uptime Kuma backup or UptimeRobot
+/// CSV, every entry created through the single-create path (see
+/// `uptime::import::run_import`). 200 with one result row per entry.
+async fn import_monitors(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(project_id): Path<Uuid>,
+    Json(request): Json<ImportRequest>,
+) -> Result<Response, AppError> {
+    require_project_role(&state.db, &user, project_id, "member").await?;
+    if request.content.len() > MAX_IMPORT_BODY_BYTES {
+        return Ok((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "content is larger than {} MiB",
+                    MAX_IMPORT_BODY_BYTES / (1024 * 1024)
+                )
+            })),
+        )
+            .into_response());
+    }
+    let report: ImportReport =
+        import::run_import(&state.db, &state.cipher, project_id, request).await?;
+    Ok(Json(report).into_response())
 }
 
 async fn get_monitor(

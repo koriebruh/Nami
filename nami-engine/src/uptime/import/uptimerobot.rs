@@ -71,6 +71,7 @@ pub fn parse(content: &str) -> Result<Vec<ParsedEntry>, ParseError> {
                     cell(columns.port),
                     cell(columns.interval),
                 ),
+                warning: None,
             }
         })
         .collect())

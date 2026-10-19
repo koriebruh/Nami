@@ -1,8 +1,20 @@
+mod common;
+
+use axum::{
+    Router,
+    body::Body,
+    http::{HeaderValue, Request, StatusCode, header},
+};
+use common::{call, seed_project, test_cipher, user_with_role};
 use nami_engine::models::monitor::{self, CreateMonitorRequest};
+use nami_engine::models::monitor_request::{open_headers, open_password};
 use nami_engine::uptime::import::{
-    ImportDefaults, ImportFormat, MAX_ENTRIES, MAX_IMPORT_BODY_BYTES, ParseError, parse,
+    IMPORT_LOCK_CLASS, ImportDefaults, ImportFormat, MAX_ENTRIES, MAX_IMPORT_BODY_BYTES,
+    MAX_IMPORT_REQUEST_BYTES, ParseError, UNREADABLE_ENTRY, existing_key, parse,
 };
 use serde_json::{Value, json};
+use tower::ServiceExt;
+use uuid::Uuid;
 
 fn bodies(format: ImportFormat, content: &str) -> Vec<(usize, Result<Value, String>)> {
     parse(format, content, &ImportDefaults::default())
@@ -695,4 +707,758 @@ fn numbers_above_the_i32_range_parse_but_cannot_become_create_requests() {
     assert_eq!(body["port"], 4_294_967_297u64);
     assert_eq!(body["interval_seconds"], 99_999_999_999u64);
     assert!(serde_json::from_value::<CreateMonitorRequest>(body.clone()).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// POST /projects/{id}/monitors/import (NAMI-UP-26)
+// ---------------------------------------------------------------------------
+
+const KUMA_FIXTURE: &str = "tests/fixtures/import/uptime_kuma.json";
+
+fn kuma_fixture() -> String {
+    std::fs::read_to_string(KUMA_FIXTURE).unwrap()
+}
+
+async fn import(
+    app: &Router,
+    project: Uuid,
+    cookie: &HeaderValue,
+    body: Value,
+) -> (StatusCode, Value) {
+    call(
+        app,
+        "POST",
+        &format!("/projects/{project}/monitors/import"),
+        Some(cookie),
+        Some(body),
+    )
+    .await
+}
+
+/// `import`, returning the raw response text too (for "never echoed" checks).
+async fn import_text(
+    app: &Router,
+    project: Uuid,
+    cookie: &HeaderValue,
+    body: Value,
+) -> (StatusCode, String) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/projects/{project}/monitors/import"))
+                .header(header::COOKIE, cookie)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+async fn monitor_count(pool: &sqlx::PgPool, project: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from monitors where project_id = $1")
+        .bind(project)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn seed_group(pool: &sqlx::PgPool, project: Uuid) -> Uuid {
+    sqlx::query_scalar(
+        "insert into monitor_groups (project_id, name, position) values ($1, 'g', 0) returning id",
+    )
+    .bind(project)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+fn kuma(entries: Value) -> Value {
+    json!({ "format": "uptime_kuma", "content": json!({ "monitorList": entries }).to_string() })
+}
+
+#[sqlx::test]
+async fn a_url_list_creates_monitors_and_reports_every_line(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (status, body) = import(
+        &app,
+        project,
+        &member,
+        json!({
+            "format": "urls",
+            "content": "https://a.test/\n# skip me\nhttps://b.test/x?token=abc\nnot-a-url\nhttps://a.test/\n",
+            "defaults": { "interval_seconds": 120 }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["dry_run"], false);
+    assert_eq!(
+        (
+            body["created"].as_u64(),
+            body["skipped"].as_u64(),
+            body["errors"].as_u64()
+        ),
+        (Some(2), Some(1), Some(1))
+    );
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results[0]["line"], 1);
+    assert_eq!(results[0]["status"], "created");
+    assert_eq!(results[0]["name"], "a.test");
+    assert_eq!(results[0]["target"], "https://a.test/");
+    assert!(results[0]["monitor_id"].is_string());
+    assert_eq!(
+        results[1]["target"], "https://b.test/x?token=***",
+        "targets are redacted"
+    );
+    assert_eq!(
+        results[2],
+        json!({ "line": 4, "status": "error", "error": "line is not a valid http(s) URL" })
+    );
+    assert_eq!(results[3]["line"], 5);
+    assert_eq!(results[3]["status"], "skipped");
+    assert_eq!(results[3]["error"], "already monitored");
+    assert!(results[3].get("monitor_id").is_none());
+    assert_eq!(monitor_count(&pool, project).await, 2);
+    let interval: i32 =
+        sqlx::query_scalar("select interval_seconds from monitors where project_id = $1 limit 1")
+            .bind(project)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(interval, 120);
+    // Created exactly like a single create: due at once, through the worker.
+    let id: Uuid = results[0]["monitor_id"].as_str().unwrap().parse().unwrap();
+    let due: bool = sqlx::query_scalar("select next_check_at <= now() from monitors where id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(due);
+}
+
+#[sqlx::test]
+async fn importing_the_same_list_twice_creates_nothing_the_second_time(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let list = json!({ "format": "urls", "content": "https://a.test/\nhttps://b.test/" });
+    let (status, first) = import(&app, project, &member, list.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["created"], 2);
+    let (status, second) = import(&app, project, &member, list).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        (second["created"].as_u64(), second["skipped"].as_u64()),
+        (Some(0), Some(2))
+    );
+    for row in second["results"].as_array().unwrap() {
+        assert_eq!(row["status"], "skipped");
+        assert_eq!(row["error"], "already monitored");
+    }
+    assert_eq!(monitor_count(&pool, project).await, 2);
+    let (status, third) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": "https://a.test/\nhttps://b.test/", "skip_existing": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{third}");
+    assert_eq!(third["created"], 2);
+    assert_eq!(monitor_count(&pool, project).await, 4);
+}
+
+#[sqlx::test]
+async fn host_based_monitors_skip_by_lowercased_host_and_port(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let entries = json!([
+        { "name": "db", "type": "port", "hostname": "DB.example.com", "port": 5432 },
+        { "name": "db again", "type": "port", "hostname": "db.example.com", "port": 5432 },
+        { "name": "db other port", "type": "port", "hostname": "db.example.com", "port": 6432 },
+        { "name": "gw", "type": "ping", "hostname": "gw.example.com" },
+    ]);
+    let (status, body) = import(&app, project, &member, kuma(entries)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let statuses: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, ["created", "skipped", "created", "created"]);
+    assert_eq!(body["results"][0]["target"], "DB.example.com:5432");
+    assert_eq!(body["results"][3]["target"], "gw.example.com");
+}
+
+#[test]
+fn the_skip_key_is_the_url_or_the_lowercased_host_and_port() {
+    let config = |body: Value| validated(&body).unwrap();
+    assert_eq!(
+        existing_key(&config(
+            json!({"name": "a", "check_type": "http", "url": " https://A.test/x "})
+        )),
+        "https://A.test/x"
+    );
+    assert_eq!(
+        existing_key(&config(
+            json!({"name": "a", "check_type": "tcp", "host": "DB.test", "port": 5432})
+        )),
+        "db.test:5432"
+    );
+    assert_eq!(
+        existing_key(&config(
+            json!({"name": "a", "check_type": "ping", "host": "GW.test"})
+        )),
+        "gw.test"
+    );
+}
+
+#[sqlx::test]
+async fn a_dry_run_validates_everything_and_creates_nothing(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (status, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "uptime_kuma", "content": kuma_fixture(), "dry_run": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["dry_run"], true);
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 8);
+    for row in &results[..5] {
+        assert_eq!(row["status"], "created", "{row}");
+        assert!(row.get("monitor_id").is_none(), "{row}");
+        assert!(row["name"].is_string());
+    }
+    for row in &results[5..] {
+        assert_eq!(row["status"], "error", "{row}");
+    }
+    assert_eq!(
+        (body["created"].as_u64(), body["errors"].as_u64()),
+        (Some(5), Some(3))
+    );
+    assert_eq!(monitor_count(&pool, project).await, 0);
+    // A repeat inside the input is skipped in the preview too.
+    let (_, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": "https://a.test/\nhttps://a.test/", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(body["results"][1]["status"], "skipped");
+    assert_eq!(monitor_count(&pool, project).await, 0);
+}
+
+#[sqlx::test]
+async fn kuma_secrets_are_sealed_never_echoed_and_notifications_never_stored(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (status, text) = import_text(
+        &app,
+        project,
+        &member,
+        json!({ "format": "uptime_kuma", "content": kuma_fixture() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    for secret in [
+        "kuma-header-secret",
+        "kuma-basic-secret",
+        "KUMA-NOTIFY-SECRET",
+        "hooks.slack.com",
+    ] {
+        assert!(!text.contains(secret), "{secret} echoed: {text}");
+    }
+    let body: Value = serde_json::from_str(&text).unwrap();
+    let id: Uuid = body["results"][0]["monitor_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (names, headers_enc, password_enc): (Vec<String>, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "select request_header_names, request_headers_enc, auth_password_enc from monitors where id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(names, ["X-Api-Key"]);
+    let cipher = test_cipher();
+    let headers = open_headers(&cipher, id, &headers_enc).unwrap();
+    assert_eq!(headers[0].value.expose(), "kuma-header-secret");
+    assert_eq!(
+        open_password(&cipher, id, &password_enc).unwrap().expose(),
+        "kuma-basic-secret"
+    );
+    for sealed in [&headers_enc, &password_enc] {
+        let raw = String::from_utf8_lossy(sealed);
+        assert!(!raw.contains("kuma-header-secret") && !raw.contains("kuma-basic-secret"));
+    }
+    let dump: Vec<String> =
+        sqlx::query_scalar("select to_jsonb(m)::text from monitors m where project_id = $1")
+            .bind(project)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(dump.len(), 5);
+    for row in dump {
+        assert!(
+            !row.contains("KUMA-NOTIFY-SECRET") && !row.contains("hooks.slack.com"),
+            "{row}"
+        );
+        assert!(
+            !row.contains("kuma-header-secret") && !row.contains("kuma-basic-secret"),
+            "{row}"
+        );
+    }
+}
+
+#[sqlx::test]
+async fn kuma_extra_status_ranges_are_reported_as_a_warning(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "uptime_kuma", "content": kuma_fixture(), "dry_run": true }),
+    )
+    .await;
+    let results = body["results"].as_array().unwrap();
+    assert!(results[0].get("warning").is_none(), "one range, no warning");
+    assert_eq!(
+        results[1]["warning"],
+        "only the first of 2 accepted_statuscodes ranges was imported; adjust the expected status range if the others matter"
+    );
+}
+
+/// The error a single `POST /projects/{id}/monitors` gives for `body`.
+async fn single_create_error(
+    app: &Router,
+    project: Uuid,
+    cookie: &HeaderValue,
+    body: &Value,
+) -> String {
+    let (status, reply) = call(
+        app,
+        "POST",
+        &format!("/projects/{project}/monitors"),
+        Some(cookie),
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+    reply["error"].as_str().unwrap().to_string()
+}
+
+#[sqlx::test]
+async fn every_entry_is_validated_like_a_single_create(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let entries = json!([
+        { "name": "inject", "type": "http", "url": "https://a.test/", "headers": "{\"X-Bad\\r\\nInjected\": \"v\"}" },
+        { "name": "host", "type": "http", "url": "https://b.test/", "headers": "{\"Host\": \"evil\"}" },
+        { "name": "js", "type": "http", "url": "javascript:alert(1)" },
+        { "name": "\u{202E}gnp.exe", "type": "http", "url": "https://c.test/" },
+        { "name": "fast", "type": "http", "url": "https://d.test/", "interval": 10 },
+        { "name": "trace", "type": "http", "url": "https://e.test/", "method": "TRACE" },
+    ]);
+    let parsed = parse(
+        ImportFormat::UptimeKuma,
+        &json!({ "monitorList": entries.clone() }).to_string(),
+        &ImportDefaults::default(),
+    )
+    .unwrap();
+    let (status, body) = import(&app, project, &member, kuma(entries)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = body["results"].as_array().unwrap();
+    for i in [0, 1, 2, 3, 5] {
+        let single = Value::Object(parsed[i].body.clone().unwrap());
+        let expected = single_create_error(&app, project, &member, &single).await;
+        assert_eq!(results[i]["status"], "error", "{}", results[i]);
+        assert_eq!(results[i]["error"], expected.as_str(), "entry {}", i + 1);
+        assert!(
+            results[i].get("name").is_none(),
+            "unvalidated names are never shown"
+        );
+    }
+    assert_eq!(results[4]["status"], "created");
+    let interval: i32 =
+        sqlx::query_scalar("select interval_seconds from monitors where project_id = $1")
+            .bind(project)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(interval, 30);
+    assert_eq!(monitor_count(&pool, project).await, 1);
+}
+
+#[sqlx::test]
+async fn bad_entries_are_entry_errors_never_a_500(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let many_headers: serde_json::Map<String, Value> = (0..21)
+        .map(|i| (format!("X-H{i}"), Value::from("v")))
+        .collect();
+    let cases: Vec<(Value, &str)> = vec![
+        (
+            json!({ "name": "blank", "type": "http", "url": "https://a.test/", "headers": "{\"X-A\": \"  \"}" }),
+            "header X-A: enter a value",
+        ),
+        (
+            json!({ "name": "dup", "type": "http", "url": "https://a.test/", "headers": "{\"X-A\": \"1\", \"x-a\": \"2\"}" }),
+            "is listed twice",
+        ),
+        (
+            json!({ "name": "host", "type": "http", "url": "https://a.test/", "headers": "{\"Host\": \"h\"}" }),
+            "header Host cannot be set",
+        ),
+        (
+            json!({ "name": "conn", "type": "http", "url": "https://a.test/", "headers": "{\"Connection\": \"close\"}" }),
+            "header Connection cannot be set",
+        ),
+        (
+            json!({ "name": "clen", "type": "http", "url": "https://a.test/", "headers": "{\"Content-Length\": \"1\"}" }),
+            "header Content-Length cannot be set",
+        ),
+        (
+            json!({ "name": "te", "type": "http", "url": "https://a.test/", "headers": "{\"TE\": \"trailers\"}" }),
+            "header TE cannot be set",
+        ),
+        (
+            json!({ "name": "expect", "type": "http", "url": "https://a.test/", "headers": "{\"Expect\": \"100-continue\"}" }),
+            "header Expect cannot be set",
+        ),
+        (
+            json!({ "name": "many", "type": "http", "url": "https://a.test/", "headers": Value::Object(many_headers).to_string() }),
+            "at most 20 request headers are allowed",
+        ),
+        (
+            json!({ "name": "big interval", "type": "http", "url": "https://a.test/", "interval": 99_999_999_999u64 }),
+            UNREADABLE_ENTRY,
+        ),
+        (
+            json!({ "name": "big port", "type": "port", "hostname": "h.test", "port": 4_294_967_297u64 }),
+            UNREADABLE_ENTRY,
+        ),
+        (
+            json!({ "name": "get body", "type": "http", "url": "https://a.test/", "method": "GET", "body": "{}" }),
+            "request_body is only allowed with POST, PUT or PATCH",
+        ),
+        (
+            json!({ "name": "head kw", "type": "keyword", "url": "https://a.test/", "method": "HEAD", "keyword": "ok" }),
+            "keyword monitors cannot use HEAD",
+        ),
+        (
+            json!({ "name": "slow", "type": "http", "url": "https://a.test/", "timeout": 60 }),
+            "timeout_seconds must be less than interval_seconds",
+        ),
+        (
+            json!({ "name": "dns ip", "type": "dns", "hostname": "1.1.1.1" }),
+            "host must be a domain name to look up",
+        ),
+    ];
+    let entries: Vec<Value> = cases.iter().map(|(entry, _)| entry.clone()).collect();
+    let (status, body) = import(&app, project, &member, kuma(Value::Array(entries))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = body["results"].as_array().unwrap();
+    for (i, (_, expected)) in cases.iter().enumerate() {
+        assert_eq!(results[i]["status"], "error", "case {i}: {}", results[i]);
+        let error = results[i]["error"].as_str().unwrap();
+        assert!(error.contains(expected), "case {i}: {error}");
+    }
+    assert_eq!(monitor_count(&pool, project).await, 0);
+
+    // The default timeout reaching the default interval is an entry error too.
+    let (_, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": "https://a.test/", "defaults": { "timeout_seconds": 60 } }),
+    )
+    .await;
+    assert_eq!(
+        body["results"][0]["error"],
+        "timeout_seconds must be less than interval_seconds"
+    );
+
+    // A Kuma password without a username is dropped by the parser, so no
+    // password is stored for it (validation would refuse it otherwise).
+    let (_, body) = import(
+        &app,
+        project,
+        &member,
+        kuma(json!([{ "name": "pw", "type": "http", "url": "https://p.test/", "basic_auth_pass": "lonely" }])),
+    )
+    .await;
+    assert_eq!(body["results"][0]["status"], "created", "{body}");
+    let stored: Option<Vec<u8>> =
+        sqlx::query_scalar("select auth_password_enc from monitors where project_id = $1")
+            .bind(project)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(stored.is_none());
+}
+
+#[sqlx::test]
+async fn entry_errors_never_echo_a_password_or_header_value(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let entries = json!([
+        { "name": "cr", "type": "http", "url": "https://a.test/", "headers": "{\"X-A\": \"HDR-SECRET\\r\\nX: y\"}" },
+        { "name": "ctl", "type": "http", "url": "https://a.test/", "headers": "{\"X-A\": \"HDR-SECRET\\u0001\"}" },
+        { "name": "dup", "type": "http", "url": "https://a.test/", "headers": "{\"X-A\": \"HDR-SECRET\", \"x-a\": \"HDR-SECRET\"}" },
+        { "name": "pwctl", "type": "http", "url": "https://a.test/", "basic_auth_user": "u", "basic_auth_pass": "PW-SECRET\u{1}" },
+        { "name": "both", "type": "http", "url": "https://a.test/", "basic_auth_user": "u", "basic_auth_pass": "PW-SECRET",
+          "headers": "{\"Authorization\": \"HDR-SECRET\"}" },
+        { "name": "range", "type": "http", "url": "https://a.test/", "basic_auth_user": "u", "basic_auth_pass": "PW-SECRET",
+          "headers": "{\"X-A\": \"HDR-SECRET\"}", "interval": 99_999_999_999u64 },
+    ]);
+    let (status, text) = import_text(&app, project, &member, kuma(entries)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(!text.contains("HDR-SECRET"), "{text}");
+    assert!(!text.contains("PW-SECRET"), "{text}");
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["errors"], 6, "{text}");
+    assert_eq!(monitor_count(&pool, project).await, 0);
+}
+
+#[sqlx::test]
+async fn import_limits_are_enforced_before_anything_is_created(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let many: String = (0..=MAX_ENTRIES)
+        .map(|i| format!("https://h{i}.test/\n"))
+        .collect();
+    let (status, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": many }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body,
+        json!({ "error": "at most 500 entries per import, got 501" })
+    );
+    // Content over 2 MiB inside a body the route accepts: 413 from the handler.
+    let content = "#".repeat(MAX_IMPORT_BODY_BYTES + 1);
+    let (status, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": content }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+    assert_eq!(body, json!({ "error": "content is larger than 2 MiB" }));
+    // A body over the route limit: 413 before the handler.
+    let content = "#".repeat(MAX_IMPORT_REQUEST_BYTES + 1);
+    let (status, _) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": content }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    // Exactly 2 MiB of content is accepted (escaping included).
+    let content = format!(
+        "https://a.test/\n{}",
+        "\"".repeat(MAX_IMPORT_BODY_BYTES - 16)
+    );
+    assert_eq!(content.len(), MAX_IMPORT_BODY_BYTES);
+    let (status, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": content, "dry_run": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "uptime_kuma", "content": "{\"monitorList\": [" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("content is not valid JSON"),
+        "{body}"
+    );
+    let (status, _) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "pingdom", "content": "x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(monitor_count(&pool, project).await, 0);
+}
+
+#[sqlx::test]
+async fn a_second_import_while_one_runs_is_409(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let mut held = pool.begin().await.unwrap();
+    let taken: bool =
+        sqlx::query_scalar("select pg_try_advisory_xact_lock($1, hashtext($2::text))")
+            .bind(IMPORT_LOCK_CLASS)
+            .bind(project)
+            .fetch_one(&mut *held)
+            .await
+            .unwrap();
+    assert!(taken);
+    let list = json!({ "format": "urls", "content": "https://a.test/" });
+    let (status, body) = import(&app, project, &member, list.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        body,
+        json!({ "error": "another import is running in this project; try again when it finishes" })
+    );
+    assert_eq!(monitor_count(&pool, project).await, 0);
+    // Another project is not blocked.
+    let other = seed_project(&pool).await;
+    let (_, _, other_member) = user_with_role(&app, &pool, other, Some("member")).await;
+    let (status, _) = import(&app, other, &other_member, list.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    // Dry runs take no lock.
+    let (status, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": "https://a.test/", "dry_run": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    held.rollback().await.unwrap();
+    let (status, body) = import(&app, project, &member, list.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], 1);
+    // The lock was released when that import finished.
+    let (status, body) = import(&app, project, &member, list).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["skipped"], 1);
+}
+
+#[sqlx::test]
+async fn import_rbac_and_foreign_groups(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (_, _, outsider) = user_with_role(&app, &pool, project, None).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let list = json!({ "format": "urls", "content": "https://a.test/\nhttps://b.test/" });
+    for cookie in [&viewer, &outsider] {
+        let (status, _) = import(&app, project, cookie, list.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = import(
+            &app,
+            project,
+            cookie,
+            json!({ "format": "urls", "content": "https://a.test/", "dry_run": true }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/projects/{project}/monitors/import"),
+        None,
+        Some(list.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(monitor_count(&pool, project).await, 0);
+
+    let other = seed_project(&pool).await;
+    let foreign = seed_group(&pool, other).await;
+    let (status, _) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": "https://a.test/", "defaults": { "group_id": foreign } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(monitor_count(&pool, project).await, 0);
+
+    let own = seed_group(&pool, project).await;
+    let (status, body) = import(
+        &app,
+        project,
+        &admin,
+        json!({ "format": "urls", "content": "https://a.test/\nhttps://b.test/", "defaults": { "group_id": own } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let groups: Vec<Option<Uuid>> =
+        sqlx::query_scalar("select group_id from monitors where project_id = $1")
+            .bind(project)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(groups, [Some(own), Some(own)]);
+}
+
+#[sqlx::test]
+async fn one_failing_entry_never_rolls_back_the_others(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let long = format!("https://b.test/{}", "x".repeat(2048));
+    let (status, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "urls", "content": format!("https://a.test/\n{long}\nhttps://c.test/") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let statuses: Vec<&str> = body["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["status"].as_str().unwrap())
+        .collect();
+    assert_eq!(statuses, ["created", "error", "created"]);
+    assert_eq!(
+        body["results"][1]["error"],
+        "url must be at most 2048 bytes"
+    );
+    assert_eq!(monitor_count(&pool, project).await, 2);
 }
