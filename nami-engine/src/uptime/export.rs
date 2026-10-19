@@ -9,7 +9,9 @@
 //! At most [`MAX_EXPORTS_IN_FLIGHT`] exports run at once per engine; the slot
 //! is an owned semaphore permit held by the producer task, which ends (and
 //! frees it) when the client goes away, when the client stops reading for
-//! [`SEND_STALL_TIMEOUT`], on a ClickHouse error, or at the end of the range.
+//! [`SEND_STALL_TIMEOUT`], when the export has run for
+//! [`EXPORT_TOTAL_DEADLINE`], on a ClickHouse error, or at the end of the
+//! range. One user may hold at most [`MAX_EXPORTS_PER_USER`] of the slots.
 //!
 //! The first slice is read before the response starts, so a ClickHouse outage
 //! is the usual JSON 500; a failure later can only abort the body (the client
@@ -42,7 +44,10 @@ use axum::{
     routing::{MethodRouter, get},
 };
 use chrono::{DateTime, TimeDelta, Utc};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    time::{Instant, timeout_at},
+};
 use uuid::Uuid;
 
 use super::{
@@ -53,6 +58,7 @@ use super::{
 use crate::{
     clickhouse::ClickHouseError,
     error::AppError,
+    logs::slots::UserSlots,
     middleware::rbac::{CurrentUser, require_project_role},
     models::monitor,
     state::AppState,
@@ -73,18 +79,44 @@ const CHANNEL_CAPACITY: usize = 2;
 /// aborted) and its slot is freed, so four stalled downloads cannot hold every
 /// slot forever.
 pub const SEND_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest one export may run, from the moment its producer starts. A
+/// client that reads just fast enough to dodge [`SEND_STALL_TIMEOUT`] (one
+/// chunk every 29 s) still gives its slot back after this, aborted.
+pub const EXPORT_TOTAL_DEADLINE: Duration = Duration::from_secs(600);
+/// Exports one user may run at once, so one viewer cannot take every slot.
+pub const MAX_EXPORTS_PER_USER: usize = 2;
 /// `Retry-After` of the 503 when every slot is taken.
 const BUSY_RETRY_AFTER_SECS: &str = "5";
 
 /// The export slots: one semaphore per router, so one per engine process
-/// (each test app builds its own router and gets its own slots).
+/// (each test app builds its own router and gets its own slots), plus the
+/// per-user counts.
 #[derive(Clone)]
-pub struct ExportSlots(Arc<Semaphore>);
+pub struct ExportSlots {
+    global: Arc<Semaphore>,
+    users: Arc<UserSlots>,
+}
 
 impl Default for ExportSlots {
     fn default() -> Self {
-        ExportSlots(Arc::new(Semaphore::new(MAX_EXPORTS_IN_FLIGHT)))
+        ExportSlots {
+            global: Arc::new(Semaphore::new(MAX_EXPORTS_IN_FLIGHT)),
+            users: Arc::default(),
+        }
     }
+}
+
+/// The 503 for an export that found no free slot.
+fn busy(message: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::RETRY_AFTER, BUSY_RETRY_AFTER_SECS),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        Json(serde_json::json!({ "error": message })),
+    )
+        .into_response()
 }
 
 /// The method router of the export route, with its slots attached.
@@ -159,16 +191,15 @@ async fn export_checks(
     monitor::find_in_project(&state.db, project_id, monitor_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    let Ok(permit) = slots.0.try_acquire_owned() else {
-        return Ok((
-            StatusCode::SERVICE_UNAVAILABLE,
-            [
-                (header::RETRY_AFTER, BUSY_RETRY_AFTER_SECS),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            Json(serde_json::json!({ "error": "busy, retry shortly" })),
-        )
-            .into_response());
+    // Both permits are RAII guards: every early return below (and the end of
+    // the producer task) gives them back.
+    let Ok(user_permit) = slots.users.acquire(user.id, MAX_EXPORTS_PER_USER) else {
+        return Ok(busy(
+            "you already have 2 exports running; retry when one finishes",
+        ));
+    };
+    let Ok(permit) = slots.global.try_acquire_owned() else {
+        return Ok(busy("busy, retry shortly"));
     };
 
     // Before the response starts: an outage here is the JSON 500.
@@ -195,10 +226,12 @@ async fn export_checks(
         tx,
         aborted: aborted.clone(),
         stall: SEND_STALL_TIMEOUT,
+        deadline: Instant::now() + EXPORT_TOTAL_DEADLINE,
     };
     tokio::spawn(async move {
-        // The slot is held for as long as the producer runs, no longer.
+        // The slots are held for as long as the producer runs, no longer.
         let _permit = permit;
+        let _user_permit = user_permit;
         producer.run(first, first_end, fetch).await;
     });
 
@@ -226,6 +259,8 @@ enum SendFailure {
     Gone,
     /// The client did not take the chunk within the stall deadline.
     Stalled,
+    /// The export reached [`EXPORT_TOTAL_DEADLINE`].
+    Expired,
 }
 
 /// The task that reads the slices and feeds the body.
@@ -234,9 +269,12 @@ struct Producer {
     to: DateTime<Utc>,
     tx: mpsc::Sender<Bytes>,
     /// Set when the export ends early on the server's side (ClickHouse error,
-    /// stalled client); the body then ends with an error instead of cleanly.
+    /// stalled client, total deadline); the body then ends with an error
+    /// instead of cleanly.
     aborted: Arc<AtomicBool>,
     stall: Duration,
+    /// When the export is cut off whatever the client does.
+    deadline: Instant,
 }
 
 impl Producer {
@@ -281,6 +319,10 @@ impl Producer {
             // ClickHouse works.
             let fetched = tokio::select! {
                 _ = self.tx.closed() => return,
+                _ = tokio::time::sleep_until(self.deadline) => {
+                    self.expire();
+                    return;
+                }
                 fetched = fetch(start, end) => fetched,
             };
             match fetched {
@@ -309,16 +351,31 @@ impl Producer {
             buf,
             String::with_capacity(CHUNK_BYTES + 1024),
         ));
-        let failure = match tokio::time::timeout(self.stall, self.tx.send(chunk)).await {
+        let stalled_at = Instant::now() + self.stall;
+        let failure = match timeout_at(stalled_at.min(self.deadline), self.tx.send(chunk)).await {
             Ok(Ok(())) => return Ok(()),
             Ok(Err(_)) => SendFailure::Gone,
+            Err(_) if Instant::now() >= self.deadline => SendFailure::Expired,
             Err(_) => SendFailure::Stalled,
         };
-        if let SendFailure::Stalled = failure {
-            tracing::warn!(monitor_id = %self.monitor_id, "check export stalled; aborting it");
-            self.aborted.store(true, Ordering::Release);
+        match failure {
+            SendFailure::Gone => {}
+            SendFailure::Stalled => {
+                tracing::warn!(monitor_id = %self.monitor_id, "check export stalled; aborting it");
+                self.aborted.store(true, Ordering::Release);
+            }
+            SendFailure::Expired => self.expire(),
         }
         Err(failure)
+    }
+
+    /// Marks the export aborted at [`EXPORT_TOTAL_DEADLINE`].
+    fn expire(&self) {
+        tracing::warn!(
+            monitor_id = %self.monitor_id,
+            "check export reached its total deadline; aborting it"
+        );
+        self.aborted.store(true, Ordering::Release);
     }
 }
 
@@ -485,12 +542,16 @@ mod tests {
     }
 
     /// The worst row a slice can hold (every error char 4 UTF-8 bytes, cut
-    /// to `MAX_ERROR_CHARS` by the query) times the slice limit stays under
-    /// the ClickHouse client's response cap, with room to spare.
+    /// to `MAX_ERROR_CHARS + 1` by the query, the `+ 1` being the checker's
+    /// `…` marker) times the slice limit stays under the ClickHouse client's
+    /// response cap, with room to spare. This relies on the checker's
+    /// `clean_error` stripping control characters before a row is stored: a
+    /// control char is escaped as `\u00XX` (6 bytes) in ClickHouse's JSON, more
+    /// than the 4 bytes per char assumed here.
     #[test]
     fn a_full_slice_fits_the_clickhouse_response_cap() {
         let worst = UptimeCheckRow {
-            error: Some("𝄞".repeat(crate::uptime::checker::MAX_ERROR_CHARS)),
+            error: Some("𝄞".repeat(crate::uptime::checker::MAX_ERROR_CHARS + 1)),
             status_code: Some(u16::MAX),
             response_time_ms: Some(u32::MAX),
             ..row(None)
@@ -551,6 +612,7 @@ mod tests {
             tx,
             aborted,
             stall: SEND_STALL_TIMEOUT,
+            deadline: Instant::now() + EXPORT_TOTAL_DEADLINE,
         }
     }
 
@@ -714,5 +776,51 @@ mod tests {
         .await;
         assert!(failed);
         assert!(body.starts_with(HEADER));
+    }
+
+    /// A client that takes one chunk every 29 s never trips the stall
+    /// deadline, but is still cut off at the total deadline: the body ends
+    /// with an error and the slot comes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_trickling_reader_is_cut_off_at_the_total_deadline() {
+        let to = at(day(180));
+        let calls: Calls = Arc::default();
+        let mut fetch = fake(30_000, calls.clone());
+        let first = fetch(at(0), slice_end(at(0), to)).into_inner().unwrap();
+        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let aborted = Arc::new(AtomicBool::new(false));
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let started = Instant::now();
+        let producer = producer(to, tx, aborted.clone());
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            producer.run(first, slice_end(at(0), to), fetch).await;
+        });
+        let mut stream = Box::pin(ExportStream {
+            rx,
+            aborted: aborted.clone(),
+            done: false,
+        });
+        let mut chunks = 0;
+        let failed = loop {
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            match stream.next().await {
+                Some(Ok(_)) => chunks += 1,
+                Some(Err(_)) => break true,
+                None => break false,
+            }
+        };
+        task.await.unwrap();
+        assert!(failed, "the body must end with an error");
+        assert!(aborted.load(Ordering::Acquire));
+        assert!(chunks >= 20, "{chunks} chunks");
+        let ended = started.elapsed();
+        assert!(ended >= EXPORT_TOTAL_DEADLINE, "{ended:?}");
+        assert!(
+            ended < EXPORT_TOTAL_DEADLINE + Duration::from_secs(4 * 29),
+            "{ended:?}"
+        );
+        assert_eq!(slots.available_permits(), 1, "the slot is free again");
     }
 }

@@ -156,13 +156,17 @@ pub async fn recent_checks(
 
 /// Most rows [`checks_between`] returns in one query. At the 30 s minimum
 /// interval one day holds 2880 checks; a caller that gets exactly this many
-/// rows continues after the last one (see `uptime::export`).
+/// rows continues one millisecond after the last one (see `uptime::export`).
+/// Rows sharing that last row's exact millisecond beyond the limit would be
+/// skipped by that continuation; this cannot happen while a monitor has at
+/// most 2880 checks a day.
 pub const CHECKS_BETWEEN_LIMIT: u32 = 20_000;
 
 /// The monitor's checks with `from <= checked_at < to`, oldest first, at most
 /// [`CHECKS_BETWEEN_LIMIT`] of them. `error` is cut to the checker's
-/// `MAX_ERROR_CHARS` here too, so one result stays far below the client's
-/// response cap (`clickhouse::MAX_RESPONSE_BYTES`) whatever a row holds.
+/// `MAX_ERROR_CHARS` plus its `…` truncation marker here too, so one result
+/// stays far below the client's response cap (`clickhouse::MAX_RESPONSE_BYTES`)
+/// whatever a row holds.
 pub async fn checks_between(
     ch: &ClickHouse,
     project_id: Uuid,
@@ -182,7 +186,11 @@ pub async fn checks_between(
         &[
             ("project_id", project_id.to_string()),
             ("monitor_id", monitor_id.to_string()),
-            ("max_error", super::checker::MAX_ERROR_CHARS.to_string()),
+            // + 1: the checker's `…` marker after a cut error survives.
+            (
+                "max_error",
+                (super::checker::MAX_ERROR_CHARS + 1).to_string(),
+            ),
             ("from_ms", from.timestamp_millis().to_string()),
             ("to_ms", to.timestamp_millis().to_string()),
             ("limit", CHECKS_BETWEEN_LIMIT.to_string()),

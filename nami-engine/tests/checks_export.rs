@@ -16,7 +16,8 @@ use nami_engine::{
     clickhouse::ClickHouse,
     uptime::{
         checker::CheckStatus,
-        export::{HEADER, MAX_EXPORTS_IN_FLIGHT},
+        checker::MAX_ERROR_CHARS,
+        export::{HEADER, MAX_EXPORTS_IN_FLIGHT, MAX_EXPORTS_PER_USER},
         store::{self, UptimeCheckRow},
     },
 };
@@ -55,6 +56,12 @@ fn check(project: Uuid, monitor: Uuid, at: DateTime<Utc>, error: Option<&str>) -
     }
 }
 
+/// An error the checker cut: `MAX_ERROR_CHARS` chars plus its `…` marker.
+fn long_error() -> &'static str {
+    static LONG: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LONG.get_or_init(|| format!("{}…", "e".repeat(MAX_ERROR_CHARS)))
+}
+
 /// A day boundary ten days ago (well inside the 180-day TTL).
 fn range_start() -> DateTime<Utc> {
     let ten_days_ago = Utc::now() - Duration::days(10);
@@ -71,6 +78,7 @@ async fn seed_three_days(ch: &ClickHouse, project: Uuid, monitor: Uuid, from: Da
             let at = from + Duration::milliseconds(i * 43_200);
             let error = match i {
                 1234 => Some(FORMULA),
+                4321 => Some(long_error()),
                 _ if i % 7 == 0 => Some("expected status 200-399, got \"503\""),
                 _ => None,
             };
@@ -164,6 +172,15 @@ async fn the_export_streams_every_check_in_the_range_as_csv(pool: PgPool) {
         formula_lines[0]
     );
 
+    // The truncation marker of a cut error survives the export query.
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.ends_with(&format!(",{}", long_error())))
+            .count(),
+        1
+    );
+
     let mut reader = csv::Reader::from_reader(body.as_bytes());
     assert_eq!(
         reader.headers().unwrap(),
@@ -185,7 +202,11 @@ async fn the_export_streams_every_check_in_the_range_as_csv(pool: PgPool) {
         assert!(previous.is_none_or(|p| p < at), "ascending");
         previous = Some(at);
         if &record[1] == "down" {
-            assert!(record[4].starts_with('\'') || record[4].starts_with("expected"));
+            assert!(
+                record[4].starts_with('\'')
+                    || record[4].starts_with("expected")
+                    || record[4] == *long_error()
+            );
         } else {
             assert_eq!(&record[4], "");
         }
@@ -334,7 +355,11 @@ async fn slots_are_bounded_and_freed_when_the_client_goes_away(pool: PgPool) {
     let (state, ch) = state_with_clickhouse(&pool).await;
     let app = app(state);
     let project = seed_project(&pool).await;
-    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    // Two exports per user: four users-worth of slots need two users.
+    let mut viewers = Vec::new();
+    for _ in 0..3 {
+        viewers.push(user_with_role(&app, &pool, project, Some("viewer")).await.2);
+    }
     let monitor = seed_http_monitor(&pool, project, "api", "https://example.com", 1).await;
     let from = range_start();
     let to = from + Duration::days(3);
@@ -342,14 +367,14 @@ async fn slots_are_bounded_and_freed_when_the_client_goes_away(pool: PgPool) {
     let uri = export_url(project, monitor, from, to);
 
     let mut held = Vec::new();
-    for _ in 0..MAX_EXPORTS_IN_FLIGHT {
-        let response = get(&app, &uri, &viewer).await;
+    for i in 0..MAX_EXPORTS_IN_FLIGHT {
+        let response = get(&app, &uri, &viewers[i / MAX_EXPORTS_PER_USER]).await;
         assert_eq!(response.status(), StatusCode::OK);
         held.push(response);
     }
     // Let every producer run until its channel is full.
     tokio::time::sleep(StdDuration::from_millis(500)).await;
-    let busy = get(&app, &uri, &viewer).await;
+    let busy = get(&app, &uri, &viewers[2]).await;
     assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(header_of(&busy, header::RETRY_AFTER), "5");
     assert_eq!(header_of(&busy, header::CACHE_CONTROL), "no-store");
@@ -362,7 +387,7 @@ async fn slots_are_bounded_and_freed_when_the_client_goes_away(pool: PgPool) {
     drop(held.pop());
     let deadline = Instant::now() + StdDuration::from_secs(10);
     let freed = loop {
-        let response = get(&app, &uri, &viewer).await;
+        let response = get(&app, &uri, &viewers[2]).await;
         if response.status() == StatusCode::OK {
             break response;
         }
@@ -380,6 +405,67 @@ async fn slots_are_bounded_and_freed_when_the_client_goes_away(pool: PgPool) {
             .count(),
         6001
     );
+    drop(held);
+    ch.drop_database().await.unwrap();
+}
+
+/// One user runs at most two exports at once, whatever slots are free; the
+/// third is a 503 with `Retry-After`, another user is unaffected, and a
+/// finished (dropped) export gives the user's slot back.
+#[sqlx::test]
+async fn one_user_runs_at_most_two_exports(pool: PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (_, _, other) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let monitor = seed_http_monitor(&pool, project, "api", "https://example.com", 1).await;
+    let from = range_start();
+    let to = from + Duration::days(3);
+    seed_three_days(&ch, project, monitor, from).await;
+    let uri = export_url(project, monitor, from, to);
+
+    let mut held = Vec::new();
+    for _ in 0..MAX_EXPORTS_PER_USER {
+        let response = get(&app, &uri, &viewer).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        held.push(response);
+    }
+    tokio::time::sleep(StdDuration::from_millis(300)).await;
+    let third = get(&app, &uri, &viewer).await;
+    assert_eq!(third.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(header_of(&third, header::RETRY_AFTER), "5");
+    assert_eq!(header_of(&third, header::CACHE_CONTROL), "no-store");
+    let body = axum::body::to_bytes(third.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "error": "you already have 2 exports running; retry when one finishes" })
+    );
+
+    // Global slots are still free: another user exports in full.
+    let response = get(&app, &uri, &other).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(body.starts_with(HEADER.as_bytes()));
+
+    // Rejected requests (403/404/400 before the slot, 503 itself) never
+    // leak a slot; dropping one held export frees one for this user.
+    drop(held.pop());
+    let deadline = Instant::now() + StdDuration::from_secs(10);
+    loop {
+        let response = get(&app, &uri, &viewer).await;
+        if response.status() == StatusCode::OK {
+            break;
+        }
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(Instant::now() < deadline, "the user's slot was never freed");
+        tokio::time::sleep(StdDuration::from_millis(50)).await;
+    }
     drop(held);
     ch.drop_database().await.unwrap();
 }
