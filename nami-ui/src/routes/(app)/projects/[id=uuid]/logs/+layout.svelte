@@ -5,13 +5,16 @@
 	let { data, children }: LayoutProps = $props();
 
 	const base = $derived(`/projects/${data.project.id}/logs`);
-	const sections = $derived([{ href: `${base}/sources`, label: 'Sources' }]);
+	const sections = $derived([
+		{ href: base, label: 'Explorer', exact: true },
+		{ href: `${base}/sources`, label: 'Sources', exact: false }
+	]);
 </script>
 
 <div class="space-y-6">
 	<nav class="flex gap-2" aria-label="Logs sections">
 		{#each sections as section (section.href)}
-			{@const active = page.url.pathname.startsWith(section.href)}
+			{@const active = section.exact ? page.url.pathname === section.href : page.url.pathname.startsWith(section.href)}
 			<a
 				href={section.href}
 				aria-current={active ? 'page' : undefined}
