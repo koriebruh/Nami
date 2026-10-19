@@ -281,13 +281,15 @@ fn uptimerobot_csv_maps_by_header_name() {
             )
         )
     );
+    // "Keyword Type" is UptimeRobot's alert condition: `not exists` alerts
+    // when the keyword is missing, which is Nami's `contains`.
     assert_eq!(
         got[1],
         (
             3,
             Ok(
                 json!({"name": "Login page", "check_type": "keyword", "url": "https://example.com/login",
-        "keyword": "Error", "keyword_mode": "not_contains", "interval_seconds": 60})
+        "keyword": "Welcome", "keyword_mode": "contains", "interval_seconds": 60})
             )
         )
     );
@@ -1590,4 +1592,103 @@ async fn a_global_admin_importing_into_a_missing_project_gets_404(pool: sqlx::Pg
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---- Phase 3 final review ----
+
+/// UptimeRobot's keyword type is the alert condition ("Alert when: keyword
+/// exists / not exists"; API v2 `keyword_type` 1 / 2): `exists` is down when
+/// the keyword is present (Nami `not_contains`), `not exists` is down when it
+/// is missing (Nami `contains`).
+#[test]
+fn uptimerobot_keyword_type_is_the_alert_condition() {
+    let csv = "Friendly Name,URL/IP,Type,Keyword Type,Keyword Value\n\
+        a,https://a.test/,Keyword,exists,Error\n\
+        b,https://b.test/,Keyword,1,Error\n\
+        c,https://c.test/,Keyword,ALERT_EXISTS,Error\n\
+        d,https://d.test/,Keyword,not exists,Welcome\n\
+        e,https://e.test/,Keyword,2,Welcome\n\
+        f,https://f.test/,Keyword,alert_not_exists,Welcome\n\
+        g,https://g.test/,Keyword,Not Exists,Welcome\n\
+        h,https://h.test/,Keyword,,Welcome\n\
+        i,https://i.test/,Keyword,sometimes,Welcome\n";
+    let entries = parse(ImportFormat::Uptimerobot, csv, &ImportDefaults::default()).unwrap();
+    let got: Vec<(&str, Option<&str>)> = entries
+        .iter()
+        .map(|e| {
+            (
+                e.body.as_ref().unwrap()["keyword_mode"].as_str().unwrap(),
+                e.warning.as_deref(),
+            )
+        })
+        .collect();
+    let unknown = Some("keyword type not given; imported as alert-when-missing");
+    assert_eq!(
+        got,
+        vec![
+            ("not_contains", None),
+            ("not_contains", None),
+            ("not_contains", None),
+            ("contains", None),
+            ("contains", None),
+            ("contains", None),
+            ("contains", None),
+            ("contains", unknown),
+            ("contains", unknown),
+        ]
+    );
+}
+
+/// CSV rows report their line in the file: the header is line 1, and a quoted
+/// cell spanning two lines moves the next row down by one.
+#[test]
+fn uptimerobot_rows_report_their_file_line() {
+    let csv = "Friendly Name,URL/IP,Type\nA,https://a.test/,HTTP(s)\n\"two\nlines\",https://b.test/,HTTP(s)\nC,https://c.test/,HTTP(s)\n";
+    let lines: Vec<usize> = bodies(ImportFormat::Uptimerobot, csv)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    assert_eq!(lines, vec![2, 3, 5]);
+}
+
+/// The live repro of the inverted keyword type: each created monitor is down
+/// exactly when UptimeRobot would have alerted.
+#[sqlx::test]
+async fn imported_uptimerobot_keyword_monitors_alert_like_uptimerobot(pool: sqlx::PgPool) {
+    let app = common::test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let csv = "Friendly Name,URL/IP,Type,Keyword Type,Keyword Value\n\
+        Alert if Error appears,https://example.com/a,Keyword,exists,Error\n\
+        Alert if Welcome missing,https://example.com/b,Keyword,not exists,Welcome\n";
+    let (status, body) = import(
+        &app,
+        project,
+        &member,
+        json!({ "format": "uptimerobot", "content": csv }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let created: Vec<(String, String, String)> = sqlx::query_as(
+        "select name, keyword, keyword_mode from monitors where project_id = $1 order by name",
+    )
+    .bind(project)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        created,
+        vec![
+            (
+                "Alert if Error appears".to_string(),
+                "Error".to_string(),
+                "not_contains".to_string()
+            ),
+            (
+                "Alert if Welcome missing".to_string(),
+                "Welcome".to_string(),
+                "contains".to_string()
+            ),
+        ]
+    );
 }

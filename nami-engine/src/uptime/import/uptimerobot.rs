@@ -1,6 +1,13 @@
 //! UptimeRobot CSV export. Columns are found by header name (case-insensitive,
 //! unknown columns ignored). Cells are plain text: a leading `=` is just a
 //! character in a name, never evaluated, and validation judges it later.
+//!
+//! "Keyword Type" is UptimeRobot's alert condition ("Alert when: keyword
+//! exists / keyword not exists"; API v2 `keyword_type` 1 = exists, 2 = not
+//! exists; v3 `ALERT_EXISTS` / `ALERT_NOT_EXISTS`): the monitor goes down when
+//! the condition is true. Nami's `keyword_mode` says what an UP page holds, so
+//! the reading is inverted: `exists` (down when present) is `not_contains`,
+//! `not exists` (down when missing) is `contains`.
 use super::printable;
 use super::{MAX_ENTRIES, ParseError, ParsedEntry};
 use serde_json::{Map, Value};
@@ -60,9 +67,10 @@ pub fn parse(content: &str) -> Result<Vec<ParsedEntry>, ParseError> {
                     .map(str::trim)
                     .filter(|c| !c.is_empty())
             };
-            ParsedEntry {
-                line: record.position().map_or(0, |p| p.line() as usize),
-                body: entry(
+            // `Position::line` is the file line the record starts on (the
+            // header is line 1), quoted multi-line cells included.
+            let line = record.position().map_or(0, |p| p.line() as usize);
+            let parsed = entry(
                     cell(Some(name)),
                     cell(Some(target)),
                     cell(Some(kind)),
@@ -70,8 +78,15 @@ pub fn parse(content: &str) -> Result<Vec<ParsedEntry>, ParseError> {
                     cell(columns.keyword),
                     cell(columns.port),
                     cell(columns.interval),
-                ),
-                warning: None,
+                );
+            let (body, warning) = match parsed {
+                Ok((body, warning)) => (Ok(body), warning),
+                Err(message) => (Err(message), None),
+            };
+            ParsedEntry {
+                line,
+                body,
+                warning: warning.map(str::to_string),
             }
         })
         .collect())
@@ -85,11 +100,12 @@ fn entry(
     keyword: Option<&str>,
     port: Option<&str>,
     interval: Option<&str>,
-) -> Result<Map<String, Value>, String> {
+) -> Result<(Map<String, Value>, Option<&'static str>), String> {
     let name = name.ok_or("row has no Friendly Name")?;
     let target = target.ok_or("row has no URL/IP")?;
     let kind = kind.ok_or("row has no Type")?;
     let mut body = Map::new();
+    let mut warning = None;
     body.insert("name".into(), name.into());
     match kind.to_lowercase().as_str() {
         "http(s)" | "http" | "https" | "1" => {
@@ -103,8 +119,13 @@ fn entry(
                 body.insert("keyword".into(), keyword.into());
             }
             let mode = match keyword_type.map(str::to_lowercase).as_deref() {
-                Some("not exists") | Some("2") => "not_contains",
-                _ => "contains",
+                Some("exists") | Some("1") | Some("alert_exists") => "not_contains",
+                Some("not exists") | Some("2") | Some("alert_not_exists") => "contains",
+                // UptimeRobot's own default is "not exists".
+                _ => {
+                    warning = Some(KEYWORD_TYPE_UNKNOWN);
+                    "contains"
+                }
             };
             body.insert("keyword_mode".into(), mode.into());
         }
@@ -130,5 +151,8 @@ fn entry(
     if let Some(n) = interval.and_then(|i| i.parse::<i64>().ok()) {
         body.insert("interval_seconds".into(), n.max(30).into());
     }
-    Ok(body)
+    Ok((body, warning))
 }
+
+/// The row warning for a keyword monitor without a known keyword type.
+const KEYWORD_TYPE_UNKNOWN: &str = "keyword type not given; imported as alert-when-missing";
