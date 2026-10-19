@@ -2,13 +2,16 @@
 //! `pattern`), storing them in ClickHouse (`store`), and HTTP ingestion
 //! (`ingest`, `msgpack`, with the `budget` that caps what a body may decode
 //! to) with its per-source limits (`rate_limit`) and usage accounting
-//! (`usage`), and syslog ingestion over TCP and UDP (`syslog`).
+//! (`usage`), syslog ingestion over TCP and UDP (`syslog`), and search
+//! (`query`, `search`).
 pub mod budget;
 pub mod ingest;
 pub mod msgpack;
 pub mod normalize;
 pub mod pattern;
+pub mod query;
 pub mod rate_limit;
+pub mod search;
 pub mod store;
 pub mod syslog;
 pub mod usage;

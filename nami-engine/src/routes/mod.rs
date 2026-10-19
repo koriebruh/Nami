@@ -1,3 +1,4 @@
+pub mod logs;
 pub mod logs_ingest;
 pub mod sources;
 pub mod health;
