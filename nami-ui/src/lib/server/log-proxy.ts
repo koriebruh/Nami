@@ -24,6 +24,15 @@ export const SEARCH_PARAMS: readonly string[] = Object.freeze([
 	'cursor'
 ]);
 
+/** Export: the filters, the window, the format and the CSV columns. */
+export const EXPORT_PARAMS: readonly string[] = Object.freeze([
+	...FILTER_PARAMS,
+	'from',
+	'to',
+	'format',
+	'columns'
+]);
+
 /** `?key=value&…` with only `keys`, or `''` when none are present. */
 export function pickLogParams(params: URLSearchParams, keys: readonly string[]): string {
 	const picked = new URLSearchParams();

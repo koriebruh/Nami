@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { FILTER_PARAMS, pickLogParams, SEARCH_PARAMS, TAIL_PARAMS } from './log-proxy';
+import {
+	EXPORT_PARAMS,
+	FILTER_PARAMS,
+	pickLogParams,
+	SEARCH_PARAMS,
+	TAIL_PARAMS
+} from './log-proxy';
 
 describe('pickLogParams', () => {
 	it('keeps only the allowed keys, repeats included, in order', () => {
@@ -24,5 +30,12 @@ describe('pickLogParams', () => {
 		expect(Object.isFrozen(SEARCH_PARAMS)).toBe(true);
 		expect(TAIL_PARAMS).not.toBe(FILTER_PARAMS);
 		expect(() => (TAIL_PARAMS as string[]).push('cursor')).toThrow();
+	});
+
+	it('lets an export carry the filters, the window, the format and its columns only', () => {
+		expect(EXPORT_PARAMS).toEqual([...FILTER_PARAMS, 'from', 'to', 'format', 'columns']);
+		expect(Object.isFrozen(EXPORT_PARAMS)).toBe(true);
+		expect(EXPORT_PARAMS).not.toContain('cursor');
+		expect(EXPORT_PARAMS).not.toContain('limit');
 	});
 });
