@@ -34,10 +34,12 @@ describe('monitorPayloadFromForm', () => {
 			payload: {
 				name: 'API',
 				check_type: 'http',
+				ip_version: 'any',
 				url: 'https://example.com',
 				http_method: 'HEAD',
 				follow_redirects: true,
 				verify_ssl: true,
+				remember_cookies: false,
 				expected_status_min: 200,
 				expected_status_max: 299,
 				interval_seconds: 30,
@@ -52,7 +54,7 @@ describe('monitorPayloadFromForm', () => {
 		const result = monitorPayloadFromForm(
 			form({ name: 'DB', check_type: 'tcp', host: 'db.internal', port: '5432', url: 'https://stale.test' })
 		);
-		expect(result).toEqual({ ok: true, payload: { name: 'DB', check_type: 'tcp', host: 'db.internal', port: 5432 } });
+		expect(result).toEqual({ ok: true, payload: { name: 'DB', check_type: 'tcp', ip_version: 'any', host: 'db.internal', port: 5432 } });
 	});
 
 	it('keeps the keyword untrimmed and defaults the mode', () => {
@@ -164,7 +166,7 @@ describe('monitorPayloadFromForm', () => {
 			if (!result.ok) throw new Error(result.message);
 			return result.payload;
 		};
-		expect(ok({ check_type: 'ping', host: ' 10.0.0.1 ', port: '22' })).toEqual({ name: 'M', check_type: 'ping', host: '10.0.0.1' });
+		expect(ok({ check_type: 'ping', host: ' 10.0.0.1 ', port: '22' })).toEqual({ name: 'M', check_type: 'ping', ip_version: 'any', host: '10.0.0.1' });
 		expect(ok({ check_type: 'dns', host: 'example.com', dns_record_type: 'TXT', dns_nameserver: '1.1.1.1', expected_value: 'v=spf1' })).toEqual({
 			name: 'M',
 			check_type: 'dns',
@@ -176,6 +178,7 @@ describe('monitorPayloadFromForm', () => {
 		expect(ok({ check_type: 'ssl_expiry', host: 'example.com', port: '', expiry_threshold_days: '21' })).toEqual({
 			name: 'M',
 			check_type: 'ssl_expiry',
+			ip_version: 'any',
 			host: 'example.com',
 			expiry_threshold_days: 21
 		});
@@ -350,5 +353,59 @@ describe('monitorPayloadFromForm on edit, empty number fields', () => {
 		);
 		expect(result.ok && result.payload.expiry_threshold_days).toBeNull();
 		expect(result.ok && 'interval_seconds' in result.payload).toBe(false);
+	});
+});
+
+describe('monitorPayloadFromForm advanced options', () => {
+	const payload = (fields: Record<string, string>, mode: 'create' | 'edit' = 'create') =>
+		monitorPayloadFromForm(form({ name: 'X', ...defaults, ...fields }), mode);
+	const ok = (fields: Record<string, string>, mode: 'create' | 'edit' = 'create') => {
+		const result = payload(fields, mode);
+		if (!result.ok) throw new Error(result.message);
+		return result.payload;
+	};
+
+	it('sends the ip version for the types that use it and never for the others', () => {
+		expect(ok({ check_type: 'tcp', host: 'db', port: '5432', ip_version: 'ipv6' }).ip_version).toBe('ipv6');
+		expect(ok({ check_type: 'dns', host: 'x.test', ip_version: 'ipv6' })).not.toHaveProperty('ip_version');
+		expect(ok({ check_type: 'http', url: 'https://a.test' }).ip_version).toBe('any');
+	});
+
+	it('sends proxy settings with keep, replace and clear for the password', () => {
+		const base = { check_type: 'http', url: 'https://a.test', proxy_url: 'http://proxy:3128', proxy_username: 'nami' };
+		expect(ok({ ...base, proxy_password: 'pw' })).toMatchObject({ proxy_url: 'http://proxy:3128', proxy_username: 'nami', proxy_password: 'pw' });
+		expect(ok({ ...base, initial_proxy_url: 'http://proxy:3128' }, 'edit')).not.toHaveProperty('proxy_password');
+		expect(ok({ ...base, proxy_password_action: 'keep' }, 'edit')).not.toHaveProperty('proxy_password');
+		expect(ok({ ...base, proxy_password_action: 'clear' }, 'edit').proxy_password).toBeNull();
+		expect(payload({ ...base, proxy_password_action: 'replace', proxy_password: '' }, 'edit')).toEqual({
+			ok: false,
+			message: 'Enter the new proxy password, or keep the current one'
+		});
+		expect(ok({ check_type: 'http', url: 'https://a.test', proxy_url: '' }, 'edit').proxy_url).toBeNull();
+		expect(ok({ check_type: 'http', url: 'https://a.test' })).not.toHaveProperty('proxy_url');
+		expect(ok({ check_type: 'http', url: 'https://a.test', remember_cookies: 'on' }).remember_cookies).toBe(true);
+		expect(ok({ check_type: 'http', url: 'https://a.test' }).remember_cookies).toBe(false);
+	});
+
+	it('refuses to keep stored secrets when the proxy moves to another origin', () => {
+		const message = 'Changing the proxy requires entering the passwords and header values again, or clearing them';
+		const stored = {
+			check_type: 'http',
+			url: 'https://a.test',
+			initial_url: 'https://a.test',
+			initial_verify_ssl: 'on',
+			initial_proxy_url: 'http://proxy:3128',
+			stored_proxy_password: 'on',
+			proxy_password_action: 'keep'
+		};
+		expect(payload({ ...stored, proxy_url: 'http://evil:3128' }, 'edit')).toEqual({ ok: false, message });
+		// Headers kept while the proxy is added also count.
+		expect(
+			payload({ check_type: 'http', url: 'https://a.test', initial_url: 'https://a.test', initial_verify_ssl: 'on', stored_headers: 'on', headers_action: 'keep', proxy_url: 'http://evil:3128' }, 'edit')
+		).toEqual({ ok: false, message });
+		// Same origin, other path, removing the proxy, or re-entering: allowed.
+		expect(payload({ ...stored, proxy_url: 'http://proxy:3128/x' }, 'edit').ok).toBe(true);
+		expect(payload({ ...stored, proxy_url: '', proxy_password_action: 'clear' }, 'edit').ok).toBe(true);
+		expect(payload({ ...stored, proxy_url: 'http://other:3128', proxy_password_action: 'replace', proxy_password: 'n' }, 'edit').ok).toBe(true);
 	});
 });

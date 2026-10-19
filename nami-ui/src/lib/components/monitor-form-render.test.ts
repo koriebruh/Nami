@@ -45,6 +45,11 @@ function monitor(overrides: Partial<Monitor> = {}): Monitor {
 		group_id: null,
 		in_maintenance: false,
 		redacted: false,
+		ip_version: 'any',
+		remember_cookies: false,
+		proxy_url: null,
+		proxy_username: null,
+		has_proxy_password: false,
 		...overrides
 	};
 }
@@ -116,5 +121,37 @@ describe('monitor form render', () => {
 		expect(body).toContain('min="3600"');
 		expect(body).toContain('placeholder="86400"');
 		expect(body).toContain('placeholder="1"');
+	});
+
+	describe('advanced options', () => {
+		it('offers the ip version for tcp and not for dns, and the proxy only for http', () => {
+			const tcp = render(MonitorForm, { props: { ...props, monitor: monitor({ check_type: 'tcp', url: null, host: 'db', port: 5432 }) } }).body;
+			expect(tcp).toContain('>Advanced<');
+			expect(tcp).toContain('name="ip_version"');
+			expect(tcp).not.toContain('name="proxy_url"');
+			expect(tcp).not.toContain('name="remember_cookies"');
+			const dns = render(MonitorForm, { props: { ...props, monitor: monitor({ check_type: 'dns', url: null, host: 'x.test' }) } }).body;
+			expect(dns).not.toContain('name="ip_version"');
+			expect(dns).not.toContain('>Advanced<');
+			const http = render(MonitorForm, { props: { ...props, monitor: null } }).body;
+			expect(http).toContain('name="proxy_url"');
+			expect(http).toContain('name="remember_cookies"');
+			expect(http).toContain('autocomplete="new-password"');
+			expect(http).toContain('The proxy resolves the target, so IP version must be Any.');
+		});
+
+		it('shows keep, replace and remove for a stored proxy password and never its value', () => {
+			const { body } = render(MonitorForm, {
+				props: { ...props, monitor: monitor({ proxy_url: 'http://proxy:3128', proxy_username: 'nami', has_proxy_password: true }) }
+			});
+			expect(body).toMatch(/name="proxy_password_action" value="keep"/);
+			expect(body).toMatch(/name="proxy_password_action" value="replace"/);
+			expect(body).toMatch(/name="proxy_password_action" value="clear"/);
+			expect(body).toContain('Keep (set)');
+			expect(body).toMatch(/name="stored_proxy_password"/);
+			expect(body).toMatch(/name="initial_proxy_url"[^>]*value="http:\/\/proxy:3128"/);
+			expect(body).not.toMatch(/name="proxy_password"[^>]*value=/);
+			expect(body).not.toMatch(/name="proxy_password_action" value="keep"[^>]*disabled/);
+		});
 	});
 });

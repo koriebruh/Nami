@@ -36,6 +36,15 @@ export const HTTP_METHODS: HttpMethod[] = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH'
 export const BODY_METHODS: HttpMethod[] = ['POST', 'PUT', 'PATCH'];
 export const DNS_RECORD_TYPES: DnsRecordType[] = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
 
+export type IpVersion = 'any' | 'ipv4' | 'ipv6';
+export const IP_VERSIONS: { value: IpVersion; label: string }[] = [
+	{ value: 'any', label: 'Any' },
+	{ value: 'ipv4', label: 'IPv4 only' },
+	{ value: 'ipv6', label: 'IPv6 only' }
+];
+/** Check types that resolve a target themselves and so honour an IP version. */
+export const IP_VERSION_TYPES: CheckType[] = ['http', 'keyword', 'tcp', 'ping', 'ssl_expiry'];
+
 /** A custom request header as the engine returns it: the value is write-only. */
 export type RequestHeaderView = { name: string; value_set: boolean };
 
@@ -79,6 +88,12 @@ export type Monitor = {
 	in_maintenance: boolean;
 	/** True when fields were masked (`***`) for the reader, a viewer. */
 	redacted: boolean;
+	ip_version: IpVersion;
+	remember_cookies: boolean;
+	proxy_url: string | null;
+	proxy_username: string | null;
+	/** The proxy password is write-only: only whether one is stored. */
+	has_proxy_password: boolean;
 };
 
 export type MonitorGroup = {
@@ -355,6 +370,22 @@ export function secretsMustBeReentered(edit: {
 		return SECRETS_TLS_MESSAGE;
 	}
 	return null;
+}
+
+export const PROXY_MESSAGE =
+	'Changing the proxy requires entering the passwords and header values again, or clearing them';
+
+/**
+ * Why the stored write-only secrets (header values, both passwords) cannot be
+ * kept by an edit that points the proxy somewhere else, or null when they
+ * can. Like the engine: a new proxy whose origin differs from the stored one
+ * (or a proxy added where there was none) counts; removing the proxy does not.
+ */
+export function proxyMustBeReentered(edit: { storedProxyUrl: string | null; proxyUrl: string }): string | null {
+	const next = edit.proxyUrl.trim();
+	if (next === '') return null;
+	const before = originOf(edit.storedProxyUrl);
+	return before !== null && before === originOf(next) ? null : PROXY_MESSAGE;
 }
 
 export type MonitorSection<M> = { group: MonitorGroup | null; monitors: M[] };

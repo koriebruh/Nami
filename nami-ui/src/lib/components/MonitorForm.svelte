@@ -4,12 +4,16 @@
 		BODY_METHODS,
 		DNS_RECORD_TYPES,
 		HTTP_METHODS,
+		IP_VERSIONS,
+		IP_VERSION_TYPES,
 		escapePayload,
 		isRedacted,
+		proxyMustBeReentered,
 		secretsMustBeReentered,
 		type CheckType,
 		type DnsRecordType,
 		type HttpMethod,
+		type IpVersion,
 		type Monitor,
 		type MonitorGroup
 	} from '#lib/uptime';
@@ -54,6 +58,12 @@
 	function initialVerifySsl(): boolean {
 		return monitor?.verify_ssl ?? true;
 	}
+	function initialIpVersion(): IpVersion {
+		return monitor?.ip_version ?? 'any';
+	}
+	function initialProxyUrl(): string {
+		return monitor?.proxy_url ?? '';
+	}
 	// Header values are write-only: the textarea of a replacement starts with
 	// one "Name: " line per stored header, so that every value is asked for.
 	function storedHeaderLines(): string {
@@ -69,11 +79,16 @@
 	// on them (see `secretsReason`).
 	let url = $state(initialUrl());
 	let verifySsl = $state(initialVerifySsl());
+	let ipVersion = $state<IpVersion>(initialIpVersion());
+	let proxyUrl = $state(initialProxyUrl());
 	// Edit only: what to do with the stored write-only secrets.
 	let headersAction = $state<'keep' | 'replace' | 'clear'>('keep');
 	let passwordAction = $state<'keep' | 'replace' | 'clear'>('keep');
+	let proxyPasswordAction = $state<'keep' | 'replace' | 'clear'>('keep');
 
 	const editing = $derived(monitor !== null);
+	const isHttp = $derived(checkType === 'http' || checkType === 'keyword');
+	const usesIpVersion = $derived(IP_VERSION_TYPES.includes(checkType));
 	// A viewer reads `***` for URL secrets, the body, the username and the
 	// udp payload (the engine flags the view `redacted`): that monitor is
 	// shown as it is, read-only, because saving would write the mask over the
@@ -94,12 +109,25 @@
 				})
 			: null
 	);
+	const storedProxyPassword = $derived(monitor?.has_proxy_password ?? false);
+	// Pointing the proxy elsewhere would let a stored secret travel to the new
+	// proxy: same rule, same forced re-entry. Only http and keyword checks use
+	// a proxy; the engine refuses the same edit with its own message.
+	const proxyReason = $derived(
+		editing && isHttp && (storedHeaders || storedPassword || storedProxyPassword)
+			? proxyMustBeReentered({ storedProxyUrl: monitor?.proxy_url ?? null, proxyUrl })
+			: null
+	);
+	const keepBlocked = $derived(secretsReason !== null || proxyReason !== null);
 	$effect(() => {
-		if (secretsReason === null) return;
+		if (!keepBlocked) return;
 		if (storedHeaders && headersAction === 'keep') headersAction = 'replace';
 		if (storedPassword && passwordAction === 'keep') passwordAction = 'replace';
 	});
-	const isHttp = $derived(checkType === 'http' || checkType === 'keyword');
+	$effect(() => {
+		if (proxyReason === null) return;
+		if (storedProxyPassword && proxyPasswordAction === 'keep') proxyPasswordAction = 'replace';
+	});
 	const isMail = $derived(checkType === 'smtp' || checkType === 'pop3' || checkType === 'imap');
 	const isExpiry = $derived(checkType === 'ssl_expiry' || checkType === 'domain_expiry');
 	const usesPort = $derived(['tcp', 'udp', 'ssl_expiry', 'smtp', 'pop3', 'imap'].includes(checkType));
@@ -189,6 +217,8 @@
 		{#if monitor.verify_ssl}<input type="hidden" name="initial_verify_ssl" defaultValue="on" />{/if}
 		{#if storedHeaders}<input type="hidden" name="stored_headers" defaultValue="on" />{/if}
 		{#if storedPassword}<input type="hidden" name="stored_password" defaultValue="on" />{/if}
+		<input type="hidden" name="initial_proxy_url" defaultValue={monitor.proxy_url ?? ''} />
+		{#if storedProxyPassword}<input type="hidden" name="stored_proxy_password" defaultValue="on" />{/if}
 	{/if}
 
 	<fieldset disabled={masked} class="min-w-0 space-y-5">
@@ -315,7 +345,7 @@
 						</p>
 						<div class="flex flex-wrap gap-4">
 							<label class={radio}
-								><input type="radio" name="headers_action" value="keep" bind:group={headersAction} disabled={secretsReason !== null && storedHeaders} />
+								><input type="radio" name="headers_action" value="keep" bind:group={headersAction} disabled={keepBlocked && storedHeaders} />
 								Keep</label
 							>
 							<label class={radio}><input type="radio" name="headers_action" value="replace" bind:group={headersAction} /> Replace all</label>
@@ -354,7 +384,7 @@
 										name="password_action"
 										value="keep"
 										bind:group={passwordAction}
-										disabled={secretsReason !== null && storedPassword}
+										disabled={keepBlocked && storedPassword}
 									/>
 									Keep {monitor?.has_auth_password ? '(set)' : '(none)'}
 								</label>
@@ -475,6 +505,87 @@
 					</div>
 				{/key}
 			{/if}
+		{/if}
+
+		{#if usesIpVersion}
+			<details
+				class={section}
+				open={!!(monitor && (monitor.ip_version !== 'any' || monitor.remember_cookies || monitor.proxy_url)) || undefined}
+			>
+				<summary class="cursor-pointer text-sm font-medium text-ink">Advanced</summary>
+				<div class="sm:w-1/2">
+					<label for="ip_version" class={label}>IP version</label>
+					<select id="ip_version" name="ip_version" bind:value={ipVersion} class={input}>
+						{#each IP_VERSIONS as option (option.value)}
+							<option value={option.value}>{option.label}</option>
+						{/each}
+					</select>
+					<p class={hint}>There is no fallback: with IPv6 only, a target without an IPv6 address goes Down.</p>
+				</div>
+
+				{#if isHttp}
+					<div>
+						<label class={radio}>
+							<input type="checkbox" name="remember_cookies" defaultChecked={monitor?.remember_cookies ?? false} />
+							Remember cookies during a check
+						</label>
+						<p class={hint}>Only for this check's redirects; never stored.</p>
+					</div>
+
+					<fieldset class="space-y-3">
+						<legend class={label}>HTTP proxy</legend>
+						<div>
+							<label for="proxy_url" class={label}>Proxy URL</label>
+							<input
+								id="proxy_url"
+								name="proxy_url"
+								type="url"
+								maxlength="2048"
+								placeholder="http://proxy.internal:3128"
+								bind:value={proxyUrl}
+								class={input}
+							/>
+							<p class={hint}>The proxy resolves the target, so IP version must be Any.</p>
+							{#if proxyUrl.trim() !== '' && ipVersion !== 'any'}
+								<p class="mt-1 text-xs text-warning-ink" role="status">A proxy cannot be combined with an IP version other than Any.</p>
+							{/if}
+							{#if proxyReason}
+								<p class="mt-1 text-xs text-warning-ink" role="status">
+									{proxyReason}: see Custom headers, Basic auth and the proxy password.
+								</p>
+							{/if}
+						</div>
+						<div class="grid gap-4 sm:grid-cols-2">
+							<div>
+								<label for="proxy_username" class={label}>Proxy username</label>
+								<input id="proxy_username" name="proxy_username" type="text" autocomplete="off" maxlength="256" defaultValue={monitor?.proxy_username ?? ''} class={input} />
+							</div>
+							<fieldset class="space-y-2">
+								<legend class={label}>Proxy password</legend>
+								{#if editing}
+									<div class="flex flex-wrap gap-4">
+										<label class={radio}>
+											<input
+												type="radio"
+												name="proxy_password_action"
+												value="keep"
+												bind:group={proxyPasswordAction}
+												disabled={proxyReason !== null && storedProxyPassword}
+											/>
+											Keep {monitor?.has_proxy_password ? '(set)' : '(none)'}
+										</label>
+										<label class={radio}><input type="radio" name="proxy_password_action" value="replace" bind:group={proxyPasswordAction} /> Replace</label>
+										<label class={radio}><input type="radio" name="proxy_password_action" value="clear" bind:group={proxyPasswordAction} /> Remove</label>
+									</div>
+								{/if}
+								{#if !editing || proxyPasswordAction === 'replace'}
+									<input name="proxy_password" type="password" autocomplete="new-password" maxlength="1024" aria-label="Proxy password" class={input} />
+								{/if}
+							</fieldset>
+						</div>
+					</fieldset>
+				{/if}
+			</details>
 		{/if}
 
 		<!-- Interval and confirmation are keyed on the kind of check: expiry

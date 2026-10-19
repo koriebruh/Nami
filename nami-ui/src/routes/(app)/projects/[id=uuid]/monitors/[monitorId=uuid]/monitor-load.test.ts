@@ -245,7 +245,7 @@ describe('edit page action', () => {
 				method: 'PATCH',
 				path: monitorPath,
 				search: '',
-				body: '{"name":"API","check_type":"http","group_id":null,"url":"https://example.com","http_method":"GET","request_body":null,"follow_redirects":true,"verify_ssl":true,"auth_username":null}'
+				body: '{"name":"API","check_type":"http","group_id":null,"ip_version":"any","url":"https://example.com","http_method":"GET","request_body":null,"follow_redirects":true,"verify_ssl":true,"auth_username":null,"remember_cookies":false,"proxy_url":null,"proxy_username":null}'
 			}
 		]);
 	});

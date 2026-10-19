@@ -17,7 +17,7 @@
 // says so), except the expiry threshold, which null resets to the type's
 // default.
 
-import { secretsMustBeReentered, unescapePayload } from '../uptime';
+import { IP_VERSION_TYPES, proxyMustBeReentered, secretsMustBeReentered, unescapePayload, type CheckType } from '../uptime';
 
 export type FormResult =
 	| { ok: true; payload: Record<string, unknown> }
@@ -66,6 +66,8 @@ export function monitorPayloadFromForm(form: FormData, mode: FormMode = 'create'
 		else if (mode === 'edit') payload[field] = null;
 	};
 	optional('group_id', formText(form, 'group_id'));
+
+	if (IP_VERSION_TYPES.includes(checkType as CheckType)) payload.ip_version = formText(form, 'ip_version') || 'any';
 
 	const numbers: string[] = [...COMMON_NUMBERS];
 	switch (checkType) {
@@ -172,9 +174,29 @@ function addRequestConfig(
 		payload.auth_password = null;
 	}
 
+	payload.remember_cookies = form.has('remember_cookies');
+	optional('proxy_url', formText(form, 'proxy_url'));
+	optional('proxy_username', formText(form, 'proxy_username'));
+	const proxyPassword = String(form.get('proxy_password') ?? '');
+	const proxyAction = mode === 'create' ? (proxyPassword ? 'replace' : 'keep') : formText(form, 'proxy_password_action');
+	if (proxyAction === 'replace') {
+		if (proxyPassword === '') return 'Enter the new proxy password, or keep the current one';
+		payload.proxy_password = proxyPassword;
+	} else if (proxyAction === 'clear') {
+		payload.proxy_password = null;
+	}
+
 	const keepsSecret =
 		(headersAction === 'keep' && form.get('stored_headers') === 'on') ||
 		(passwordAction === 'keep' && form.get('stored_password') === 'on');
+	const keepsProxyPassword = proxyAction === 'keep' && form.get('stored_proxy_password') === 'on';
+	if (mode === 'edit' && (keepsSecret || keepsProxyPassword)) {
+		const proxyReason = proxyMustBeReentered({
+			storedProxyUrl: formText(form, 'initial_proxy_url') || null,
+			proxyUrl: formText(form, 'proxy_url')
+		});
+		if (proxyReason) return proxyReason;
+	}
 	if (mode === 'edit' && keepsSecret) {
 		const reason = secretsMustBeReentered({
 			storedUrl: formText(form, 'initial_url') || null,
