@@ -388,3 +388,46 @@ async fn invalid_group_patches_are_rejected_and_change_nothing(pool: sqlx::PgPoo
             .unwrap();
     assert_eq!((name.as_str(), position), ("APIs", 3));
 }
+
+#[sqlx::test]
+async fn deleting_a_group_ungroups_its_heartbeats_and_monitors(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let group = seed_group(&pool, project, "Shared", 0).await;
+    let monitor = seed_http_monitor(&pool, project, "API", "https://example.com", 2).await;
+    sqlx::query("update monitors set group_id = $2 where id = $1")
+        .bind(monitor)
+        .bind(group)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, created) = call(
+        &app,
+        "POST",
+        &format!("/projects/{project}/heartbeats"),
+        Some(&member),
+        Some(json!({ "name": "Backup", "period_seconds": 60, "group_id": group })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let heartbeat: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+
+    let (status, _) = call(
+        &app,
+        "DELETE",
+        &format!("/projects/{project}/monitor-groups/{group}"),
+        Some(&admin),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(group_of(&pool, monitor).await, None);
+    let kept: Option<Uuid> = sqlx::query_scalar("select group_id from heartbeats where id = $1")
+        .bind(heartbeat)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, None, "the heartbeat survives, ungrouped");
+}
