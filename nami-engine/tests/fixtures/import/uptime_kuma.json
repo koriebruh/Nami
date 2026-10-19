@@ -1,0 +1,25 @@
+{
+  "version": "1.23.16",
+  "notificationList": [
+    { "id": 1, "name": "Ops Slack", "config": "{\"slackwebhookURL\":\"https://hooks.slack.com/services/KUMA-NOTIFY-SECRET\"}", "active": true }
+  ],
+  "proxyList": [],
+  "monitorList": [
+    { "id": 1, "name": "Website", "type": "http", "url": "https://example.com/", "method": "GET",
+      "interval": 20, "maxretries": 2, "ignoreTls": false, "maxredirects": 10, "active": true,
+      "accepted_statuscodes": ["200-299"], "timeout": 16, "upsideDown": false,
+      "headers": "{\"X-Api-Key\": \"kuma-header-secret\"}", "body": null,
+      "authMethod": "basic", "basic_auth_user": "ops", "basic_auth_pass": "kuma-basic-secret",
+      "notificationIDList": { "1": true } },
+    { "id": 2, "name": "Pricing keyword", "type": "keyword", "url": "https://example.com/pricing",
+      "method": "GET", "keyword": "Sold out", "invertKeyword": true, "interval": 60, "maxretries": 0,
+      "ignoreTls": true, "maxredirects": 0, "active": 0, "accepted_statuscodes": ["200-299", "300-399"] },
+    { "id": 3, "name": "Postgres", "type": "port", "hostname": "db.internal", "port": 5432, "interval": 30, "maxretries": 20, "active": 1 },
+    { "id": 4, "name": "Gateway", "type": "ping", "hostname": "10.0.0.1", "interval": 45, "maxretries": 1, "active": true },
+    { "id": 5, "name": "MX", "type": "dns", "hostname": "example.com", "dns_resolve_type": "MX",
+      "dns_resolve_server": "1.1.1.1", "port": 53, "interval": 300, "maxretries": 0, "active": true },
+    { "id": 6, "name": "Container", "type": "docker", "docker_container": "web", "interval": 60, "active": true },
+    { "id": 7, "name": "Upside", "type": "http", "url": "https://example.org/", "upsideDown": true, "interval": 60, "active": true },
+    { "id": 8, "name": "NTLM", "type": "http", "url": "https://intranet.test/", "authMethod": "ntlm", "interval": 60, "active": true }
+  ]
+}
