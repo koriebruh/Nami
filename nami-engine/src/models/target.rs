@@ -4,7 +4,7 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-use super::is_invisible_or_bidi_char;
+use super::has_invisible_or_bidi;
 
 /// The longest `host` a monitor may name, in characters.
 pub(crate) const MAX_HOST_CHARS: usize = 253;
@@ -25,7 +25,7 @@ const NOT_A_HOST: &str = "host must be a host name or an IP address (no scheme, 
 ///
 /// An empty host passes: wording "host is required" is up to the caller.
 pub(crate) fn check_host_text(raw: &str) -> Result<&str, String> {
-    if raw.chars().any(is_invisible_or_bidi_char) {
+    if has_invisible_or_bidi(raw) {
         return Err("host must not contain invisible or text-direction characters".into());
     }
     let host = raw.trim();

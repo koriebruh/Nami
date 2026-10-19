@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use super::is_invisible_or_bidi_char;
+use super::has_invisible_or_bidi;
 use crate::crypto::{Cipher, DecryptError, SecretString};
 
 pub const HTTP_METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
@@ -207,7 +207,7 @@ pub fn validate_username(raw: &str) -> Result<String, String> {
     if raw.contains(':') || raw.chars().any(char::is_control) {
         return Err("auth_username must not contain ':' or control characters".into());
     }
-    if raw.chars().any(is_invisible_or_bidi_char) {
+    if has_invisible_or_bidi(raw) {
         return Err("auth_username must not contain invisible or text-direction characters".into());
     }
     if raw.chars().count() > MAX_USERNAME_CHARS {
@@ -321,7 +321,7 @@ pub fn validate_proxy_url(raw: &str) -> Result<String, String> {
     const SCHEME: &str = "proxy_url must be an http:// or https:// URL";
     // Checked before trimming, like monitor URLs: `trim` would drop U+2028 at
     // the edges, and `Url::parse` silently strips tabs and newlines.
-    if raw.chars().any(is_invisible_or_bidi_char) {
+    if has_invisible_or_bidi(raw) {
         return Err("proxy_url must not contain invisible or text-direction characters".into());
     }
     let url = raw.trim();
@@ -386,7 +386,7 @@ pub fn validate_proxy_username(raw: &str) -> Result<String, String> {
     if raw.chars().any(char::is_control) {
         return Err("proxy_username must not contain control characters".into());
     }
-    if raw.chars().any(is_invisible_or_bidi_char) {
+    if has_invisible_or_bidi(raw) {
         return Err(
             "proxy_username must not contain invisible or text-direction characters".into(),
         );

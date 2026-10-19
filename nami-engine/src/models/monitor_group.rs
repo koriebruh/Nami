@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgExecutor, PgPool};
 use uuid::Uuid;
 
-use super::{ProjectQuota, validate_name};
+use super::{ProjectQuota, validate_name, with_unchanged_values};
 use crate::error::AppError;
 
 pub const MAX_POSITION: i32 = 1_000_000;
@@ -122,10 +122,12 @@ pub async fn update_in_project(
     let Some(current) = current else {
         return Ok(None);
     };
-    let (name, position) = validate(
-        patch.name.as_deref().unwrap_or(&current.name),
-        patch.position.unwrap_or(current.position),
-    )
+    let (name, position) = with_unchanged_values(vec![current.name.clone()], || {
+        validate(
+            patch.name.as_deref().unwrap_or(&current.name),
+            patch.position.unwrap_or(current.position),
+        )
+    })
     .map_err(AppError::Validation)?;
     let updated: MonitorGroup = sqlx::query_as(
         "update monitor_groups set name = $3, position = $4 where id = $1 and project_id = $2 returning *",

@@ -1,10 +1,10 @@
 pub mod heartbeat;
 pub mod incident;
+pub mod log_view;
 pub mod maintenance;
 pub mod monitor;
 pub mod monitor_group;
 pub mod monitor_request;
-pub mod log_view;
 pub mod project;
 pub mod source;
 pub mod target;
@@ -40,7 +40,7 @@ pub fn validate_label(field: &str, raw: &str) -> Result<String, String> {
     // Checked on the raw input, before trimming: U+2028 and U+2029 are
     // whitespace, so `trim` would otherwise drop them at the edges instead
     // of rejecting them.
-    if raw.chars().any(is_invisible_or_bidi_char) {
+    if has_invisible_or_bidi(raw) {
         return Err(format!(
             "{field} must not contain invisible or text-direction characters"
         ));
@@ -135,6 +135,63 @@ impl ProjectQuota {
     }
 }
 
+thread_local! {
+    /// Stored values of the row a PATCH is validated against; see
+    /// [`with_unchanged_values`].
+    static UNCHANGED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `validate` (synchronous: no await inside, so the thread-local cannot
+/// leak to another task) with `stored`, the row's current text fields, marked
+/// unchanged: a field a PATCH leaves as it is is not refused for invisible
+/// characters the rules came to reject after it was stored (the tag
+/// characters, U+FFF9-FFFB), so such a row can still be paused or edited.
+/// A field the PATCH sets to a new value is checked in full.
+pub(crate) fn with_unchanged_values<T>(stored: Vec<String>, validate: impl FnOnce() -> T) -> T {
+    let previous = UNCHANGED.with(|cell| cell.replace(stored));
+    let result = validate();
+    UNCHANGED.with(|cell| cell.replace(previous));
+    result
+}
+
+fn is_unchanged(text: &str) -> bool {
+    UNCHANGED.with(|cell| cell.borrow().iter().any(|stored| stored == text))
+}
+
+/// Whether `text` holds a character [`is_invisible_or_bidi_char`] refuses,
+/// with one exception: an emoji tag sequence (U+1F3F4, one or more tag
+/// characters U+E0020-E007E, then the terminator U+E007F) is a subdivision
+/// flag (England, Scotland, Wales) and is allowed. A tag character anywhere
+/// else is refused. A value a PATCH leaves unchanged passes (see
+/// [`with_unchanged_values`]).
+pub(crate) fn has_invisible_or_bidi(text: &str) -> bool {
+    if is_unchanged(text) {
+        return false;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\u{1F3F4}' {
+            let mut end = i + 1;
+            while end < chars.len() && ('\u{E0020}'..='\u{E007E}').contains(&chars[end]) {
+                end += 1;
+            }
+            if end > i + 1 {
+                if chars.get(end) == Some(&'\u{E007F}') {
+                    i = end + 1;
+                    continue;
+                }
+                return true;
+            }
+        }
+        if is_invisible_or_bidi_char(chars[i]) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 pub(crate) fn is_invisible_or_bidi_char(c: char) -> bool {
     matches!(
         c,
@@ -187,6 +244,43 @@ mod tests {
             chars.extend(range.map(|code| char::from_u32(code).unwrap()));
         }
         chars
+    }
+
+    #[test]
+    fn subdivision_flags_are_allowed_and_stray_tag_characters_are_not() {
+        let england = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+        assert_eq!(
+            validate_name(&format!("{england} Team")).unwrap(),
+            format!("{england} Team")
+        );
+        for bad in [
+            "a\u{E0041}b".to_string(),
+            // A sequence without its terminator, a terminator alone, tags
+            // without the flag, and a flag sequence followed by a stray tag.
+            "\u{1F3F4}\u{E0067}\u{E0062}".to_string(),
+            "\u{1F3F4}\u{E007F}".to_string(),
+            "\u{E0067}\u{E0062}\u{E007F}".to_string(),
+            format!("{england}\u{E0041}"),
+        ] {
+            assert_eq!(validate_name(&bad).unwrap_err(), INVISIBLE, "{bad:?}");
+        }
+        // The black flag alone is an ordinary emoji.
+        assert!(validate_name("\u{1F3F4} pirates").is_ok());
+    }
+
+    #[test]
+    fn an_unchanged_stored_value_is_not_refused_for_invisible_characters() {
+        let stored = "legacy\u{E0041}".to_string();
+        assert!(validate_name(&stored).is_err());
+        let checked = super::with_unchanged_values(vec![stored.clone()], || validate_name(&stored));
+        assert_eq!(checked.unwrap(), stored);
+        let other = "other\u{E0041}";
+        let checked = super::with_unchanged_values(vec![stored.clone()], || validate_name(other));
+        assert!(checked.is_err(), "a new value is checked in full");
+        assert!(
+            validate_name(&stored).is_err(),
+            "the marking ends with the closure"
+        );
     }
 
     #[test]
