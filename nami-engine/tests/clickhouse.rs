@@ -387,6 +387,12 @@ async fn every_setting_the_client_sends_on_its_own_is_refused_as_an_extra() {
     ch.insert_rows("uptime_checks", &[row(Uuid::new_v4(), now_millis(), None)])
         .await
         .unwrap();
+    // The streamed read (the log export) owns more of them.
+    let mut rows = ch
+        .stream_rows_with("SELECT 1", &[("x", "1".to_string())], &[], 1024)
+        .await
+        .unwrap();
+    assert!(rows.next_line().await.unwrap().is_none());
 
     let sent: std::collections::BTreeSet<String> = server
         .received_requests()
@@ -397,7 +403,7 @@ async fn every_setting_the_client_sends_on_its_own_is_refused_as_an_extra() {
         .filter(|name| !name.starts_with("param_"))
         .collect();
     assert!(
-        sent.len() >= 11,
+        sent.len() >= 12,
         "expected the client's own settings, got {sent:?}"
     );
     for name in sent {

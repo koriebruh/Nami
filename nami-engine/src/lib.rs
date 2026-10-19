@@ -3,6 +3,7 @@ pub mod clickhouse;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod download;
 pub mod email;
 pub mod error;
 pub mod logs;
