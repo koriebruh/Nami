@@ -62,5 +62,10 @@ mod tests {
     #[test]
     fn pattern_settings_extend_the_read_settings() {
         assert_eq!(PATTERN_SETTINGS[..2], search::READ_SETTINGS);
+        // Grouping stays bounded and approximate past a million patterns (R-P2-10).
+        assert_eq!(
+            PATTERN_SETTINGS[2..],
+            [("max_rows_to_group_by", "1000000"), ("group_by_overflow_mode", "any")]
+        );
     }
 }
