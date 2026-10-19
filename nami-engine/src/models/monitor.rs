@@ -1631,6 +1631,15 @@ fn secrets_stay_where_they_were(current: &Monitor, config: &MonitorConfig) -> Re
 /// alone does not ask for the proxy password: it only ever goes to the proxy,
 /// which did not change (`secrets_stay_where_they_were` covers the target's
 /// secrets). The message never names a header or a value.
+///
+/// Residual risk, accepted: removing a proxy keeps the target's secrets, yet
+/// it changes where the target name is resolved. Behind a proxy the proxy
+/// resolves it (in the proxy's network, with its DNS); without one the engine
+/// does. A name that meant one host to the proxy can mean another to the
+/// engine, and the next check sends the kept headers and basic auth there. The
+/// engine's own resolution still goes through `GuardedResolver`, so link-local
+/// and metadata addresses stay refused; the URL and its origin do not change,
+/// and whoever controls the engine's DNS could redirect the monitor anyway.
 fn secrets_follow_the_proxy(current: &Monitor, config: &MonitorConfig) -> Result<(), String> {
     let Some(new_proxy) = config.proxy_url.as_deref() else {
         return Ok(());

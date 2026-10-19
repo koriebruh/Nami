@@ -15,7 +15,7 @@ use super::{
     },
     tls::{self, date_of, days},
 };
-use crate::models::monitor::Monitor;
+use crate::models::monitor::{IpVersion, Monitor};
 
 pub const DEFAULT_SSL_THRESHOLD_DAYS: i32 = 14;
 pub const DEFAULT_DOMAIN_THRESHOLD_DAYS: i32 = 30;
@@ -31,7 +31,7 @@ pub(crate) async fn probe_ssl(
     let Some(port) = monitor.port.and_then(|port| u16::try_from(port).ok()) else {
         return Observation::down(None, None, "monitor has no valid port".to_string());
     };
-    let stream = match tls::connect(ctx.tls.clone(), host, port).await {
+    let stream = match tls::connect(ctx.tls.clone(), host, port, monitor.ip_version()).await {
         Ok(stream) => stream,
         Err(message) => return Observation::down(None, None, message),
     };
@@ -85,7 +85,7 @@ pub(crate) async fn probe_domain(
     // it (no custom headers, certificates verified). Same client as every
     // check: no proxy, guarded resolver, no Referer, and no timeout of its
     // own: the deadline in `perform_check` covers the whole lookup.
-    let client = ctx.http.select(true, true, false);
+    let client = ctx.http.select(true, true, false, IpVersion::Any);
     let request = client.get(url).header(
         reqwest::header::ACCEPT,
         "application/rdap+json, application/json",

@@ -3,6 +3,7 @@
 //! it, hence the blanket `dead_code` allowance.
 #![allow(dead_code)]
 
+pub mod proxy;
 pub mod tls;
 
 use std::sync::OnceLock;
@@ -17,7 +18,7 @@ use nami_engine::{
     crypto::{Cipher, SecretString, TEST_KEY},
     models::{
         monitor::Monitor,
-        monitor_request::{RequestHeader, seal_headers, seal_password},
+        monitor_request::{RequestHeader, seal_headers, seal_password, seal_proxy_password},
     },
     state::AppState,
     uptime::checker::{CheckContext, CheckOutcome, CheckStatus},
@@ -342,6 +343,28 @@ pub fn with_basic_auth(monitor: Monitor, username: &str, password: &str) -> Moni
             monitor.id,
             &SecretString::new(password),
         )),
+        ..monitor
+    }
+}
+
+/// `monitor` with this proxy and, optionally, `(username, password)` for it,
+/// the password sealed for the monitor's own id (what the API stores).
+pub fn with_proxy(monitor: Monitor, url: &str, credentials: Option<(&str, &str)>) -> Monitor {
+    let (proxy_username, proxy_password_enc) = match credentials {
+        Some((username, password)) => (
+            Some(username.to_string()),
+            Some(seal_proxy_password(
+                &test_cipher(),
+                monitor.id,
+                &SecretString::new(password),
+            )),
+        ),
+        None => (None, None),
+    };
+    Monitor {
+        proxy_url: Some(url.to_string()),
+        proxy_username,
+        proxy_password_enc,
         ..monitor
     }
 }
