@@ -37,6 +37,7 @@
 	}
 	let kind = $state<WindowKind>(initialKind());
 	let scope = $state(initialScope());
+	const savedScopeMissing = $derived(initialScope() !== '' && !monitors.some((m) => m.id === initialScope()));
 	let timezone = $state(initialTimezone());
 	// Suggestions only: the engine is the authority on what a zone is.
 	let zones = $state<string[]>(['UTC']);
@@ -101,6 +102,12 @@
 				{#each monitors as monitor (monitor.id)}
 					<option value={monitor.id}>{monitor.name}</option>
 				{/each}
+				<!-- The saved monitor stays selectable even when the monitor list
+				     failed to load or no longer has it, so saving an edit never
+				     silently widens the window to the whole project. -->
+				{#if savedScopeMissing}
+					<option value={initialScope()}>Current monitor (unlisted)</option>
+				{/if}
 			</select>
 		</div>
 	</div>

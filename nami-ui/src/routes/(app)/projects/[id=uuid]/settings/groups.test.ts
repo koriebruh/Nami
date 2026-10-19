@@ -37,6 +37,12 @@ describe('group actions', () => {
 		expect(calls()).toEqual([{ method: 'PATCH', path: `${base}/${GROUP_ID}`, search: '', body: JSON.stringify({ name: 'Core', position: 3 }) }]);
 	});
 
+	it('keeps the current position when the field is cleared on edit', async () => {
+		const { event, calls } = fakeEvent({ status: 200, body: '{}', form: { group_id: GROUP_ID, name: 'Core', position: '' } });
+		expect(await actions.updateGroup(event)).toMatchObject({ success: true });
+		expect(calls()[0].body).toBe(JSON.stringify({ name: 'Core' }));
+	});
+
 	it('shows the engine message (duplicate name)', async () => {
 		const { event } = fakeEvent({ status: 409, body: '{"error":"group name already used"}', form: { group_id: GROUP_ID, name: 'x' } });
 		expect(await actions.updateGroup(event)).toMatchObject({ status: 409, data: { message: 'group name already used' } });

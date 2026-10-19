@@ -29,12 +29,16 @@ export const load: PageServerLoad = async (event) => {
 const GROUP_MAX_POSITION = 1_000_000;
 
 /** Name and position from a group form, or the message to show. */
-function groupBody(form: FormData): { name: string; position: number } | string {
+// A blank position means 0 on create but "keep the current one" on update,
+// so clearing the field never silently moves a group to the top.
+function groupBody(form: FormData, mode: 'create' | 'update'): { name: string; position?: number } | string {
 	const position = formWholeNumber(form, 'position');
 	if (position === 'invalid' || (position !== undefined && (position < 0 || position > GROUP_MAX_POSITION))) {
 		return `Position must be a whole number from 0 to ${GROUP_MAX_POSITION}`;
 	}
-	return { name: formText(form, 'name'), position: position ?? 0 };
+	const name = formText(form, 'name');
+	if (position === undefined) return mode === 'create' ? { name, position: 0 } : { name };
+	return { name, position };
 }
 
 const groupFail = (status: number, message: string) =>
@@ -90,7 +94,7 @@ export const actions: Actions = {
 		};
 	},
 	createGroup: async (event) => {
-		const body = groupBody(await event.request.formData());
+		const body = groupBody(await event.request.formData(), 'create');
 		if (typeof body === 'string') return groupFail(400, body);
 		const response = await callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`, {
 			method: 'POST',
@@ -103,7 +107,7 @@ export const actions: Actions = {
 		const form = await event.request.formData();
 		const groupId = form.get('group_id');
 		if (!isUuid(groupId)) return groupFail(400, 'Unknown group.');
-		const body = groupBody(form);
+		const body = groupBody(form, 'update');
 		if (typeof body === 'string') return groupFail(400, body);
 		const response = await callEngine(
 			event,
