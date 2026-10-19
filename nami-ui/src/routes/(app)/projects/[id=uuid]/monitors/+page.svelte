@@ -145,6 +145,8 @@
 
 	<Card title="Monitors" subtitle="Refreshes every 30 seconds." padded={false}>
 		{#snippet actions()}
+			<a href="/projects/{data.project.id}/monitors/import" class="btn btn-secondary">Import</a>
+			<a href="/projects/{data.project.id}/monitors/import" class="btn btn-secondary">Import</a>
 			<a href="/projects/{data.project.id}/monitors/new" class="btn btn-primary">
 				<Icon name="plus" size={16} /> New monitor
 			</a>
