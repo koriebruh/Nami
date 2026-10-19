@@ -252,6 +252,11 @@ async fn put_pipeline(
     Json(payload): Json<PipelineBody>,
 ) -> Result<Json<Value>, AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
+    // 404 for a source outside this project before any CPU is spent on the
+    // rules, as the preview does.
+    source::find_in_project(&state.db, project_id, source_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
     let rules = validate_rules(payload.rules).await?;
     let updated_at = source::set_pipeline(&state.db, project_id, source_id, &rules)
         .await?

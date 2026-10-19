@@ -95,6 +95,25 @@ async fn a_source_of_another_project_is_not_found(pool: sqlx::PgPool) {
             .0,
         StatusCode::NOT_FOUND
     );
+    // The source is looked up before the rules are validated: invalid rules
+    // for a foreign or unknown source are 404, not 400.
+    let invalid = Some(json!({"rules": [{"type":"redact","regex":"("}]}));
+    let unknown = format!(
+        "/projects/{project}/sources/{}/pipeline",
+        uuid::Uuid::new_v4()
+    );
+    for target in [&uri, &unknown] {
+        let (status, body) = call(&app, "PUT", target, Some(&member), invalid.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{target}: {body}");
+    }
+    // The preview answers 404 for another project's source too.
+    let preview = Some(json!({"rules": [], "events": [{"message":"m"}]}));
+    assert_eq!(
+        call(&app, "POST", &format!("{uri}/test"), Some(&member), preview)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
     let stored: serde_json::Value =
         sqlx::query_scalar("select pipeline from sources where id = $1")
             .bind(foreign)

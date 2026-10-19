@@ -429,9 +429,15 @@ pub fn parse_rules(value: &Value) -> Result<Vec<Rule>, PipelineError> {
 
 /// serde's message, without the offending value: "invalid type: string
 /// \"…\", expected u32" would otherwise echo whatever the sender put in a
-/// wrongly typed slot, a pattern included. Unknown keys and variants keep
-/// their names (the tests and the editor rely on them).
+/// wrongly typed slot, a pattern included. Unknown keys and rule types get
+/// fixed texts too, since their names are whatever the sender wrote.
 fn serde_message(message: &str) -> String {
+    if message.starts_with("unknown variant") {
+        return "unknown rule type".to_string();
+    }
+    if message.starts_with("unknown field") {
+        return "unknown key".to_string();
+    }
     for prefix in ["invalid type", "invalid value", "invalid length"] {
         if message.starts_with(prefix) {
             return match message.rfind(", expected ") {
@@ -590,8 +596,9 @@ impl Compiler {
                 }
                 let target = target(field)?;
                 if let Target::Level = target {
-                    // Stored levels are canonical: `DEBUG` or `dbg` means `debug`.
-                    if let Some(level) = normalize::known_level(&Value::String(text.clone())) {
+                    // Stored levels are canonical: `DEBUG`, `dbg` or the
+                    // pino number 20 all mean `debug`.
+                    if let Some(level) = normalize::known_level(equals) {
                         text = level.to_string();
                     }
                 }
@@ -859,9 +866,9 @@ mod tests {
             (
                 json!([{"type":"drop","match":{"field":"a","equals":1},"extra":1}]),
                 0,
-                "extra",
+                "unknown key",
             ),
-            (json!([{"type":"explode"}]), 0, "variant"),
+            (json!([{"type":"explode"}]), 0, "unknown rule type"),
             (json!([{"type":"redact","keys":[""]}]), 0, "key"),
         ] {
             let error = rejected(value.clone());
@@ -881,7 +888,7 @@ mod tests {
 
     #[test]
     fn a_regex_that_matches_the_empty_string_is_rejected() {
-        for pattern in ["a*", "\\b", "(?:)", "x?"] {
+        for pattern in ["a*", "\\b", "(?:)", "x?", "^", "$", "a|", "(?i)a*"] {
             let error = rejected(json!([{"type":"redact","regex":pattern}]));
             assert!(error.message.contains("empty"), "{pattern}: {error}");
         }
@@ -975,6 +982,33 @@ mod tests {
         assert_eq!(
             replace_matches(&regex, "axxb").as_deref(),
             Some("a[REDACTED]b")
+        );
+    }
+
+    #[test]
+    fn a_level_condition_accepts_a_level_number() {
+        let p = rules(json!([{"type":"drop","match":{"field":"level","equals":50}}]));
+        assert!(matches!(
+            p.apply(event(json!({"message":"m","level":"error"}))),
+            Outcome::Dropped
+        ));
+        assert!(matches!(
+            p.apply(event(json!({"message":"m","level":"warn"}))),
+            Outcome::Keep(_)
+        ));
+    }
+
+    #[test]
+    fn the_regex_count_is_checked_before_compiling() {
+        let mut over: Vec<Value> = (0..MAX_REGEXES)
+            .map(|n| json!({"type":"redact","regex":format!("secret{n}")}))
+            .collect();
+        over.push(json!({"type":"drop","match":{"message_regex":"("}}));
+        let error = rejected(Value::Array(over));
+        assert_eq!(error.index, MAX_REGEXES, "{error}");
+        assert!(
+            error.message.contains("at most 20 regular expressions"),
+            "{error}"
         );
     }
 
