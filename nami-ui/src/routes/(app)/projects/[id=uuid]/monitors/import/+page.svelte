@@ -160,7 +160,7 @@
 								<tr>
 									<td class="tabular-nums">{row.line}</td>
 									<td><Badge tone={TONE[row.status]}>{statusLabel(row.status, report.dry_run)}</Badge></td>
-									<td class="wrap-anywhere">
+									<td class="min-w-[9rem]">
 										{#if row.monitor_id && !report.dry_run}
 											<a href="/projects/{data.project.id}/monitors/{row.monitor_id}" class="font-medium text-ink hover:text-primary">{row.name}</a>
 										{:else}{row.name ?? ''}{/if}
