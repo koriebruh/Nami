@@ -55,7 +55,7 @@
 	{#snippet menu()}
 		{#if exportHref}
 			<CardMenu label="Availability actions">
-				<a class="menu-item" href={exportHref} download>Export CSV</a>
+				<a class="menu-item" href={exportHref}>Export CSV</a>
 			</CardMenu>
 		{/if}
 	{/snippet}
