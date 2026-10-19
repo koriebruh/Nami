@@ -2726,7 +2726,7 @@ fn unreadable_body() -> Body {
     use tokio_stream::StreamExt;
     Body::from_stream(tokio_stream::iter([()]).map(
         |()| -> Result<axum::body::Bytes, std::io::Error> {
-            panic!("the body of a ping with an unknown token was read")
+            panic!("a ping body was read that should not have been")
         },
     ))
 }
@@ -2760,7 +2760,12 @@ async fn no_body_is_read_for_an_unknown_token(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn one_body_per_heartbeat_is_read_at_a_time(pool: sqlx::PgPool) {
-    let public = common::test_public_app(pool.clone());
+    // One database place: the slow body must not hold it while it arrives,
+    // or B's ping below would be 503.
+    let public = nami_engine::router::build_public_router_with_ping_slots(
+        AppState::for_test(pool.clone()),
+        Arc::new(Semaphore::new(1)),
+    );
     let project = seed_project(&pool).await;
     let (a, token_a) = seed_heartbeat(&pool, project, "A", 3600, 60, 0).await;
     let (_, token_b) = seed_heartbeat(&pool, project, "B", 3600, 60, 0).await;
@@ -2796,7 +2801,11 @@ async fn one_body_per_heartbeat_is_read_at_a_time(pool: sqlx::PgPool) {
         b"x".to_vec(),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "other heartbeats are unaffected");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "other heartbeats are unaffected, and no database place is held during the body read"
+    );
 
     // The slow body runs out of time: 408, and the heartbeat is unchanged.
     tokio::time::pause();
@@ -2865,4 +2874,26 @@ async fn more_than_the_burst_of_pings_per_heartbeat_is_429(pool: sqlx::PgPool) {
         .0,
         StatusCode::NOT_FOUND
     );
+}
+
+/// A heartbeat over its rate limit is turned away before its body is read.
+#[sqlx::test]
+async fn the_rate_limit_is_checked_before_any_body_is_read(pool: sqlx::PgPool) {
+    let limits = Arc::new(TokenBuckets::new(0.000_1, 1.0));
+    let public = nami_engine::router::build_public_router_with_ping_limits(
+        AppState::for_test(pool.clone()),
+        Arc::new(Semaphore::new(MAX_PINGS_IN_FLIGHT)),
+        limits,
+    );
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_heartbeat(&pool, project, "A", 3600, 60, 0).await;
+    let path = format!("/api/v1/heartbeat/{token}/fail");
+
+    // The only token of the bucket.
+    assert_eq!(ping_with(&public, &path, vec![]).await.0, StatusCode::OK);
+
+    let (status, headers, body) = ping_body(&public, &path, unreadable_body()).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(headers["retry-after"], "1");
+    assert_eq!(body, json!({ "error": "too many requests" }));
 }
