@@ -748,3 +748,57 @@ async fn a_project_has_at_most_its_maximum_number_of_sources(pool: sqlx::PgPool)
     assert_eq!(status, StatusCode::OK);
     create(&app, project, &member, json!({ "name": "again" })).await;
 }
+
+/// Security: every response that carries a token tells caches not to keep
+/// it (`Cache-Control: no-store`).
+#[sqlx::test]
+async fn token_responses_are_never_cached(pool: sqlx::PgPool) {
+    use axum::http::{Request, header};
+    use tower::ServiceExt;
+
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let send = |method: &str, uri: String, body: Option<Value>| {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::COOKIE, member.clone());
+        let body = match body {
+            Some(json) => {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+                axum::body::Body::from(json.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        let app = app.clone();
+        let request = request.body(body).unwrap();
+        async move { app.oneshot(request).await.unwrap() }
+    };
+    let created = send(
+        "POST",
+        format!("/projects/{project}/sources"),
+        Some(json!({ "name": "api" })),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(created.headers()[header::CACHE_CONTROL], "no-store");
+    let bytes = axum::body::to_bytes(created.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let source_id = id_of(&serde_json::from_slice(&bytes).unwrap());
+    for (method, path, body) in [("GET", "token", None), ("POST", "rotate", Some(json!({})))] {
+        let response = send(
+            method,
+            format!("/projects/{project}/sources/{source_id}/{path}"),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            response.headers()[header::CACHE_CONTROL],
+            "no-store",
+            "{path}"
+        );
+    }
+}
