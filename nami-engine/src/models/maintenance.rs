@@ -151,16 +151,30 @@ impl MaintenanceWindow {
     }
 }
 
-/// Whether any of `windows` (all in effect, see [`active_windows`]) covers
-/// `monitor_id`.
-pub fn covers_monitor(windows: &[MaintenanceWindow], monitor_id: Uuid) -> bool {
-    windows.iter().any(|w| w.applies_to_monitor(monitor_id))
-}
+/// The windows of one project in effect at one instant. Only
+/// [`active_windows`] hands one out (the field and the constructor are
+/// private), so the coverage questions below can never be asked of windows
+/// that were not filtered by [`MaintenanceWindow::covers`] first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ActiveWindows(Vec<MaintenanceWindow>);
 
-/// Whether any of `windows` (all in effect, see [`active_windows`]) covers
-/// the project's heartbeats.
-pub fn covers_heartbeats(windows: &[MaintenanceWindow]) -> bool {
-    windows.iter().any(MaintenanceWindow::applies_to_heartbeats)
+impl ActiveWindows {
+    /// The windows of `windows` that are in effect at `at`.
+    fn in_effect(windows: Vec<MaintenanceWindow>, at: DateTime<Utc>) -> ActiveWindows {
+        ActiveWindows(windows.into_iter().filter(|w| w.covers(at)).collect())
+    }
+
+    /// Whether one of these windows covers `monitor_id` (project-wide, or
+    /// scoped to it).
+    pub fn covers_monitor(&self, monitor_id: Uuid) -> bool {
+        self.0.iter().any(|w| w.applies_to_monitor(monitor_id))
+    }
+
+    /// Whether one of these windows covers the project's heartbeats (only a
+    /// project-wide one does).
+    pub fn covers_heartbeats(&self) -> bool {
+        self.0.iter().any(MaintenanceWindow::applies_to_heartbeats)
+    }
 }
 
 /// A window as API responses show it: `active` = in effect right now.
@@ -513,7 +527,7 @@ pub async fn active_windows<'e>(
     executor: impl PgExecutor<'e>,
     project_id: Uuid,
     at: DateTime<Utc>,
-) -> Result<Vec<MaintenanceWindow>, sqlx::Error> {
+) -> Result<ActiveWindows, sqlx::Error> {
     let windows: Vec<MaintenanceWindow> = sqlx::query_as(concat!(
         "select * from maintenance_windows where project_id = $2 and ",
         maybe_in_effect!()
@@ -522,7 +536,7 @@ pub async fn active_windows<'e>(
     .bind(project_id)
     .fetch_all(executor)
     .await?;
-    Ok(windows.into_iter().filter(|w| w.covers(at)).collect())
+    Ok(ActiveWindows::in_effect(windows, at))
 }
 
 /// Whether a window covering `monitor_id` (project-wide or scoped to it) is
@@ -866,11 +880,26 @@ mod tests {
         assert!(scoped.applies_to_monitor(monitor));
         assert!(!scoped.applies_to_monitor(Uuid::new_v4()));
         assert!(!scoped.applies_to_heartbeats());
-        let scoped_only = [scoped];
-        assert!(covers_monitor(&scoped_only, monitor));
-        assert!(!covers_monitor(&scoped_only, Uuid::new_v4()));
-        assert!(!covers_heartbeats(&scoped_only));
-        assert!(covers_heartbeats(&[project_wide]));
+        let now = Utc::now();
+        let scoped_only = ActiveWindows::in_effect(vec![scoped], now);
+        assert!(scoped_only.covers_monitor(monitor));
+        assert!(!scoped_only.covers_monitor(Uuid::new_v4()));
+        assert!(!scoped_only.covers_heartbeats());
+        assert!(ActiveWindows::in_effect(vec![project_wide.clone()], now).covers_heartbeats());
+        // Windows not in effect are dropped before any question is asked.
+        let broken = row();
+        let over = MaintenanceWindow {
+            kind: "once".to_string(),
+            days_of_week: None,
+            start_time: None,
+            end_time: None,
+            timezone: None,
+            starts_at: Some(now - TimeDelta::hours(2)),
+            ends_at: Some(now - TimeDelta::hours(1)),
+            ..project_wide
+        };
+        let inactive = ActiveWindows::in_effect(vec![broken, over], now);
+        assert!(!inactive.covers_heartbeats() && !inactive.covers_monitor(monitor));
     }
 
     fn config(kind: &str) -> WindowConfig {

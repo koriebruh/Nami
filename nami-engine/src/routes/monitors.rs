@@ -105,7 +105,7 @@ async fn list_monitors(
             .into_iter()
             .map(|monitor| {
                 let uptime_24h = uptime.get(&monitor.id).copied();
-                let in_maintenance = maintenance::covers_monitor(&windows, monitor.id);
+                let in_maintenance = windows.covers_monitor(monitor.id);
                 MonitorSummary {
                     monitor: MonitorView::new(monitor.for_reader(reader), in_maintenance),
                     uptime_24h,

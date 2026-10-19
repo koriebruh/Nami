@@ -853,10 +853,103 @@ async fn the_sweep_skips_heartbeats_of_a_project_in_maintenance(pool: sqlx::PgPo
             .unwrap();
     assert_eq!(incidents, 0);
 
-    // Once the window ends, the next sweep takes it.
+    let anchored: bool =
+        sqlx::query_scalar("select outage_anchor_at is not null from heartbeats where id = $1")
+            .bind(covered)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(anchored, "its deadline was moved to the sweep");
+
+    // Right after the window it is not down: its deadline did not run out
+    // during the window, it gets a full period (30 s) and grace (0 s).
     end_window(&pool, window).await;
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 0);
+    assert_eq!(heartbeat_status(&pool, covered).await, "pending");
+    // 29 s later: still on time.
+    pass_time(&pool, covered, 29).await;
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 0);
+    assert_eq!(heartbeat_status(&pool, covered).await, "pending");
+    // Past period + grace without a ping: down.
+    pass_time(&pool, covered, 2).await;
     assert_eq!(sweep_heartbeats(&state).await.unwrap(), 1);
     assert_eq!(heartbeat_status(&pool, covered).await, "down");
+}
+
+/// As if `seconds` had passed for heartbeat `id`: every anchor of its
+/// deadline moves that far into the past.
+async fn pass_time(pool: &sqlx::PgPool, id: Uuid, seconds: i32) {
+    sqlx::query(
+        "update heartbeats set
+             created_at = created_at - make_interval(secs => $2),
+             last_ping_at = last_ping_at - make_interval(secs => $2),
+             resumed_at = resumed_at - make_interval(secs => $2),
+             outage_anchor_at = outage_anchor_at - make_interval(secs => $2)
+         where id = $1",
+    )
+    .bind(id)
+    .bind(f64::from(seconds))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn a_heartbeat_pinging_normally_during_a_window_is_unaffected(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let public = public_app(state.clone());
+    let project = seed_project(&pool).await;
+    let token = new_token();
+    let id: Uuid = sqlx::query_scalar(
+        "insert into heartbeats (project_id, name, token, period_seconds, grace_seconds, current_status, last_ping_at)
+         values ($1, 'Cron', $2, 30, 0, 'up', now()) returning id",
+    )
+    .bind(project)
+    .bind(&token)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let window = seed_window_now(&pool, project, None).await;
+
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 0);
+    let (status, _) = call(
+        &public,
+        "POST",
+        &format!("/api/v1/heartbeat/{token}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 0);
+    let (current, anchored): (String, bool) = sqlx::query_as(
+        "select current_status, outage_anchor_at is not null from heartbeats where id = $1",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (current.as_str(), anchored),
+        ("up", false),
+        "on time: no re-anchoring"
+    );
+
+    end_window(&pool, window).await;
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 0);
+    let (status, _) = call(
+        &public,
+        "POST",
+        &format!("/api/v1/heartbeat/{token}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(heartbeat_status(&pool, id).await, "up");
+    // Its deadline runs from its last ping as always: 31 s without one, down.
+    pass_time(&pool, id, 31).await;
+    assert_eq!(sweep_heartbeats(&state).await.unwrap(), 1);
 }
 
 #[sqlx::test]

@@ -129,8 +129,13 @@ macro_rules! due_at {
 /// different heartbeats, so none is flipped (or alerted on) twice.
 ///
 /// Heartbeats of a project inside a project-wide maintenance window (judged at
-/// the transaction's `now()`, the instant the UPDATE compares against) are left
-/// as they are; once the window is over, the next sweep judges them as usual.
+/// the transaction's `now()`, the instant the UPDATE compares against) never go
+/// down, and their deadline does not run out during the window: each sweep
+/// moves the anchor of those that are overdue to `now()` (`outage_anchor_at`,
+/// the same anchor an engine outage sets), so after the window a heartbeat
+/// gets a full period and grace before it can go down. One still on time is
+/// left alone and keeps its deadline. The re-anchoring skips locked rows like
+/// the flip does; a row skipped is re-anchored by the next sweep.
 pub async fn sweep_overdue(pool: &PgPool, limit: i64) -> Result<Vec<Transition>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     // now() is the transaction's start time: the same instant the UPDATE uses.
@@ -139,6 +144,24 @@ pub async fn sweep_overdue(pool: &PgPool, limit: i64) -> Result<Vec<Transition>,
         .await?;
     let in_maintenance =
         maintenance::projects_with_heartbeats_in_maintenance(&mut *tx, now).await?;
+    if !in_maintenance.is_empty() {
+        sqlx::query(concat!(
+            "update heartbeats set outage_anchor_at = now()
+             where id in (
+                 select id from heartbeats
+                 where project_id = any($1)
+                   and not paused
+                   and current_status <> 'down'
+                   and ",
+            due_at!(),
+            " < now()
+                 for update skip locked
+             )"
+        ))
+        .bind(&in_maintenance)
+        .execute(&mut *tx)
+        .await?;
+    }
     let overdue: Vec<(Uuid, Uuid, String, i32, i32)> = sqlx::query_as(concat!(
         "update heartbeats set current_status = 'down'
          where id in (
