@@ -18,6 +18,56 @@ pub enum PingOutcome {
     Recorded { transition: Option<Transition> },
 }
 
+/// The most output a failure ping (`/fail`, a non-zero exit code) stores, and
+/// the most an incident keeps.
+pub const MAX_OUTPUT_BYTES: usize = 10 * 1024;
+
+/// The most output a success ping (plain ping, exit code 0) stores: nothing
+/// attaches it to an incident, so it gets a tenth of the failure cap.
+pub const SUCCESS_OUTPUT_MAX: usize = 1024;
+
+/// Appended to output that was cut at its cap.
+pub const TRUNCATED_MARKER: &str = "\n\u{2026}[truncated]";
+
+/// Whether `c` can reorder or hide text: the bidi embedding, override and
+/// isolate controls, the directional marks, and invisible separators.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+            // Line and paragraph separators, zero-width characters, BOM and
+            // word joiner: invisible, or they break a line unseen.
+            | '\u{2028}' | '\u{2029}' | '\u{200B}' | '\u{FEFF}' | '\u{2060}'
+    )
+}
+
+/// Turns a ping body into storable text with the failure cap
+/// ([`MAX_OUTPUT_BYTES`]); see [`sanitize_output_capped`].
+pub fn sanitize_output(body: &[u8]) -> String {
+    sanitize_output_capped(body, MAX_OUTPUT_BYTES)
+}
+
+/// Turns a ping body into storable text: invalid UTF-8 becomes U+FFFD, every
+/// control character except `\n` and `\t` (C0, DEL, C1, so no `\r` and no
+/// escape sequence) and every bidi control is dropped, and text over `max`
+/// bytes is cut at a char boundary with [`TRUNCATED_MARKER`] appended.
+/// Filtering comes first, so dropped characters never count toward the cap.
+pub fn sanitize_output_capped(body: &[u8], max: usize) -> String {
+    let mut text: String = String::from_utf8_lossy(body)
+        .chars()
+        .filter(|&c| (!c.is_control() || c == '\n' || c == '\t') && !is_bidi_control(c))
+        .collect();
+    if text.len() > max {
+        let mut cut = max;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+        text.push_str(TRUNCATED_MARKER);
+    }
+    text
+}
+
 /// A ping token's length: 32 random bytes, hex-encoded (see
 /// `models::heartbeat::insert_heartbeat`).
 pub const TOKEN_LEN: usize = 64;
@@ -108,6 +158,8 @@ pub async fn lookup_token(pool: &PgPool, token: &str) -> Result<Option<Uuid>, sq
 pub struct Recorded {
     pub heartbeat_id: Uuid,
     pub project_id: Uuid,
+    /// The transaction's `now()`: when the ping counts as received.
+    pub received_at: DateTime<Utc>,
     pub transition: Option<Transition>,
 }
 
@@ -174,6 +226,7 @@ pub async fn record_signal(
                     project_id,
                     name,
                     cause: None,
+                    details: None,
                     at: pinged_at,
                 })
             } else {
@@ -197,20 +250,31 @@ pub async fn record_signal(
                 now,
             )
             .await?;
-            opened.map(|_| Transition {
-                kind: TransitionKind::Down,
-                subject: Subject::Heartbeat(id),
-                project_id,
-                name,
-                cause: Some(cause),
-                at: now,
-            })
+            match opened {
+                Some(incident_id) => {
+                    let details = (!ping.output.is_empty()).then(|| ping.output.clone());
+                    if let Some(details) = &details {
+                        incident::attach_details(&mut tx, incident_id, details).await?;
+                    }
+                    Some(Transition {
+                        kind: TransitionKind::Down,
+                        subject: Subject::Heartbeat(id),
+                        project_id,
+                        name,
+                        cause: Some(cause),
+                        details,
+                        at: now,
+                    })
+                }
+                None => None,
+            }
         }
     };
     tx.commit().await?;
     Ok(Some(Recorded {
         heartbeat_id: id,
         project_id,
+        received_at: now,
         transition,
     }))
 }
@@ -343,6 +407,7 @@ pub async fn sweep_overdue(pool: &PgPool, limit: i64) -> Result<Vec<Transition>,
                 project_id,
                 name,
                 cause: Some(cause),
+                details: None,
                 at: now,
             });
         }
@@ -518,5 +583,89 @@ mod tests {
             PingKind::Success
         );
         assert_eq!(Ping::success().exit_code, None);
+    }
+
+    #[test]
+    fn output_keeps_text_newlines_and_tabs() {
+        assert_eq!(sanitize_output(b"line 1\n\tline 2\n"), "line 1\n\tline 2\n");
+        assert_eq!(
+            sanitize_output("gagal \u{2026} 日本語 🦀".as_bytes()),
+            "gagal \u{2026} 日本語 🦀"
+        );
+        assert_eq!(sanitize_output(b""), "");
+    }
+
+    #[test]
+    fn carriage_returns_and_escape_sequences_cannot_hide_text() {
+        assert_eq!(
+            sanitize_output(b"rm -rf done\rall good"),
+            "rm -rf doneall good"
+        );
+        assert_eq!(
+            sanitize_output(b"\x1b[8mhidden\x1b[0m ok"),
+            "[8mhidden[0m ok"
+        );
+        assert_eq!(sanitize_output(b"a\0b\x07c\x7fd"), "abcd");
+        let c1: String = ('\u{80}'..='\u{9f}').collect();
+        assert_eq!(sanitize_output(format!("x{c1}y").as_bytes()), "xy");
+    }
+
+    #[test]
+    fn direction_controls_are_removed() {
+        let text = "a\u{202A}b\u{202B}c\u{202C}d\u{202D}e\u{202E}f\u{2066}g\u{2067}h\u{2068}i\u{2069}j\u{200E}k\u{200F}l\u{061C}m";
+        assert_eq!(sanitize_output(text.as_bytes()), "abcdefghijklm");
+    }
+
+    #[test]
+    fn invisible_separators_and_zero_width_characters_are_removed() {
+        let text = "a\u{2028}b\u{2029}c\u{200B}d\u{FEFF}e\u{2060}f";
+        assert_eq!(sanitize_output(text.as_bytes()), "abcdef");
+    }
+
+    #[test]
+    fn invalid_utf8_becomes_the_replacement_character() {
+        assert_eq!(
+            sanitize_output(b"ok \xff\xfe end"),
+            "ok \u{FFFD}\u{FFFD} end"
+        );
+    }
+
+    #[test]
+    fn output_is_cut_at_ten_kib_on_a_char_boundary_with_a_marker() {
+        let exact = "a".repeat(MAX_OUTPUT_BYTES);
+        assert_eq!(sanitize_output(exact.as_bytes()), exact);
+        let over = sanitize_output("a".repeat(MAX_OUTPUT_BYTES + 1).as_bytes());
+        assert_eq!(
+            over,
+            format!("{}{TRUNCATED_MARKER}", "a".repeat(MAX_OUTPUT_BYTES))
+        );
+        // 3-byte chars: the cut never splits one, and the kept part is <= 10 KiB.
+        let wide = sanitize_output("€".repeat(MAX_OUTPUT_BYTES).as_bytes());
+        let kept = wide.strip_suffix(TRUNCATED_MARKER).unwrap();
+        assert!(kept.len() <= MAX_OUTPUT_BYTES && kept.chars().all(|c| c == '€'));
+        // Replacement characters can grow the text: still capped.
+        let invalid = sanitize_output(&vec![0xff; MAX_OUTPUT_BYTES]);
+        assert!(invalid.strip_suffix(TRUNCATED_MARKER).unwrap().len() <= MAX_OUTPUT_BYTES);
+        // Stripped characters do not count toward the cap.
+        let mut noisy = b"\r".repeat(MAX_OUTPUT_BYTES);
+        noisy.extend_from_slice(b"tail");
+        assert_eq!(sanitize_output(&noisy), "tail");
+    }
+
+    #[test]
+    fn a_success_cap_cuts_at_one_kib_with_the_same_marker() {
+        let exact = "a".repeat(SUCCESS_OUTPUT_MAX);
+        assert_eq!(
+            sanitize_output_capped(exact.as_bytes(), SUCCESS_OUTPUT_MAX),
+            exact
+        );
+        let over = sanitize_output_capped(
+            "a".repeat(SUCCESS_OUTPUT_MAX + 1).as_bytes(),
+            SUCCESS_OUTPUT_MAX,
+        );
+        assert_eq!(
+            over,
+            format!("{}{TRUNCATED_MARKER}", "a".repeat(SUCCESS_OUTPUT_MAX))
+        );
     }
 }

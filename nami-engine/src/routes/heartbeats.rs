@@ -6,13 +6,14 @@ use std::{
 use axum::{
     Extension, Json, Router,
     body::{Body, HttpBody},
-    extract::{Path, Request, State, rejection::PathRejection},
+    extract::{Path, Query, Request, State, rejection::PathRejection},
     http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::Utc;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -31,8 +32,10 @@ use crate::{
     uptime::{
         alerts,
         heartbeat::{
-            Ping, PingKind, is_well_formed_token, lookup_token, parse_signal, record_signal,
+            MAX_OUTPUT_BYTES, Ping, PingKind, SUCCESS_OUTPUT_MAX, is_well_formed_token,
+            lookup_token, parse_signal, record_signal, sanitize_output_capped,
         },
+        pings::{self, HeartbeatPingRow},
     },
 };
 
@@ -54,6 +57,45 @@ pub fn router() -> Router<AppState> {
             "/projects/{id}/heartbeats/{heartbeat_id}/rotate-token",
             post(rotate_heartbeat_token),
         )
+        .route(
+            "/projects/{id}/heartbeats/{heartbeat_id}/pings",
+            get(list_pings),
+        )
+}
+
+/// `GET .../pings?limit=`: the default when `limit` is absent. A `limit`
+/// outside `MIN_PINGS_LIMIT..=MAX_PINGS_LIMIT` is clamped into it.
+pub const DEFAULT_PINGS_LIMIT: u32 = 50;
+const MIN_PINGS_LIMIT: u32 = 1;
+const MAX_PINGS_LIMIT: u32 = 100;
+
+/// How long a ping waits for ClickHouse to store its row. The ping itself
+/// (state, incident, alert) is already committed: a slow or failing
+/// ClickHouse only loses the log row.
+const PING_LOG_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Deserialize)]
+struct PingsQuery {
+    limit: Option<u32>,
+}
+
+async fn list_pings(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<PingsQuery>,
+) -> Result<Json<Vec<HeartbeatPingRow>>, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    heartbeat::find_in_project(&state.db, project_id, heartbeat_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_PINGS_LIMIT)
+        .clamp(MIN_PINGS_LIMIT, MAX_PINGS_LIMIT);
+    Ok(Json(
+        pings::recent_pings(&state.clickhouse, project_id, heartbeat_id, limit).await?,
+    ))
 }
 
 /// How many pings may be handled at once. The endpoint is public and needs no
@@ -329,6 +371,13 @@ async fn handle_ping(
         return Ok(too_many());
     }
 
+    // A success ping keeps little output (nothing attaches it to an incident);
+    // a failure ping keeps the full cap.
+    let output_cap = match kind {
+        PingKind::Success => SUCCESS_OUTPUT_MAX,
+        PingKind::Fail => MAX_OUTPUT_BYTES,
+    };
+    let mut output = String::new();
     if body.size_hint().exact() != Some(0) {
         let Some(_reading) = guards.bodies_per_heartbeat.try_enter(heartbeat_id) else {
             return Ok(too_many());
@@ -336,31 +385,55 @@ async fn handle_ping(
         let Ok(_body_slot) = guards.body_slots.try_acquire() else {
             return Ok(busy());
         };
-        // Read, bounded, and not stored yet (NAMI-UP-21 stores the output).
         match read_body(body).await {
-            Ok(_output) => {}
+            Ok(bytes) => output = sanitize_output_capped(&bytes, output_cap),
             Err(reply) => return Ok(*reply),
         }
     }
 
-    let recorded = {
+    let (ping, recorded) = {
         let Ok(_slot) = guards.slots.try_acquire() else {
             return Ok(busy());
         };
         let ping = Ping {
             kind,
             exit_code,
-            output: String::new(),
+            output,
         };
-        record_signal(&state.db, &token, &ping)
+        let recorded = record_signal(&state.db, &token, &ping)
             .await?
-            .ok_or(AppError::NotFound)?
+            .ok_or(AppError::NotFound)?;
+        (ping, recorded)
+    };
+    let row = HeartbeatPingRow {
+        heartbeat_id: recorded.heartbeat_id,
+        project_id: recorded.project_id,
+        received_at: recorded.received_at,
+        kind: ping.kind,
+        exit_code: ping.exit_code,
+        output: ping.output,
     };
     if let Some(transition) = recorded.transition {
         // A cron job is waiting on this response: deliver the alert in the
         // background.
         let state = state.clone();
         tokio::spawn(async move { alerts::notify_transition(&state, &transition).await });
+    }
+    // After the record slot is dropped, so a slow ClickHouse never holds one.
+    match tokio::time::timeout(
+        PING_LOG_TIMEOUT,
+        pings::insert_ping(&state.clickhouse, &row),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        // Never the token: only ids.
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, heartbeat_id = %row.heartbeat_id, "heartbeat ping not recorded in ClickHouse");
+        }
+        Err(_) => {
+            tracing::warn!(heartbeat_id = %row.heartbeat_id, "heartbeat ping not recorded in ClickHouse (timeout)");
+        }
     }
     Ok(Json(json!({ "ok": true })).into_response())
 }

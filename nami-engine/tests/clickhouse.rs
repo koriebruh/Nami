@@ -158,6 +158,7 @@ async fn migrate_is_idempotent() {
     assert_eq!(
         tables,
         vec![
+            serde_json::json!({ "name": "heartbeat_pings" }),
             serde_json::json!({ "name": "logs" }),
             serde_json::json!({ "name": "uptime_checks" })
         ]
@@ -237,6 +238,7 @@ async fn query_rows_is_read_only_so_ddl_and_writes_fail_on_the_read_path() {
     assert_eq!(
         tables,
         vec![
+            serde_json::json!({ "name": "heartbeat_pings" }),
             serde_json::json!({ "name": "logs" }),
             serde_json::json!({ "name": "uptime_checks" })
         ]

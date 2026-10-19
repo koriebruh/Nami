@@ -57,3 +57,32 @@ async fn incidents_are_indexed_by_their_source(pool: sqlx::PgPool) {
         "{monitor}"
     );
 }
+
+/// Incidents carry the output of the heartbeat ping that opened them, capped
+/// in the database too.
+#[sqlx::test]
+async fn incidents_have_a_bounded_details_column(pool: sqlx::PgPool) {
+    let columns: Vec<(String,)> = sqlx::query_as(
+        "select column_name from information_schema.columns
+         where table_schema = 'public' and table_name = 'incidents' and column_name = 'details'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(columns.len(), 1);
+    let project = common_project(&pool).await;
+    let too_long = sqlx::query(
+        "insert into incidents (project_id, title, details) values ($1, 't', repeat('a', 10241 + 16))",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await;
+    assert!(too_long.is_err(), "details beyond the cap must be refused");
+}
+
+async fn common_project(pool: &sqlx::PgPool) -> uuid::Uuid {
+    sqlx::query_scalar("insert into projects (name, slug) values ('p', 'p') returning id")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}

@@ -218,6 +218,7 @@ pub async fn apply_outcome(
                     project_id: state.project_id,
                     name: state.name,
                     cause: None,
+                    details: None,
                     at: outcome.checked_at,
                 })
             } else {
@@ -261,6 +262,7 @@ pub async fn apply_outcome(
                     project_id: state.project_id,
                     name: state.name,
                     cause,
+                    details: None,
                     at: outcome.checked_at,
                 })
             } else {
