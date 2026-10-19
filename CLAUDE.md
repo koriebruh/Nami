@@ -120,3 +120,21 @@ task review — disclose this in every PR description.
   (`SaiNanamii`, `koriebruh`). This repo requires `koriebruh` (owner) —
   check `gh auth status` and `gh auth switch -h github.com -u koriebruh`
   before pushing/opening PRs if a push gets a 403.
+
+## UI conventions
+
+- Visual reference: `docs/superpowers/design/ui-reference-atom.png` (light
+  "Atom" dashboard: grey-blue canvas, white cards, indigo primary, cyan and
+  periwinkle accents, thin large headings, icon sidebar).
+- All UI must use the design tokens in `nami-ui/src/routes/layout.css`
+  (`@theme`: `canvas`, `surface`, `ink`, `muted`, `primary`, `success`/
+  `danger`/`warning`/`info` with AA `-ink` and `-soft` variants, `status-*`
+  for up/down/pending/paused/maintenance) and the components in
+  `nami-ui/src/lib/components/ui/` (AppShell, Card, PageHeader,
+  SegmentedTabs, StatCard, Sparkline, Legend, Badge, Button, Input, Select,
+  EmptyState, Icon). Form controls that need raw attributes use the
+  primitive classes (`.input`, `.select`, `.btn .btn-primary|secondary|ghost|danger`,
+  `.alert-*`, `.badge-*`, `.table`). Never use raw hex values or Tailwind's
+  stock palette in pages.
+- No CDN assets: Inter is self-hosted via `@fontsource-variable/inter`;
+  icons are inline SVG (`Icon.svelte`).
