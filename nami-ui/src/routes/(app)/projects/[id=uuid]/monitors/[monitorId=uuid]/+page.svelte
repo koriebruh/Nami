@@ -189,7 +189,7 @@
 	</Card>
 
 	<div class="grid gap-6 xl:grid-cols-5">
-		<Card title="Recent checks" titleTag="h3" padded={false} class="xl:col-span-3">
+		<Card title="Recent checks" titleTag="h3" padded={false} class="min-w-0 xl:col-span-3">
 			{#if data.checks.length === 0}
 				<EmptyState icon="clock" message="No checks yet." />
 			{:else}
@@ -223,7 +223,7 @@
 			{/if}
 		</Card>
 
-		<Card title="Incidents" titleTag="h3" padded={false} class="xl:col-span-2">
+		<Card title="Incidents" titleTag="h3" padded={false} class="min-w-0 xl:col-span-2">
 			{#if data.incidents.length === 0}
 				<EmptyState icon="incident" message="No incidents." />
 			{:else}
