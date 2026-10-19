@@ -106,7 +106,8 @@
 {/snippet}
 
 {#snippet nav(showLabel: boolean)}
-	<nav aria-label="Main" class="flex flex-1 flex-col gap-1 overflow-y-auto px-3 py-2">
+	<!-- Collapsed, the nav must not clip: its tooltips overflow to the right. -->
+	<nav aria-label="Main" class="flex flex-1 flex-col gap-1 px-3 py-2 {showLabel ? 'overflow-y-auto' : ''}">
 		{#each mainItems as item (item.href)}{@render navLink(item, showLabel)}{/each}
 		{#if project}
 			<div class="my-2 border-t border-border"></div>
