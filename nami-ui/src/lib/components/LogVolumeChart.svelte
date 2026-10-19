@@ -120,7 +120,7 @@
 			height={HEIGHT}
 			role="img"
 			aria-label="Log volume over the selected time range, stacked by errors, warnings and other levels"
-			class="block cursor-pointer rounded-md peer-focus-visible:ring-2 peer-focus-visible:ring-primary/40"
+			class="block cursor-pointer rounded-md peer-focus-visible:ring-2 peer-focus-visible:ring-primary"
 			onpointermove={onPointerMove}
 			onpointerleave={() => (hoverIndex = null)}
 			onclick={() => select(hoverIndex)}

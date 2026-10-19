@@ -3,8 +3,9 @@
 	// hamburger widens it on desktop and opens it as a drawer on mobile) and a
 	// top bar with the current context, the incidents bell and the user menu.
 	// Inside a project the sidebar adds the project's sections.
-	import type { Snippet } from 'svelte';
+	import { tick, untrack, type Snippet } from 'svelte';
 	import { page } from '$app/state';
+	import { dismissible } from './dismiss';
 	import Brand from './Brand.svelte';
 	import Icon, { type IconName } from './Icon.svelte';
 
@@ -52,24 +53,54 @@
 	let expanded = $state(false);
 	let drawerOpen = $state(false);
 	let userMenuOpen = $state(false);
+	let toggleButton = $state<HTMLButtonElement>();
+	let drawerClose = $state<HTMLButtonElement>();
+
+	// The mobile drawer is a modal dialog: opening it moves focus into it and
+	// makes the page behind inert; closing it (Escape, the scrim, the close
+	// button or a link) returns focus to the toggle.
+	async function openDrawer() {
+		drawerOpen = true;
+		await tick();
+		drawerClose?.focus();
+	}
+
+	async function closeDrawer() {
+		if (!drawerOpen) return;
+		drawerOpen = false;
+		// The toggle sits in the inert page until the DOM has updated.
+		await tick();
+		toggleButton?.focus();
+	}
 
 	// A navigation closes the drawer and the user menu.
 	$effect(() => {
 		void pathname;
-		drawerOpen = false;
-		userMenuOpen = false;
+		untrack(() => {
+			void closeDrawer();
+			userMenuOpen = false;
+		});
+	});
+
+	// Growing past the mobile breakpoint hides the drawer: close it so the
+	// page does not stay inert behind a drawer nobody can see.
+	$effect(() => {
+		const wide = window.matchMedia('(min-width: 768px)');
+		const onchange = () => {
+			if (wide.matches) void closeDrawer();
+		};
+		wide.addEventListener('change', onchange);
+		return () => wide.removeEventListener('change', onchange);
 	});
 
 	function toggle() {
 		if (window.matchMedia('(min-width: 768px)').matches) expanded = !expanded;
-		else drawerOpen = !drawerOpen;
+		else if (drawerOpen) void closeDrawer();
+		else void openDrawer();
 	}
 
 	function onkeydown(event: KeyboardEvent) {
-		if (event.key === 'Escape') {
-			drawerOpen = false;
-			userMenuOpen = false;
-		}
+		if (event.key === 'Escape' && drawerOpen) void closeDrawer();
 	}
 
 	const initials = $derived(user.email.slice(0, 2).toUpperCase());
@@ -84,7 +115,7 @@
 		aria-current={item.active ? 'page' : undefined}
 		class="group relative flex h-10 items-center gap-3 rounded-control px-3 text-sm transition-colors {item.active
 			? 'bg-primary-soft text-primary'
-			: 'text-faint hover:bg-surface hover:text-primary'}"
+			: 'text-muted hover:bg-surface hover:text-primary'}"
 	>
 		{#if item.active}
 			<span class="absolute top-2 bottom-2 -left-3 w-0.5 rounded-full bg-primary" aria-hidden="true"></span>
@@ -141,33 +172,42 @@
 		{@render nav(expanded)}
 	</aside>
 
-	<!-- Mobile drawer -->
-	{#if drawerOpen}
-		<button
-			type="button"
-			class="fixed inset-0 z-40 bg-ink/30 md:hidden"
-			aria-label="Close menu"
-			onclick={() => (drawerOpen = false)}
+	<!-- Mobile drawer: always rendered (aria-controls points at it), hidden
+	     and inert while closed. -->
+	<div
+		id="app-drawer"
+		role="dialog"
+		aria-modal="true"
+		aria-label="Navigation"
+		hidden={!drawerOpen}
+		inert={!drawerOpen}
+		class="md:hidden"
+	>
+		<button type="button" tabindex="-1" class="fixed inset-0 z-40 bg-ink/30" aria-label="Close menu" onclick={closeDrawer}
 		></button>
-		<aside
-			id="app-drawer"
-			class="fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-border bg-canvas shadow-pop md:hidden"
-		>
+		<aside class="fixed inset-y-0 left-0 z-50 flex w-64 flex-col border-r border-border bg-canvas shadow-pop">
 			<div class="flex h-16 items-center justify-between px-5">
 				<a href="/" aria-label="nami home"><Brand /></a>
-				<button type="button" class="btn btn-ghost px-2" aria-label="Close menu" onclick={() => (drawerOpen = false)}>
+				<button
+					type="button"
+					bind:this={drawerClose}
+					class="btn btn-ghost px-2"
+					aria-label="Close menu"
+					onclick={closeDrawer}
+				>
 					<Icon name="close" />
 				</button>
 			</div>
 			{@render nav(true)}
 		</aside>
-	{/if}
+	</div>
 
-	<div class="transition-[padding] {expanded ? 'md:pl-56' : 'md:pl-[72px]'}">
+	<div class="transition-[padding] {expanded ? 'md:pl-56' : 'md:pl-[72px]'}" inert={drawerOpen}>
 		<header class="sticky top-0 z-20 border-b border-border/70 bg-canvas/90 backdrop-blur">
 			<div class="mx-auto flex h-16 max-w-7xl items-center gap-3 px-4 sm:px-6 lg:px-8">
 				<button
 					type="button"
+					bind:this={toggleButton}
 					class="btn btn-ghost -ml-2 px-2"
 					aria-label="Toggle navigation"
 					aria-controls="app-drawer"
@@ -182,7 +222,7 @@
 				<nav aria-label="Breadcrumb" class="hidden min-w-0 items-center gap-1.5 text-sm sm:flex">
 					<a href="/projects" class="text-muted hover:text-primary">Projects</a>
 					{#if project}
-						<Icon name="chevronRight" size={14} class="text-faint" />
+						<Icon name="chevronRight" size={14} class="text-muted" />
 						<a href="/projects/{project.id}" class="truncate font-medium text-ink hover:text-primary">{project.name}</a>
 					{/if}
 				</nav>
@@ -199,7 +239,7 @@
 						</a>
 					{/if}
 
-					<details class="relative" bind:open={userMenuOpen}>
+					<details class="relative" bind:open={userMenuOpen} use:dismissible>
 						<summary
 							class="flex cursor-pointer list-none items-center gap-2.5 rounded-full py-1 pr-1 pl-1 hover:bg-surface sm:pr-2 [&::-webkit-details-marker]:hidden"
 							aria-label="Account menu"
@@ -219,14 +259,11 @@
 								<span class="badge badge-primary mt-1">{user.global_role}</span>
 							</div>
 							<div class="my-1 border-t border-border"></div>
-							<a href="/security" class="flex items-center gap-2 rounded-control px-3 py-2 text-ink-2 hover:bg-primary-soft hover:text-primary">
+							<a href="/security" class="menu-item">
 								<Icon name="shield" size={16} /> Security
 							</a>
 							<form method="POST" action="/logout">
-								<button
-									type="submit"
-									class="flex w-full items-center gap-2 rounded-control px-3 py-2 text-left text-ink-2 hover:bg-danger-soft hover:text-danger-ink"
-								>
+								<button type="submit" class="menu-item menu-item-danger">
 									<Icon name="logout" size={16} /> Log out
 								</button>
 							</form>

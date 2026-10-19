@@ -1,7 +1,9 @@
 <script lang="ts">
 	// A dependency-free SVG sparkline. Null values are gaps; the line breaks
-	// there instead of interpolating. Decorative unless `label` is given.
-	import { TONE_VAR, type Tone } from './tones';
+	// there instead of interpolating. With fewer than two finite points there
+	// is no trend to draw: a flat baseline is shown instead. Decorative
+	// unless `label` is given.
+	import { finitePoints, TONE_VAR, type Tone } from './tones';
 
 	let {
 		values,
@@ -20,7 +22,8 @@
 	} = $props();
 
 	const PAD = 2;
-	const gradientId = `spark-${Math.random().toString(36).slice(2, 9)}`;
+	const uid = $props.id();
+	const gradientId = `spark-${uid}`;
 
 	const known = $derived(values.filter((v): v is number => v !== null && Number.isFinite(v)));
 	const min = $derived(known.length ? Math.min(...known) : 0);
@@ -70,6 +73,9 @@
 			<stop offset="100%" stop-color={TONE_VAR[tone]} stop-opacity="0" />
 		</linearGradient>
 	</defs>
+	{#if finitePoints(values) < 2}
+		<line x1={PAD} x2={width - PAD} y1={height / 2} y2={height / 2} stroke="var(--color-border-strong)" stroke-width="1.5" stroke-dasharray="3 3" />
+	{:else}
 	{#each runs as run (run[0].i)}
 		{#if run.length === 1}
 			<circle cx={x(run[0].i)} cy={y(run[0].v)} r="1.75" fill={TONE_VAR[tone]} />
@@ -85,4 +91,5 @@
 			/>
 		{/if}
 	{/each}
+	{/if}
 </svg>

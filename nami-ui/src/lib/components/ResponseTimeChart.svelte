@@ -116,7 +116,7 @@
 		height={HEIGHT}
 		role="img"
 		aria-label="Average response time per 30 minutes over the last 24 hours"
-		class="block rounded-md peer-focus-visible:ring-2 peer-focus-visible:ring-primary/40"
+		class="block rounded-md peer-focus-visible:ring-2 peer-focus-visible:ring-primary"
 		onpointermove={onPointerMove}
 		onpointerleave={() => (hoverIndex = null)}
 	>

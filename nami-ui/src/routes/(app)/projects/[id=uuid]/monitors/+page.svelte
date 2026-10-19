@@ -57,7 +57,17 @@
 
 {#snippet table(monitors: typeof data.monitors)}
 	<div class="overflow-x-auto">
-		<table class="table table-hover">
+		<!-- Fixed layout with one shared colgroup: the columns line up across
+		     the group tables. -->
+		<table class="table table-hover min-w-[56rem] table-fixed">
+			<colgroup>
+				<col class="w-[11rem]" />
+				<col class="w-[14rem]" />
+				<col class="w-[6.5rem]" />
+				<col />
+				<col class="w-[12rem]" />
+				<col class="w-[8.5rem]" />
+			</colgroup>
 			<thead>
 				<tr>
 					<th>Status</th>
@@ -80,11 +90,12 @@
 						<td>
 							<a
 								href="/projects/{data.project.id}/monitors/{monitor.id}"
-								class="font-medium whitespace-nowrap text-ink hover:text-primary">{monitor.name}</a
+								title={monitor.name}
+								class="block truncate font-medium text-ink hover:text-primary">{monitor.name}</a
 							>
 						</td>
 						<td class="whitespace-nowrap">{CHECK_TYPE_LABELS[monitor.check_type]}</td>
-						<td class="max-w-xs truncate font-mono text-xs" title={monitorTarget(monitor)}>
+						<td class="truncate font-mono text-xs" title={monitorTarget(monitor)}>
 							{monitorTarget(monitor)}
 						</td>
 						<td>
@@ -108,25 +119,20 @@
 
 <div class="space-y-6">
 	{#if data.monitors.length > 0}
-		<StatStrip label="Monitor summary">
+		<!-- Shares are a snapshot, not a trend: plain hint text, no arrows. -->
+		<StatStrip label="Monitor summary" cols={5}>
 			<StatCard label="Monitors" value={String(kpi.total)} hint="{data.groups.length} group{data.groups.length === 1 ? '' : 's'}" />
 			<StatCard
 				label="Up"
 				value={String(kpi.up)}
 				valueTone={kpi.up > 0 ? 'success' : undefined}
-				delta={kpi.share(kpi.up)}
-				direction="up"
-				deltaTone="success"
-				hint="of all monitors"
+				hint="{kpi.share(kpi.up)} of all monitors"
 			/>
 			<StatCard
 				label="Down"
 				value={String(kpi.down)}
 				valueTone={kpi.down > 0 ? 'danger' : undefined}
-				delta={kpi.share(kpi.down)}
-				direction="down"
-				deltaTone={kpi.down > 0 ? 'danger' : 'neutral'}
-				hint={kpi.down > 0 ? 'need attention' : 'all clear'}
+				hint="{kpi.share(kpi.down)} of all monitors"
 			/>
 			<StatCard
 				label="Paused"

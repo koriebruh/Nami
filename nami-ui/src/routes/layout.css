@@ -25,7 +25,8 @@
 	--color-ink: #1b2559;
 	--color-ink-2: #47548c;
 	--color-muted: #5f6b8f;
-	--color-faint: #8b95b4;
+	/* faint: decorative text and functional icons, >= 3:1 on canvas and surface */
+	--color-faint: #7a85a6;
 
 	/* Brand */
 	--color-primary: #3a4fd8;
@@ -40,6 +41,7 @@
 	--color-success-soft: #e7f7ef;
 	--color-danger: #e5484d;
 	--color-danger-ink: #c42a3f;
+	--color-danger-ink-hover: #a82235;
 	--color-danger-soft: #fdeef0;
 	--color-warning: #f5a524;
 	--color-warning-ink: #9a5b00;
@@ -47,6 +49,14 @@
 	--color-info: #0ea5e9;
 	--color-info-ink: #0b6a8f;
 	--color-info-soft: #e6f6fc;
+
+	/* Categorical series, in order, for multi-series charts (seriesColor(i)) */
+	--color-series-1: #3a4fd8;
+	--color-series-2: #31c3f0;
+	--color-series-3: #8e9bf5;
+	--color-series-4: #1f2d8a;
+	--color-series-5: #e8a33d;
+	--color-series-6: #d85fa8;
 
 	/* Uptime status: up / down / pending / paused / maintenance */
 	--color-status-up: var(--color-success);
@@ -116,7 +126,7 @@ body {
 
 	/* Buttons */
 	.btn {
-		@apply inline-flex items-center justify-center gap-1.5 rounded-control border px-3.5 py-2 text-sm font-medium whitespace-nowrap transition-colors focus-visible:ring-2 focus-visible:ring-primary/40 focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50;
+		@apply inline-flex items-center justify-center gap-1.5 rounded-control border px-3.5 py-2 text-sm font-medium whitespace-nowrap transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50;
 	}
 	.btn-sm {
 		@apply px-2.5 py-1 text-xs;
@@ -134,7 +144,7 @@ body {
 		@apply border-danger-ink/30 bg-surface text-danger-ink hover:border-danger-ink hover:bg-danger-soft;
 	}
 	.btn-danger-solid {
-		@apply border-danger-ink bg-danger-ink text-white hover:bg-[#a82235];
+		@apply border-danger-ink bg-danger-ink text-white hover:bg-danger-ink-hover;
 	}
 
 	/* Form controls */
@@ -229,6 +239,14 @@ body {
 		@apply rounded-control border border-border bg-surface-2 px-3 py-2 font-mono text-xs text-ink-2;
 	}
 
+	/* Menu items (CardMenu, user menu): links and buttons, form buttons included */
+	.menu-item {
+		@apply flex w-full items-center gap-2 rounded-control px-3 py-2 text-left text-sm text-ink-2 transition-colors hover:bg-primary-soft hover:text-primary focus-visible:bg-primary-soft focus-visible:text-primary;
+	}
+	.menu-item-danger {
+		@apply hover:bg-danger-soft hover:text-danger-ink focus-visible:bg-danger-soft focus-visible:text-danger-ink;
+	}
+
 	/* Disclosure summaries (native <details>) */
 	.summary {
 		@apply cursor-pointer text-sm text-muted select-none hover:text-primary;
@@ -250,7 +268,7 @@ body {
 
 /* Visible keyboard focus everywhere, without a ring on mouse clicks. */
 :where(a, button, summary, [tabindex]):not(.btn):focus-visible {
-	outline: 2px solid color-mix(in srgb, var(--color-primary) 55%, transparent);
+	outline: 2px solid var(--color-primary);
 	outline-offset: 2px;
 	border-radius: 4px;
 }
