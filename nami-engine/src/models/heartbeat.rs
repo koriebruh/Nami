@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::validate_name;
+use super::{monitor_group, nullable, validate_name};
 use crate::error::AppError;
 
 /// The longest a heartbeat's period, or its grace, may be: 31 days.
@@ -36,6 +36,8 @@ pub struct Heartbeat {
     /// only the sweep reads, see `uptime::heartbeat::note_worker_alive`).
     pub resumed_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// A `monitor_groups` row of the same project, or ungrouped.
+    pub group_id: Option<Uuid>,
 }
 
 impl fmt::Debug for Heartbeat {
@@ -53,6 +55,7 @@ impl fmt::Debug for Heartbeat {
             last_ping_at,
             resumed_at,
             created_at,
+            group_id,
         } = self;
         f.debug_struct("Heartbeat")
             .field("id", id)
@@ -66,6 +69,7 @@ impl fmt::Debug for Heartbeat {
             .field("last_ping_at", last_ping_at)
             .field("resumed_at", resumed_at)
             .field("created_at", created_at)
+            .field("group_id", group_id)
             .finish()
     }
 }
@@ -87,6 +91,7 @@ impl Heartbeat {
             last_ping_at,
             resumed_at: _,
             created_at,
+            group_id,
         } = self;
         HeartbeatView {
             id,
@@ -100,6 +105,7 @@ impl Heartbeat {
             last_ping_at,
             created_at,
             in_maintenance,
+            group_id,
         }
     }
 }
@@ -123,6 +129,8 @@ pub struct HeartbeatView {
     /// Whether a project-wide maintenance window covers it right now: pings
     /// are recorded but its state is frozen (see `uptime::heartbeat`).
     pub in_maintenance: bool,
+    /// The project's monitor group this heartbeat is listed under, if any.
+    pub group_id: Option<Uuid>,
 }
 
 impl fmt::Debug for HeartbeatView {
@@ -139,6 +147,7 @@ impl fmt::Debug for HeartbeatView {
             last_ping_at,
             created_at,
             in_maintenance,
+            group_id,
         } = self;
         f.debug_struct("HeartbeatView")
             .field("id", id)
@@ -152,6 +161,7 @@ impl fmt::Debug for HeartbeatView {
             .field("last_ping_at", last_ping_at)
             .field("created_at", created_at)
             .field("in_maintenance", in_maintenance)
+            .field("group_id", group_id)
             .finish()
     }
 }
@@ -163,6 +173,7 @@ pub struct HeartbeatConfig {
     pub period_seconds: i32,
     pub grace_seconds: i32,
     pub paused: bool,
+    pub group_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +184,8 @@ pub struct CreateHeartbeatRequest {
     pub grace_seconds: i32,
     #[serde(default)]
     pub paused: bool,
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
 }
 
 fn default_grace_seconds() -> i32 {
@@ -186,6 +199,7 @@ impl CreateHeartbeatRequest {
             period_seconds: self.period_seconds,
             grace_seconds: self.grace_seconds,
             paused: self.paused,
+            group_id: self.group_id,
         }
     }
 }
@@ -196,6 +210,9 @@ pub struct PatchHeartbeatRequest {
     pub period_seconds: Option<i32>,
     pub grace_seconds: Option<i32>,
     pub paused: Option<bool>,
+    /// Omitted keeps the group, `null` ungroups, a value regroups.
+    #[serde(default, deserialize_with = "nullable")]
+    pub group_id: Option<Option<Uuid>>,
 }
 
 impl PatchHeartbeatRequest {
@@ -205,6 +222,7 @@ impl PatchHeartbeatRequest {
             period_seconds: self.period_seconds.unwrap_or(base.period_seconds),
             grace_seconds: self.grace_seconds.unwrap_or(base.grace_seconds),
             paused: self.paused.unwrap_or(base.paused),
+            group_id: self.group_id.unwrap_or(base.group_id),
         }
     }
 }
@@ -243,8 +261,8 @@ pub async fn insert_heartbeat(
     c: &HeartbeatConfig,
 ) -> Result<Heartbeat, sqlx::Error> {
     sqlx::query_as(
-        "insert into heartbeats (project_id, name, token, period_seconds, grace_seconds, paused)
-         values ($1, $2, $3, $4, $5, $6)
+        "insert into heartbeats (project_id, name, token, period_seconds, grace_seconds, paused, group_id)
+         values ($1, $2, $3, $4, $5, $6, $7)
          returning *",
     )
     .bind(project_id)
@@ -253,6 +271,7 @@ pub async fn insert_heartbeat(
     .bind(c.period_seconds)
     .bind(c.grace_seconds)
     .bind(c.paused)
+    .bind(c.group_id)
     .fetch_one(pool)
     .await
 }
@@ -301,18 +320,27 @@ pub async fn update_in_project(
         return Ok(None);
     };
     let was_paused = current.paused;
+    let previous_group = current.group_id;
     let base = HeartbeatConfig {
         name: current.name,
         period_seconds: current.period_seconds,
         grace_seconds: current.grace_seconds,
         paused: current.paused,
+        group_id: current.group_id,
     };
     let config = validate(patch.apply_to(base)).map_err(AppError::Validation)?;
+    if let Some(group_id) = config.group_id.filter(|g| Some(*g) != previous_group) {
+        // A group of another project is a 404, like any foreign id.
+        if !monitor_group::belongs_to(&mut *tx, project_id, group_id).await? {
+            return Err(AppError::NotFound);
+        }
+    }
     let resumed = was_paused && !config.paused;
     let updated: Heartbeat = sqlx::query_as(
         "update heartbeats
          set name = $3, period_seconds = $4, grace_seconds = $5, paused = $6,
-             resumed_at = case when $7 then now() else resumed_at end
+             resumed_at = case when $7 then now() else resumed_at end,
+             group_id = $8
          where id = $1 and project_id = $2
          returning *",
     )
@@ -323,8 +351,16 @@ pub async fn update_in_project(
     .bind(config.grace_seconds)
     .bind(config.paused)
     .bind(resumed)
+    .bind(config.group_id)
     .fetch_one(&mut *tx)
-    .await?;
+    .await
+    .map_err(|e| match &e {
+        // The group was deleted between the check and the write.
+        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
+            AppError::NotFound
+        }
+        _ => AppError::Database(e),
+    })?;
     tx.commit().await?;
     Ok(Some(updated))
 }
@@ -378,6 +414,7 @@ mod tests {
             last_ping_at: None,
             resumed_at: None,
             created_at: DateTime::UNIX_EPOCH,
+            group_id: None,
         }
     }
 
@@ -387,6 +424,7 @@ mod tests {
             period_seconds,
             grace_seconds,
             paused: false,
+            group_id: None,
         }
     }
 
@@ -425,6 +463,33 @@ mod tests {
         with_token_removed["token"] = serde_json::Value::Null;
         assert_eq!(with_token_removed, without);
         assert!(with.get("resumed_at").is_none());
+    }
+
+    #[test]
+    fn the_view_carries_the_group_id() {
+        let none = serde_json::to_value(heartbeat().into_view(false, false)).unwrap();
+        assert!(none.get("group_id").is_some_and(|g| g.is_null()), "{none}");
+        let group = Uuid::from_u128(7);
+        let mut row = heartbeat();
+        row.group_id = Some(group);
+        let some = serde_json::to_value(row.into_view(false, false)).unwrap();
+        assert_eq!(some["group_id"], group.to_string());
+    }
+
+    #[test]
+    fn a_patch_keeps_sets_or_clears_the_group() {
+        let group = Uuid::from_u128(7);
+        let base = HeartbeatConfig {
+            group_id: Some(group),
+            ..config(60, 60)
+        };
+        let keep: PatchHeartbeatRequest = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        assert_eq!(keep.apply_to(base.clone()).group_id, Some(group));
+        let clear: PatchHeartbeatRequest = serde_json::from_str(r#"{"group_id":null}"#).unwrap();
+        assert_eq!(clear.apply_to(base).group_id, None);
+        let set: PatchHeartbeatRequest =
+            serde_json::from_value(serde_json::json!({"group_id": group})).unwrap();
+        assert_eq!(set.apply_to(config(60, 60)).group_id, Some(group));
     }
 
     #[test]

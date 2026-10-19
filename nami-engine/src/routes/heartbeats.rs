@@ -26,7 +26,7 @@ use crate::{
         heartbeat::{
             self, CreateHeartbeatRequest, Heartbeat, HeartbeatView, PatchHeartbeatRequest,
         },
-        maintenance,
+        maintenance, monitor_group,
     },
     state::AppState,
     uptime::{
@@ -222,6 +222,12 @@ async fn create_heartbeat(
 ) -> Result<(StatusCode, Json<HeartbeatView>), AppError> {
     require_project_role(&state.db, &user, project_id, "member").await?;
     let config = heartbeat::validate(payload.into_config()).map_err(AppError::Validation)?;
+    // A group of another project is a 404, like any foreign id.
+    if let Some(group_id) = config.group_id
+        && !monitor_group::belongs_to(&state.db, project_id, group_id).await?
+    {
+        return Err(AppError::NotFound);
+    }
     let created = heartbeat::insert_heartbeat(&state.db, project_id, &config)
         .await
         .map_err(|e| match &e {

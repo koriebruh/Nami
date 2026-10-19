@@ -2897,3 +2897,144 @@ async fn the_rate_limit_is_checked_before_any_body_is_read(pool: sqlx::PgPool) {
     assert_eq!(headers["retry-after"], "1");
     assert_eq!(body, json!({ "error": "too many requests" }));
 }
+
+async fn create_group(app: &Router, cookie: &axum::http::HeaderValue, project: Uuid) -> String {
+    let (status, group) = call(
+        app,
+        "POST",
+        &format!("/projects/{project}/monitor-groups"),
+        Some(cookie),
+        Some(json!({ "name": "Jobs" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{group}");
+    group["id"].as_str().unwrap().to_string()
+}
+
+async fn stored_group(pool: &sqlx::PgPool, heartbeat: &str) -> Option<Uuid> {
+    sqlx::query_scalar("select group_id from heartbeats where id = $1::uuid")
+        .bind(heartbeat)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn heartbeats_join_their_projects_groups(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let other = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (_, _, other_member) = user_with_role(&app, &pool, other, Some("member")).await;
+    let group = create_group(&app, &member, project).await;
+    let foreign = create_group(&app, &other_member, other).await;
+    let collection = format!("/projects/{project}/heartbeats");
+
+    let (status, created) = call(
+        &app,
+        "POST",
+        &collection,
+        Some(&member),
+        Some(json!({ "name": "Backup", "period_seconds": 86400, "group_id": group })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["group_id"], group);
+    let id = created["id"].as_str().unwrap().to_string();
+    let item = format!("{collection}/{id}");
+
+    let (_, list) = call(&app, "GET", &collection, Some(&viewer), None).await;
+    assert_eq!(list[0]["group_id"], group, "viewers see the group too");
+
+    // Omitted keeps, null clears, a value sets.
+    let (status, patched) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "name": "Backup 2" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(patched["group_id"], group);
+    let (_, cleared) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "group_id": null })),
+    )
+    .await;
+    assert!(cleared["group_id"].is_null(), "{cleared}");
+    let (_, set) = call(
+        &app,
+        "PATCH",
+        &item,
+        Some(&member),
+        Some(json!({ "group_id": group })),
+    )
+    .await;
+    assert_eq!(set["group_id"], group);
+
+    // Another project's group, and an unknown one: 404, row unchanged.
+    for bad in [foreign.clone(), Uuid::new_v4().to_string()] {
+        let (status, body) = call(
+            &app,
+            "PATCH",
+            &item,
+            Some(&member),
+            Some(json!({ "group_id": bad, "name": "changed" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!body.to_string().contains(&foreign), "{body}");
+        assert_eq!(stored_group(&pool, &id).await, Some(group.parse().unwrap()));
+        let (_, now) = call(&app, "GET", &item, Some(&member), None).await;
+        assert_eq!(now["name"], "Backup 2", "{now}");
+        // Same on create: nothing inserted.
+        let (status, body) = call(
+            &app,
+            "POST",
+            &collection,
+            Some(&member),
+            Some(json!({ "name": "Other", "period_seconds": 60, "group_id": bad })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let count: i64 =
+            sqlx::query_scalar("select count(*) from heartbeats where project_id = $1")
+                .bind(project)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+}
+
+#[sqlx::test]
+async fn the_database_refuses_a_group_of_another_project(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let other = seed_project(&pool).await;
+    let (_, _, other_member) = user_with_role(&app, &pool, other, Some("member")).await;
+    let foreign = create_group(&app, &other_member, other).await;
+    let heartbeat: Uuid = sqlx::query_scalar(
+        "insert into heartbeats (project_id, name, token, period_seconds, grace_seconds)
+         values ($1, 'x', repeat('a', 64), 60, 60) returning id",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let err = sqlx::query("update heartbeats set group_id = $2::uuid where id = $1")
+        .bind(heartbeat)
+        .bind(&foreign)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23503")
+    );
+}
