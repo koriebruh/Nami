@@ -68,7 +68,7 @@ Also out of scope (ruled 2026-10-13):
       Kuma JSON, UptimeRobot CSV
 - [ ] Advanced request options: IP version (any/IPv4/IPv6), remember
       cookies within a check, HTTP(S) proxy with encrypted credentials
-- [ ] Availability (SLA) report for a monitor over an arbitrary range;
+- [x] Availability (SLA) report for a monitor over an arbitrary range;
       check-history CSV export
 - [ ] UI for all of the above
 
