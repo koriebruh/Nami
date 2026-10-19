@@ -358,3 +358,35 @@ async fn a_clickhouse_outage_never_fails_a_ping(pool: sqlx::PgPool) {
     .unwrap();
     assert_eq!(open, 1);
 }
+
+#[sqlx::test]
+async fn a_first_failure_with_the_maximum_output_opens_an_incident_with_all_of_it(
+    pool: sqlx::PgPool,
+) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let app = common::app(state.clone());
+    let public = public_app(state);
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, token) = create_heartbeat(&app, project, &member).await;
+
+    let body = vec![b'z'; 11 * 1024];
+    let (status, _) = ping(&public, &format!("/api/v1/heartbeat/{token}/fail"), &body).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, incidents) = call(
+        &app,
+        "GET",
+        &format!("/projects/{project}/incidents"),
+        Some(&member),
+        None,
+    )
+    .await;
+    let details = incidents[0]["details"].as_str().unwrap();
+    assert_eq!(details.len(), MAX_OUTPUT_BYTES + TRUNCATED_MARKER.len());
+    assert_eq!(
+        details,
+        format!("{}{TRUNCATED_MARKER}", "z".repeat(MAX_OUTPUT_BYTES))
+    );
+    ch.drop_database().await.unwrap();
+}

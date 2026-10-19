@@ -1,16 +1,15 @@
-use axum::{
-    body::Body,
-    http::{Request, StatusCode, header},
-};
+use axum::{body::Body, http::{Request, StatusCode, header}};
+use tower::ServiceExt;
 use nami_engine::state::AppState;
 use serde_json::json;
-use tower::ServiceExt;
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState::for_test(pool);
-    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state)).layer(
-        nami_engine::router::configure_session_layer(tower_sessions::MemoryStore::default(), false),
-    )
+    nami_engine::router::with_fallback_connect_info(nami_engine::router::build_router(state))
+        .layer(nami_engine::router::configure_session_layer(
+            tower_sessions::MemoryStore::default(),
+            false,
+        ))
 }
 
 async fn login_as(app: axum::Router, email: &str) -> axum::http::HeaderValue {
@@ -20,9 +19,7 @@ async fn login_as(app: axum::Router, email: &str) -> axum::http::HeaderValue {
                 .method("POST")
                 .uri("/auth/login")
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    json!({"email": email, "password": "password123"}).to_string(),
-                ))
+                .body(Body::from(json!({"email": email, "password": "password123"}).to_string()))
                 .unwrap(),
         )
         .await
@@ -50,9 +47,7 @@ async fn viewer_cannot_create_project(pool: sqlx::PgPool) {
                 .uri("/projects")
                 .header("content-type", "application/json")
                 .header(header::COOKIE, cookie)
-                .body(Body::from(
-                    json!({"name": "Test", "slug": "test"}).to_string(),
-                ))
+                .body(Body::from(json!({"name": "Test", "slug": "test"}).to_string()))
                 .unwrap(),
         )
         .await
@@ -80,9 +75,7 @@ async fn admin_can_create_project(pool: sqlx::PgPool) {
                 .uri("/projects")
                 .header("content-type", "application/json")
                 .header(header::COOKIE, cookie)
-                .body(Body::from(
-                    json!({"name": "Test", "slug": "test"}).to_string(),
-                ))
+                .body(Body::from(json!({"name": "Test", "slug": "test"}).to_string()))
                 .unwrap(),
         )
         .await
@@ -111,13 +104,11 @@ async fn stale_session_after_password_change_is_rejected(pool: sqlx::PgPool) {
     // Simulate a password change happening after this session was issued
     // (e.g. via a password reset) by bumping `password_changed_at` past
     // `auth_at`, without going through the reset flow itself.
-    sqlx::query(
-        "update users set password_changed_at = now() + interval '1 minute' where email = $1",
-    )
-    .bind("admin2@example.com")
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("update users set password_changed_at = now() + interval '1 minute' where email = $1")
+        .bind("admin2@example.com")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let response = app
         .oneshot(
@@ -126,9 +117,7 @@ async fn stale_session_after_password_change_is_rejected(pool: sqlx::PgPool) {
                 .uri("/projects")
                 .header("content-type", "application/json")
                 .header(header::COOKIE, cookie)
-                .body(Body::from(
-                    json!({"name": "Test", "slug": "test"}).to_string(),
-                ))
+                .body(Body::from(json!({"name": "Test", "slug": "test"}).to_string()))
                 .unwrap(),
         )
         .await
@@ -145,11 +134,12 @@ async fn member_without_project_row_gets_forbidden(pool: sqlx::PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let project_id: (uuid::Uuid,) =
-        sqlx::query_as("insert into projects (name, slug) values ('Test', 'test') returning id")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let project_id: (uuid::Uuid,) = sqlx::query_as(
+        "insert into projects (name, slug) values ('Test', 'test') returning id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     let app = test_app(pool.clone());
     let cookie = login_as(app.clone(), "member@example.com").await;
@@ -182,11 +172,12 @@ async fn member_with_viewer_project_row_can_access_project(pool: sqlx::PgPool) {
     .fetch_one(&pool)
     .await
     .unwrap();
-    let project_id: (uuid::Uuid,) =
-        sqlx::query_as("insert into projects (name, slug) values ('Test3', 'test3') returning id")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let project_id: (uuid::Uuid,) = sqlx::query_as(
+        "insert into projects (name, slug) values ('Test3', 'test3') returning id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         "insert into project_members (project_id, user_id, project_role) values ($1, $2, 'viewer')",
     )
@@ -249,17 +240,13 @@ async fn project_creator_is_seeded_as_project_admin(pool: sqlx::PgPool) {
                 .uri("/projects")
                 .header("content-type", "application/json")
                 .header(header::COOKIE, cookie.clone())
-                .body(Body::from(
-                    json!({"name": "Creator Project", "slug": "creator-project"}).to_string(),
-                ))
+                .body(Body::from(json!({"name": "Creator Project", "slug": "creator-project"}).to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(create_res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(create_res.into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let body = axum::body::to_bytes(create_res.into_body(), usize::MAX).await.unwrap();
     let project: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let project_id = project["id"].as_str().unwrap();
 
@@ -286,18 +273,12 @@ async fn project_creator_is_seeded_as_project_admin(pool: sqlx::PgPool) {
                 .uri(format!("/projects/{project_id}/members"))
                 .header("content-type", "application/json")
                 .header(header::COOKIE, cookie)
-                .body(Body::from(
-                    json!({"user_id": other_user_id.0, "project_role": "member"}).to_string(),
-                ))
+                .body(Body::from(json!({"user_id": other_user_id.0, "project_role": "member"}).to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(
-        add_member_res.status(),
-        StatusCode::OK,
-        "project creator must be able to add members, not get 403"
-    );
+    assert_eq!(add_member_res.status(), StatusCode::OK, "project creator must be able to add members, not get 403");
 }
 
 #[sqlx::test]
@@ -309,11 +290,12 @@ async fn global_admin_bypasses_project_membership(pool: sqlx::PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let project_id: (uuid::Uuid,) =
-        sqlx::query_as("insert into projects (name, slug) values ('Test2', 'test2') returning id")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let project_id: (uuid::Uuid,) = sqlx::query_as(
+        "insert into projects (name, slug) values ('Test2', 'test2') returning id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     let app = test_app(pool.clone());
     let cookie = login_as(app.clone(), "admin2@example.com").await;

@@ -30,11 +30,14 @@ pub const SUCCESS_OUTPUT_MAX: usize = 1024;
 pub const TRUNCATED_MARKER: &str = "\n\u{2026}[truncated]";
 
 /// Whether `c` can reorder or hide text: the bidi embedding, override and
-/// isolate controls and the directional marks.
+/// isolate controls, the directional marks, and invisible separators.
 fn is_bidi_control(c: char) -> bool {
     matches!(
         c,
         '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+            // Line and paragraph separators, zero-width characters, BOM and
+            // word joiner: invisible, or they break a line unseen.
+            | '\u{2028}' | '\u{2029}' | '\u{200B}' | '\u{FEFF}' | '\u{2060}'
     )
 }
 
@@ -611,6 +614,12 @@ mod tests {
     fn direction_controls_are_removed() {
         let text = "a\u{202A}b\u{202B}c\u{202C}d\u{202D}e\u{202E}f\u{2066}g\u{2067}h\u{2068}i\u{2069}j\u{200E}k\u{200F}l\u{061C}m";
         assert_eq!(sanitize_output(text.as_bytes()), "abcdefghijklm");
+    }
+
+    #[test]
+    fn invisible_separators_and_zero_width_characters_are_removed() {
+        let text = "a\u{2028}b\u{2029}c\u{200B}d\u{FEFF}e\u{2060}f";
+        assert_eq!(sanitize_output(text.as_bytes()), "abcdef");
     }
 
     #[test]

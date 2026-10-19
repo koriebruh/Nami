@@ -1,7 +1,8 @@
 //! Uptime monitoring: performing checks (`checker`, with one module per
 //! non-http probe), storing results in ClickHouse (`store`), the background
 //! worker and its state machine (`worker`), heartbeat pings and the overdue
-//! sweep (`heartbeat`), the heartbeat ping log in ClickHouse (`pings`), TLS for the non-http checks (`tls`), and alert delivery
+//! sweep (`heartbeat`), the heartbeat ping log in ClickHouse (`pings`), TLS for
+//! the non-http checks (`tls`), and alert delivery
 //! (`alerts`).
 pub mod alerts;
 pub mod checker;

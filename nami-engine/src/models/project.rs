@@ -45,15 +45,9 @@ pub async fn insert_project(
     Ok(project)
 }
 
-pub async fn list_projects_for_user(
-    pool: &PgPool,
-    user_id: Uuid,
-    is_global_admin: bool,
-) -> Result<Vec<Project>, sqlx::Error> {
+pub async fn list_projects_for_user(pool: &PgPool, user_id: Uuid, is_global_admin: bool) -> Result<Vec<Project>, sqlx::Error> {
     if is_global_admin {
-        sqlx::query_as("select id, name, slug from projects")
-            .fetch_all(pool)
-            .await
+        sqlx::query_as("select id, name, slug from projects").fetch_all(pool).await
     } else {
         sqlx::query_as(
             "select p.id, p.name, p.slug from projects p
@@ -66,12 +60,7 @@ pub async fn list_projects_for_user(
     }
 }
 
-pub async fn upsert_member(
-    pool: &PgPool,
-    project_id: Uuid,
-    user_id: Uuid,
-    role: &str,
-) -> Result<(), sqlx::Error> {
+pub async fn upsert_member(pool: &PgPool, project_id: Uuid, user_id: Uuid, role: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "insert into project_members (project_id, user_id, project_role) values ($1, $2, $3)
          on conflict (project_id, user_id) do update set project_role = excluded.project_role",
@@ -84,11 +73,7 @@ pub async fn upsert_member(
     Ok(())
 }
 
-pub async fn remove_member(
-    pool: &PgPool,
-    project_id: Uuid,
-    user_id: Uuid,
-) -> Result<(), sqlx::Error> {
+pub async fn remove_member(pool: &PgPool, project_id: Uuid, user_id: Uuid) -> Result<(), sqlx::Error> {
     sqlx::query("delete from project_members where project_id = $1 and user_id = $2")
         .bind(project_id)
         .bind(user_id)
