@@ -32,11 +32,29 @@ pub fn parse(content: &str) -> Result<Vec<ParsedEntry>, ParseError> {
     Ok(list
         .iter()
         .enumerate()
-        .map(|(i, item)| ParsedEntry {
-            line: i + 1,
-            body: entry(item),
+        .map(|(i, item)| {
+            let body = entry(item);
+            let warning = body.as_ref().ok().and_then(|_| status_codes_warning(item));
+            ParsedEntry {
+                line: i + 1,
+                body,
+                warning,
+            }
         })
         .collect())
+}
+
+/// Kuma accepts several status ranges; a monitor holds one, so only the first
+/// is imported. Said in the entry's result instead of silently narrowing what
+/// counts as up. Quotes no source text, only how many ranges were listed.
+fn status_codes_warning(item: &Value) -> Option<String> {
+    let listed = item.get("accepted_statuscodes")?.as_array()?.len();
+    (listed > 1).then(|| {
+        format!(
+            "only the first of {listed} accepted_statuscodes ranges was imported; \
+             adjust the expected status range if the others matter"
+        )
+    })
 }
 
 fn str_field<'a>(m: &'a Map<String, Value>, key: &str) -> Option<&'a str> {

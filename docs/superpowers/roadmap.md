@@ -64,7 +64,7 @@ Also out of scope (ruled 2026-10-13):
 - [x] Heartbeat `/fail` endpoint and exit-code path segment (0 = success)
 - [x] Heartbeat output capture (<= 10 KiB, sanitized, attached to the incident)
 - [x] Heartbeat groups (shared with monitor groups)
-- [ ] Monitor bulk import: URL list (<= 500, per-line results), Uptime
+- [x] Monitor bulk import: URL list (<= 500, per-line results), Uptime
       Kuma JSON, UptimeRobot CSV
 - [x] Advanced request options: IP version (any/IPv4/IPv6), remember
       cookies within a check, HTTP(S) proxy with encrypted credentials

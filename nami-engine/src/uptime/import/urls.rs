@@ -19,6 +19,7 @@ pub fn parse(content: &str) -> Result<Vec<ParsedEntry>, ParseError> {
         .map(|(line, text)| ParsedEntry {
             line,
             body: entry(text),
+            warning: None,
         })
         .collect())
 }
