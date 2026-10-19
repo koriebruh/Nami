@@ -134,3 +134,57 @@ async fn sources_have_an_empty_pipeline_by_default_and_reject_non_arrays(pool: s
             .is_err()
     );
 }
+
+/// Advanced request options (NAMI-UP-23): IP version, cookie jar and proxy,
+/// with credentials only beside a proxy url, enforced in the database too.
+#[sqlx::test]
+async fn monitors_have_the_advanced_request_columns(pool: sqlx::PgPool) {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "select column_name from information_schema.columns
+         where table_schema = 'public' and table_name = 'monitors'
+           and column_name in ('ip_version', 'remember_cookies', 'proxy_url',
+                               'proxy_username', 'proxy_password_enc')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    let project = common_project(&pool).await;
+    let insert = |extra: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let sql = match extra {
+                "ip" => {
+                    "insert into monitors (project_id, name, check_type, ip_version) values ($1, 'm', 'http', 'v4')"
+                }
+                "user" => {
+                    "insert into monitors (project_id, name, check_type, proxy_username) values ($1, 'm', 'http', 'u')"
+                }
+                "password" => {
+                    "insert into monitors (project_id, name, check_type, proxy_password_enc) values ($1, 'm', 'http', '\\x01')"
+                }
+                _ => {
+                    "insert into monitors (project_id, name, check_type, proxy_url, proxy_username, proxy_password_enc) values ($1, 'm', 'http', 'http://p:1', 'u', '\\x01')"
+                }
+            };
+            sqlx::query(sql).bind(project).execute(&pool).await
+        }
+    };
+    assert!(insert("ip").await.is_err(), "unknown ip_version");
+    assert!(
+        insert("user").await.is_err(),
+        "proxy_username without proxy_url"
+    );
+    assert!(
+        insert("password").await.is_err(),
+        "proxy password without proxy_url"
+    );
+    insert("ok").await.unwrap();
+    let (ip_version, cookies): (String, bool) =
+        sqlx::query_as("select ip_version, remember_cookies from monitors where project_id = $1")
+            .bind(project)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((ip_version.as_str(), cookies), ("any", false));
+}

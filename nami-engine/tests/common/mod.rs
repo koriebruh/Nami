@@ -302,6 +302,7 @@ pub fn unsaved_monitor(check_type: &str) -> Monitor {
         verify_ssl: true,
         next_check_at: Utc::now(),
         created_at: Utc::now(),
+        ip_version: "any".to_string(),
         ..Monitor::default()
     }
 }
