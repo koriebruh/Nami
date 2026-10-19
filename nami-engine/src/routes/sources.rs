@@ -6,12 +6,18 @@ use axum::{
 };
 use chrono::Utc;
 use serde::Deserialize;
+use serde_json::Map;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    logs::usage::{self, DailyUsage},
+    logs::{
+        normalize, pipeline,
+        pipeline::Outcome,
+        store,
+        usage::{self, DailyUsage},
+    },
     middleware::rbac::{CurrentUser, require_project_role},
     models::source::{self, CreateSourceRequest, PatchSourceRequest, Source, SourceWithToken},
     state::AppState,
@@ -23,7 +29,8 @@ const NO_STORE: NoStore = [(header::CACHE_CONTROL, "no-store")];
 type NoStore = [(header::HeaderName, &'static str); 1];
 
 // Viewers read sources but never their tokens; members create, edit, reveal
-// and rotate; admins delete.
+// and rotate; admins delete. Viewers read a source's pipeline rules; members
+// replace them and preview them.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
@@ -45,6 +52,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/projects/{id}/sources/{source_id}/usage",
             get(source_usage),
+        )
+        .route(
+            "/projects/{id}/sources/{source_id}/pipeline",
+            get(get_pipeline).put(put_pipeline),
+        )
+        .route(
+            "/projects/{id}/sources/{source_id}/pipeline/test",
+            post(test_pipeline),
         )
 }
 
@@ -174,4 +189,140 @@ async fn source_usage(
     Ok(Json(
         usage::daily_usage(&state.db, source_id, days, Utc::now().date_naive()).await?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineBody {
+    rules: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipelineTestBody {
+    rules: Value,
+    events: Vec<Value>,
+}
+
+fn pipeline_reply(rules: Value, updated_at: chrono::DateTime<Utc>) -> Json<Value> {
+    Json(json!({ "rules": rules, "updated_at": updated_at }))
+}
+
+/// Runs CPU work (compiling regexes, applying rules) on a blocking thread,
+/// never an async worker. A panic there is re-raised here.
+async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(error) => std::panic::resume_unwind(error.into_panic()),
+    }
+}
+
+/// Validates and compiles `rules` off the async workers and returns their
+/// canonical form, which is what gets stored.
+async fn validate_rules(rules: Value) -> Result<Value, AppError> {
+    let parsed = blocking(move || {
+        let parsed = pipeline::parse_rules(&rules)?;
+        pipeline::compile(&parsed)?;
+        Ok(parsed)
+    })
+    .await
+    .map_err(|error: pipeline::PipelineError| AppError::Validation(error.to_string()))?;
+    serde_json::to_value(&parsed)
+        .map_err(|_| AppError::Validation("rules could not be stored".to_string()))
+}
+
+async fn get_pipeline(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, source_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, AppError> {
+    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    let (rules, updated_at) = source::get_pipeline(&state.db, project_id, source_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(pipeline_reply(rules, updated_at))
+}
+
+/// Replaces the source's rules as a whole. They are validated and compiled
+/// first; nothing is stored when any rule is invalid (400 naming it).
+async fn put_pipeline(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, source_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<PipelineBody>,
+) -> Result<Json<Value>, AppError> {
+    require_project_role(&state.db, &user, project_id, "member").await?;
+    let rules = validate_rules(payload.rules).await?;
+    let updated_at = source::set_pipeline(&state.db, project_id, source_id, &rules)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(pipeline_reply(rules, updated_at))
+}
+
+/// Runs `rules` (not necessarily the stored ones) over at most
+/// [`pipeline::MAX_TEST_EVENTS`] sample events and shows what each would
+/// become. Nothing is stored and no sample counter outlives the request.
+async fn test_pipeline(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, source_id)): Path<(Uuid, Uuid)>,
+    Json(payload): Json<PipelineTestBody>,
+) -> Result<Json<Value>, AppError> {
+    require_project_role(&state.db, &user, project_id, "member").await?;
+    let source = source::ingest_source(&state.db, project_id, source_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if payload.events.len() > pipeline::MAX_TEST_EVENTS {
+        return Err(AppError::Validation(format!(
+            "at most {} sample events",
+            pipeline::MAX_TEST_EVENTS
+        )));
+    }
+    // Checked before any CPU work.
+    let events: Vec<Map<String, Value>> = payload
+        .events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| match event {
+            Value::Object(object) => Ok(object),
+            _ => Err(AppError::Validation(format!(
+                "events[{index}] must be a JSON object"
+            ))),
+        })
+        .collect::<Result<_, _>>()?;
+    let rules = payload.rules;
+    let results = blocking(move || -> Result<Vec<Value>, AppError> {
+        let compiled = pipeline::parse_rules(&rules)
+            .and_then(|parsed| pipeline::compile(&parsed))
+            .map_err(|error| AppError::Validation(error.to_string()))?;
+        let now = Utc::now();
+        Ok(events
+            .into_iter()
+            .map(
+                |object| match compiled.apply(normalize::from_json(object, now)) {
+                    Outcome::Keep(event) => {
+                        let row = store::build_row_at(event, &source, now);
+                        let fields: Value = serde_json::from_str(&row.fields)
+                            .unwrap_or_else(|_| Value::Object(Map::new()));
+                        json!({
+                            "outcome": "kept",
+                            "event": {
+                                "dt": row.dt,
+                                "level": row.level,
+                                "message": row.message,
+                                "fields": fields,
+                                "trace_id": row.trace_id,
+                                "span_id": row.span_id,
+                                "pattern": row.pattern,
+                            },
+                        })
+                    }
+                    Outcome::Dropped => json!({ "outcome": "dropped" }),
+                    Outcome::SampledOut => json!({ "outcome": "sampled_out" }),
+                },
+            )
+            .collect())
+    })
+    .await?;
+    Ok(Json(json!({ "results": results })))
 }

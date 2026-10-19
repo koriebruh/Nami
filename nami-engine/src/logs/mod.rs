@@ -1,5 +1,5 @@
 //! Log management: turning ingested events into rows (`normalize`,
-//! `pattern`), storing them in ClickHouse (`store`), and HTTP ingestion
+//! per-source rules in `pipeline`, `pattern`), storing them in ClickHouse (`store`), and HTTP ingestion
 //! (`ingest`, `msgpack`, with the `budget` that caps what a body may decode
 //! to) with its per-source limits (`rate_limit`) and usage accounting
 //! (`usage`), syslog ingestion over TCP and UDP (`syslog`), and search
@@ -10,6 +10,7 @@ pub mod msgpack;
 pub mod normalize;
 pub mod pattern;
 pub mod patterns;
+pub mod pipeline;
 pub mod query;
 pub mod rate_limit;
 pub mod search;

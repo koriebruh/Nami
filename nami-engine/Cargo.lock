@@ -1895,6 +1895,7 @@ dependencies = [
  "rand_core 0.10.1",
  "rcgen",
  "regex",
+ "regex-syntax",
  "reqwest 0.13.5",
  "rmp-serde",
  "rustls",

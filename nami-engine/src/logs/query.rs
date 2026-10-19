@@ -213,13 +213,11 @@ struct RawFilter {
     value: Option<Value>,
 }
 
-pub fn parse_filter(raw: &str) -> Result<FieldFilter, String> {
-    let raw: RawFilter = serde_json::from_str(raw).map_err(|_| {
-        "must be JSON like {\"path\":\"a.b\",\"op\":\"eq\",\"value\":\"x\"} with op one of eq, neq, contains, \
-         exists, regex, not_regex, gt, gte, lt, lte"
-            .to_string()
-    })?;
-    let path: Vec<String> = raw.path.split('.').map(str::to_string).collect();
+/// A dotted JSON path into `fields` (`a.b.c`): at most [`MAX_PATH_DEPTH`]
+/// segments of 1-[`MAX_SEGMENT_LEN`] characters of A-Z, a-z, 0-9, `_` or
+/// `-`. The rule of search filters, shared with the ingest pipeline's paths.
+pub fn parse_path(raw: &str) -> Result<Vec<String>, String> {
+    let path: Vec<String> = raw.split('.').map(str::to_string).collect();
     if path.len() > MAX_PATH_DEPTH {
         return Err(format!("path may have at most {MAX_PATH_DEPTH} segments"));
     }
@@ -232,6 +230,16 @@ pub fn parse_filter(raw: &str) -> Result<FieldFilter, String> {
     if !path.iter().all(valid_segment) {
         return Err("path segments must be 1-64 characters of A-Z, a-z, 0-9, _ or -".to_string());
     }
+    Ok(path)
+}
+
+pub fn parse_filter(raw: &str) -> Result<FieldFilter, String> {
+    let raw: RawFilter = serde_json::from_str(raw).map_err(|_| {
+        "must be JSON like {\"path\":\"a.b\",\"op\":\"eq\",\"value\":\"x\"} with op one of eq, neq, contains, \
+         exists, regex, not_regex, gt, gte, lt, lte"
+            .to_string()
+    })?;
+    let path = parse_path(&raw.path)?;
     let value = match raw.op {
         FilterOp::Exists => FilterValue::None,
         FilterOp::Eq | FilterOp::Neq | FilterOp::Contains => {
