@@ -13,6 +13,48 @@ pub fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
 }
 
+/// A throwaway certificate authority. Its root goes into the checker's
+/// root store (`CheckContext::tls`), so the leaves it issues are trusted.
+pub struct TestCa {
+    pub cert: CertificateDer<'static>,
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
+}
+
+impl TestCa {
+    pub fn new() -> TestCa {
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Nami Test CA");
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        TestCa {
+            cert: cert.der().clone(),
+            issuer: rcgen::Issuer::new(params, key),
+        }
+    }
+
+    /// A `localhost` certificate valid from 30 days ago until `not_after`.
+    pub fn leaf(&self, not_after: time::OffsetDateTime) -> CertAndKey {
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+        params.not_after = not_after;
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, &self.issuer).unwrap();
+        (
+            cert.der().clone(),
+            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+        )
+    }
+
+    pub fn roots(&self) -> rustls::RootCertStore {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.cert.clone()).unwrap();
+        roots
+    }
+}
+
 /// A self-signed `localhost` certificate that no root store trusts.
 pub fn self_signed() -> CertAndKey {
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();

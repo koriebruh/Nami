@@ -1882,7 +1882,9 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots",
  "wiremock",
+ "x509-parser",
  "zeroize",
 ]
 
