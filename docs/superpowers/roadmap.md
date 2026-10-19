@@ -74,24 +74,26 @@ Also out of scope (ruled 2026-10-13):
 
 ## 3. Log management
 
-- [ ] Sources per project with ingest tokens (create, rotate, delete)
-- [ ] HTTP ingestion: JSON object, JSON array, NDJSON; size limits;
+### Part 1 — done (PRs #29-#45, security fix wave #50; decisions: `docs/superpowers/decisions/2026-10-13-log-management-part1.md`)
+
+- [x] Sources per project with ingest tokens (create, rotate, delete)
+- [x] HTTP ingestion: JSON object, JSON array, NDJSON; size limits;
       per-source rate limiting
-- [ ] MessagePack ingestion (`application/msgpack`)
-- [ ] Syslog ingestion (RFC 5424 over TCP/UDP)
+- [x] MessagePack ingestion (`application/msgpack`)
+- [x] Syslog ingestion (RFC 5424 over TCP/UDP)
 - [ ] Per-source ingest pipeline: drop, remove fields, redact, rename,
       sample (1 in N)
-- [ ] ClickHouse storage with per-source retention (TTL)
-- [ ] Search: time range, level, full-text, structured field filters,
+- [x] ClickHouse storage with per-source retention (TTL)
+- [x] Search: time range, level, full-text, structured field filters,
       pagination
-- [ ] Field filter operators: regex, not_regex, gt/gte/lt/lte
+- [x] Field filter operators: regex, not_regex, gt/gte/lt/lte
 - [ ] Message pattern grouping + explorer Patterns tab
-- [ ] `trace_id` / `span_id` columns (trace linking)
-- [ ] Shareable explorer URLs, column picker
+- [x] `trace_id` / `span_id` columns (trace linking)
+- [x] Shareable explorer URLs, column picker
 - [ ] Streamed CSV/NDJSON export (capped at 100k rows)
-- [ ] Per-source ingestion stats (events/bytes per day) and optional
+- [x] Per-source ingestion stats (events/bytes per day) and optional
       daily byte quota (429 `quota_exceeded`)
-- [ ] Live tail (SSE through the BFF)
+- [x] Live tail (SSE through the BFF)
 - [ ] Saved views
 - [ ] Log alerts (threshold over a window → incident)
 - [ ] UI: sources, explorer, live tail, saved views, alerts
