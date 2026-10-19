@@ -12,7 +12,7 @@ use super::{
     is_invisible_or_bidi_char, monitor_group,
     monitor_request::{
         self, BODY_METHODS, HTTP_METHODS, HeaderView, HeadersChange, MAX_BODY_BYTES,
-        PasswordChange, RequestHeader, seal_headers, seal_password,
+        PasswordChange, RequestHeader, seal_headers, seal_password, seal_proxy_password,
     },
     nullable,
     target::{check_host_text, parse_nameserver, validate_host},
@@ -45,6 +45,34 @@ pub const CHECK_TYPES: [&str; 11] = [
     "imap",
     "udp",
 ];
+
+/// What `ip_version` may be.
+pub const IP_VERSIONS: [&str; 3] = ["any", "ipv4", "ipv6"];
+
+/// The check types that honour `ip_version`; every other type stores `any`.
+pub const IP_VERSION_TYPES: [&str; 5] = ["http", "keyword", "tcp", "ping", "ssl_expiry"];
+
+/// The address family a check connects over. `Any` takes what the resolver
+/// returns; `V4` / `V6` drop the other family, with no fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IpVersion {
+    #[default]
+    Any,
+    V4,
+    V6,
+}
+
+impl IpVersion {
+    /// The stored spelling (one of [`IP_VERSIONS`]); anything else is `None`.
+    pub fn parse(text: &str) -> Option<IpVersion> {
+        match text {
+            "any" => Some(IpVersion::Any),
+            "ipv4" => Some(IpVersion::V4),
+            "ipv6" => Some(IpVersion::V6),
+            _ => None,
+        }
+    }
+}
 
 /// The longest `udp_payload`, in bytes.
 pub const MAX_UDP_PAYLOAD_BYTES: usize = 1024;
@@ -125,6 +153,25 @@ pub struct Monitor {
     pub udp_payload: Option<String>,
     /// A `monitor_groups` row of the same project, or ungrouped.
     pub group_id: Option<Uuid>,
+    /// One of [`IP_VERSIONS`]; see [`Monitor::ip_version`].
+    pub ip_version: String,
+    /// http/keyword: keep the cookies a response sets for the rest of that
+    /// one check (redirects); never kept between checks.
+    pub remember_cookies: bool,
+    /// http/keyword: `http(s)://host:port` of the proxy every request of the
+    /// check goes through.
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    /// AES-GCM sealed proxy password, see `monitor_request::open_proxy_password`.
+    #[serde(skip_serializing)]
+    pub proxy_password_enc: Option<Vec<u8>>,
+}
+
+impl Monitor {
+    /// The stored `ip_version`; text the API never writes reads as `Any`.
+    pub fn ip_version(&self) -> IpVersion {
+        IpVersion::parse(&self.ip_version).unwrap_or_default()
+    }
 }
 
 /// What `Debug` prints in place of a sealed column that holds a value.
@@ -175,6 +222,11 @@ impl fmt::Debug for Monitor {
             use_tls,
             udp_payload,
             group_id,
+            ip_version,
+            remember_cookies,
+            proxy_url,
+            proxy_username,
+            proxy_password_enc,
         } = self;
         f.debug_struct("Monitor")
             .field("id", id)
@@ -220,12 +272,21 @@ impl fmt::Debug for Monitor {
             .field("use_tls", use_tls)
             .field("udp_payload", &udp_payload.as_ref().map(|_| SET))
             .field("group_id", group_id)
+            .field("ip_version", ip_version)
+            .field("remember_cookies", remember_cookies)
+            .field("proxy_url", proxy_url)
+            .field("proxy_username", &proxy_username.as_ref().map(|_| SET))
+            .field(
+                "proxy_password_enc",
+                &proxy_password_enc.as_ref().map(|_| SEALED),
+            )
             .finish()
     }
 }
 
 /// A monitor as every API response shows it: the secrets are reduced to
-/// `request_headers` (names, `value_set: true`) and `has_auth_password`,
+/// `request_headers` (names, `value_set: true`), `has_auth_password` and
+/// `has_proxy_password`,
 /// `in_maintenance` says whether a maintenance window covers it right now, and
 /// `redacted` whether fields were masked for its reader (see
 /// [`Monitor::for_reader`]): a client tells a masked view from a URL that
@@ -236,6 +297,7 @@ pub struct MonitorView {
     pub monitor: Monitor,
     pub request_headers: Vec<HeaderView>,
     pub has_auth_password: bool,
+    pub has_proxy_password: bool,
     pub in_maintenance: bool,
     pub redacted: bool,
 }
@@ -264,10 +326,12 @@ impl MonitorView {
             })
             .collect();
         let has_auth_password = monitor.auth_password_enc.is_some();
+        let has_proxy_password = monitor.proxy_password_enc.is_some();
         MonitorView {
             monitor,
             request_headers,
             has_auth_password,
+            has_proxy_password,
             in_maintenance,
             redacted: false,
         }
@@ -285,13 +349,18 @@ impl Monitor {
     /// [`redact_url`]) and its request body, basic-auth username and udp
     /// payload hidden: they carry credentials (tokens, SNMP communities,
     /// RADIUS secrets) as often as a URL does, so a viewer learns that they
-    /// are set, not what they are.
+    /// are set, not what they are. The proxy username is hidden the same way
+    /// and the proxy URL goes through [`redact_url`] (a no-op for every proxy
+    /// URL validation accepts; it only matters for a row written around the
+    /// API).
     pub fn for_reader(mut self, reader: ProjectReader) -> Self {
         if reader == ProjectReader::Viewer {
             self.url = self.url.as_deref().map(redact_url);
             self.request_body = self.request_body.map(|_| REDACTED.to_string());
             self.auth_username = self.auth_username.map(|_| REDACTED.to_string());
             self.udp_payload = self.udp_payload.map(|_| REDACTED.to_string());
+            self.proxy_url = self.proxy_url.map(redact_proxy_url);
+            self.proxy_username = self.proxy_username.map(|_| REDACTED.to_string());
         }
         self
     }
@@ -330,6 +399,17 @@ pub fn redact_url(url: &str) -> String {
         parsed.set_fragment(Some(REDACTED));
     }
     parsed.to_string()
+}
+
+/// A proxy URL as a viewer reads it: [`redact_url`], except that a URL with
+/// nothing to mask is returned as stored (the URL parser would add a `/` to
+/// `http://proxy:3128`, which validation accepts without one).
+fn redact_proxy_url(url: String) -> String {
+    let redacted = redact_url(&url);
+    match reqwest::Url::parse(&url) {
+        Ok(parsed) if parsed.as_str() == redacted => url,
+        _ => redacted,
+    }
 }
 
 /// Whether `url` carries credentials of its own (`https://user:pass@host/`,
@@ -373,6 +453,11 @@ pub struct MonitorConfig {
     pub use_tls: bool,
     pub udp_payload: Option<String>,
     pub group_id: Option<Uuid>,
+    pub ip_version: String,
+    pub remember_cookies: bool,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: PasswordChange,
 }
 
 impl From<&Monitor> for MonitorConfig {
@@ -410,6 +495,13 @@ impl From<&Monitor> for MonitorConfig {
             use_tls: m.use_tls,
             udp_payload: m.udp_payload.clone(),
             group_id: m.group_id,
+            ip_version: m.ip_version.clone(),
+            remember_cookies: m.remember_cookies,
+            proxy_url: m.proxy_url.clone(),
+            proxy_username: m.proxy_username.clone(),
+            proxy_password: PasswordChange::Keep {
+                present: m.proxy_password_enc.is_some(),
+            },
         }
     }
 }
@@ -444,6 +536,11 @@ impl MonitorConfig {
             || self.expiry_threshold_days != current.expiry_threshold_days
             || self.use_tls != current.use_tls
             || self.udp_payload != current.udp_payload
+            || self.ip_version != current.ip_version
+            || self.remember_cookies != current.remember_cookies
+            || self.proxy_url != current.proxy_url
+            || self.proxy_username != current.proxy_username
+            || !matches!(self.proxy_password, PasswordChange::Keep { .. })
     }
 }
 
@@ -492,8 +589,18 @@ pub struct CreateMonitorRequest {
     pub use_tls: bool,
     pub udp_payload: Option<String>,
     pub group_id: Option<Uuid>,
+    #[serde(default = "default_ip_version")]
+    pub ip_version: String,
+    #[serde(default)]
+    pub remember_cookies: bool,
+    pub proxy_url: Option<String>,
+    pub proxy_username: Option<String>,
+    pub proxy_password: Option<SecretString>,
 }
 
+fn default_ip_version() -> String {
+    "any".to_string()
+}
 fn default_http_method() -> String {
     "GET".to_string()
 }
@@ -575,6 +682,14 @@ impl CreateMonitorRequest {
             use_tls: self.use_tls,
             udp_payload: self.udp_payload,
             group_id: self.group_id,
+            ip_version: self.ip_version,
+            remember_cookies: self.remember_cookies,
+            proxy_url: self.proxy_url,
+            proxy_username: self.proxy_username,
+            proxy_password: match self.proxy_password {
+                Some(password) => PasswordChange::Replace(password),
+                None => PasswordChange::Keep { present: false },
+            },
         }
     }
 }
@@ -623,6 +738,14 @@ pub struct PatchMonitorRequest {
     pub udp_payload: Option<String>,
     #[serde(default, deserialize_with = "nullable")]
     pub group_id: Option<Option<Uuid>>,
+    pub ip_version: Option<String>,
+    pub remember_cookies: Option<bool>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub proxy_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub proxy_username: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub proxy_password: Option<Option<SecretString>>,
 }
 
 /// A nullable PATCH field applied to its current value.
@@ -659,6 +782,15 @@ impl PatchMonitorRequest {
                 None
             }
             None => base.port,
+        };
+        // `proxy_url: null` (or `""`) removes the proxy, and with it the stored username
+        // (validation then drops the password); a username the request names
+        // next to it is still refused as a username without a proxy.
+        let proxy_username = match self.proxy_username {
+            Some(explicit) => explicit,
+            None if matches!(&self.proxy_url, Some(None)) => None,
+            None if matches!(&self.proxy_url, Some(Some(url)) if url.is_empty()) => None,
+            None => base.proxy_username,
         };
         MonitorConfig {
             name: self.name.unwrap_or(base.name),
@@ -699,6 +831,15 @@ impl PatchMonitorRequest {
             use_tls: self.use_tls.unwrap_or(base.use_tls),
             udp_payload: self.udp_payload.or(base.udp_payload),
             group_id: patched(self.group_id, base.group_id),
+            ip_version: self.ip_version.unwrap_or(base.ip_version),
+            remember_cookies: self.remember_cookies.unwrap_or(base.remember_cookies),
+            proxy_url: patched(self.proxy_url, base.proxy_url),
+            proxy_username,
+            proxy_password: match self.proxy_password {
+                None => base.proxy_password,
+                Some(None) => PasswordChange::Clear,
+                Some(Some(password)) => PasswordChange::Replace(password),
+            },
         }
     }
 }
@@ -717,6 +858,9 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
     }
     if !matches!(c.keyword_mode.as_str(), "contains" | "not_contains") {
         return Err("keyword_mode must be contains or not_contains".into());
+    }
+    if IpVersion::parse(&c.ip_version).is_none() {
+        return Err("ip_version must be any, ipv4 or ipv6".into());
     }
     match c.check_type.as_str() {
         "http" | "keyword" => validate_http(&mut c)?,
@@ -888,6 +1032,49 @@ fn validate_request_config(c: &mut MonitorConfig, credentials_in_url: bool) -> R
     if c.auth_username.is_some() && credentials_in_url {
         return Err("use either basic auth or credentials in the url, not both".into());
     }
+    validate_proxy(c)
+}
+
+/// The proxy of an http or keyword monitor: an optional URL (see
+/// `monitor_request::validate_proxy_url`), a username that needs the URL and
+/// a password that needs the username. Removing the URL removes the username
+/// and password; removing the username removes the password. A proxy resolves
+/// the target itself, so `ip_version` cannot be combined with one. Error
+/// messages never repeat the password.
+fn validate_proxy(c: &mut MonitorConfig) -> Result<(), String> {
+    c.proxy_url = match c.proxy_url.take().filter(|url| !url.is_empty()) {
+        Some(url) => Some(monitor_request::validate_proxy_url(&url)?),
+        None => None,
+    };
+    c.proxy_username = match c
+        .proxy_username
+        .take()
+        .filter(|username| !username.is_empty())
+    {
+        Some(username) => {
+            if c.proxy_url.is_none() {
+                return Err("proxy_username requires proxy_url".into());
+            }
+            Some(monitor_request::validate_proxy_username(&username)?)
+        }
+        None => None,
+    };
+    if let PasswordChange::Replace(password) = &c.proxy_password {
+        if c.proxy_username.is_none() {
+            return Err("proxy_password requires proxy_username".into());
+        }
+        monitor_request::validate_proxy_password(password)?;
+    }
+    if c.proxy_username.is_none() && c.proxy_password.is_set() {
+        // No username (because there is no proxy, or the username was
+        // removed): the stored password goes with it.
+        c.proxy_password = PasswordChange::Clear;
+    }
+    if c.proxy_url.is_some() && c.ip_version != "any" {
+        return Err(
+            "ip_version cannot be combined with a proxy: the proxy resolves the target".into(),
+        );
+    }
     Ok(())
 }
 
@@ -900,6 +1087,9 @@ fn clear_unused_fields(c: &mut MonitorConfig) {
     if !uses(&["http", "keyword"]) {
         c.url = None;
         clear_request_config(c);
+    }
+    if !uses(&IP_VERSION_TYPES) {
+        c.ip_version = default_ip_version();
     }
     if !uses(&["keyword", "udp"]) {
         c.keyword = None;
@@ -950,6 +1140,12 @@ fn clear_request_config(c: &mut MonitorConfig) {
     }
     if !matches!(c.auth_password, PasswordChange::Keep { present: false }) {
         c.auth_password = PasswordChange::Clear;
+    }
+    c.remember_cookies = false;
+    c.proxy_url = None;
+    c.proxy_username = None;
+    if !matches!(c.proxy_password, PasswordChange::Keep { present: false }) {
+        c.proxy_password = PasswordChange::Clear;
     }
 }
 
@@ -1233,6 +1429,13 @@ async fn write_config(
         PasswordChange::Clear => (false, None),
         PasswordChange::Replace(password) => (false, Some(seal_password(cipher, id, password))),
     };
+    let (keep_proxy_password, sealed_proxy_password) = match &c.proxy_password {
+        PasswordChange::Keep { .. } => (true, None),
+        PasswordChange::Clear => (false, None),
+        PasswordChange::Replace(password) => {
+            (false, Some(seal_proxy_password(cipher, id, password)))
+        }
+    };
     sqlx::query_as(
         "update monitors set
              next_check_at = case when $2 then now() else next_check_at end,
@@ -1249,7 +1452,9 @@ async fn write_config(
              use_tls = $31, udp_payload = $32,
              group_id = $33,
              consecutive_failures = case when $35 then 0 else consecutive_failures end,
-             consecutive_successes = case when $35 then 0 else consecutive_successes end
+             consecutive_successes = case when $35 then 0 else consecutive_successes end,
+             ip_version = $36, remember_cookies = $37, proxy_url = $38, proxy_username = $39,
+             proxy_password_enc = case when $40 then proxy_password_enc else $41 end
          where id = $1 and project_id = $34
          returning *",
     )
@@ -1288,6 +1493,12 @@ async fn write_config(
     .bind(c.group_id)
     .bind(project_id)
     .bind(write.reset_counters)
+    .bind(&c.ip_version)
+    .bind(c.remember_cookies)
+    .bind(&c.proxy_url)
+    .bind(&c.proxy_username)
+    .bind(keep_proxy_password)
+    .bind(sealed_proxy_password)
     .fetch_one(&mut *conn)
     .await
 }
@@ -1341,6 +1552,7 @@ pub async fn update_in_project(
     let config =
         validate(patch.apply_to(MonitorConfig::from(&current))).map_err(AppError::Validation)?;
     secrets_stay_where_they_were(&current, &config).map_err(AppError::Validation)?;
+    secrets_follow_the_proxy(&current, &config).map_err(AppError::Validation)?;
     if let Some(group_id) = config.group_id.filter(|g| Some(*g) != current.group_id) {
         // A group of another project is a 404, like any foreign id.
         if !monitor_group::belongs_to(&mut *tx, project_id, group_id).await? {
@@ -1403,6 +1615,41 @@ fn secrets_stay_where_they_were(current: &Monitor, config: &MonitorConfig) -> Re
         .is_some_and(|u| reqwest::Url::parse(u).is_ok_and(|p| p.scheme() == "https"));
     if over_tls && current.verify_ssl && !config.verify_ssl {
         return Err("turning off certificate verification requires entering the header values and password again, or clearing them".into());
+    }
+    Ok(())
+}
+
+/// Refuses a PATCH that moves the proxy to another origin (scheme, host or
+/// port, compared as `Url::origin` does; adding a proxy where there was none
+/// counts, removing one does not) while keeping any stored write-only secret:
+/// header values, the basic-auth password or the proxy password. The proxy
+/// password goes to the proxy, and the target's headers and basic auth pass
+/// through it readable whenever the target is `http://` (or unverified TLS),
+/// so a member who never saw them could otherwise point the proxy at a host
+/// of their own and read them off the next check. Every stored secret must be
+/// entered again or cleared in the same request. A change of the target URL
+/// alone does not ask for the proxy password: it only ever goes to the proxy,
+/// which did not change (`secrets_stay_where_they_were` covers the target's
+/// secrets). The message never names a header or a value.
+fn secrets_follow_the_proxy(current: &Monitor, config: &MonitorConfig) -> Result<(), String> {
+    let Some(new_proxy) = config.proxy_url.as_deref() else {
+        return Ok(());
+    };
+    let origin = |url: &str| reqwest::Url::parse(url).ok().map(|u| u.origin());
+    let before = current.proxy_url.as_deref().and_then(origin);
+    // An unparsable stored proxy URL (only a row written around the API holds
+    // one) gives no origin to compare with: treated as a change.
+    if before.is_some() && before == origin(new_proxy) {
+        return Ok(());
+    }
+    let keeps_headers = current.request_headers_enc.is_some()
+        && matches!(config.request_headers, HeadersChange::Keep { .. });
+    let keeps_password = current.auth_password_enc.is_some()
+        && matches!(config.auth_password, PasswordChange::Keep { .. });
+    let keeps_proxy_password = current.proxy_password_enc.is_some()
+        && matches!(config.proxy_password, PasswordChange::Keep { .. });
+    if keeps_headers || keeps_password || keeps_proxy_password {
+        return Err("changing the proxy requires entering the header values and passwords again, or clearing them".into());
     }
     Ok(())
 }
@@ -1506,6 +1753,7 @@ mod tests {
             follow_redirects: true,
             verify_ssl: true,
             recovery_threshold: 1,
+            ip_version: "any".to_string(),
             ..Monitor::default()
         }
     }
@@ -2247,5 +2495,390 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    // ---- advanced request options (NAMI-UP-23) -------------------------------
+
+    fn proxied_monitor() -> Monitor {
+        Monitor {
+            proxy_url: Some("http://proxy.internal:3128".to_string()),
+            proxy_username: Some("nami".to_string()),
+            proxy_password_enc: Some(vec![7, 8, 9]),
+            ..stored_monitor()
+        }
+    }
+
+    fn merged_proxied(body: serde_json::Value) -> MonitorConfig {
+        patch(body).apply_to(MonitorConfig::from(&proxied_monitor()))
+    }
+
+    #[test]
+    fn ip_version_is_kept_for_the_types_that_connect_and_reset_for_the_others() {
+        let tcp = json!({ "check_type": "tcp", "host": "db.internal", "port": 5432 });
+        let ping = json!({ "check_type": "ping", "host": "db.internal" });
+        let ssl = json!({ "check_type": "ssl_expiry", "host": "example.com",
+            "interval_seconds": 86400 });
+        for version in ["ipv4", "ipv6", "any"] {
+            for mut body in [
+                json!({}),
+                json!({ "check_type": "keyword", "keyword": "ok",
+                "http_method": "GET", "request_body": null }),
+                tcp.clone(),
+                ping.clone(),
+                ssl.clone(),
+            ] {
+                body["ip_version"] = json!(version);
+                assert_eq!(
+                    validate(merged(body.clone())).unwrap().ip_version,
+                    version,
+                    "{body}"
+                );
+            }
+        }
+        for mut body in [
+            json!({ "check_type": "dns", "host": "example.com" }),
+            json!({ "check_type": "domain_expiry", "host": "example.com", "interval_seconds": 86400 }),
+            json!({ "check_type": "smtp", "host": "mail.example.com" }),
+            json!({ "check_type": "pop3", "host": "mail.example.com" }),
+            json!({ "check_type": "imap", "host": "mail.example.com" }),
+            json!({ "check_type": "udp", "host": "example.com", "port": 53, "udp_payload": "x" }),
+        ] {
+            body["ip_version"] = json!("ipv6");
+            assert_eq!(
+                validate(merged(body.clone())).unwrap().ip_version,
+                "any",
+                "{body}"
+            );
+        }
+        for wrong in ["IPv4", "v4", "", "ipv5"] {
+            assert_eq!(
+                validate(merged(json!({ "ip_version": wrong }))).unwrap_err(),
+                "ip_version must be any, ipv4 or ipv6",
+                "{wrong}"
+            );
+        }
+        let create: CreateMonitorRequest = serde_json::from_value(json!({
+            "name": "n", "check_type": "http", "url": "https://example.com",
+        }))
+        .unwrap();
+        let config = create.into_config();
+        assert_eq!(config.ip_version, "any");
+        assert!(!config.remember_cookies);
+        assert_eq!(
+            config.proxy_password,
+            PasswordChange::Keep { present: false }
+        );
+    }
+
+    #[test]
+    fn a_stored_ip_version_reads_as_its_family_and_unknown_text_as_any() {
+        for (text, version) in [
+            ("any", IpVersion::Any),
+            ("ipv4", IpVersion::V4),
+            ("ipv6", IpVersion::V6),
+            ("bogus", IpVersion::Any),
+        ] {
+            let monitor = Monitor {
+                ip_version: text.to_string(),
+                ..Monitor::default()
+            };
+            assert_eq!(monitor.ip_version(), version, "{text}");
+        }
+        assert_eq!(IpVersion::default(), IpVersion::Any);
+        assert_eq!(IpVersion::parse("IPv4"), None);
+    }
+
+    #[test]
+    fn remember_cookies_belongs_to_http_and_keyword_only() {
+        let ok = |body: serde_json::Value| validate(merged(body)).unwrap();
+        assert!(ok(json!({ "remember_cookies": true })).remember_cookies);
+        assert!(
+            ok(
+                json!({ "remember_cookies": true, "check_type": "keyword", "keyword": "ok",
+            "http_method": "GET", "request_body": null })
+            )
+            .remember_cookies
+        );
+        assert!(
+            !ok(json!({ "remember_cookies": true, "check_type": "tcp",
+            "host": "db.internal", "port": 5432 }))
+            .remember_cookies
+        );
+    }
+
+    #[test]
+    fn proxy_settings_need_their_url_and_username_in_order() {
+        assert_eq!(
+            validate(merged(json!({ "proxy_username": "nami" }))).unwrap_err(),
+            "proxy_username requires proxy_url"
+        );
+        assert_eq!(
+            validate(merged(
+                json!({ "proxy_url": "http://proxy:3128", "proxy_password": "p" })
+            ))
+            .unwrap_err(),
+            "proxy_password requires proxy_username"
+        );
+        // A username named next to the removal is still a username without a proxy.
+        assert_eq!(
+            validate(merged_proxied(
+                json!({ "proxy_url": null, "proxy_username": "other" })
+            ))
+            .unwrap_err(),
+            "proxy_username requires proxy_url"
+        );
+        let full = validate(merged(json!({
+            "proxy_url": " http://proxy:3128 ", "proxy_username": "nami", "proxy_password": "p",
+        })))
+        .unwrap();
+        assert_eq!(full.proxy_url.as_deref(), Some("http://proxy:3128"));
+        assert_eq!(full.proxy_username.as_deref(), Some("nami"));
+        assert_eq!(
+            full.proxy_password,
+            PasswordChange::Replace(SecretString::new("p"))
+        );
+
+        // Removing the url removes the username and the stored password.
+        for removal in [json!({ "proxy_url": null }), json!({ "proxy_url": "" })] {
+            let removed = validate(merged_proxied(removal.clone())).unwrap();
+            assert_eq!(removed.proxy_url, None, "{removal}");
+            assert_eq!(removed.proxy_username, None, "{removal}");
+            assert_eq!(removed.proxy_password, PasswordChange::Clear, "{removal}");
+        }
+        // Removing the username removes the password, the url stays.
+        let no_user = validate(merged_proxied(json!({ "proxy_username": null }))).unwrap();
+        assert_eq!(
+            no_user.proxy_url.as_deref(),
+            Some("http://proxy.internal:3128")
+        );
+        assert_eq!(no_user.proxy_password, PasswordChange::Clear);
+        // An empty patch keeps all three as they are.
+        let kept = validate(merged_proxied(json!({}))).unwrap();
+        assert_eq!(kept.proxy_password, PasswordChange::Keep { present: true });
+        assert_eq!(kept.proxy_username.as_deref(), Some("nami"));
+    }
+
+    #[test]
+    fn a_non_http_monitor_carries_no_proxy() {
+        let tcp = validate(merged_proxied(json!({
+            "check_type": "tcp", "host": "db.internal", "port": 5432,
+        })))
+        .unwrap();
+        assert_eq!((tcp.proxy_url, tcp.proxy_username), (None, None));
+        assert_eq!(tcp.proxy_password, PasswordChange::Clear);
+        // Nothing stored, nothing to clear.
+        let plain = validate(merged(json!({
+            "check_type": "tcp", "host": "db.internal", "port": 5432,
+        })))
+        .unwrap();
+        assert_eq!(
+            plain.proxy_password,
+            PasswordChange::Keep { present: false }
+        );
+    }
+
+    #[test]
+    fn ip_version_cannot_be_combined_with_a_proxy() {
+        for version in ["ipv4", "ipv6"] {
+            assert_eq!(
+                validate(merged_proxied(json!({ "ip_version": version }))).unwrap_err(),
+                "ip_version cannot be combined with a proxy: the proxy resolves the target"
+            );
+        }
+        assert!(validate(merged_proxied(json!({ "ip_version": "any" }))).is_ok());
+        assert_eq!(
+            validate(merged_proxied(
+                json!({ "ip_version": "ipv6", "proxy_url": null })
+            ))
+            .unwrap()
+            .ip_version,
+            "ipv6"
+        );
+    }
+
+    #[test]
+    fn proxy_username_and_password_are_checked_without_echoing_the_password() {
+        let with = |username: &str, password: &str| {
+            validate(merged(json!({
+                "proxy_url": "http://proxy:3128",
+                "proxy_username": username,
+                "proxy_password": password,
+            })))
+        };
+        assert_eq!(
+            with("a:b", "p").unwrap_err(),
+            "proxy_username must not contain ':'"
+        );
+        assert!(with(&"u".repeat(257), "p").is_err());
+        assert!(with("a\u{1}b", "p").is_err());
+        let long = format!("needle-{}", "p".repeat(1020));
+        let error = with("nami", &long).unwrap_err();
+        assert_eq!(error, "proxy_password must be at most 1024 bytes");
+        assert!(!error.contains("needle"));
+        let error = with("nami", "needle\n").unwrap_err();
+        assert!(!error.contains("needle"), "{error}");
+    }
+
+    #[test]
+    fn every_advanced_option_reschedules_the_check() {
+        let stored = proxied_monitor();
+        let reschedules = |body: serde_json::Value| {
+            validate(patch(body).apply_to(MonitorConfig::from(&stored)))
+                .unwrap()
+                .changes_check_of(&stored)
+        };
+        for body in [
+            json!({}),
+            json!({ "ip_version": "any" }),
+            json!({ "remember_cookies": false }),
+            json!({ "proxy_url": "http://proxy.internal:3128", "proxy_username": "nami" }),
+        ] {
+            assert!(!reschedules(body.clone()), "{body}");
+        }
+        for body in [
+            json!({ "remember_cookies": true }),
+            json!({ "proxy_url": "http://proxy.internal:3129" }),
+            json!({ "proxy_username": "other" }),
+            json!({ "proxy_password": "new" }),
+            json!({ "proxy_password": null }),
+            json!({ "proxy_url": null }),
+        ] {
+            assert!(reschedules(body.clone()), "{body}");
+        }
+        let plain = stored_monitor();
+        assert!(
+            validate(patch(json!({ "ip_version": "ipv4" })).apply_to(MonitorConfig::from(&plain)))
+                .unwrap()
+                .changes_check_of(&plain)
+        );
+    }
+
+    #[test]
+    fn viewers_read_the_proxy_username_masked_and_the_proxy_url_redacted() {
+        use crate::middleware::rbac::ProjectReader;
+
+        let monitor = proxied_monitor();
+        let viewer = MonitorView::for_reader(monitor.clone(), ProjectReader::Viewer, false);
+        assert!(viewer.redacted && viewer.has_proxy_password);
+        assert_eq!(viewer.monitor.proxy_username.as_deref(), Some("***"));
+        assert_eq!(
+            viewer.monitor.proxy_url.as_deref(),
+            Some("http://proxy.internal:3128"),
+            "a valid proxy url has nothing to redact"
+        );
+        // A row written around the API: redact_url still masks it.
+        let odd = Monitor {
+            proxy_url: Some("http://u:pw@proxy:3128/?k=v".to_string()),
+            ..monitor.clone()
+        };
+        assert_eq!(
+            odd.for_reader(ProjectReader::Viewer).proxy_url.as_deref(),
+            Some("http://u:***@proxy:3128/?k=***")
+        );
+        let member = MonitorView::for_reader(monitor.clone(), ProjectReader::Member, false);
+        assert_eq!(member.monitor, monitor);
+        let text = serde_json::to_string(&member).unwrap();
+        assert!(text.contains("\"has_proxy_password\":true"), "{text}");
+        assert!(
+            !text.contains("proxy_password_enc") && !text.contains("[7,8,9]"),
+            "{text}"
+        );
+        let none = MonitorView::new(stored_monitor(), false);
+        assert!(!none.has_proxy_password);
+    }
+
+    #[test]
+    fn debug_hides_the_proxy_credentials() {
+        let monitor = Monitor {
+            proxy_username: Some("proxy-user-secret".to_string()),
+            request_headers_enc: None,
+            auth_username: None,
+            auth_password_enc: None,
+            request_body: None,
+            ..proxied_monitor()
+        };
+        let compact = format!("{monitor:?}");
+        assert!(
+            compact.contains("proxy_password_enc: Some(\"<sealed>\")"),
+            "{compact}"
+        );
+        assert!(
+            compact.contains("proxy_username: Some(\"<set>\")"),
+            "{compact}"
+        );
+        for printed in [format!("{monitor:?}"), format!("{monitor:#?}")] {
+            assert!(!printed.contains("proxy-user-secret"), "{printed}");
+            assert!(!printed.contains("[7, 8, 9]"), "{printed}");
+            assert!(
+                printed.contains("<sealed>") && printed.contains("<set>"),
+                "{printed}"
+            );
+            assert!(printed.contains("http://proxy.internal:3128"), "{printed}");
+            assert!(printed.contains("ip_version") && printed.contains("remember_cookies"));
+        }
+    }
+
+    #[test]
+    fn moving_the_proxy_requires_every_stored_secret_again() {
+        let current = proxied_monitor();
+        let check = |body: serde_json::Value| {
+            let config = validate(patch(body).apply_to(MonitorConfig::from(&current))).unwrap();
+            secrets_follow_the_proxy(&current, &config)
+        };
+        let refusal = "changing the proxy requires entering the header values and passwords again, or clearing them";
+        for body in [
+            json!({ "proxy_url": "http://proxy.internal:3129" }),
+            json!({ "proxy_url": "https://proxy.internal:3128" }),
+            json!({ "proxy_url": "http://other:3128" }),
+            json!({ "proxy_url": "http://other:3128", "proxy_password": "new" }),
+            json!({ "proxy_url": "http://other:3128", "proxy_password": "new",
+                "request_headers": null }),
+            json!({ "proxy_url": "http://other:3128", "proxy_password": "new",
+                "auth_password": null }),
+        ] {
+            assert_eq!(check(body.clone()).unwrap_err(), refusal, "{body}");
+        }
+        for body in [
+            json!({}),
+            json!({ "name": "renamed" }),
+            // Same origin, spelled with the trailing slash.
+            json!({ "proxy_url": "http://proxy.internal:3128/" }),
+            json!({ "proxy_url": null }),
+            json!({ "proxy_url": "http://other:3128", "proxy_password": "new",
+                "request_headers": null, "auth_password": "again" }),
+            json!({ "proxy_url": "http://other:3128", "proxy_password": null,
+                "request_headers": [{ "name": "X-Api-Key", "value": "again" }],
+                "auth_username": null }),
+            // The target's origin alone: the proxy password stays (the target
+            // rule asks for the target's own secrets).
+            json!({ "url": "https://example.org/" }),
+        ] {
+            assert!(check(body.clone()).is_ok(), "{body}");
+        }
+        // Adding a proxy counts as moving it.
+        let unproxied = stored_monitor();
+        let config = validate(
+            patch(json!({ "proxy_url": "http://127.0.0.1:3128" }))
+                .apply_to(MonitorConfig::from(&unproxied)),
+        )
+        .unwrap();
+        assert_eq!(
+            secrets_follow_the_proxy(&unproxied, &config).unwrap_err(),
+            refusal
+        );
+        // Without stored secrets there is nothing to protect.
+        let bare = Monitor {
+            request_headers_enc: None,
+            request_header_names: Vec::new(),
+            auth_username: None,
+            auth_password_enc: None,
+            ..stored_monitor()
+        };
+        let config = validate(
+            patch(json!({ "proxy_url": "http://127.0.0.1:3128" }))
+                .apply_to(MonitorConfig::from(&bare)),
+        )
+        .unwrap();
+        assert!(secrets_follow_the_proxy(&bare, &config).is_ok());
     }
 }

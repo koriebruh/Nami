@@ -280,6 +280,138 @@ pub fn open_password(
         .map_err(|_| DecryptError)
 }
 
+/// The column part of the AES-GCM associated data of
+/// `monitors.proxy_password_enc`; what is used is [`proxy_password_context`].
+pub const PROXY_PASSWORD_CONTEXT: &str = "monitors.proxy_password";
+/// The longest `proxy_url`, in bytes (the cap of a monitor URL).
+pub const MAX_PROXY_URL_BYTES: usize = 2048;
+
+/// The AES-GCM associated data of one monitor's sealed proxy password:
+/// `monitors.proxy_password:{id}`.
+pub fn proxy_password_context(monitor_id: Uuid) -> String {
+    format!("{PROXY_PASSWORD_CONTEXT}:{monitor_id}")
+}
+
+pub fn seal_proxy_password(cipher: &Cipher, monitor_id: Uuid, password: &SecretString) -> Vec<u8> {
+    cipher.encrypt(
+        &proxy_password_context(monitor_id),
+        password.expose().as_bytes(),
+    )
+}
+
+pub fn open_proxy_password(
+    cipher: &Cipher,
+    monitor_id: Uuid,
+    sealed: &[u8],
+) -> Result<SecretString, DecryptError> {
+    let bytes = cipher.decrypt(&proxy_password_context(monitor_id), sealed)?;
+    String::from_utf8(bytes)
+        .map(SecretString::new)
+        .map_err(|_| DecryptError)
+}
+
+/// A proxy URL: `http://host:port` or `https://host:port`, the port written
+/// out, no credentials (they go in `proxy_username` / `proxy_password`, where
+/// the password is sealed), nothing after the authority but an optional `/`.
+/// A host that is an IP literal must not be an address no check may contact
+/// (link-local, cloud metadata, `0.0.0.0/8`, `::`, see
+/// `checker::is_forbidden_destination`); names are judged where the check
+/// resolves them. Returns the trimmed input as typed.
+pub fn validate_proxy_url(raw: &str) -> Result<String, String> {
+    const SCHEME: &str = "proxy_url must be an http:// or https:// URL";
+    // Checked before trimming, like monitor URLs: `trim` would drop U+2028 at
+    // the edges, and `Url::parse` silently strips tabs and newlines.
+    if raw.chars().any(is_invisible_or_bidi_char) {
+        return Err("proxy_url must not contain invisible or text-direction characters".into());
+    }
+    let url = raw.trim();
+    if url.len() > MAX_PROXY_URL_BYTES {
+        return Err(format!(
+            "proxy_url must be at most {MAX_PROXY_URL_BYTES} bytes"
+        ));
+    }
+    if url.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+        return Err("proxy_url must not contain whitespace or control characters".into());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|_| SCHEME.to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(SCHEME.into());
+    }
+    if super::monitor::url_has_credentials(&parsed) {
+        return Err(
+            "proxy_url must not contain credentials; use proxy_username and proxy_password".into(),
+        );
+    }
+    // `Url::port()` hides a port equal to the scheme's default (`:80` on
+    // http, `:443` on https), so the text is read too.
+    if parsed.port().is_none() && !authority_names_a_port(url) {
+        return Err("proxy_url must include a port".into());
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("proxy_url must be scheme://host:port with nothing after it".into());
+    }
+    if crate::uptime::checker::names_forbidden_address(&parsed) {
+        return Err(
+            "proxy_url must not point at a link-local, metadata or unspecified address".into(),
+        );
+    }
+    Ok(url.to_string())
+}
+
+/// Whether the authority of `url` (between `://` and the first `/`, `?` or
+/// `#`) ends in `:<digits>`. Only called on a URL that parsed and has no
+/// userinfo.
+fn authority_names_a_port(url: &str) -> bool {
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            !port.is_empty()
+                && port.bytes().all(|b| b.is_ascii_digit())
+                // `[::1]` alone has colons but no port.
+                && (!host.starts_with('[') || host.ends_with(']'))
+        }
+        None => false,
+    }
+}
+
+/// Proxy user id: the rules of a basic-auth user id (RFC 7617, see
+/// [`validate_username`]) with `proxy_username` in the messages.
+pub fn validate_proxy_username(raw: &str) -> Result<String, String> {
+    if raw.contains(':') {
+        return Err("proxy_username must not contain ':'".into());
+    }
+    if raw.chars().any(char::is_control) {
+        return Err("proxy_username must not contain control characters".into());
+    }
+    if raw.chars().any(is_invisible_or_bidi_char) {
+        return Err(
+            "proxy_username must not contain invisible or text-direction characters".into(),
+        );
+    }
+    if raw.chars().count() > MAX_USERNAME_CHARS {
+        return Err(format!(
+            "proxy_username must be at most {MAX_USERNAME_CHARS} characters"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+pub fn validate_proxy_password(password: &SecretString) -> Result<(), String> {
+    let value = password.expose();
+    if value.chars().any(char::is_control) {
+        return Err("proxy_password must not contain control characters".into());
+    }
+    if value.len() > MAX_PASSWORD_BYTES {
+        return Err(format!(
+            "proxy_password must be at most {MAX_PASSWORD_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,5 +784,164 @@ mod tests {
         for printed in [format!("{change:?}"), format!("{password:?}")] {
             assert!(!printed.contains("needle-"), "{printed}");
         }
+    }
+
+    // ---- proxy (NAMI-UP-23) ------------------------------------------------
+
+    #[test]
+    fn proxy_urls_must_be_http_or_https_host_and_port_without_credentials() {
+        assert_eq!(
+            validate_proxy_url(" http://proxy.internal:3128 ").unwrap(),
+            "http://proxy.internal:3128"
+        );
+        assert_eq!(
+            validate_proxy_url("https://10.0.0.5:8443/").unwrap(),
+            "https://10.0.0.5:8443/"
+        );
+        assert_eq!(
+            validate_proxy_url("http://[fd00::1]:3128").unwrap(),
+            "http://[fd00::1]:3128"
+        );
+        // Url::port() hides a port equal to the scheme's default: an explicit
+        // :80 / :443 is still a port.
+        assert_eq!(
+            validate_proxy_url("http://proxy:80").unwrap(),
+            "http://proxy:80"
+        );
+        assert_eq!(
+            validate_proxy_url("https://proxy:443").unwrap(),
+            "https://proxy:443"
+        );
+        assert_eq!(
+            validate_proxy_url("http://127.0.0.1:3128").unwrap(),
+            "http://127.0.0.1:3128",
+            "loopback and private proxies are what self-hosting is for"
+        );
+        let credentials =
+            "proxy_url must not contain credentials; use proxy_username and proxy_password";
+        assert_eq!(
+            validate_proxy_url("http://user:pass@proxy:3128").unwrap_err(),
+            credentials
+        );
+        assert_eq!(
+            validate_proxy_url("http://user@proxy:3128").unwrap_err(),
+            credentials
+        );
+        for scheme in [
+            "socks5://proxy:1080",
+            "ftp://proxy:21",
+            "proxy:3128",
+            "//proxy:3128",
+            "",
+        ] {
+            assert_eq!(
+                validate_proxy_url(scheme).unwrap_err(),
+                "proxy_url must be an http:// or https:// URL",
+                "{scheme}"
+            );
+        }
+        for portless in [
+            "http://proxy",
+            "http://proxy/",
+            "http://proxy:",
+            "http://[::1]",
+        ] {
+            assert_eq!(
+                validate_proxy_url(portless).unwrap_err(),
+                "proxy_url must include a port",
+                "{portless}"
+            );
+        }
+        for extra in [
+            "http://proxy:3128/path",
+            "http://proxy:3128/?a=b",
+            "http://proxy:3128/#x",
+            "http://proxy:3128?a=b",
+        ] {
+            assert_eq!(
+                validate_proxy_url(extra).unwrap_err(),
+                "proxy_url must be scheme://host:port with nothing after it",
+                "{extra}"
+            );
+        }
+        assert!(validate_proxy_url("http://pro xy:3128").is_err());
+        assert!(validate_proxy_url("http://proxy:3128\r\nX: y").is_err());
+        assert!(validate_proxy_url("http://proxy:3128\u{2028}").is_err());
+        assert!(validate_proxy_url(&format!("http://{}:1", "a".repeat(2100))).is_err());
+    }
+
+    /// The engine connects to the proxy itself: a proxy on the metadata
+    /// service would hand its credentials to the check.
+    #[test]
+    fn a_proxy_cannot_be_a_link_local_or_metadata_address() {
+        let refused = "proxy_url must not point at a link-local, metadata or unspecified address";
+        for url in [
+            "http://169.254.169.254:80",
+            "http://169.254.0.1:3128",
+            "http://[fe80::1]:3128",
+            "http://[fd00:ec2::254]:80",
+            "http://100.100.100.200:80",
+            "http://0.0.0.0:3128",
+            "http://[::]:3128",
+            "http://[::ffff:169.254.169.254]:80",
+            // The URL parser reads numeric hosts as addresses.
+            "http://2852039166:80",
+            "http://0xa9fea9fe:80",
+        ] {
+            assert_eq!(validate_proxy_url(url).unwrap_err(), refused, "{url}");
+        }
+    }
+
+    #[test]
+    fn proxy_usernames_and_passwords_follow_the_basic_auth_rules() {
+        assert_eq!(validate_proxy_username("nami").unwrap(), "nami");
+        assert_eq!(
+            validate_proxy_username("a:b").unwrap_err(),
+            "proxy_username must not contain ':'"
+        );
+        assert_eq!(
+            validate_proxy_username("a\nb").unwrap_err(),
+            "proxy_username must not contain control characters"
+        );
+        assert!(validate_proxy_username("a\u{202e}b").is_err());
+        assert_eq!(
+            validate_proxy_username(&"u".repeat(257)).unwrap_err(),
+            "proxy_username must be at most 256 characters"
+        );
+        assert!(validate_proxy_password(&SecretString::new("p".repeat(1024))).is_ok());
+        assert_eq!(
+            validate_proxy_password(&SecretString::new("p".repeat(1025))).unwrap_err(),
+            "proxy_password must be at most 1024 bytes"
+        );
+        assert_eq!(
+            validate_proxy_password(&SecretString::new("a\rb")).unwrap_err(),
+            "proxy_password must not contain control characters"
+        );
+    }
+
+    #[test]
+    fn a_sealed_proxy_password_opens_only_for_its_monitor_and_column() {
+        let cipher = Cipher::new(&TEST_KEY);
+        let (id, other) = (Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(
+            proxy_password_context(id),
+            format!("monitors.proxy_password:{id}")
+        );
+        let sealed = seal_proxy_password(&cipher, id, &SecretString::new("pr0xy"));
+        assert!(!sealed.windows(5).any(|w| w == b"pr0xy"));
+        assert_eq!(
+            open_proxy_password(&cipher, id, &sealed).unwrap().expose(),
+            "pr0xy"
+        );
+        assert!(open_proxy_password(&cipher, other, &sealed).is_err());
+        assert!(
+            open_password(&cipher, id, &sealed).is_err(),
+            "not the basic-auth password"
+        );
+        let basic = seal_password(&cipher, id, &SecretString::new("pr0xy"));
+        assert!(
+            open_proxy_password(&cipher, id, &basic).is_err(),
+            "and the basic-auth password is not the proxy password"
+        );
     }
 }
