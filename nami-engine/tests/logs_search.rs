@@ -287,7 +287,11 @@ async fn levels_sources_text_and_ids_narrow_the_results(pool: sqlx::PgPool) {
         "fields are searched only with in_fields"
     );
     assert_eq!(f.messages("q=orders&in_fields=true").await, [M2]);
-    assert_eq!(f.messages("q=ORDERS&in_fields=true").await, [M2], "in_fields is case-insensitive too");
+    assert_eq!(
+        f.messages("q=ORDERS&in_fields=true").await,
+        [M2],
+        "in_fields is case-insensitive too"
+    );
     assert_eq!(
         f.messages("trace_id=4BF92F3577B34DA6A3CE929D0E0E4736")
             .await,
