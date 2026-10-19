@@ -32,7 +32,7 @@ const MAX_URL_BYTES: usize = 2048;
 const MAX_KEYWORD_BYTES: usize = 1024;
 
 /// What `check_type` may be.
-pub const CHECK_TYPES: [&str; 7] = [
+pub const CHECK_TYPES: [&str; 11] = [
     "http",
     "keyword",
     "tcp",
@@ -40,7 +40,14 @@ pub const CHECK_TYPES: [&str; 7] = [
     "dns",
     "ssl_expiry",
     "domain_expiry",
+    "smtp",
+    "pop3",
+    "imap",
+    "udp",
 ];
+
+/// The longest `udp_payload`, in bytes.
+pub const MAX_UDP_PAYLOAD_BYTES: usize = 1024;
 
 /// The record types a dns monitor can look up (the `dns_record_type` column's
 /// check constraint lists the same).
@@ -108,6 +115,11 @@ pub struct Monitor {
     /// ssl_expiry and domain_expiry: down when the expiry is less than this
     /// many days away (1-365).
     pub expiry_threshold_days: Option<i32>,
+    /// smtp, pop3 and imap: speak TLS from the first byte (ports 465, 995,
+    /// 993).
+    pub use_tls: bool,
+    /// udp: the datagram to send, verbatim (UTF-8, no NUL).
+    pub udp_payload: Option<String>,
 }
 
 /// What `Debug` prints in place of a sealed column that holds a value.
@@ -151,6 +163,8 @@ impl fmt::Debug for Monitor {
             dns_nameserver,
             expected_value,
             expiry_threshold_days,
+            use_tls,
+            udp_payload,
         } = self;
         f.debug_struct("Monitor")
             .field("id", id)
@@ -193,6 +207,8 @@ impl fmt::Debug for Monitor {
             .field("dns_nameserver", dns_nameserver)
             .field("expected_value", expected_value)
             .field("expiry_threshold_days", expiry_threshold_days)
+            .field("use_tls", use_tls)
+            .field("udp_payload", udp_payload)
             .finish()
     }
 }
@@ -320,6 +336,8 @@ pub struct MonitorConfig {
     pub dns_nameserver: Option<String>,
     pub expected_value: Option<String>,
     pub expiry_threshold_days: Option<i32>,
+    pub use_tls: bool,
+    pub udp_payload: Option<String>,
 }
 
 impl From<&Monitor> for MonitorConfig {
@@ -354,6 +372,8 @@ impl From<&Monitor> for MonitorConfig {
             dns_nameserver: m.dns_nameserver.clone(),
             expected_value: m.expected_value.clone(),
             expiry_threshold_days: m.expiry_threshold_days,
+            use_tls: m.use_tls,
+            udp_payload: m.udp_payload.clone(),
         }
     }
 }
@@ -385,6 +405,8 @@ impl MonitorConfig {
             || self.dns_nameserver != current.dns_nameserver
             || self.expected_value != current.expected_value
             || self.expiry_threshold_days != current.expiry_threshold_days
+            || self.use_tls != current.use_tls
+            || self.udp_payload != current.udp_payload
     }
 }
 
@@ -429,6 +451,9 @@ pub struct CreateMonitorRequest {
     pub dns_nameserver: Option<String>,
     pub expected_value: Option<String>,
     pub expiry_threshold_days: Option<i32>,
+    #[serde(default)]
+    pub use_tls: bool,
+    pub udp_payload: Option<String>,
 }
 
 fn default_http_method() -> String {
@@ -509,6 +534,8 @@ impl CreateMonitorRequest {
             dns_nameserver: self.dns_nameserver,
             expected_value: self.expected_value,
             expiry_threshold_days: self.expiry_threshold_days,
+            use_tls: self.use_tls,
+            udp_payload: self.udp_payload,
         }
     }
 }
@@ -553,6 +580,8 @@ pub struct PatchMonitorRequest {
     /// `null` resets to the type's default (see `validate_threshold`).
     #[serde(default, deserialize_with = "nullable")]
     pub expiry_threshold_days: Option<Option<i32>>,
+    pub use_tls: Option<bool>,
+    pub udp_payload: Option<String>,
 }
 
 /// A nullable PATCH field applied to its current value.
@@ -610,6 +639,8 @@ impl PatchMonitorRequest {
             dns_nameserver: patched(self.dns_nameserver, base.dns_nameserver),
             expected_value: patched(self.expected_value, base.expected_value),
             expiry_threshold_days,
+            use_tls: self.use_tls.unwrap_or(base.use_tls),
+            udp_payload: self.udp_payload.or(base.udp_payload),
         }
     }
 }
@@ -636,6 +667,8 @@ pub fn validate(mut c: MonitorConfig) -> Result<MonitorConfig, String> {
         "dns" => validate_dns(&mut c)?,
         "ssl_expiry" => validate_ssl_expiry(&mut c)?,
         "domain_expiry" => validate_domain_expiry(&mut c)?,
+        "smtp" | "pop3" | "imap" => validate_mail(&mut c)?,
+        "udp" => validate_udp(&mut c)?,
         _ => {
             return Err(format!(
                 "check_type must be one of {}",
@@ -714,12 +747,7 @@ fn validate_http(c: &mut MonitorConfig) -> Result<(), String> {
         if keyword.trim().is_empty() {
             return Err("keyword is required for keyword monitors".into());
         }
-        if keyword.len() > MAX_KEYWORD_BYTES {
-            return Err(format!("keyword must be at most {MAX_KEYWORD_BYTES} bytes"));
-        }
-        if keyword.chars().any(char::is_control) {
-            return Err("keyword must not contain control characters".into());
-        }
+        validate_keyword(keyword)?;
         // Any other method has a body to search; a HEAD response has none.
         if c.http_method == "HEAD" {
             return Err(
@@ -729,6 +757,18 @@ fn validate_http(c: &mut MonitorConfig) -> Result<(), String> {
         }
     }
     validate_request_config(c, credentials_in_url)
+}
+
+/// The rules of every keyword: at most [`MAX_KEYWORD_BYTES`] and no control
+/// characters, because keywords end up in error text, incidents and emails.
+fn validate_keyword(keyword: &str) -> Result<(), String> {
+    if keyword.len() > MAX_KEYWORD_BYTES {
+        return Err(format!("keyword must be at most {MAX_KEYWORD_BYTES} bytes"));
+    }
+    if keyword.chars().any(char::is_control) {
+        return Err("keyword must not contain control characters".into());
+    }
+    Ok(())
 }
 
 /// Body, headers and basic auth of an http or keyword monitor (the method is
@@ -803,14 +843,30 @@ fn clear_unused_fields(c: &mut MonitorConfig) {
         c.url = None;
         clear_request_config(c);
     }
-    if !uses(&["keyword"]) {
+    if !uses(&["keyword", "udp"]) {
         c.keyword = None;
     }
-    if !uses(&["tcp", "ping", "dns", "ssl_expiry", "domain_expiry"]) {
+    if !uses(&[
+        "tcp",
+        "ping",
+        "dns",
+        "ssl_expiry",
+        "domain_expiry",
+        "smtp",
+        "pop3",
+        "imap",
+        "udp",
+    ]) {
         c.host = None;
     }
-    if !uses(&["tcp", "ssl_expiry"]) {
+    if !uses(&["tcp", "ssl_expiry", "smtp", "pop3", "imap", "udp"]) {
         c.port = None;
+    }
+    if !uses(&["smtp", "pop3", "imap"]) {
+        c.use_tls = false;
+    }
+    if !uses(&["udp"]) {
+        c.udp_payload = None;
     }
     if !uses(&["dns"]) {
         c.dns_record_type = None;
@@ -937,6 +993,56 @@ fn validate_domain_expiry(c: &mut MonitorConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// smtp, pop3 and imap: a host and a port that defaults to the protocol's:
+/// 25, 110, 143, or with implicit TLS (`use_tls`) 465, 995, 993.
+fn validate_mail(c: &mut MonitorConfig) -> Result<(), String> {
+    c.host = Some(required_host(c)?);
+    let default_port = match (c.check_type.as_str(), c.use_tls) {
+        ("smtp", false) => 25,
+        ("smtp", true) => 465,
+        ("pop3", false) => 110,
+        ("pop3", true) => 995,
+        ("imap", false) => 143,
+        _ => 993,
+    };
+    let port = c.port.unwrap_or(default_port);
+    if !(1..=65535).contains(&port) {
+        return Err("port must be between 1 and 65535".into());
+    }
+    c.port = Some(port);
+    Ok(())
+}
+
+/// udp: host, port and the payload to send are required; `keyword` is an
+/// optional match on the reply and follows the rules of every keyword.
+fn validate_udp(c: &mut MonitorConfig) -> Result<(), String> {
+    c.host = Some(required_host(c)?);
+    if !c.port.is_some_and(|p| (1..=65535).contains(&p)) {
+        return Err("port must be between 1 and 65535".into());
+    }
+    let Some(payload) = c
+        .udp_payload
+        .as_deref()
+        .filter(|payload| !payload.is_empty())
+    else {
+        return Err("udp_payload is required for udp monitors".into());
+    };
+    // Postgres text cannot hold NUL: a 400 here, not a failed insert.
+    if payload.contains('\0') {
+        return Err("udp_payload must not contain NUL characters".into());
+    }
+    if payload.len() > MAX_UDP_PAYLOAD_BYTES {
+        return Err(format!(
+            "udp_payload must be at most {MAX_UDP_PAYLOAD_BYTES} bytes"
+        ));
+    }
+    c.keyword = c.keyword.take().filter(|keyword| !keyword.is_empty());
+    if let Some(keyword) = &c.keyword {
+        validate_keyword(keyword)?;
+    }
+    Ok(())
+}
+
 fn validate_threshold(days: Option<i32>, default: i32) -> Result<i32, String> {
     let days = days.unwrap_or(default);
     if !(1..=365).contains(&days) {
@@ -1036,7 +1142,8 @@ async fn write_config(
              auth_password_enc = case when $24 then auth_password_enc else $25 end,
              recovery_threshold = $26,
              dns_record_type = $27, dns_nameserver = $28, expected_value = $29,
-             expiry_threshold_days = $30
+             expiry_threshold_days = $30,
+             use_tls = $31, udp_payload = $32
          where id = $1
          returning *",
     )
@@ -1070,6 +1177,8 @@ async fn write_config(
     .bind(&c.dns_nameserver)
     .bind(&c.expected_value)
     .bind(c.expiry_threshold_days)
+    .bind(c.use_tls)
+    .bind(&c.udp_payload)
     .fetch_one(&mut *conn)
     .await
 }

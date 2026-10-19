@@ -826,3 +826,106 @@ async fn expiry_monitors_alert_on_the_first_failed_check_by_default(pool: sqlx::
         .await;
     assert_eq!(http["confirmation_threshold"], 2, "other types keep 2");
 }
+
+#[sqlx::test]
+async fn mail_monitors_default_their_port_from_protocol_and_tls(pool: sqlx::PgPool) {
+    let c = ctx(pool).await;
+    let cases = [
+        ("smtp", false, 25),
+        ("smtp", true, 465),
+        ("pop3", false, 110),
+        ("pop3", true, 995),
+        ("imap", false, 143),
+        ("imap", true, 993),
+    ];
+    for (check_type, use_tls, port) in cases {
+        let (status, created) = c
+            .create(json!({ "name": check_type, "check_type": check_type, "host": "mail.example.com", "use_tls": use_tls }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["port"], port, "{check_type} use_tls={use_tls}");
+        assert_eq!(created["use_tls"], use_tls);
+    }
+    let (status, custom) = c
+        .create(json!({ "name": "submission", "check_type": "smtp", "host": "mail.example.com", "port": 587 }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{custom}");
+    assert_eq!(custom["port"], 587);
+    let (_, http) = c
+        .create(json!({ "name": "web", "check_type": "http", "url": "https://example.com", "use_tls": true }))
+        .await;
+    assert_eq!(
+        http["use_tls"], false,
+        "use_tls only applies to mail monitors"
+    );
+
+    let c = ctx(c.pool.clone()).await;
+    c.assert_rejected(vec![
+        (
+            json!({ "name": "x", "check_type": "imap" }),
+            "host is required",
+        ),
+        (
+            json!({ "name": "x", "check_type": "pop3", "host": "mail.example.com", "port": 0 }),
+            "port",
+        ),
+        (
+            json!({ "name": "x", "check_type": "smtp", "host": "smtp://mail.example.com" }),
+            "host must not contain",
+        ),
+    ])
+    .await;
+}
+
+#[sqlx::test]
+async fn udp_monitors_need_a_port_and_a_payload(pool: sqlx::PgPool) {
+    let c = ctx(pool).await;
+    let (status, created) = c
+        .create(json!({
+            "name": "Game server", "check_type": "udp", "host": "game.example.com", "port": 27015,
+            "udp_payload": "\u{ff}\u{ff}status\r\n", "keyword": "players"
+        }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(
+        created["udp_payload"], "\u{ff}\u{ff}status\r\n",
+        "payloads are sent verbatim, line breaks included"
+    );
+    assert_eq!(created["keyword"], "players");
+    let id = created["id"].as_str().unwrap();
+    let (status, tcp) = c.patch(id, json!({ "check_type": "tcp" })).await;
+    assert_eq!(status, StatusCode::OK, "{tcp}");
+    assert_eq!(tcp["udp_payload"], Value::Null);
+    assert_eq!(tcp["keyword"], Value::Null);
+
+    let c = ctx(c.pool.clone()).await;
+    let udp = |extra: Value| {
+        let mut body = json!({ "name": "x", "check_type": "udp", "host": "game.example.com", "port": 27015, "udp_payload": "hi" });
+        body.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        body
+    };
+    c.assert_rejected(vec![
+        (udp(json!({ "port": null })), "port"),
+        (
+            udp(json!({ "udp_payload": null })),
+            "udp_payload is required",
+        ),
+        (udp(json!({ "udp_payload": "" })), "udp_payload is required"),
+        (udp(json!({ "udp_payload": "a\u{0}b" })), "NUL"),
+        (
+            udp(json!({ "udp_payload": "a".repeat(1025) })),
+            "at most 1024 bytes",
+        ),
+        (
+            udp(json!({ "keyword": "a".repeat(1025) })),
+            "keyword must be at most 1024 bytes",
+        ),
+        (
+            udp(json!({ "keyword": "a\nb" })),
+            "keyword must not contain control characters",
+        ),
+    ])
+    .await;
+}

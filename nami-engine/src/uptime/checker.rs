@@ -491,6 +491,8 @@ pub async fn perform_check(ctx: &CheckContext, monitor: &Monitor) -> CheckOutcom
             "dns" => super::dns::probe(monitor, timeout, started).await,
             "ssl_expiry" => super::expiry::probe_ssl(ctx, monitor, started).await,
             "domain_expiry" => super::expiry::probe_domain(ctx, monitor, started).await,
+            "smtp" | "pop3" | "imap" => super::mail::probe(ctx, monitor, started).await,
+            "udp" => super::udp::probe(monitor, started).await,
             other => Observation::down(None, None, format!("unsupported check type {other:?}")),
         }
     };
