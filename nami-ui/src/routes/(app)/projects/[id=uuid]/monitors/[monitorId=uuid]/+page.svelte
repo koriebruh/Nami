@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import { refreshAll } from '$app/navigation';
+	import AvailabilityCard from '#lib/components/AvailabilityCard.svelte';
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import ResponseTimeChart from '#lib/components/ResponseTimeChart.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
@@ -176,6 +177,8 @@
 			<StatCard label={tile.label} value={tile.value} spark={tile.spark} sparkTone={tile.tone} />
 		{/each}
 	</section>
+
+	<AvailabilityCard availability={data.availability} exportBase="{base}/checks.csv" />
 
 	<Card title="Response time" subtitle="Last 24 hours, average per 30 minutes (UTC)">
 		{#if data.stats}

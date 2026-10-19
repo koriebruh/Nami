@@ -35,12 +35,15 @@ describe('heartbeat detail load', () => {
 		process.env.PUBLIC_ENGINE_URL = 'https://engine.example.com/';
 		const heartbeat = { id: HEARTBEAT_ID, name: 'Backup', token: 'b'.repeat(64) };
 		const { event, calls } = fakeEvent({ respond: answer(heartbeat) });
-		expect(await load(event)).toEqual({ heartbeat, pings: [], groups: [], engineUrl: 'https://engine.example.com' });
-		expect(calls()).toEqual([
-			{ method: 'GET', path: heartbeatPath, search: '', body: undefined },
-			{ method: 'GET', path: pingsPath, search: '?limit=50', body: undefined },
-			{ method: 'GET', path: groupsPath, search: '', body: undefined }
+		expect(await load(event)).toMatchObject({ heartbeat, pings: [], groups: [], engineUrl: 'https://engine.example.com' });
+		expect(calls().map((call) => [call.method, call.path])).toEqual([
+			['GET', heartbeatPath],
+			['GET', pingsPath],
+			['GET', groupsPath],
+			['GET', `${heartbeatPath}/availability`]
 		]);
+		expect(calls()[1].search).toBe('?limit=50');
+		expect(calls()[3].search).toMatch(/^\?from=[^&]+&to=[^&]+$/);
 	});
 
 	// A viewer's heartbeat has no token (null). The load keeps it that way.
@@ -48,8 +51,28 @@ describe('heartbeat detail load', () => {
 		const heartbeat = { id: HEARTBEAT_ID, name: 'Backup', token: null };
 		const { event } = fakeEvent({ respond: answer(heartbeat) });
 		const data = await load(event);
-		expect(data).toEqual({ heartbeat, pings: [], groups: [], engineUrl: 'http://localhost:8081' });
+		expect(data).toMatchObject({ heartbeat, pings: [], groups: [], engineUrl: 'http://localhost:8081' });
 		expect(data).toHaveProperty('heartbeat.token', null);
+	});
+
+	it('still loads, with the availability unavailable, when that call fails', async () => {
+		const heartbeat = { id: HEARTBEAT_ID, name: 'Backup', token: null };
+		const { event } = fakeEvent({
+			respond: (url) =>
+				url.pathname.endsWith('/availability') ? new Response('{"error":"x"}', { status: 500 }) : new Response(JSON.stringify(heartbeat))
+		});
+		expect(await load(event)).toMatchObject({ heartbeat, availability: { data: null, unavailable: true } });
+	});
+
+	it('shows the availability the engine returns for the chosen range', async () => {
+		const availability = { uptime_pct: 100, incidents: 0 };
+		const { event, calls } = fakeEvent({
+			url: 'http://ui.test/?range=7d',
+			respond: (url) => new Response(JSON.stringify(url.pathname.endsWith('/availability') ? availability : { id: HEARTBEAT_ID }))
+		});
+		const data = (await load(event)) as any;
+		expect(data.availability).toMatchObject({ range: { key: '7d' }, data: availability, unavailable: false });
+		expect(calls()).toHaveLength(4);
 	});
 
 	it('is a 404 for a heartbeat the engine does not have', async () => {
@@ -94,7 +117,8 @@ describe('heartbeat detail load', () => {
 		expect(project.calls().map((call) => call.path)).toEqual([
 			`${base}/heartbeats/${HEARTBEAT_ID}`,
 			`${base}/heartbeats/${HEARTBEAT_ID}/pings`,
-			`${base}/monitor-groups`
+			`${base}/monitor-groups`,
+			`${base}/heartbeats/${HEARTBEAT_ID}/availability`
 		]);
 
 		const heartbeat = fakeEvent({ params: { heartbeatId: hostile }, body: '{}' });
@@ -102,7 +126,8 @@ describe('heartbeat detail load', () => {
 		expect(heartbeat.calls().map((call) => call.path)).toEqual([
 			`${listPath}/${hostileSegment}`,
 			`${listPath}/${hostileSegment}/pings`,
-			groupsPath
+			groupsPath,
+			`${listPath}/${hostileSegment}/availability`
 		]);
 	});
 

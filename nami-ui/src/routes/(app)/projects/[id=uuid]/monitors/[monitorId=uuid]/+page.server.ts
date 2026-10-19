@@ -6,6 +6,7 @@ import {
 	enginePath,
 	redirectToLoginIfUnauthorized
 } from '#lib/server/engine';
+import { loadAvailability } from '#lib/server/availability';
 import { formText } from '#lib/server/monitor-form';
 import type { Incident, Monitor, MonitorStats, UptimeCheck } from '#lib/uptime';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
@@ -18,11 +19,12 @@ export const load: PageServerLoad = async (event) => {
 	event.setHeaders({ 'cache-control': 'private, no-store' });
 
 	const { id, monitorId } = event.params;
-	const [monitorRes, statsRes, checksRes, incidentsRes] = await Promise.all([
+	const [monitorRes, statsRes, checksRes, incidentsRes, availability] = await Promise.all([
 		callEngine(event, enginePath`/projects/${id}/monitors/${monitorId}`),
 		callEngine(event, enginePath`/projects/${id}/monitors/${monitorId}/stats`),
 		callEngine(event, enginePath`/projects/${id}/monitors/${monitorId}/checks?limit=20`),
-		callEngine(event, enginePath`/projects/${id}/incidents?monitor_id=${monitorId}`)
+		callEngine(event, enginePath`/projects/${id}/incidents?monitor_id=${monitorId}`),
+		loadAvailability(event, enginePath`/projects/${id}/monitors/${monitorId}/availability`)
 	]);
 	redirectToLoginIfUnauthorized(monitorRes);
 	if (monitorRes.status === 404) throw error(404, 'Monitor not found.');
@@ -38,7 +40,7 @@ export const load: PageServerLoad = async (event) => {
 	const stats: MonitorStats | null = statsRes.ok ? await statsRes.json() : null;
 	const checks: UptimeCheck[] = checksRes.ok ? await checksRes.json() : [];
 	const incidents: Incident[] = incidentsRes.ok ? await incidentsRes.json() : [];
-	return { monitor, stats, checks, incidents };
+	return { monitor, stats, checks, incidents, availability };
 };
 
 async function setPaused(event: RequestEvent, paused: boolean) {
