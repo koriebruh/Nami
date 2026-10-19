@@ -2,6 +2,7 @@ pub mod heartbeat;
 pub mod incident;
 pub mod maintenance;
 pub mod monitor;
+pub mod monitor_group;
 pub mod monitor_request;
 pub mod project;
 pub mod source;
