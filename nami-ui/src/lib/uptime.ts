@@ -3,7 +3,41 @@
 // client-rendered markup agree (and match the alert emails).
 
 export type Status = 'pending' | 'up' | 'down';
-export type CheckType = 'http' | 'keyword' | 'tcp';
+export type CheckType =
+	| 'http'
+	| 'keyword'
+	| 'tcp'
+	| 'ping'
+	| 'dns'
+	| 'ssl_expiry'
+	| 'domain_expiry'
+	| 'smtp'
+	| 'pop3'
+	| 'imap'
+	| 'udp';
+export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'OPTIONS';
+export type DnsRecordType = 'A' | 'AAAA' | 'CNAME' | 'MX' | 'TXT' | 'NS';
+
+export const CHECK_TYPE_LABELS: Record<CheckType, string> = {
+	http: 'HTTP',
+	keyword: 'Keyword',
+	tcp: 'TCP',
+	ping: 'Ping',
+	dns: 'DNS',
+	ssl_expiry: 'SSL expiry',
+	domain_expiry: 'Domain expiry',
+	smtp: 'SMTP',
+	pop3: 'POP3',
+	imap: 'IMAP',
+	udp: 'UDP'
+};
+
+export const HTTP_METHODS: HttpMethod[] = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'];
+export const BODY_METHODS: HttpMethod[] = ['POST', 'PUT', 'PATCH'];
+export const DNS_RECORD_TYPES: DnsRecordType[] = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
+
+/** A custom request header as the engine returns it: the value is write-only. */
+export type RequestHeaderView = { name: string; value_set: boolean };
 
 export type Monitor = {
 	id: string;
@@ -13,7 +47,7 @@ export type Monitor = {
 	url: string | null;
 	host: string | null;
 	port: number | null;
-	http_method: 'GET' | 'HEAD';
+	http_method: HttpMethod;
 	keyword: string | null;
 	keyword_mode: 'contains' | 'not_contains';
 	expected_status_min: number;
@@ -26,6 +60,30 @@ export type Monitor = {
 	consecutive_failures: number;
 	last_checked_at: string | null;
 	next_check_at: string;
+	created_at: string;
+	request_body: string | null;
+	request_headers: RequestHeaderView[];
+	auth_username: string | null;
+	has_auth_password: boolean;
+	follow_redirects: boolean;
+	verify_ssl: boolean;
+	recovery_threshold: number;
+	consecutive_successes: number;
+	dns_record_type: DnsRecordType | null;
+	dns_nameserver: string | null;
+	expected_value: string | null;
+	expiry_threshold_days: number | null;
+	use_tls: boolean;
+	udp_payload: string | null;
+	group_id: string | null;
+	in_maintenance: boolean;
+};
+
+export type MonitorGroup = {
+	id: string;
+	project_id: string;
+	name: string;
+	position: number;
 	created_at: string;
 };
 
@@ -83,6 +141,7 @@ export type Heartbeat = {
 	current_status: Status;
 	last_ping_at: string | null;
 	created_at: string;
+	in_maintenance: boolean;
 };
 
 /** The URL a cron job pings: straight to nami-engine, not through this BFF. */
@@ -181,9 +240,73 @@ export function formatClockUtc(iso: string): string {
 	return new Date(iso).toISOString().slice(11, 16);
 }
 
-/** What the monitor checks: the URL, or host:port for TCP. */
-export function monitorTarget(m: Pick<Monitor, 'check_type' | 'url' | 'host' | 'port'>): string {
-	return m.check_type === 'tcp' ? `${m.host ?? ''}:${m.port ?? ''}` : (m.url ?? '');
+/**
+ * What the monitor checks: the URL for http/keyword, the host for ping and
+ * domain expiry, "TYPE host @nameserver" for DNS, host:port otherwise.
+ */
+export function monitorTarget(
+	m: Pick<Monitor, 'check_type' | 'url' | 'host' | 'port'> &
+		Partial<Pick<Monitor, 'dns_record_type' | 'dns_nameserver'>>
+): string {
+	switch (m.check_type) {
+		case 'http':
+		case 'keyword':
+			return m.url ?? '';
+		case 'ping':
+		case 'domain_expiry':
+			return m.host ?? '';
+		case 'dns':
+			return `${m.dns_record_type ?? 'A'} ${m.host ?? ''}${m.dns_nameserver ? ` @${m.dns_nameserver}` : ''}`;
+		default:
+			return `${m.host ?? ''}:${m.port ?? ''}`;
+	}
+}
+
+const UNESCAPES: Record<string, string> = { n: '\n', r: '\r', t: '\t', '\\': '\\' };
+const ESCAPES: Record<string, string> = { '\n': '\\n', '\r': '\\r', '\t': '\\t', '\\': '\\\\' };
+
+/** UDP payloads are typed on one line: `\n`, `\r`, `\t` and `\\` are escapes. */
+export function unescapePayload(text: string): string {
+	return text.replace(/\\([nrt\\])/g, (_, c: string) => UNESCAPES[c]);
+}
+
+/** The inverse of {@link unescapePayload}, for showing a stored payload. */
+export function escapePayload(text: string): string {
+	return text.replace(/[\\\n\r\t]/g, (c) => ESCAPES[c]);
+}
+
+/**
+ * Whether the monitor carries the `***` the engine puts in place of a URL
+ * secret, a request body or a basic-auth username when a viewer reads it. A
+ * monitor like that cannot be edited from what it shows: saving would write
+ * the mask over the real values.
+ */
+export function hasMaskedValues(m: Pick<Monitor, 'url' | 'request_body' | 'auth_username'>): boolean {
+	return m.request_body === '***' || m.auth_username === '***' || (m.url?.includes('***') ?? false);
+}
+
+export type MonitorSection<M> = { group: MonitorGroup | null; monitors: M[] };
+
+/**
+ * Monitors bucketed by group for the list page: groups in the engine's
+ * order (position, then name), then the ungrouped ones (`group: null`).
+ * Empty sections are dropped. A monitor whose group is unknown (e.g. just
+ * deleted) counts as ungrouped.
+ */
+export function groupMonitors<M extends Pick<Monitor, 'group_id'>>(
+	monitors: M[],
+	groups: MonitorGroup[]
+): MonitorSection<M>[] {
+	const known = new Set(groups.map((group) => group.id));
+	const sections: MonitorSection<M>[] = groups.map((group) => ({
+		group,
+		monitors: monitors.filter((monitor) => monitor.group_id === group.id)
+	}));
+	sections.push({
+		group: null,
+		monitors: monitors.filter((monitor) => !monitor.group_id || !known.has(monitor.group_id))
+	});
+	return sections.filter((section) => section.monitors.length > 0);
 }
 
 /**

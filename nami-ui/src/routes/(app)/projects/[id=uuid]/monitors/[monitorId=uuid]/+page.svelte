@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import { refreshAll } from '$app/navigation';
+	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import ResponseTimeChart from '#lib/components/ResponseTimeChart.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
 	import {
+		CHECK_TYPE_LABELS,
 		formatDuration,
 		formatMs,
 		formatUptime,
@@ -81,7 +83,10 @@
 	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
 		<div class="flex flex-wrap items-start justify-between gap-4">
 			<div>
-				<p class="text-3xl font-semibold tracking-tight {headline.class}">{headline.text}</p>
+				<div class="flex flex-wrap items-center gap-3">
+					<p class="text-3xl font-semibold tracking-tight {headline.class}">{headline.text}</p>
+					{#if data.monitor.in_maintenance}<MaintenanceBadge />{/if}
+				</div>
 				<!-- The engine stores no pause time, and `since` is when the status
 				     before the pause began, so a paused monitor shows no "since". -->
 				<p class="mt-1 text-sm text-neutral-500">
@@ -94,7 +99,11 @@
 				<h2 class="mt-4 text-base font-semibold wrap-anywhere text-neutral-100">{data.monitor.name}</h2>
 				<p class="font-mono text-xs break-all text-neutral-400">{monitorTarget(data.monitor)}</p>
 				<p class="mt-1 text-xs text-neutral-500">
-					Checked every {data.monitor.interval_seconds}s · last check {timeAgo(data.monitor.last_checked_at, now)}
+					{CHECK_TYPE_LABELS[data.monitor.check_type]} · checked every {data.monitor.interval_seconds}s · last check
+					{timeAgo(data.monitor.last_checked_at, now)}
+					{#if data.monitor.recovery_threshold > 1}
+						· recovers after {data.monitor.recovery_threshold} successful checks
+					{/if}
 				</p>
 			</div>
 			<div class="flex flex-wrap gap-2">

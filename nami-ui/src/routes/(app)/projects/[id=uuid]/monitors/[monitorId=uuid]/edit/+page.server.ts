@@ -7,7 +7,7 @@ import {
 	redirectToLoginIfUnauthorized
 } from '#lib/server/engine';
 import { monitorPayloadFromForm } from '#lib/server/monitor-form';
-import type { Monitor } from '#lib/uptime';
+import type { Monitor, MonitorGroup } from '#lib/uptime';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {
@@ -17,22 +17,23 @@ export const load: PageServerLoad = async (event) => {
 	// too), and only here: SvelteKit throws when a header is set twice.
 	event.setHeaders({ 'cache-control': 'private, no-store' });
 
-	const response = await callEngine(
-		event,
-		enginePath`/projects/${event.params.id}/monitors/${event.params.monitorId}`
-	);
+	const [response, groupsResponse] = await Promise.all([
+		callEngine(event, enginePath`/projects/${event.params.id}/monitors/${event.params.monitorId}`),
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`)
+	]);
 	redirectToLoginIfUnauthorized(response);
 	if (response.status === 404) throw error(404, 'Monitor not found.');
 	if (!response.ok) {
 		throw error(response.status === 403 ? 403 : 500, await engineErrorMessage(response, 'Could not load monitor.'));
 	}
 	const monitor: Monitor = await response.json();
-	return { monitor };
+	const groups: MonitorGroup[] = groupsResponse.ok ? await groupsResponse.json() : [];
+	return { monitor, groups };
 };
 
 export const actions: Actions = {
 	default: async (event) => {
-		const parsed = monitorPayloadFromForm(await event.request.formData());
+		const parsed = monitorPayloadFromForm(await event.request.formData(), 'edit');
 		if (!parsed.ok) return fail(400, { message: parsed.message });
 		const response = await callEngine(
 			event,

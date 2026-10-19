@@ -2,6 +2,7 @@
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import { refreshAll } from '$app/navigation';
 	import CopyButton from '#lib/components/CopyButton.svelte';
+	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
 	import { formatSeconds, formatUtc, pingCommand, pingUrl, timeAgo } from '#lib/uptime';
 	import type { PageProps } from './$types';
@@ -111,7 +112,10 @@
 	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
 		<div class="flex flex-wrap items-start justify-between gap-4">
 			<div class="space-y-2">
-				<StatusBadge status={data.heartbeat.current_status} paused={data.heartbeat.paused} />
+				<div class="flex flex-wrap items-center gap-3">
+					<StatusBadge status={data.heartbeat.current_status} paused={data.heartbeat.paused} />
+					{#if data.heartbeat.in_maintenance}<MaintenanceBadge />{/if}
+				</div>
 				<h2 class="text-base font-semibold wrap-anywhere text-neutral-100">{data.heartbeat.name}</h2>
 				<p class="text-sm text-neutral-500">
 					Last ping:

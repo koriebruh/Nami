@@ -4,7 +4,7 @@ import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/fake-event';
 import { load as loadLayout } from './+layout.server';
 import { load as loadRoot } from './+page.server';
 import { load as loadMonitors } from './monitors/+page.server';
-import { actions as newActions } from './monitors/new/+page.server';
+import { actions as newActions, load as loadNew } from './monitors/new/+page.server';
 import { actions as settingsActions } from './settings/+page.server';
 
 describe('project layout load', () => {
@@ -96,8 +96,23 @@ describe('monitor list load', () => {
 	it('returns the monitors', async () => {
 		const monitors = [{ id: MONITOR_ID, name: 'API', uptime_24h: null }];
 		const { event, calls } = fakeEvent({ body: JSON.stringify(monitors) });
-		expect(await loadMonitors(event)).toEqual({ monitors });
-		expect(calls().map((call) => call.path)).toEqual([`/projects/${PROJECT_ID}/monitors`]);
+		// Both calls answer with the monitors here: the groups only need to be a list.
+		expect(await loadMonitors(event)).toEqual({ monitors, groups: monitors });
+		expect(calls().map((call) => call.path)).toEqual([
+			`/projects/${PROJECT_ID}/monitors`,
+			`/projects/${PROJECT_ID}/monitor-groups`
+		]);
+	});
+
+	it('still lists the monitors, flat, when the groups cannot be loaded', async () => {
+		const monitors = [{ id: MONITOR_ID, name: 'API', uptime_24h: null }];
+		const { event } = fakeEvent({
+			respond: (url) =>
+				url.pathname.endsWith('/monitor-groups')
+					? new Response('{"error":"internal error"}', { status: 500 })
+					: new Response(JSON.stringify(monitors))
+		});
+		expect(await loadMonitors(event)).toEqual({ monitors, groups: [] });
 	});
 
 	it('keeps a 403 a 403', async () => {
@@ -118,7 +133,10 @@ describe('monitor list load', () => {
 	it('keeps a hostile id inside one path segment', async () => {
 		const { event, calls } = fakeEvent({ params: { id: '../auth/me?' }, body: '[]' });
 		await loadMonitors(event);
-		expect(calls().map((call) => call.path + call.search)).toEqual(['/projects/..%2Fauth%2Fme%3F/monitors']);
+		expect(calls().map((call) => call.path + call.search)).toEqual([
+			'/projects/..%2Fauth%2Fme%3F/monitors',
+			'/projects/..%2Fauth%2Fme%3F/monitor-groups'
+		]);
 	});
 
 	// A member's list carries every monitor URL as saved (in the data sent with
@@ -136,8 +154,28 @@ describe('monitor list load', () => {
 	});
 });
 
+describe('new monitor load', () => {
+	it('offers the groups of the project', async () => {
+		const groups = [{ id: 'g1', name: 'APIs' }];
+		const { event, calls } = fakeEvent({ body: JSON.stringify(groups) });
+		expect(await loadNew(event)).toEqual({ groups });
+		expect(calls().map((call) => call.path)).toEqual([`/projects/${PROJECT_ID}/monitor-groups`]);
+	});
+
+	it('offers no groups, and still opens, when they cannot be loaded', async () => {
+		const { event } = fakeEvent({ status: 500, body: '{"error":"internal error"}' });
+		expect(await loadNew(event)).toEqual({ groups: [] });
+	});
+
+	it('sends a visitor whose session is gone to the login page', async () => {
+		const { event } = fakeEvent({ status: 401, body: '{"error":"unauthorized"}' });
+		await expect(loadNew(event)).rejects.toMatchObject({ status: 303, location: '/login' });
+	});
+});
+
 describe('new monitor action', () => {
-	const fields = { name: 'API', check_type: 'http', url: 'https://example.com' };
+	// The checkboxes the form renders checked by default.
+	const fields = { name: 'API', check_type: 'http', url: 'https://example.com', follow_redirects: 'on', verify_ssl: 'on' };
 
 	it('creates the monitor and opens its page', async () => {
 		const { event, calls } = fakeEvent({ form: fields, status: 201, body: JSON.stringify({ id: MONITOR_ID }) });
@@ -150,7 +188,7 @@ describe('new monitor action', () => {
 				method: 'POST',
 				path: `/projects/${PROJECT_ID}/monitors`,
 				search: '',
-				body: '{"name":"API","check_type":"http","url":"https://example.com","http_method":"GET"}'
+				body: '{"name":"API","check_type":"http","url":"https://example.com","http_method":"GET","follow_redirects":true,"verify_ssl":true}'
 			}
 		]);
 	});

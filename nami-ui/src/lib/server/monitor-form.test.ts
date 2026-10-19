@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { monitorPayloadFromForm } from './monitor-form';
+import { monitorPayloadFromForm, parseHeaderLines } from './monitor-form';
 
 function form(fields: Record<string, string>): FormData {
 	const data = new FormData();
@@ -7,10 +7,14 @@ function form(fields: Record<string, string>): FormData {
 	return data;
 }
 
+/** The checkboxes the form renders checked by default. */
+const defaults = { follow_redirects: 'on', verify_ssl: 'on' };
+
 describe('monitorPayloadFromForm', () => {
 	it('sends http fields and parsed numbers for an http monitor', () => {
 		const result = monitorPayloadFromForm(
 			form({
+				...defaults,
 				name: ' API ',
 				check_type: 'http',
 				url: ' https://example.com ',
@@ -20,6 +24,7 @@ describe('monitorPayloadFromForm', () => {
 				interval_seconds: '30',
 				timeout_seconds: '5',
 				confirmation_threshold: '3',
+				recovery_threshold: '2',
 				host: 'ignored',
 				keyword: 'ignored'
 			})
@@ -31,11 +36,14 @@ describe('monitorPayloadFromForm', () => {
 				check_type: 'http',
 				url: 'https://example.com',
 				http_method: 'HEAD',
+				follow_redirects: true,
+				verify_ssl: true,
 				expected_status_min: 200,
 				expected_status_max: 299,
 				interval_seconds: 30,
 				timeout_seconds: 5,
-				confirmation_threshold: 3
+				confirmation_threshold: 3,
+				recovery_threshold: 2
 			}
 		});
 	});
@@ -51,17 +59,13 @@ describe('monitorPayloadFromForm', () => {
 		const result = monitorPayloadFromForm(
 			form({ name: 'Home', check_type: 'keyword', url: 'https://example.com', keyword: ' Welcome ' })
 		);
-		expect(result.ok).toBe(true);
-		if (!result.ok) return;
-		expect(result.payload.keyword).toBe(' Welcome ');
-		expect(result.payload.keyword_mode).toBe('contains');
+		expect(result.ok && result.payload.keyword).toBe(' Welcome ');
+		expect(result.ok && result.payload.keyword_mode).toBe('contains');
 	});
 
 	it('omits blank numbers so the engine defaults apply', () => {
 		const result = monitorPayloadFromForm(form({ name: 'API', check_type: 'http', url: 'https://x.test', interval_seconds: '' }));
-		expect(result.ok).toBe(true);
-		if (!result.ok) return;
-		expect(result.payload).not.toHaveProperty('interval_seconds');
+		expect(result.ok && 'interval_seconds' in result.payload).toBe(false);
 	});
 
 	it('rejects non-whole numbers', () => {
@@ -73,5 +77,197 @@ describe('monitorPayloadFromForm', () => {
 			ok: false,
 			message: 'port must be a whole number'
 		});
+	});
+
+	it('sends the request body only with POST, PUT or PATCH', () => {
+		const post = monitorPayloadFromForm(
+			form({ name: 'API', check_type: 'http', url: 'https://x.test', http_method: 'POST', request_body: '{"a":1}' })
+		);
+		expect(post.ok && post.payload.request_body).toBe('{"a":1}');
+		const get = monitorPayloadFromForm(
+			form({ name: 'API', check_type: 'http', url: 'https://x.test', http_method: 'GET', request_body: '{"a":1}' })
+		);
+		expect(get.ok && 'request_body' in get.payload).toBe(false);
+	});
+
+	it('on create sends filled-in secrets and skips empty ones', () => {
+		const result = monitorPayloadFromForm(
+			form({
+				name: 'API',
+				check_type: 'http',
+				url: 'https://x.test',
+				request_headers: 'X-Api-Key: abc:def\r\n\r\nX-Tenant:acme',
+				auth_username: 'monitor',
+				auth_password: 's3cret'
+			})
+		);
+		expect(result.ok && result.payload.request_headers).toEqual([
+			{ name: 'X-Api-Key', value: 'abc:def' },
+			{ name: 'X-Tenant', value: 'acme' }
+		]);
+		expect(result.ok && result.payload.auth_username).toBe('monitor');
+		expect(result.ok && result.payload.auth_password).toBe('s3cret');
+
+		const empty = monitorPayloadFromForm(form({ name: 'API', check_type: 'http', url: 'https://x.test', auth_password: '' }));
+		expect(empty.ok && ['request_headers', 'auth_username', 'auth_password'].some((k) => k in empty.payload)).toBe(false);
+	});
+
+	it('on edit keeps, replaces or clears each stored secret as chosen', () => {
+		const base = { name: 'API', check_type: 'http', url: 'https://x.test', auth_username: 'monitor' };
+		const keep = monitorPayloadFromForm(
+			form({ ...base, headers_action: 'keep', password_action: 'keep', request_headers: 'X-Ignored: 1' }),
+			'edit'
+		);
+		expect(keep.ok && 'request_headers' in keep.payload).toBe(false);
+		expect(keep.ok && 'auth_password' in keep.payload).toBe(false);
+
+		const replace = monitorPayloadFromForm(
+			form({ ...base, headers_action: 'replace', request_headers: 'X-New: 2', password_action: 'replace', auth_password: 'n3w' }),
+			'edit'
+		);
+		expect(replace.ok && replace.payload.request_headers).toEqual([{ name: 'X-New', value: '2' }]);
+		expect(replace.ok && replace.payload.auth_password).toBe('n3w');
+
+		const clear = monitorPayloadFromForm(form({ ...base, headers_action: 'clear', password_action: 'clear' }), 'edit');
+		expect(clear.ok && clear.payload.request_headers).toBeNull();
+		expect(clear.ok && clear.payload.auth_password).toBeNull();
+	});
+
+	it('on edit sends null for blank optional fields so they are cleared', () => {
+		const http = monitorPayloadFromForm(
+			form({ name: 'API', check_type: 'http', url: 'https://x.test', http_method: 'GET', auth_username: '', group_id: '' }),
+			'edit'
+		);
+		expect(http.ok && http.payload.request_body).toBeNull();
+		expect(http.ok && http.payload.auth_username).toBeNull();
+		expect(http.ok && http.payload.group_id).toBeNull();
+		const dns = monitorPayloadFromForm(
+			form({ name: 'MX', check_type: 'dns', host: 'example.com', dns_record_type: 'MX', dns_nameserver: '', expected_value: '' }),
+			'edit'
+		);
+		expect(dns.ok && dns.payload).toMatchObject({ dns_nameserver: null, expected_value: null });
+	});
+
+	it('refuses a replaced password left empty and a malformed header line', () => {
+		expect(
+			monitorPayloadFromForm(form({ name: 'A', check_type: 'http', password_action: 'replace', auth_password: '' }), 'edit')
+		).toEqual({ ok: false, message: 'Enter the new password, or keep the current one' });
+		expect(monitorPayloadFromForm(form({ name: 'A', check_type: 'http', request_headers: 'no colon here' }))).toEqual({
+			ok: false,
+			message: 'Header line 1 must look like "Name: value"'
+		});
+	});
+
+	it('shapes every other check type', () => {
+		const ok = (fields: Record<string, string>) => {
+			const result = monitorPayloadFromForm(form({ name: 'M', ...fields }));
+			if (!result.ok) throw new Error(result.message);
+			return result.payload;
+		};
+		expect(ok({ check_type: 'ping', host: ' 10.0.0.1 ', port: '22' })).toEqual({ name: 'M', check_type: 'ping', host: '10.0.0.1' });
+		expect(ok({ check_type: 'dns', host: 'example.com', dns_record_type: 'TXT', dns_nameserver: '1.1.1.1', expected_value: 'v=spf1' })).toEqual({
+			name: 'M',
+			check_type: 'dns',
+			host: 'example.com',
+			dns_record_type: 'TXT',
+			dns_nameserver: '1.1.1.1',
+			expected_value: 'v=spf1'
+		});
+		expect(ok({ check_type: 'ssl_expiry', host: 'example.com', port: '', expiry_threshold_days: '21' })).toEqual({
+			name: 'M',
+			check_type: 'ssl_expiry',
+			host: 'example.com',
+			expiry_threshold_days: 21
+		});
+		expect(ok({ check_type: 'domain_expiry', host: 'example.com', expiry_threshold_days: '45' })).toEqual({
+			name: 'M',
+			check_type: 'domain_expiry',
+			host: 'example.com',
+			expiry_threshold_days: 45
+		});
+		expect(ok({ check_type: 'imap', host: 'mail.example.com', port: '993', use_tls: 'on' })).toEqual({
+			name: 'M',
+			check_type: 'imap',
+			host: 'mail.example.com',
+			port: 993,
+			use_tls: true
+		});
+		expect(ok({ check_type: 'smtp', host: 'mail.example.com' })).toEqual({
+			name: 'M',
+			check_type: 'smtp',
+			host: 'mail.example.com',
+			use_tls: false
+		});
+		expect(ok({ check_type: 'udp', host: 'game.example.com', port: '27015', udp_payload: 'PING\\r\\n', keyword: 'PONG' })).toEqual({
+			name: 'M',
+			check_type: 'udp',
+			host: 'game.example.com',
+			port: 27015,
+			udp_payload: 'PING\r\n',
+			keyword: 'PONG',
+			keyword_mode: 'contains'
+		});
+	});
+
+	it('sends the group, or nothing on create when ungrouped', () => {
+		const grouped = monitorPayloadFromForm(form({ name: 'A', check_type: 'tcp', host: 'h', port: '1', group_id: 'g-1' }));
+		expect(grouped.ok && grouped.payload.group_id).toBe('g-1');
+		const ungrouped = monitorPayloadFromForm(form({ name: 'A', check_type: 'tcp', host: 'h', port: '1', group_id: '' }));
+		expect(ungrouped.ok && 'group_id' in ungrouped.payload).toBe(false);
+	});
+});
+
+describe('monitorPayloadFromForm after a type switch on edit', () => {
+	const base = { name: 'M', host: 'example.com' };
+	const ok = (fields: Record<string, string>) => {
+		const result = monitorPayloadFromForm(form({ ...base, ...fields }), 'edit');
+		if (!result.ok) throw new Error(result.message);
+		return result.payload;
+	};
+
+	it('sends the expiry defaults for fields left empty when a ping becomes an SSL check', () => {
+		expect(ok({ check_type: 'ssl_expiry', initial_check_type: 'ping' })).toMatchObject({
+			interval_seconds: 86400,
+			confirmation_threshold: 1,
+			expiry_threshold_days: 14
+		});
+	});
+
+	it('sends the plain defaults when an expiry check becomes a ping, and keeps typed values', () => {
+		expect(ok({ check_type: 'ping', initial_check_type: 'domain_expiry' })).toMatchObject({
+			interval_seconds: 60,
+			confirmation_threshold: 2
+		});
+		expect(ok({ check_type: 'ping', initial_check_type: 'domain_expiry', interval_seconds: '45' })).toMatchObject({
+			interval_seconds: 45
+		});
+	});
+
+	it('resets only the threshold between the two expiry types', () => {
+		const payload = ok({ check_type: 'domain_expiry', initial_check_type: 'ssl_expiry' });
+		expect(payload).toMatchObject({ expiry_threshold_days: 30 });
+		expect(payload).not.toHaveProperty('interval_seconds');
+	});
+
+	it('adds nothing without a switch, and nothing on create', () => {
+		expect(ok({ check_type: 'ping', initial_check_type: 'ping' })).not.toHaveProperty('interval_seconds');
+		const created = monitorPayloadFromForm(form({ ...base, check_type: 'ssl_expiry', initial_check_type: 'ping' }));
+		expect(created.ok && 'interval_seconds' in created.payload).toBe(false);
+	});
+});
+
+describe('parseHeaderLines', () => {
+	it('splits at the first colon and trims around it', () => {
+		expect(parseHeaderLines('Authorization: Bearer a:b\nX-Empty:')).toEqual({
+			ok: true,
+			headers: [
+				{ name: 'Authorization', value: 'Bearer a:b' },
+				{ name: 'X-Empty', value: '' }
+			]
+		});
+		expect(parseHeaderLines('  \n')).toEqual({ ok: true, headers: [] });
+	});
+	it('names the first malformed line', () => {
+		expect(parseHeaderLines('X-Ok: 1\n: no name')).toEqual({ ok: false, message: 'Header line 2 must look like "Name: value"' });
 	});
 });

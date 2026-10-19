@@ -22,6 +22,7 @@ function heartbeat(overrides: Partial<Heartbeat> = {}): Heartbeat {
 		current_status: 'up',
 		last_ping_at: '2026-10-13T10:00:00Z',
 		created_at: '2026-10-12T10:00:00Z',
+		in_maintenance: false,
 		...overrides
 	};
 }
@@ -73,6 +74,11 @@ describe('heartbeat list page', () => {
 		expect(body).toContain('Down');
 		expect(body).toContain('every 1h 30m');
 		expect(body).toContain('grace 0s');
+	});
+
+	it('shows the maintenance badge only for a heartbeat a window covers', () => {
+		const { body } = renderPage([heartbeat({ in_maintenance: true }), heartbeat({ id: 'other', name: 'Other' })]);
+		expect(body.match(/Maintenance/g)).toHaveLength(1);
 	});
 
 	it('says so when there are no heartbeats', () => {

@@ -2,6 +2,7 @@
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import { refreshAll } from '$app/navigation';
 	import CopyButton from '#lib/components/CopyButton.svelte';
+	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
 	import { formatSeconds, pingUrl, timeAgo } from '#lib/uptime';
 	import type { PageProps } from './$types';
@@ -63,6 +64,7 @@
 						<div class="flex flex-wrap items-center justify-between gap-2">
 							<div class="flex items-center gap-4">
 								<StatusBadge status={heartbeat.current_status} paused={heartbeat.paused} />
+								{#if heartbeat.in_maintenance}<MaintenanceBadge />{/if}
 								<a
 									href="/projects/{data.project.id}/heartbeats/{heartbeat.id}"
 									class="font-medium wrap-anywhere text-neutral-100 hover:text-teal-300">{heartbeat.name}</a
