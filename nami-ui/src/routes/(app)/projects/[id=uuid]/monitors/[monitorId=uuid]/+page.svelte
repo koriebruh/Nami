@@ -4,6 +4,9 @@
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
 	import ResponseTimeChart from '#lib/components/ResponseTimeChart.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
+	import Card from '#lib/components/ui/Card.svelte';
+	import EmptyState from '#lib/components/ui/EmptyState.svelte';
+	import StatCard from '#lib/components/ui/StatCard.svelte';
 	import {
 		CHECK_TYPE_LABELS,
 		formatDuration,
@@ -32,18 +35,26 @@
 	const since = $derived(statusSince(data.monitor, data.incidents));
 	const headline = $derived(
 		data.monitor.paused
-			? { text: 'PAUSED', class: 'text-neutral-400' }
+			? { text: 'PAUSED', class: 'text-paused-ink' }
 			: data.monitor.current_status === 'up'
-				? { text: 'UP', class: 'text-teal-300' }
+				? { text: 'UP', class: 'text-success-ink' }
 				: data.monitor.current_status === 'down'
-					? { text: 'DOWN', class: 'text-red-400' }
-					: { text: 'PENDING', class: 'text-neutral-400' }
+					? { text: 'DOWN', class: 'text-danger-ink' }
+					: { text: 'PENDING', class: 'text-warning-ink' }
 	);
+	// Sparklines come from the 24 h series the page already loads.
+	const upSeries = $derived(data.stats?.series.map((b) => b.up_ratio) ?? []);
+	const responseSeries = $derived(data.stats?.series.map((b) => b.avg_response_ms) ?? []);
 	const tiles = $derived([
-		{ label: 'Uptime, 24 hours', value: formatUptime(data.stats?.uptime_24h) },
-		{ label: 'Uptime, 7 days', value: formatUptime(data.stats?.uptime_7d) },
-		{ label: 'Uptime, 30 days', value: formatUptime(data.stats?.uptime_30d) },
-		{ label: 'Avg response, 24 hours', value: formatMs(data.stats?.avg_response_ms_24h) }
+		{ label: 'Uptime, 24 hours', value: formatUptime(data.stats?.uptime_24h), spark: upSeries, tone: 'success' as const },
+		{ label: 'Uptime, 7 days', value: formatUptime(data.stats?.uptime_7d), spark: undefined, tone: 'success' as const },
+		{ label: 'Uptime, 30 days', value: formatUptime(data.stats?.uptime_30d), spark: undefined, tone: 'success' as const },
+		{
+			label: 'Avg response, 24 hours',
+			value: formatMs(data.stats?.avg_response_ms_24h),
+			spark: responseSeries,
+			tone: 'primary' as const
+		}
 	]);
 
 	// The buttons stay disabled from a submit until its result is applied, so a
@@ -71,8 +82,7 @@
 		return submit(input);
 	};
 
-	const button =
-		'rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:border-teal-500/30 hover:text-neutral-100 disabled:cursor-not-allowed disabled:opacity-50';
+	const button = 'btn btn-secondary';
 </script>
 
 <svelte:head>
@@ -80,25 +90,43 @@
 </svelte:head>
 
 <div class="space-y-6">
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
+	<section class="card p-5 sm:p-6">
 		<div class="flex flex-wrap items-start justify-between gap-4">
-			<div>
+			<div class="min-w-0">
 				<div class="flex flex-wrap items-center gap-3">
-					<p class="text-3xl font-semibold tracking-tight {headline.class}">{headline.text}</p>
+					<span class="relative flex h-3 w-3" aria-hidden="true">
+						{#if !data.monitor.paused && data.monitor.current_status !== 'pending'}
+							<span
+								class="absolute inline-flex h-full w-full animate-ping rounded-full opacity-40 motion-reduce:hidden {data.monitor.current_status === 'up'
+									? 'bg-status-up'
+									: 'bg-status-down'}"
+							></span>
+						{/if}
+						<span
+							class="relative inline-flex h-3 w-3 rounded-full {data.monitor.paused
+								? 'bg-status-paused'
+								: data.monitor.current_status === 'up'
+									? 'bg-status-up'
+									: data.monitor.current_status === 'down'
+										? 'bg-status-down'
+										: 'bg-status-pending'}"
+						></span>
+					</span>
+					<p class="text-4xl font-light tracking-tight {headline.class}">{headline.text}</p>
 					{#if data.monitor.in_maintenance}<MaintenanceBadge />{/if}
 				</div>
 				<!-- The engine stores no pause time, and `since` is when the status
 				     before the pause began, so a paused monitor shows no "since". -->
-				<p class="mt-1 text-sm text-neutral-500">
+				<p class="mt-1 text-sm text-muted">
 					{#if data.monitor.paused}
 						Checks are paused.
 					{:else}
 						since {formatUtc(since)} ({timeAgo(since, now)})
 					{/if}
 				</p>
-				<h2 class="mt-4 text-base font-semibold wrap-anywhere text-neutral-100">{data.monitor.name}</h2>
-				<p class="font-mono text-xs break-all text-neutral-400">{monitorTarget(data.monitor)}</p>
-				<p class="mt-1 text-xs text-neutral-500">
+				<h2 class="mt-4 text-xl font-light wrap-anywhere text-ink">{data.monitor.name}</h2>
+				<p class="font-mono text-xs break-all text-ink-2">{monitorTarget(data.monitor)}</p>
+				<p class="mt-1 text-xs text-muted">
 					{CHECK_TYPE_LABELS[data.monitor.check_type]} · checked every {data.monitor.interval_seconds}s · last check
 					{timeAgo(data.monitor.last_checked_at, now)}
 					{#if data.monitor.recovery_threshold > 1}
@@ -118,18 +146,12 @@
 					</form>
 				{/if}
 				<form method="POST" action="?/delete" use:enhance={confirmDelete}>
-					<button
-						type="submit"
-						disabled={busy}
-						class="rounded-md border border-[#262626] px-3 py-1.5 text-sm text-neutral-400 transition-colors hover:border-red-500/30 hover:text-red-400 disabled:cursor-not-allowed disabled:opacity-50"
-					>
-						Delete
-					</button>
+					<button type="submit" disabled={busy} class="btn btn-danger">Delete</button>
 				</form>
 			</div>
 		</div>
 		{#if form?.message}
-			<div role="alert" class="mt-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-400">
+			<div role="alert" class="alert alert-danger mt-4">
 				{form.message}
 			</div>
 		{/if}
@@ -139,101 +161,89 @@
 				method="POST"
 				action="?/delete"
 				use:enhance={submit}
-				class="mt-4 flex flex-wrap items-center gap-3 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-300"
+				class="alert alert-danger mt-4 flex flex-wrap items-center gap-3"
 			>
 				<input type="hidden" name="confirm" value="yes" />
 				<span class="wrap-anywhere">Delete monitor "{data.monitor.name}"? Its incidents are deleted too.</span>
-				<button
-					type="submit"
-					disabled={busy}
-					class="rounded-md border border-red-500/40 px-3 py-1.5 text-sm text-red-300 transition-colors hover:bg-red-500/10 disabled:cursor-not-allowed disabled:opacity-50"
-				>
-					Yes, delete
-				</button>
-				<a href={base} class="text-neutral-400 hover:text-neutral-200">Cancel</a>
+				<button type="submit" disabled={busy} class="btn btn-danger-solid btn-sm">Yes, delete</button>
+				<a href={base} class="text-ink-2 hover:text-ink">Cancel</a>
 			</form>
 		{/if}
-	</div>
+	</section>
 
-	<div class="grid grid-cols-2 gap-4 lg:grid-cols-4">
+	<section aria-label="Uptime and response summary" class="grid grid-cols-2 gap-3 sm:gap-4 lg:grid-cols-4">
 		{#each tiles as tile (tile.label)}
-			<div class="rounded-xl border border-[#262626] bg-[#141414] p-4">
-				<p class="text-xs text-neutral-500">{tile.label}</p>
-				<p class="mt-1 text-xl font-semibold text-neutral-100">{tile.value}</p>
-			</div>
+			<StatCard label={tile.label} value={tile.value} spark={tile.spark} sparkTone={tile.tone} />
 		{/each}
-	</div>
+	</section>
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414] p-6">
-		<h3 class="text-sm font-semibold text-neutral-200">Response time, last 24 hours</h3>
-		<div class="mt-4">
-			{#if data.stats}
-				<ResponseTimeChart series={data.stats.series} />
+	<Card title="Response time" subtitle="Last 24 hours, average per 30 minutes (UTC)">
+		{#if data.stats}
+			<ResponseTimeChart series={data.stats.series} />
+		{:else}
+			<p class="text-sm text-muted">Check history is unavailable right now.</p>
+		{/if}
+	</Card>
+
+	<div class="grid gap-6 xl:grid-cols-5">
+		<Card title="Recent checks" titleTag="h3" padded={false} class="xl:col-span-3">
+			{#if data.checks.length === 0}
+				<EmptyState icon="clock" message="No checks yet." />
 			{:else}
-				<p class="text-sm text-neutral-500">Check history is unavailable right now.</p>
-			{/if}
-		</div>
-	</div>
-
-	<div class="rounded-xl border border-[#262626] bg-[#141414]">
-		<h3 class="border-b border-[#262626] px-6 py-4 text-sm font-semibold text-neutral-200">Recent checks</h3>
-		{#if data.checks.length === 0}
-			<p class="px-6 py-6 text-sm text-neutral-500">No checks yet.</p>
-		{:else}
-			<div class="overflow-x-auto">
-				<table class="w-full text-sm">
-					<thead class="text-left text-xs text-neutral-500">
-						<tr class="border-b border-[#262626]">
-							<th class="px-6 py-2 font-medium">Time</th>
-							<th class="px-6 py-2 font-medium">Result</th>
-							<th class="px-6 py-2 font-medium">Status code</th>
-							<th class="px-6 py-2 font-medium">Response</th>
-							<th class="px-6 py-2 font-medium">Error</th>
-						</tr>
-					</thead>
-					<tbody class="tabular-nums">
-						<!-- Unkeyed on purpose: rows hold no state, and `checked_at` is not a
-						     key (millisecond resolution, no unique constraint), so a repeated
-						     timestamp must not become a duplicate-key error. -->
-						{#each data.checks as check}
-							<tr class="border-b border-[#262626] last:border-0">
-								<td class="px-6 py-2 whitespace-nowrap text-neutral-400">{formatUtc(check.checked_at)}</td>
-								<td class="px-6 py-2"><StatusBadge status={check.status} /></td>
-								<td class="px-6 py-2 text-neutral-300">{check.status_code ?? '—'}</td>
-								<td class="px-6 py-2 text-neutral-300">{formatMs(check.response_time_ms)}</td>
-								<td class="px-6 py-2 text-neutral-400">{check.error ?? ''}</td>
+				<div class="overflow-x-auto">
+					<table class="table table-compact">
+						<thead>
+							<tr>
+								<th>Time</th>
+								<th>Result</th>
+								<th>Status code</th>
+								<th>Response</th>
+								<th>Error</th>
 							</tr>
-						{/each}
-					</tbody>
-				</table>
-			</div>
-		{/if}
-	</div>
+						</thead>
+						<tbody class="tabular-nums">
+							<!-- Unkeyed on purpose: rows hold no state, and `checked_at` is not a
+							     key (millisecond resolution, no unique constraint), so a repeated
+							     timestamp must not become a duplicate-key error. -->
+							{#each data.checks as check}
+								<tr>
+									<td class="whitespace-nowrap text-muted">{formatUtc(check.checked_at)}</td>
+									<td><StatusBadge status={check.status} /></td>
+									<td>{check.status_code ?? '—'}</td>
+									<td class="whitespace-nowrap">{formatMs(check.response_time_ms)}</td>
+									<td class="text-muted wrap-anywhere">{check.error ?? ''}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
+			{/if}
+		</Card>
 
-	<div class="rounded-xl border border-[#262626] bg-[#141414]">
-		<h3 class="border-b border-[#262626] px-6 py-4 text-sm font-semibold text-neutral-200">Incidents</h3>
-		{#if data.incidents.length === 0}
-			<p class="px-6 py-6 text-sm text-neutral-500">No incidents.</p>
-		{:else}
-			<ul>
-				{#each data.incidents as incident (incident.id)}
-					<li class="flex flex-wrap items-baseline justify-between gap-2 border-b border-[#262626] px-6 py-3 last:border-0">
-						<div>
-							<!-- The cause can echo the keyword or text from the target, with no
-							     spaces to wrap at: break anywhere instead of widening the page. -->
-							<p class="text-sm wrap-anywhere text-neutral-200">{incident.cause ?? incident.title}</p>
-							<p class="text-xs text-neutral-500">Started {formatUtc(incident.started_at)}</p>
-						</div>
-						<p class="text-xs {incident.status === 'open' ? 'text-red-400' : 'text-neutral-500'}">
-							{incident.status === 'open' ? 'Ongoing' : 'Resolved'} · {formatDuration(
-								incident.started_at,
-								incident.resolved_at,
-								now
-							)}
-						</p>
-					</li>
-				{/each}
-			</ul>
-		{/if}
+		<Card title="Incidents" titleTag="h3" padded={false} class="xl:col-span-2">
+			{#if data.incidents.length === 0}
+				<EmptyState icon="incident" message="No incidents." />
+			{:else}
+				<ul class="divide-y divide-border">
+					{#each data.incidents as incident (incident.id)}
+						<li class="flex flex-wrap items-baseline justify-between gap-2 px-5 py-3 sm:px-6">
+							<div class="min-w-0">
+								<!-- The cause can echo the keyword or text from the target, with no
+								     spaces to wrap at: break anywhere instead of widening the page. -->
+								<p class="text-sm wrap-anywhere text-ink">{incident.cause ?? incident.title}</p>
+								<p class="text-xs text-muted">Started {formatUtc(incident.started_at)}</p>
+							</div>
+							<span class="badge {incident.status === 'open' ? 'badge-danger' : 'badge-neutral'}">
+								{incident.status === 'open' ? 'Ongoing' : 'Resolved'} · {formatDuration(
+									incident.started_at,
+									incident.resolved_at,
+									now
+								)}
+							</span>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</Card>
 	</div>
 </div>

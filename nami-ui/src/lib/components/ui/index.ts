@@ -1,6 +1,7 @@
 // Nami design system. Tokens live in src/routes/layout.css (@theme); the
 // reference is docs/superpowers/design/ui-reference-atom.png.
 export { default as AppShell } from './AppShell.svelte';
+export { default as AuthCard } from './AuthCard.svelte';
 export { default as Badge } from './Badge.svelte';
 export { default as Brand } from './Brand.svelte';
 export { default as Button } from './Button.svelte';
