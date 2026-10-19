@@ -82,6 +82,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(routes::maintenance::router())
         .merge(routes::monitor_groups::router())
         .merge(routes::logs::router())
+        .merge(routes::log_views::router())
         .layer(middleware::from_fn(require_json_body))
         .with_state(state)
 }

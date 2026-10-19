@@ -4,6 +4,7 @@ pub mod maintenance;
 pub mod monitor;
 pub mod monitor_group;
 pub mod monitor_request;
+pub mod log_view;
 pub mod project;
 pub mod source;
 pub mod target;

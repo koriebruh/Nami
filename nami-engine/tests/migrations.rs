@@ -23,6 +23,7 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "worker_state",
         "maintenance_windows",
         "monitor_groups",
+        "log_views",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -187,4 +188,27 @@ async fn monitors_have_the_advanced_request_columns(pool: sqlx::PgPool) {
             .await
             .unwrap();
     assert_eq!((ip_version.as_str(), cookies), ("any", false));
+}
+
+#[sqlx::test]
+async fn log_views_names_are_unique_per_project(pool: sqlx::PgPool) {
+    let (project, _) = seed_source_row(&pool).await;
+    let (other, _) = seed_source_row(&pool).await;
+    let insert = |project: uuid::Uuid| {
+        sqlx::query("insert into log_views (project_id, name) values ($1, 'Errors')")
+            .bind(project)
+            .execute(&pool)
+    };
+    insert(project).await.unwrap();
+    let error = insert(project).await.unwrap_err();
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23505")
+    );
+    insert(other).await.unwrap();
+    let bad = sqlx::query("insert into log_views (project_id, name, query) values ($1, 'x', '[]')")
+        .bind(project)
+        .execute(&pool)
+        .await;
+    assert!(bad.is_err(), "a non-object query must be refused");
 }
