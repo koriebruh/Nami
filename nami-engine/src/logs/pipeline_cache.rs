@@ -5,11 +5,16 @@
 //! `sources.pipeline` (one indexed query) and compiles it off the async
 //! runtime. The cache holds at most [`MAX_CACHED_PIPELINES`] entries and is
 //! cleared when full; with at most 20 regexes of bounded size per pipeline
-//! (`pipeline::MAX_REGEXES`, R-P2-26) that bounds its memory.
+//! (`pipeline::MAX_REGEXES`, R-P2-26) that bounds its memory. Clearing is
+//! deliberately simple, not LRU: an instance ingesting for more than 1,024
+//! active sources at once keeps clearing and recompiling (a performance
+//! cliff, not a correctness one). Raise the bound or switch to LRU before
+//! such deployments.
 //!
-//! A stored pipeline that no longer compiles is an error, never "no rules": a
-//! redact rule that silently stopped applying would leak, so ingestion for
-//! that source fails closed.
+//! A pipeline that cannot be had is an error, never "no rules": a stored one
+//! that no longer compiles, a source deleted between its token lookup and the
+//! pipeline read, or a database error. A redact rule that silently stopped
+//! applying would leak, so ingestion for that source fails closed.
 
 use std::{collections::HashMap, sync::Arc, sync::Mutex};
 
@@ -37,6 +42,9 @@ pub enum PipelineLoadError {
     Database(#[from] sqlx::Error),
     #[error("the source's stored pipeline does not compile: {0}")]
     Invalid(String),
+    /// The source was deleted after its token was looked up.
+    #[error("the source no longer exists")]
+    Gone,
 }
 
 impl PipelineCache {
@@ -50,10 +58,15 @@ impl PipelineCache {
     }
 
     /// Stores the rules of `source_id` as of `updated_at`, replacing what was
-    /// cached for it. A full cache is cleared first.
+    /// cached for it unless that is newer (a slow compile of older rules must
+    /// not push out a newer version). A full cache is cleared first.
     pub fn put(&self, source_id: Uuid, updated_at: DateTime<Utc>, pipeline: Arc<CompiledPipeline>) {
         let mut entries = self.entries.lock().expect("pipeline cache lock poisoned");
-        if entries.len() >= MAX_CACHED_PIPELINES && !entries.contains_key(&source_id) {
+        if let Some((at, _)) = entries.get(&source_id) {
+            if *at > updated_at {
+                return;
+            }
+        } else if entries.len() >= MAX_CACHED_PIPELINES {
             entries.clear();
         }
         entries.insert(source_id, (updated_at, pipeline));
@@ -75,9 +88,9 @@ impl PipelineCache {
     /// `updated_at` the load returned, which may be newer than the token
     /// lookup's). `db_permits` (HTTP: `IngestLimits::queries`; syslog: `None`)
     /// guards only the Postgres read; the compile runs in `spawn_blocking`
-    /// after the permit is released. A source deleted meanwhile gets no rules
-    /// (and nothing is cached): its insert stores rows that age out like the
-    /// rest of a deleted source's.
+    /// after the permit is released. A source deleted meanwhile is
+    /// [`PipelineLoadError::Gone`] (fail closed: its events are not stored
+    /// without its rules).
     pub async fn for_source(
         &self,
         pool: &PgPool,
@@ -97,7 +110,7 @@ impl PipelineCache {
             source::load_pipeline(pool, source.id).await?
         };
         let Some((rules, updated_at)) = loaded else {
-            return Ok(Arc::new(CompiledPipeline::empty()));
+            return Err(PipelineLoadError::Gone);
         };
         if let Some(pipeline) = self.get(source.id, updated_at) {
             return Ok(pipeline);
@@ -133,6 +146,18 @@ mod tests {
         cache.put(id, t1, Arc::new(CompiledPipeline::empty()));
         assert!(cache.get(id, t0).is_none(), "the older rules are replaced");
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn an_entry_is_never_replaced_by_older_rules() {
+        let cache = PipelineCache::default();
+        let id = Uuid::new_v4();
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::microseconds(1);
+        cache.put(id, t1, Arc::new(CompiledPipeline::empty()));
+        cache.put(id, t0, Arc::new(CompiledPipeline::empty()));
+        assert!(cache.get(id, t1).is_some(), "the newer rules stay");
+        assert!(cache.get(id, t0).is_none());
     }
 
     #[test]

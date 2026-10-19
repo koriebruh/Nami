@@ -761,6 +761,7 @@ impl Batcher {
             rows,
             runs,
             oversized,
+            missing,
             budget: _budget,
         } = match built {
             Ok(Ok(built)) => built,
@@ -775,6 +776,13 @@ impl Batcher {
                 return;
             }
         };
+        if missing > 0 {
+            bump(&self.stats.store_failed, missing);
+            tracing::error!(
+                frames = missing,
+                "syslog: frames without a pipeline were dropped"
+            );
+        }
         if oversized > 0 {
             bump(&self.stats.too_large, oversized as u64);
             self.warnings
@@ -817,7 +825,11 @@ impl Batcher {
                 }
             }
         }
-        // What the pipeline left out does not depend on the inserts.
+        // What the pipeline left out does not depend on the inserts, so it is
+        // recorded even when an insert failed. HTTP differs on purpose: there
+        // a failed insert records nothing, because the client retries the
+        // whole request and would be counted twice; dropped syslog frames are
+        // never resent.
         for (source_id, (dropped, sampled_out)) in rows.pipeline_counts() {
             state
                 .logs
@@ -834,6 +846,9 @@ struct Built {
     runs: Vec<std::ops::Range<usize>>,
     /// Rows left out because one alone encodes to more than an insert may.
     oversized: usize,
+    /// Frames left out because their source had no pipeline (a bug; counted
+    /// as `store_failed`).
+    missing: u64,
     /// The frames' shares of [`QUEUE_MAX_BYTES`], held until the inserts end.
     budget: Vec<OwnedSemaphorePermit>,
 }
@@ -851,9 +866,16 @@ fn build_and_chunk(
     // No stored cap here: the queue's byte budget already bounds a batch.
     let mut rows = store::RowBatch::with_capacity(allowed.len(), usize::MAX);
     let mut budget = Vec::with_capacity(allowed.len());
+    let mut missing = 0;
     for (pending, source) in allowed {
         budget.push(pending._bytes);
+        debug_assert!(
+            pipelines.contains_key(&source.id),
+            "a frame's source has no pipeline"
+        );
         let Some(pipeline) = pipelines.get(&source.id) else {
+            // Never stored without its rules (fail closed).
+            missing += 1;
             continue;
         };
         let event = pending.message.into_event(pending.received_at);
@@ -865,6 +887,7 @@ fn build_and_chunk(
         rows: Arc::new(rows),
         runs,
         oversized,
+        missing,
         budget,
     })
 }
@@ -906,10 +929,45 @@ mod tests {
         let built = build_and_chunk(allowed, &pipelines, 2000).unwrap();
         assert_eq!(built.rows.len(), 3, "the dropped frame has no row");
         assert_eq!(built.oversized, 1);
+        assert_eq!(built.missing, 0);
         let in_runs: usize = built.runs.iter().map(|run| run.len()).sum();
         assert_eq!(in_runs, 2);
         assert_eq!(built.budget.len(), 4, "every frame's share is held");
         assert_eq!(built.rows.pipeline_counts()[&source.id], (1, 0));
+    }
+
+    fn frame_without_pipeline() -> (Vec<(Pending, IngestSource)>, Arc<Semaphore>) {
+        let budget = Arc::new(Semaphore::new(16));
+        let source = IngestSource {
+            id: Uuid::new_v4(),
+            project_id: Uuid::new_v4(),
+            retention_days: 30,
+            daily_byte_quota: None,
+            updated_at: Utc::now(),
+        };
+        let pending = Pending {
+            token_hash: String::new(),
+            message: parse::parse(b"<14>1 - host app - - - pw=hunter2").unwrap(),
+            received_at: Utc::now(),
+            _bytes: Arc::clone(&budget).try_acquire_many_owned(1).unwrap(),
+        };
+        (vec![(pending, source)], budget)
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "a frame's source has no pipeline")]
+    fn a_frame_without_a_pipeline_is_a_bug_in_debug_builds() {
+        let (allowed, _budget) = frame_without_pipeline();
+        let _ = build_and_chunk(allowed, &HashMap::new(), usize::MAX);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn a_frame_without_a_pipeline_is_counted_not_stored() {
+        let (allowed, _budget) = frame_without_pipeline();
+        let built = build_and_chunk(allowed, &HashMap::new(), usize::MAX).unwrap();
+        assert_eq!((built.rows.len(), built.missing), (0, 1));
     }
 
     #[test]

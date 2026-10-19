@@ -826,3 +826,36 @@ async fn syslog_frames_of_a_source_whose_pipeline_fails_are_dropped(pool: sqlx::
     assert_eq!(rows[0]["message"], "fine", "other sources keep ingesting");
     ch.drop_database().await.unwrap();
 }
+
+#[sqlx::test]
+async fn a_pipeline_edit_applies_to_the_next_syslog_batch(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let project = seed_project(&pool).await;
+    let (source_id, token) = seed_source(&pool, project, "syslog").await;
+    let handle = start(state).await;
+    let mut tcp = TcpStream::connect(handle.tcp_addr).await.unwrap();
+    // Cached: no rules.
+    tcp.write_all(format!("{}\n", frame(&token, "secret-1")).as_bytes())
+        .await
+        .unwrap();
+    rows_eventually(&ch, project, 1).await;
+    source::set_pipeline(
+        &pool,
+        project,
+        source_id,
+        &json!([{"type":"redact","regex":"secret-\\d"}]),
+    )
+    .await
+    .unwrap();
+    tcp.write_all(format!("{}\n", frame(&token, "secret-2")).as_bytes())
+        .await
+        .unwrap();
+    let rows = rows_eventually(&ch, project, 2).await;
+    let mut messages: Vec<&str> = rows
+        .iter()
+        .map(|r| r["message"].as_str().unwrap())
+        .collect();
+    messages.sort();
+    assert_eq!(messages, ["[REDACTED]", "secret-1"]);
+    ch.drop_database().await.unwrap();
+}

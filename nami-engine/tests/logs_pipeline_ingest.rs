@@ -5,7 +5,7 @@ mod common;
 use axum::http::StatusCode;
 use common::{
     app, call,
-    logs::{post_json, seed_source, stored_rows},
+    logs::{post_json, seed_source, stored_rows, unreachable_pool},
     public_app, seed_project, state_with_clickhouse, user_with_role,
 };
 use serde_json::{Value, json};
@@ -250,4 +250,49 @@ async fn the_quota_counts_bytes_after_the_pipeline(pool: sqlx::PgPool) {
     let pending = logs.usage.pending(source, chrono::Utc::now().date_naive());
     assert_eq!(pending.bytes, 1 + 2, "message \"m\" plus fields \"{{}}\"");
     ch.drop_database().await.unwrap();
+}
+
+fn ingest_source(id: uuid::Uuid) -> nami_engine::models::source::IngestSource {
+    nami_engine::models::source::IngestSource {
+        id,
+        project_id: uuid::Uuid::new_v4(),
+        retention_days: 30,
+        daily_byte_quota: None,
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+#[sqlx::test]
+async fn a_source_deleted_before_its_pipeline_is_read_fails_closed(pool: sqlx::PgPool) {
+    let cache = nami_engine::logs::pipeline_cache::PipelineCache::default();
+    let result = cache
+        .for_source(&pool, &ingest_source(uuid::Uuid::new_v4()), None)
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(nami_engine::logs::pipeline_cache::PipelineLoadError::Gone)
+        ),
+        "{result:?}"
+    );
+    assert!(cache.is_empty());
+}
+
+#[tokio::test]
+async fn a_database_error_reading_the_pipeline_fails_closed() {
+    let cache = nami_engine::logs::pipeline_cache::PipelineCache::default();
+    let result = cache
+        .for_source(
+            &unreachable_pool(),
+            &ingest_source(uuid::Uuid::new_v4()),
+            None,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(nami_engine::logs::pipeline_cache::PipelineLoadError::Database(_))
+        ),
+        "{result:?}"
+    );
 }
