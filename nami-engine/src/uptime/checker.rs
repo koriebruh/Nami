@@ -452,6 +452,7 @@ impl HttpClients {
                 ip_version,
                 proxy: None,
                 cookies: false,
+                last_hop: None,
             })
             .expect("failed to build an uptime HTTP client")
         })
@@ -477,6 +478,30 @@ struct ClientOptions {
     proxy: Option<MonitorProxy>,
     /// A cookie jar of the client's own, for a client built for one check.
     cookies: bool,
+    /// Where the redirect policy records each hop it follows, for a client
+    /// built for one check (see [`LastHop`]).
+    last_hop: Option<LastHop>,
+}
+
+/// The URL of the last redirect hop a per-check client followed. reqwest
+/// follows redirects inside tower-http's `FollowRedirect`, and an error on a
+/// hop carries the URL of the original request (`reqwest::Error::url`), not the
+/// hop's; a proxied check needs the failing hop's scheme to tell which side
+/// failed (see [`describe_proxied_error`]). Only per-check clients get one, so
+/// it never mixes the hops of two checks.
+#[derive(Clone, Default)]
+struct LastHop(Arc<std::sync::Mutex<Option<reqwest::Url>>>);
+
+impl LastHop {
+    fn record(&self, url: &reqwest::Url) {
+        if let Ok(mut last) = self.0.lock() {
+            *last = Some(url.clone());
+        }
+    }
+
+    fn get(&self) -> Option<reqwest::Url> {
+        self.0.lock().ok().and_then(|last| last.clone())
+    }
 }
 
 /// A monitor's proxy as a client uses it.
@@ -503,8 +528,8 @@ struct MonitorProxy {
 fn build_client(options: ClientOptions) -> Result<reqwest::Client, String> {
     let policy = match options.redirects {
         RedirectMode::None => reqwest::redirect::Policy::none(),
-        RedirectMode::Follow => follow_policy(false, options.ip_version),
-        RedirectMode::SameOrigin => follow_policy(true, options.ip_version),
+        RedirectMode::Follow => follow_policy(false, options.ip_version, options.last_hop),
+        RedirectMode::SameOrigin => follow_policy(true, options.ip_version, options.last_hop),
     };
     let mut builder = reqwest::Client::builder().no_proxy();
     let mut proxy_tls_host = None;
@@ -540,9 +565,8 @@ fn build_client(options: ClientOptions) -> Result<reqwest::Client, String> {
 /// verified too: the verifier only sees the name.
 fn proxy_only_verified_tls(proxy_host: &str) -> Result<rustls::ClientConfig, String> {
     let provider = super::tls::provider();
-    let strict = rustls_platform_verifier::Verifier::new(provider.clone())
-        .map_err(|e| format!("could not load the system's TLS roots: {e}"))?;
-    let verifier = ProxyOnlyVerifier::new(proxy_host, Arc::new(strict), &provider)?;
+    let strict = system_verifier()?;
+    let verifier = ProxyOnlyVerifier::new(proxy_host, strict, &provider)?;
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| format!("invalid TLS settings: {e}"))?
@@ -551,6 +575,22 @@ fn proxy_only_verified_tls(proxy_host: &str) -> Result<rustls::ClientConfig, Str
         .with_no_client_auth();
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Ok(config)
+}
+
+/// The system's certificate verifier (what reqwest verifies with), built once
+/// for the life of the process and shared: building it loads the system's
+/// roots, which per-check clients would otherwise repeat on every check. Only
+/// the [`ProxyOnlyVerifier`] wrapper around it is built per check. A failure
+/// to build it is kept, and every check that needs it is down with it.
+fn system_verifier() -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, String> {
+    static VERIFIER: std::sync::LazyLock<
+        Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, String>,
+    > = std::sync::LazyLock::new(|| {
+        rustls_platform_verifier::Verifier::new(super::tls::provider())
+            .map(|v| Arc::new(v) as Arc<dyn rustls::client::danger::ServerCertVerifier>)
+            .map_err(|e| format!("could not load the system's TLS roots: {e}"))
+    });
+    VERIFIER.clone()
 }
 
 /// Verifies the certificate of exactly one server name, the proxy's, with
@@ -633,8 +673,13 @@ impl rustls::client::danger::ServerCertVerifier for ProxyOnlyVerifier {
 /// no check may contact (see [`is_forbidden_destination`]), every hop to an IP
 /// literal of the family `ip_version` excludes (see
 /// [`literal_of_other_family`]), and, with `same_origin_only`, every hop that
-/// leaves the monitored origin.
-fn follow_policy(same_origin_only: bool, ip_version: IpVersion) -> reqwest::redirect::Policy {
+/// leaves the monitored origin. With `last_hop`, every hop it lets through is
+/// recorded there.
+fn follow_policy(
+    same_origin_only: bool,
+    ip_version: IpVersion,
+    last_hop: Option<LastHop>,
+) -> reqwest::redirect::Policy {
     let limit = reqwest::redirect::Policy::limited(MAX_REDIRECTS);
     reqwest::redirect::Policy::custom(move |attempt| {
         if names_forbidden_address(attempt.url()) {
@@ -648,7 +693,12 @@ fn follow_policy(same_origin_only: bool, ip_version: IpVersion) -> reqwest::redi
             .flatten();
         match leaves {
             Some(refused) => attempt.error(refused),
-            None => limit.redirect(attempt),
+            None => {
+                if let Some(last_hop) = &last_hop {
+                    last_hop.record(attempt.url());
+                }
+                limit.redirect(attempt)
+            }
         }
     })
 }
@@ -872,8 +922,8 @@ async fn probe_http(ctx: &CheckContext, monitor: &Monitor) -> Observation {
     }
     // Last before sending: the secrets are opened only for a request that
     // will be sent.
-    let request = match build_request(ctx, monitor, url, keyword.is_some()).await {
-        Ok(request) => request,
+    let (request, last_hop) = match build_request(ctx, monitor, url, keyword.is_some()).await {
+        Ok(prepared) => prepared,
         Err(message) => return Observation::down(None, None, message),
     };
     let proxied = monitor.proxy_url.is_some();
@@ -883,7 +933,14 @@ async fn probe_http(ctx: &CheckContext, monitor: &Monitor) -> Observation {
     let mut response = match request.send().await {
         Ok(response) => response,
         Err(e) if proxied => {
-            let target_is_https = parsed.as_ref().is_some_and(|u| u.scheme() == "https");
+            // The failing hop: the last redirect followed, else the request's
+            // own URL.
+            let failing = last_hop
+                .as_ref()
+                .and_then(LastHop::get)
+                .or_else(|| e.url().cloned())
+                .or(parsed);
+            let target_is_https = failing.is_some_and(|u| u.scheme() == "https");
             return Observation::down(None, None, describe_proxied_error(&e, target_is_https));
         }
         Err(e) => return Observation::down(None, None, describe_request_error(&e)),
@@ -892,7 +949,9 @@ async fn probe_http(ctx: &CheckContext, monitor: &Monitor) -> Observation {
     // A 407 behind a proxy is the proxy refusing its credentials (an http
     // target goes through the proxy as a plain request, so the refusal comes
     // back as a response). Checked before the expected range, which may
-    // include 407.
+    // include 407. Inherently ambiguous: a target that itself answers 407
+    // behind a proxy reads as a proxy failure too, since nothing in the
+    // response tells the two apart; a proxy refusal is the likely meaning.
     if proxied && code == 407 {
         return Observation::down(
             Some(code),
@@ -975,8 +1034,12 @@ fn carries_secrets(
 /// this one check (see [`build_client`]), so a proxy and a cookie jar are
 /// never shared between monitors or checks: the client lives in the returned
 /// request (a `Client` is reference counted) and is dropped with it, and the
-/// jar with it. The jar is reqwest's: a cookie goes only to hosts its domain
-/// matches (RFC 6265, without a public-suffix list), and reqwest strips
+/// jar with it. The jar is reqwest's (`cookie_store`): a cookie goes only to
+/// hosts its domain matches (RFC 6265). It is built without a public-suffix
+/// list, so a target can set a cookie for a whole public suffix (`Domain=com`)
+/// and the jar would send it to every host under it that a redirect of this
+/// same check reaches; it never outlives the check, so that is the whole
+/// reach. reqwest strips
 /// `Cookie` from a cross-origin hop's copied headers before the jar adds what
 /// matches the new host. Nothing is persisted. Such clients rebuild their TLS
 /// state on every check (no session resumption, roots loaded per build).
@@ -989,7 +1052,7 @@ async fn build_request(
     monitor: &Monitor,
     url: &str,
     needs_body: bool,
-) -> Result<reqwest::RequestBuilder, String> {
+) -> Result<(reqwest::RequestBuilder, Option<LastHop>), String> {
     let method = request_method(&monitor.http_method, needs_body)?;
     let headers = match &monitor.request_headers_enc {
         Some(sealed) => open_headers(&ctx.cipher, monitor.id, sealed)
@@ -1029,6 +1092,8 @@ async fn build_request(
         Some(proxy_url) => Some(monitor_proxy(ctx, monitor, proxy_url, url).await?),
         None => None,
     };
+    // Only proxied checks need to know where a redirect went.
+    let last_hop = proxy.is_some().then(LastHop::default);
     let request = if proxy.is_some() || monitor.remember_cookies {
         build_client(ClientOptions {
             redirects: RedirectMode::for_request(monitor.follow_redirects, carries_secrets),
@@ -1036,6 +1101,7 @@ async fn build_request(
             ip_version: monitor.ip_version(),
             proxy,
             cookies: monitor.remember_cookies,
+            last_hop: last_hop.clone(),
         })?
         .request(method, url)
     } else {
@@ -1056,7 +1122,7 @@ async fn build_request(
         Some(body) if sends_body => request = request.body(body.clone()),
         _ => {}
     }
-    Ok(request)
+    Ok((request, last_hop))
 }
 
 /// The proxy of one check of `monitor`, after every check that must pass
@@ -1095,8 +1161,10 @@ async fn monitor_proxy(
 }
 
 /// A proxy resolves the target's name itself, but never blindly: the name is
-/// resolved locally first, and when it resolves here and every address is
-/// forbidden, nothing is sent ([`DESTINATION_NOT_ALLOWED`]). This keeps a proxy
+/// resolved locally first, and when it resolves here to any forbidden address
+/// at all, nothing is sent ([`DESTINATION_NOT_ALLOWED`]): the proxy picks the
+/// address itself, so one forbidden address among allowed ones is enough
+/// (see [`proxied_target_verdict`]). This keeps a proxy
 /// running next to the engine (`127.0.0.1:3128`) from being used to reach the
 /// engine host's metadata service by name. A name that does not resolve here
 /// (one only the proxy knows) goes ahead.
@@ -1116,9 +1184,25 @@ async fn check_proxied_target(target: &str) -> Result<(), String> {
         None => return Ok(()),
     };
     let port = parsed.port_or_known_default().unwrap_or(80);
-    match resolve_target(&host, port, IpVersion::Any).await {
-        Err(message) if message == DESTINATION_NOT_ALLOWED => Err(message),
-        _ => Ok(()),
+    match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(resolved) => proxied_target_verdict(resolved),
+        // Only the proxy knows the name.
+        Err(_) => Ok(()),
+    }
+}
+
+/// Whether a proxied target that resolved locally to `resolved` may be sent:
+/// not when any one address is forbidden. Stricter than
+/// [`allowed_addresses`], which a direct check uses because it then connects
+/// only to the allowed addresses itself; a proxy chooses on its own.
+fn proxied_target_verdict(resolved: impl IntoIterator<Item = SocketAddr>) -> Result<(), String> {
+    if resolved
+        .into_iter()
+        .any(|address| is_forbidden_destination(address.ip()))
+    {
+        Err(DESTINATION_NOT_ALLOWED.to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -1199,6 +1283,11 @@ pub(crate) fn describe_request_error(error: &reqwest::Error) -> String {
 /// wrapped in one of them. An http target goes to the proxy as a plain request,
 /// so every connection error is the proxy's. Everything else (the target's TLS
 /// inside the tunnel, a refused redirect, the response) is the target's.
+///
+/// `target_is_https` is about the failing hop, not the monitor's URL: an http
+/// monitor redirected to https fails inside a tunnel. The caller takes it from
+/// the last redirect the client followed ([`LastHop`]), else from
+/// `error.url()`, else from the monitor's URL.
 fn describe_proxied_error(error: &reqwest::Error, target_is_https: bool) -> String {
     if caused_by::<DestinationNotAllowed>(error) {
         return DESTINATION_NOT_ALLOWED.to_string();
@@ -1910,6 +1999,36 @@ mod tests {
         }
     }
 
+    /// A proxy picks among the addresses itself: one forbidden address among
+    /// allowed ones refuses the target.
+    #[test]
+    fn a_proxied_target_with_any_forbidden_address_is_refused() {
+        for mixed in [
+            vec![address("169.254.169.254"), address("93.184.216.34")],
+            vec![address("2001:db8::1"), address("fe80::1")],
+            vec![address("10.0.0.1"), address("100.100.100.200")],
+            vec![address("::ffff:169.254.169.254")],
+        ] {
+            assert_eq!(
+                proxied_target_verdict(mixed.clone()),
+                Err(DESTINATION_NOT_ALLOWED.to_string()),
+                "{mixed:?}"
+            );
+        }
+        assert_eq!(
+            proxied_target_verdict([address("93.184.216.34"), address("127.0.0.1")]),
+            Ok(())
+        );
+        assert_eq!(proxied_target_verdict([]), Ok(()));
+    }
+
+    #[test]
+    fn the_system_verifier_is_built_once_and_shared() {
+        let first = system_verifier().unwrap();
+        let second = system_verifier().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
     #[test]
     fn the_client_cache_has_a_slot_per_redirect_mode_tls_setting_and_ip_version() {
         let clients = HttpClients::new();
@@ -2033,6 +2152,7 @@ mod tests {
                     tls_host: None,
                 }),
                 cookies: false,
+                last_hop: None,
             })
             .unwrap()
         };
@@ -2154,6 +2274,7 @@ mod tests {
                     tls_host: Some("proxy.test".to_string()),
                 }),
                 cookies: true,
+                last_hop: None,
             })
             .unwrap();
         }

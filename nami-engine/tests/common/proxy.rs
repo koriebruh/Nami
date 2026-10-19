@@ -24,10 +24,11 @@ pub struct RecordedRequest {
 #[derive(Clone)]
 enum Behaviour {
     /// Answer every request with this full HTTP/1.1 response and close.
-    Reply(&'static str),
+    Reply(String),
     /// Accept `CONNECT host:port`, answer 200 and splice the connection to
     /// `127.0.0.1:port` (whatever the host).
-    Tunnel,
+    /// Requests other than `CONNECT` are answered with `otherwise`, if set.
+    Tunnel { otherwise: Option<String> },
 }
 
 pub struct FakeProxy {
@@ -40,14 +41,14 @@ impl FakeProxy {
     /// "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
     /// and closes.
     pub async fn start(reply: &'static str) -> FakeProxy {
-        FakeProxy::spawn(Behaviour::Reply(reply), None).await
+        FakeProxy::spawn(Behaviour::Reply(reply.to_string()), None).await
     }
 
     /// Like [`FakeProxy::start`], behind TLS with this certificate (an
     /// `https://` proxy). A connection whose handshake fails records nothing.
     pub async fn start_tls(reply: &'static str, cert_and_key: super::tls::CertAndKey) -> FakeProxy {
         FakeProxy::spawn(
-            Behaviour::Reply(reply),
+            Behaviour::Reply(reply.to_string()),
             Some(super::tls::acceptor(cert_and_key)),
         )
         .await
@@ -57,7 +58,19 @@ impl FakeProxy {
     /// `127.0.0.1:port`, so an https target served locally can be reached
     /// under any name.
     pub async fn start_tunnel() -> FakeProxy {
-        FakeProxy::spawn(Behaviour::Tunnel, None).await
+        FakeProxy::spawn(Behaviour::Tunnel { otherwise: None }, None).await
+    }
+
+    /// A tunnelling proxy that answers every plain (non-`CONNECT`) request
+    /// with `reply`.
+    pub async fn start_tunnel_or_reply(reply: String) -> FakeProxy {
+        FakeProxy::spawn(
+            Behaviour::Tunnel {
+                otherwise: Some(reply),
+            },
+            None,
+        )
+        .await
     }
 
     async fn spawn(behaviour: Behaviour, tls: Option<tokio_rustls::TlsAcceptor>) -> FakeProxy {
@@ -120,7 +133,12 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
             let _ = stream.write_all(reply.as_bytes()).await;
             let _ = stream.shutdown().await;
         }
-        Behaviour::Tunnel => {
+        Behaviour::Tunnel { otherwise } => {
+            if let (false, Some(reply)) = (request_line.starts_with("CONNECT "), otherwise) {
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.shutdown().await;
+                return;
+            }
             let port = request_line
                 .strip_prefix("CONNECT ")
                 .and_then(|rest| rest.split(' ').next())

@@ -637,3 +637,35 @@ async fn verify_ssl_still_applies_to_the_target_behind_a_proxy() {
             .all(|r| r.request_line == format!("CONNECT localhost:{target_port} HTTP/1.1"))
     );
 }
+
+/// Which side failed is decided by the failing hop's scheme: an http monitor
+/// redirected (through the proxy) to an https URL fails inside the tunnel,
+/// and a certificate error there is the target's, not the proxy's.
+#[tokio::test]
+async fn a_redirect_to_https_behind_a_proxy_blames_the_target_for_its_certificate() {
+    let target_port = tls::serve_https_ok(tls::self_signed()).await;
+    let proxy = FakeProxy::start_tunnel_or_reply(format!(
+        "HTTP/1.1 302 Found\r\nlocation: https://localhost:{target_port}/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    ))
+    .await;
+    let monitor = with_proxy(
+        http_monitor("http://target.test/start"),
+        &format!("http://127.0.0.1:{}", proxy.port),
+        None,
+    );
+    let error = perform_check(&check_context(), &monitor)
+        .await
+        .error
+        .unwrap();
+    assert!(!error.starts_with("proxy"), "the target failed: {error}");
+    assert!(error.contains("certificate"), "{error}");
+    let seen = proxy.requests();
+    assert_eq!(
+        seen[0].request_line,
+        "GET http://target.test/start HTTP/1.1"
+    );
+    assert_eq!(
+        seen[1].request_line,
+        format!("CONNECT localhost:{target_port} HTTP/1.1")
+    );
+}
