@@ -88,7 +88,7 @@ export function targetChoices(
 ): TargetChoice[] {
 	return [
 		{ value: 'all_members', label: 'All members' },
-		...members.map((m) => ({ value: `user:${m.user_id}`, label: m.email })),
+		...members.map((m) => ({ value: `user:${m.user_id}`, label: `${m.email} (${m.project_role})` })),
 		...schedules.map((s) => ({ value: `schedule:${s.id}`, label: `Schedule: ${s.name}` })),
 		...channels.map((c) => ({ value: `channel:${c.id}`, label: `Channel: ${c.name} (${c.kind})` }))
 	];

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import Card from '#lib/components/ui/Card.svelte';
 	import { MAX_DELAY_MINUTES, MAX_REPEAT_COUNT, MAX_STEPS, MAX_TARGETS_PER_STEP, newStep, type EditorStep } from '#lib/incidents/escalation';
 	import { WEEKDAYS } from '#lib/uptime/maintenance';
@@ -42,15 +42,51 @@
 		}
 	});
 
+	// Moving, adding and removing re-render the list: focus goes back where a
+	// keyboard user expects it, and the change is announced (as ScheduleForm).
+	let announcement = $state('');
+	async function focusLater(elementId: string) {
+		await tick();
+		document.getElementById(elementId)?.focus();
+	}
 	function move(i: number, by: -1 | 1) {
 		const j = i + by;
 		if (j < 0 || j >= steps.length) return;
 		[steps[i], steps[j]] = [steps[j], steps[i]];
+		const moved = steps[j];
+		announcement = `Step moved to position ${j + 1} of ${steps.length}.`;
+		// At the top or bottom the pressed button is disabled; use the other one.
+		const atEdge = by < 0 ? j === 0 : j === steps.length - 1;
+		focusLater(id(`s${moved.key}-${by < 0 !== atEdge ? 'up' : 'down'}`));
 	}
-	function addTarget(step: Row) {
+	function addStep() {
+		const step = row(newStep());
+		steps.push(step);
+		announcement = `Step ${steps.length} added.`;
+		focusLater(id(`s${step.key}-delay`));
+	}
+	function removeStep(i: number) {
+		steps.splice(i, 1);
+		announcement = `Step ${i + 1} removed.`;
+		const next = steps[i] ?? steps[i - 1];
+		focusLater(id(`s${next.key}-remove`));
+	}
+	function addTarget(step: Row, i: number) {
 		const choice = data.choices.find((c) => c.value === step.pick);
-		if (choice && !step.targets.some((t) => t.value === choice.value)) step.targets.push({ ...choice });
+		if (choice && !step.targets.some((t) => t.value === choice.value)) {
+			step.targets.push({ ...choice });
+			announcement = `${choice.label} added to step ${i + 1}.`;
+		}
 		step.pick = '';
+		// The Add button is disabled now; the picker (or, at the target limit,
+		// the last target) takes the focus.
+		focusLater(step.targets.length < MAX_TARGETS_PER_STEP ? id(`s${step.key}-pick`) : id(`s${step.key}-t${step.targets.length - 1}`));
+	}
+	function removeTarget(step: Row, i: number, t: number) {
+		const [removed] = step.targets.splice(t, 1);
+		announcement = `${removed.label} removed from step ${i + 1}.`;
+		const next = Math.min(t, step.targets.length - 1);
+		focusLater(next >= 0 ? id(`s${step.key}-t${next}`) : id(`s${step.key}-pick`));
 	}
 
 	let busy = $state(false);
@@ -147,9 +183,9 @@
 							<li class="space-y-3 rounded-control border border-border px-4 py-4">
 								<div class="flex flex-wrap items-center gap-2">
 									<h3 class="flex-1 text-sm font-medium text-ink">Step {i + 1}</h3>
-									<button type="button" class="btn btn-ghost btn-sm" disabled={i === 0} onclick={() => move(i, -1)} aria-label="Move step {i + 1} up">↑</button>
-									<button type="button" class="btn btn-ghost btn-sm" disabled={i === steps.length - 1} onclick={() => move(i, 1)} aria-label="Move step {i + 1} down">↓</button>
-									<button type="button" class="btn btn-ghost btn-sm" disabled={steps.length === 1} onclick={() => steps.splice(i, 1)}>
+									<button type="button" id={id(`s${step.key}-up`)} class="btn btn-ghost btn-sm" disabled={i === 0} onclick={() => move(i, -1)} aria-label="Move step {i + 1} up">↑</button>
+									<button type="button" id={id(`s${step.key}-down`)} class="btn btn-ghost btn-sm" disabled={i === steps.length - 1} onclick={() => move(i, 1)} aria-label="Move step {i + 1} down">↓</button>
+									<button type="button" id={id(`s${step.key}-remove`)} class="btn btn-ghost btn-sm" disabled={steps.length === 1} onclick={() => removeStep(i)}>
 										Remove<span class="sr-only"> step {i + 1}</span>
 									</button>
 								</div>
@@ -179,7 +215,13 @@
 											<li class="badge badge-primary">
 												<input type="hidden" name="step_{i}_target" value={target.value} />
 												<span class="wrap-anywhere">{target.label}</span>
-												<button type="button" class="ml-1 hover:text-ink" aria-label="Remove {target.label} from step {i + 1}" onclick={() => step.targets.splice(t, 1)}>×</button>
+												<button
+													type="button"
+													id={id(`s${step.key}-t${t}`)}
+													class="ml-1 hover:text-ink"
+													aria-label="Remove {target.label} from step {i + 1}"
+													onclick={() => removeTarget(step, i, t)}>×</button
+												>
 											</li>
 										{/each}
 									</ul>
@@ -194,7 +236,7 @@
 													{/each}
 												</select>
 											</div>
-											<button type="button" class="btn btn-secondary btn-sm" disabled={step.pick === ''} onclick={() => addTarget(step)}>Add</button>
+											<button type="button" class="btn btn-secondary btn-sm" disabled={step.pick === ''} onclick={() => addTarget(step, i)}>Add</button>
 										</div>
 									{/if}
 								</fieldset>
@@ -233,13 +275,14 @@
 							</li>
 						{/each}
 					</ol>
+					<p class="sr-only" role="status" aria-live="polite">{announcement}</p>
 					<datalist id={id('zones')}>
 						{#each zones as zone (zone)}
 							<option value={zone}></option>
 						{/each}
 					</datalist>
 					{#if steps.length < MAX_STEPS}
-						<button type="button" class="btn btn-secondary btn-sm" onclick={() => steps.push(row(newStep()))}>Add step</button>
+						<button type="button" class="btn btn-secondary btn-sm" onclick={addStep}>Add step</button>
 					{/if}
 					<div class="border-t border-border pt-4">
 						<button type="submit" disabled={busy} class="btn btn-primary">Save policy</button>

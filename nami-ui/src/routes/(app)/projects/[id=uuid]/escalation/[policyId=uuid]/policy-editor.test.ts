@@ -1,6 +1,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 import { fakeEvent, PROJECT_ID } from '#lib/server/core/fake-event';
+import { policyPayloadFromForm } from '#lib/server/incidents/policy-form';
 import type { EditorState, PolicyView, TargetChoice } from '#lib/incidents/escalation';
 import { actions, load } from './+page.server';
 import Page from './+page.svelte';
@@ -169,5 +170,52 @@ describe('policy editor page', () => {
 		// The fallback select offers the other policy, never this one.
 		expect(body).toMatch(new RegExp(`<option value="${OTHER_ID}"[^>]*selected`));
 		expect(body).not.toContain(`<option value="${POLICY_ID}"`);
+	});
+
+	// What the browser would submit for the rendered form, unchanged: inputs
+	// with a name (checkboxes only when checked) and each select's selected
+	// option (else its first).
+	function submitted(body: string): FormData {
+		const html = body.slice(body.indexOf('action="?/save"'), body.indexOf('</form>', body.indexOf('action="?/save"')));
+		const attr = (tag: string, name: string) => new RegExp(`\\s${name}="([^"]*)"`).exec(tag)?.[1];
+		const form = new FormData();
+		for (const [tag] of html.matchAll(/<input\b[^>]*>/g)) {
+			const name = attr(tag, 'name');
+			if (!name) continue;
+			if (attr(tag, 'type') === 'checkbox' && !/\schecked/.test(tag)) continue;
+			form.append(name, attr(tag, 'value') ?? 'on');
+		}
+		for (const [, open, options] of html.matchAll(/<select\b([^>]*)>([\s\S]*?)<\/select>/g)) {
+			const name = attr(open, 'name');
+			if (!name) continue;
+			const all = [...options.matchAll(/<option\b([^>]*)>/g)].map((m) => m[1]);
+			form.append(name, attr(all.find((o) => /\sselected/.test(o)) ?? all[0], 'value') ?? '');
+		}
+		return form;
+	}
+
+	it('submits the stored policy unchanged when saved without edits', async () => {
+		const stored = policy();
+		expect(policyPayloadFromForm(submitted(await renderPage('admin')))).toEqual({
+			ok: true,
+			payload: {
+				name: stored.name,
+				repeat_count: stored.repeat_count,
+				fallback_policy_id: stored.fallback_policy_id,
+				steps: stored.steps.map(({ delay_minutes, condition, targets }) => ({
+					delay_minutes,
+					condition,
+					targets: targets.map(({ label: _, ...target }) => target)
+				}))
+			}
+		});
+	});
+
+	it('gives step and target controls stable ids and a live region for moves', async () => {
+		const body = await renderPage('admin');
+		expect(body).toMatch(/<p class="sr-only" role="status" aria-live="polite">/);
+		for (const control of ['up', 'down', 'remove', 'delay', 'pick', 't0']) {
+			expect(body).toMatch(new RegExp(`id="policy-s\\d+-${control}"`));
+		}
 	});
 });

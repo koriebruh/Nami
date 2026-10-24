@@ -74,7 +74,7 @@ describe('targetChoices', () => {
 			[{ id: U, name: 'Ops', kind: 'slack' }]
 		)).toEqual([
 			{ value: 'all_members', label: 'All members' },
-			{ value: `user:${U}`, label: 'ann@b.test' },
+			{ value: `user:${U}`, label: 'ann@b.test (member)' },
 			{ value: `schedule:${S}`, label: 'Schedule: Primary' },
 			{ value: `channel:${U}`, label: 'Channel: Ops (slack)' }
 		]);
