@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     core::error::AppError,
     core::middleware::rbac::{
-        CurrentUser, ProjectReader, require_project_reader, require_project_role,
+        CurrentUser, ProjectReader, Role, require_project_reader, require_project_role,
     },
     core::state::AppState,
     uptime::group::model as monitor_group,
@@ -158,7 +158,7 @@ async fn create_monitor(
     Path(project_id): Path<Uuid>,
     Json(payload): Json<CreateMonitorRequest>,
 ) -> Result<(StatusCode, Json<MonitorView>), AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let config = monitor::validate(payload.into_config()).map_err(AppError::Validation)?;
     if let Some(group_id) = config.group_id {
         // A group of another project is a 404, like any foreign id.
@@ -172,7 +172,7 @@ async fn create_monitor(
             // A global admin bypasses membership, so the project itself may
             // not exist (or the group was just deleted): SQLSTATE 23503
             // (foreign_key_violation) -> 404.
-            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
+            sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
                 AppError::NotFound
             }
             _ => AppError::Database(e),
@@ -192,7 +192,7 @@ async fn import_monitors(
     Path(project_id): Path<Uuid>,
     Json(request): Json<ImportRequest>,
 ) -> Result<Response, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     if request.content.len() > MAX_IMPORT_BODY_BYTES {
         return Ok((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -228,7 +228,7 @@ async fn patch_monitor(
     Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PatchMonitorRequest>,
 ) -> Result<Json<MonitorView>, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let updated =
         monitor::update_in_project(&state.db, &state.cipher, project_id, monitor_id, payload)
             .await?
@@ -243,7 +243,7 @@ async fn delete_monitor(
     user: CurrentUser,
     Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_project_role(&state.db, &user, project_id, "admin").await?;
+    require_project_role(&state.db, &user, project_id, Role::Admin).await?;
     if !monitor::delete_in_project(&state.db, project_id, monitor_id).await? {
         return Err(AppError::NotFound);
     }
@@ -261,7 +261,7 @@ async fn list_checks(
     Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<ChecksQuery>,
 ) -> Result<Json<Vec<UptimeCheckRow>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     monitor::find_in_project(&state.db, project_id, monitor_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -279,7 +279,7 @@ async fn get_stats(
     user: CurrentUser,
     Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<MonitorStats>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     monitor::find_in_project(&state.db, project_id, monitor_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -294,7 +294,7 @@ async fn get_availability(
     Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
     Query(range): Query<RangeQuery>,
 ) -> Result<Json<Availability>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     availability::check_range(range.from, range.to).map_err(AppError::Validation)?;
     availability::for_monitor(
         &state.db,

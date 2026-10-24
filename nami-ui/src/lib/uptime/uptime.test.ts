@@ -132,6 +132,7 @@ describe('statusSince', () => {
 		project_id: 'p',
 		monitor_id: 'm',
 		heartbeat_id: null,
+		log_alert_id: null,
 		source_name: 'API',
 		title: 'API is down',
 		cause: null,

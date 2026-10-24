@@ -346,3 +346,44 @@ async fn errors_never_echo_a_pattern_and_writes_must_be_json(pool: sqlx::PgPool)
     let response = app.clone().oneshot(form).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }
+
+/// Previews run on blocking threads, so each user and the instance have a
+/// cap on how many run at once; past either, 429, and a refusal holds
+/// nothing.
+#[sqlx::test]
+async fn previews_are_capped_per_user_and_per_instance(pool: sqlx::PgPool) {
+    use nami_engine::logs::ingest::pipeline::{
+        MAX_PIPELINE_PREVIEWS_PER_INSTANCE as INSTANCE, MAX_PIPELINE_PREVIEWS_PER_USER as PER_USER,
+    };
+    let state = nami_engine::core::state::AppState::for_test(pool.clone());
+    let previews = state.logs.pipeline_previews.clone();
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (source, _) = seed_source(&pool, project, "api").await;
+    let (user, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let uri = format!("/projects/{project}/sources/{source}/pipeline/test");
+    let body = json!({ "rules": [], "events": [{"message":"m"}] });
+    let preview = |body: serde_json::Value| call(&app, "POST", &uri, Some(&member), Some(body));
+
+    let mine: Vec<_> = (0..PER_USER - 1)
+        .map(|_| previews.acquire_capped(user, PER_USER, INSTANCE).unwrap())
+        .collect();
+    assert_eq!(preview(body.clone()).await.0, StatusCode::OK, "the last slot of the user");
+    assert_eq!(previews.open(user), PER_USER - 1, "the slot comes back");
+    let _one_more = previews.acquire_capped(user, PER_USER, INSTANCE).unwrap();
+    assert_eq!(preview(body.clone()).await.0, StatusCode::TOO_MANY_REQUESTS);
+    // The slot is taken before the body is checked.
+    let many = json!({ "rules": [], "events": vec![json!({"message":"m"}); 101] });
+    assert_eq!(preview(many).await.0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(previews.open(user), PER_USER, "a refusal holds nothing");
+    drop((mine, _one_more));
+
+    let others: Vec<_> = (0..INSTANCE - 1)
+        .map(|_| previews.acquire_capped(uuid::Uuid::new_v4(), PER_USER, INSTANCE).unwrap())
+        .collect();
+    assert_eq!(preview(body.clone()).await.0, StatusCode::OK, "the last slot of the instance");
+    let _last = previews.acquire_capped(uuid::Uuid::new_v4(), PER_USER, INSTANCE).unwrap();
+    assert_eq!(preview(body).await.0, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(previews.open(user), 0);
+    drop(others);
+}

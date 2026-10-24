@@ -256,6 +256,12 @@ impl ActiveWindows {
     pub fn covers_heartbeats(&self) -> bool {
         self.0.iter().any(MaintenanceWindow::applies_to_heartbeats)
     }
+
+    /// Whether one of these windows covers the whole project (a project-wide
+    /// one): what holds log alerts. Same windows as [`Self::covers_heartbeats`].
+    pub fn covers_project(&self) -> bool {
+        self.covers_heartbeats()
+    }
 }
 
 /// A window as API responses show it: `active` = in effect right now.
@@ -470,7 +476,7 @@ pub fn validate(c: WindowConfig) -> Result<ValidWindow, String> {
 /// key refuses another project's monitor. Either way, a 404.
 fn not_found_on_foreign_key(e: sqlx::Error) -> AppError {
     match &e {
-        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
+        sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
             AppError::NotFound
         }
         _ => AppError::Database(e),

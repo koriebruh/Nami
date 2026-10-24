@@ -1,54 +1,73 @@
 # Log Management — Part 2 Implementation Plan
 
-> **Restructure note (2026-10-19):** after this plan was written, the engine, its tests, its migrations and `nami-ui/src/lib` were reorganised by domain, and work now ships as one PR per phase (see `CLAUDE.md`). File paths, test files and migration numbers in the steps below predate that change. Map them with the path table in `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. For example, `src/routes/logs.rs` is now `src/logs/query/routes.rs`, `src/logs/store.rs` is `src/logs/ingest/store.rs`, `src/models/source.rs` is `src/logs/source/model.rs`, `tests/logs_search.rs` is a module of the `tests/logs/main.rs` target, and `#lib/logs` is `#lib/logs/logs`. New migrations follow the convention in that file: numbered sequentially after the newest file in `nami-engine/migrations/` (the first is `0006_`), named `NNNN_<domain>_<change>.sql`, and at most one file per domain per phase PR. Tasks 9-13 are merged (their 0042/0043 are folded into `0005_logs.sql`); the remaining Tasks 14-18 put their schema (the plan's `0044_create_log_alerts.sql`) into one `NNNN_logs_<change>.sql`. The plan body is otherwise unchanged.
+> **Status:** done. NAMI-LOG-9..13 merged as PRs #56, #63, #67, #75, #76; NAMI-LOG-14..19 shipped as one phase PR. Decisions: `docs/superpowers/decisions/2026-10-25-log-management-part2.md`.
+> **Branch:** `feat/logs-part2` in `.worktrees/logs-part2/`.
+> **Depends on:** Logs Part 1 and Uptime Phases 1-3 (merged).
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Finish BetterStack-style log management in Nami. This part adds per-source ingest pipeline rules (drop, remove fields, redact, rename, sample) with an editor and live preview, message patterns (`/logs/patterns` and an explorer Patterns tab), streamed CSV/NDJSON export capped at 100,000 rows, saved views, and log alerts (a threshold over a window opens an incident and sends notifications). It also adds a 30-day usage chart per source, live-tail resume across reconnects, and the explorer fixes that Part 1 deferred.
 
-**Architecture:** The pipeline is a pure module (`logs::pipeline`). It compiles a source's rules once and applies them to a normalized `LogEvent`. It plugs into the one shared event→row step that the Part 1 fix wave extracted (`store::RowBatch::push`), so HTTP and syslog run the same order: parse → field mapping → caps → **pipeline** → pattern → row → encoded caps → quota accounting → insert. The compiled rules are cached per source and keyed on `sources.updated_at`. The token lookup already returns that value, so a cache hit costs no query. Patterns, export and alert counts reuse Part 1's parameter parser and `logs::query::Sql` builder (fixed fragments and numbered placeholders only) and the fix wave's read budgets. Export streams ClickHouse `JSONEachRow` line by line through a bounded channel, with caps on rows, bytes and line length. It never buffers a result. Saved views and log alerts live in Postgres and share one validated query shape (`logs::saved_query`). A worker loop claims due alerts with the monitors' `for update skip locked` pattern and reuses `alerts::notify_transition` and `uptime::worker::Notifications`. nami-ui proxies export and live tail as streams, and preview calls as small JSON POSTs, through allow-listing `+server.ts` endpoints.
+**Architecture:** The pipeline is a pure module (`logs::ingest::pipeline`). It compiles a source's rules once and applies them to a normalized `LogEvent`. It plugs into the one shared event→row step that the Part 1 fix wave extracted (`store::RowBatch::push`), so HTTP and syslog run the same order: parse → field mapping → caps → **pipeline** → pattern → row → encoded caps → quota accounting → insert. The compiled rules are cached per source and keyed on `sources.updated_at`. The token lookup already returns that value, so a cache hit costs no query. Patterns, export and alert counts reuse Part 1's parameter parser and `logs::query::Sql` builder (fixed fragments and numbered placeholders only) and the fix wave's read budgets. Export streams ClickHouse `JSONEachRow` line by line through a bounded channel, with caps on rows, bytes and line length. It never buffers a result. Saved views and log alerts live in Postgres and share one validated query shape (`logs::view::saved_query`). A worker loop claims due alerts with the monitors' `for update skip locked` pattern and reuses `alerts::notify_transition` and `uptime::worker::Notifications`. nami-ui proxies export and live tail as streams, and preview calls as small JSON POSTs, through allow-listing `+server.ts` endpoints.
 
 **Tech Stack:** Rust 2024 (Axum 0.8, SQLx 0.9 runtime queries, tokio, reqwest 0.13, `regex` 1.13, `tokio-stream` 0.1). One crate becomes a direct dependency: `regex-syntax` (already in `Cargo.lock` as a dependency of `regex`; `cargo add regex-syntax@<locked version>` in Task 10). No other new crates. Postgres 17, ClickHouse 26.9, SvelteKit 3 + Svelte 5 runes + Tailwind 4, vitest.
 
 **Spec:** `docs/superpowers/specs/2026-10-13-log-management-design.md` (including "Parity additions (2026-10-13)"). Part 1 plan: `docs/superpowers/plans/2026-10-13-log-management-part1.md`. Roadmap: `docs/superpowers/roadmap.md` §3. Part 1 rulings, limits and deferred items: `docs/superpowers/decisions/2026-10-13-log-management-part1.md` (the committed record; the scratch ledger under `.superpowers/sdd/` is local only and is not a source of truth).
 
-**When to start:** now. The Logs Part 1 final-review fix wave merged as `94f9362` (PR #50) while this plan was being written, and the plan is aligned to that merged code. The table below lists what each task takes from it. Task 11 is the only task that depends on the shared event→row step.
+**When to start:** now, with NAMI-LOG-14. Tasks 9-13 merged to `main` and are kept below as the record of what landed. The Logs Part 1 final-review fix wave merged as `94f9362` (PR #50) while this plan was being written, and the plan is aligned to that merged code. The table below lists what each task takes from it. Task 11 is the only task that depends on the shared event→row step.
 
-**Interfaces assumed from the fix wave** (verify each against merged `main` before starting the task that uses it; adapt names minimally, keep the behaviour and the tests, and note the mapping in the PR):
+**Interfaces assumed from the fix wave** (verify each against the branch before starting the task that uses it; adapt names minimally, keep the behaviour and the tests, and record the mapping as a "Drift" note in the task):
 
 | Interface | Where (`main` `94f9362`) | Used by |
 |---|---|---|
-| `clickhouse::MAX_RESPONSE_BYTES` (32 MiB), `ClickHouse::with_max_response_bytes`, `ClickHouseError::ResponseTooLarge { limit }`, capped `read_capped` body reader | `src/clickhouse.rs` | T9, T12, T14 |
-| `logs::search::READ_SETTINGS` (`max_result_bytes=33554432`, `result_overflow_mode=throw`); `search::user_error` mapping `TOO_MANY_ROWS_OR_BYTES` / `ResponseTooLarge` to 400 | `src/logs/search.rs` | T9, T12, T14 |
-| `logs::search::{QueryPermit, QuerySlots, MAX_QUERIES_PER_USER = 4}`; `QueryPermit::acquire(&Arc<LogsState>, user_id) -> Result<QueryPermit, AppError>` (429 `RateLimited`). It currently also guards entry reads (`routes/logs.rs` `log_entry`), which Task 9 moves to a cap of their own (R-P2-23) | `src/logs/search.rs`, `LogsState.query_slots` | T9, T14 |
-| `logs::search::{ENTRY_COLUMNS (cut list columns + `truncated`), FULL_COLUMNS, LogEntry.truncated, entry()}`, `GET /projects/{id}/logs/{log_id}?dt=<rfc3339>`; UI: `LogEntry.truncated?`, `entryHref`, the `logs/entry/[logId=uuid]/+server.ts` proxy, and expanding a cut row loads the whole row (`f3b358f`) | `src/logs/search.rs`, `src/routes/logs.rs`, `nami-ui/src/lib/logs.ts`, explorer page | T9 (entry cap), T15, T17 (reused as is) |
-| `Sql::list` made `pub` | `src/logs/query.rs` | T9, T12 |
-| `rate_limit::{ProjectLimits, MAX_IN_FLIGHT_PER_PROJECT = 8, MAX_DECODES_PER_PROJECT = 2}`, `LogsState.project_limits`; `ingest::prepare(.., shares, project_shares)` | `src/logs/rate_limit.rs`, `src/logs/ingest.rs` | T11 (unchanged, only threaded through) |
-| `config.max_sources_per_project` (`MAX_SOURCES_PER_PROJECT`, default 50), `source::create_source` → 409 | `src/config.rs`, `src/models/source.rs` | T12 (source-name map size bound) |
-| The shared event→row step (item 6): `store::RowBatch { with_capacity(capacity, max_stored_bytes), push(&mut self, event: LogEvent, source: &IngestSource) -> Result<(), StoredTooLarge>, rows(), into_rows(), len(), stored_bytes(), encode(max_bytes) -> Result<EncodedRows, ClickHouseError> }`, `store::EncodedRows { body, events, bytes, per_source: SourceCounts }`, `store::SourceCounts = HashMap<Uuid, (u64, u64)>`, `store::encode_run(rows, max_bytes)`, `store::chunk_rows(rows, max_bytes) -> Result<(Vec<Range<usize>>, usize), ClickHouseError>`. HTTP: `ingest::row_batch` (private) → `build_batch`/`build_rows_within`. Syslog: the batcher builds a `RowBatch` in `spawn_blocking`, then runs `chunk_rows` on the async task (T11 moves it into the blocking build, R-P2-24) and encodes each run in its own `spawn_blocking`. `RowBatch::push` is the documented pipeline hook point | `src/logs/store.rs`, `src/logs/ingest.rs`, `src/logs/syslog/mod.rs` | T11 |
-| `serve::{MAX_PUBLIC_CONNECTIONS = 512, MAX_API_CONNECTIONS = 512}` plus header-read deadlines on both listeners | `src/serve.rs` | final review (risk: the caps are global per listener; per-IP limits stay with Platform) |
+| `core::clickhouse::MAX_RESPONSE_BYTES` (32 MiB), `ClickHouse::with_max_response_bytes`, `ClickHouseError::ResponseTooLarge { limit }`, capped `read_capped` body reader | `src/core/clickhouse.rs` | T9, T12, T14 |
+| `logs::query::search::READ_SETTINGS` (`max_result_bytes=33554432`, `result_overflow_mode=throw`); `search::user_error` mapping `TOO_MANY_ROWS_OR_BYTES` / `ResponseTooLarge` to 400 | `src/logs/query/search.rs` | T9, T12, T14 |
+| `logs::query::search::{QueryPermit, QuerySlots, MAX_QUERIES_PER_USER = 4}`; `QueryPermit::acquire(&Arc<LogsState>, user_id) -> Result<QueryPermit, AppError>` (429 `RateLimited`). It currently also guards entry reads (`logs/query/routes.rs` `log_entry`), which Task 9 moves to a cap of their own (R-P2-23) | `src/logs/query/search.rs`, `LogsState.query_slots` | T9, T14 |
+| `logs::query::search::{ENTRY_COLUMNS (cut list columns + `truncated`), FULL_COLUMNS, LogEntry.truncated, entry()}`, `GET /projects/{id}/logs/{log_id}?dt=<rfc3339>`; UI: `LogEntry.truncated?`, `entryHref`, the `logs/entry/[logId=uuid]/+server.ts` proxy, and expanding a cut row loads the whole row (`f3b358f`) | `src/logs/query/search.rs`, `src/logs/query/routes.rs`, `nami-ui/src/lib/logs/logs.ts`, explorer page | T9 (entry cap), T15, T17 (reused as is) |
+| `Sql::list` made `pub` | `src/logs/query/mod.rs` | T9, T12 |
+| `rate_limit::{ProjectLimits, MAX_IN_FLIGHT_PER_PROJECT = 8, MAX_DECODES_PER_PROJECT = 2}`, `LogsState.project_limits`; `ingest::prepare(.., shares, project_shares)` | `src/logs/ingest/rate_limit.rs`, `src/logs/ingest/mod.rs` | T11 (unchanged, only threaded through) |
+| `config.max_sources_per_project` (`MAX_SOURCES_PER_PROJECT`, default 50), `source::create_source` → 409 | `src/core/config.rs`, `src/logs/source/model.rs` | T12 (source-name map size bound) |
+| The shared event→row step (item 6): `store::RowBatch { with_capacity(capacity, max_stored_bytes), push(&mut self, event: LogEvent, source: &IngestSource) -> Result<(), StoredTooLarge>, rows(), into_rows(), len(), stored_bytes(), encode(max_bytes) -> Result<EncodedRows, ClickHouseError> }`, `store::EncodedRows { body, events, bytes, per_source: SourceCounts }`, `store::SourceCounts = HashMap<Uuid, (u64, u64)>`, `store::encode_run(rows, max_bytes)`, `store::chunk_rows(rows, max_bytes) -> Result<(Vec<Range<usize>>, usize), ClickHouseError>`. HTTP: `ingest::row_batch` (private) → `build_batch`/`build_rows_within`. Syslog: the batcher builds a `RowBatch` in `spawn_blocking`, then runs `chunk_rows` on the async task (T11 moves it into the blocking build, R-P2-24) and encodes each run in its own `spawn_blocking`. `RowBatch::push` is the documented pipeline hook point | `src/logs/ingest/store.rs`, `src/logs/ingest/mod.rs`, `src/logs/syslog/mod.rs` | T11 |
+| `serve::{MAX_PUBLIC_CONNECTIONS = 512, MAX_API_CONNECTIONS = 512}` plus header-read deadlines on both listeners | `src/core/serve.rs` | final review (risk: the caps are global per listener; per-IP limits stay with Platform) |
 
-Implementers still check each row against `main` before starting the task that uses it. A later fix may rename something; adapt minimally, keep the behaviour and the tests, and note the mapping in the PR.
+Implementers still check each row against the branch before starting the task that uses it. A later fix may rename something; adapt minimally, keep the behaviour and the tests, and record the mapping as a "Drift" note in the task.
 
 **Verification status:** this plan was **not** replayed on a scratch copy. That differs from Part 1. Planning ran docs-only, with Docker left untouched. The code blocks are written against `main` `94f9362` as read on 2026-10-19 and have not been compiled. Implementers run every step, treat a failing compile in a given block as drift to fix minimally, and keep the tests' assertions.
 
-**Plan review (2026-10-19).** Every signature this plan uses was spot-checked against `94f9362` (`store`, `query`, `search`, `clickhouse`, `tail`, `routes/logs*.rs`, `models/source.rs`, `models/incident.rs`, `models/maintenance.rs`, `uptime/alerts.rs`, `uptime/worker.rs`, the test helpers in `tests/common`, `tests/logs_*.rs`, `tests/migrations.rs`, and nami-ui's `engine.ts`, `log-proxy.ts`, `fake-event.ts`, `lib/logs.ts`, the tail proxy and the explorer). Fixed in this revision (each fix is in the task it belongs to):
-- Drift that would not compile or would fail: `tests/migrations.rs` has no `mod common;` (migration tests now seed with SQL); `store.rs`'s test helper is `source(retention_days)`, not `test_source()`; the tail proxy test's `fakeEvent` returns `{ event, controller }`; `Prepared` (not only `Batch`) must carry the pipeline counts; `new Response('', { status: 204 })` throws (null-body status); `cargo test` takes one test-name filter (several go after `--`); a 64 KiB + 1 message is truncated by `from_json` before the pipeline sees it; `updated_at` strings do not compare lexicographically (chrono prints 0, 3 or 6 fraction digits); `"garbage\r\nx"` panics in the request builder; `99999999999999999999` is not a `u64` and the engine answers 400; T13 needs T10's `query::parse_path`, so it is not independent of T10.
+**Drift check (2026-10-24):** Tasks 14-18 were re-read against `feat/logs-part2` after the domain restructure (PR #78) and the merges of Tasks 9-13. Paths, module names and test helpers are in the new layout. Where the current code behaves differently from what a task assumed, the task carries a "Drift (2026-10-24)" note with the minimal adaptation; the tests' assertions are unchanged.
+
+**Plan review (2026-10-19, file names as they were before the restructure).** Every signature this plan uses was spot-checked against `94f9362` (`store`, `query`, `search`, `clickhouse`, `tail`, `routes/logs*.rs`, `models/source.rs`, `models/incident.rs`, `models/maintenance.rs`, `uptime/alerts.rs`, `uptime/worker.rs`, the test helpers in `tests/common`, `tests/logs_*.rs`, `tests/core/migrations.rs`, and nami-ui's `engine.ts`, `log-proxy.ts`, `fake-event.ts`, `lib/logs.ts`, the tail proxy and the explorer). Fixed in this revision (each fix is in the task it belongs to):
+- Drift that would not compile or would fail: `tests/core/migrations.rs` has no `mod common;` (migration tests now seed with SQL); `store.rs`'s test helper is `source(retention_days)`, not `test_source()`; the tail proxy test's `fakeEvent` returns `{ event, controller }`; `Prepared` (not only `Batch`) must carry the pipeline counts; `new Response('', { status: 204 })` throws (null-body status); `cargo test` takes one test-name filter (several go after `--`); a 64 KiB + 1 message is truncated by `from_json` before the pipeline sees it; `updated_at` strings do not compare lexicographically (chrono prints 0, 3 or 6 fraction digits); `"garbage\r\nx"` panics in the request builder; `99999999999999999999` is not a `u64` and the engine answers 400; T13 needs T10's `query::parse_path`, so it is not independent of T10.
 - Security: regex memory budget per pipeline and in the cache (R-P2-26); compile and preview run off the async runtime; regex redaction also covers numbers (R-P2-5); every write to `sources` bumps `updated_at` monotonically (R-P2-6); export ends at a deadline even when the client stops reading, has a per-instance cap, and never writes a ClickHouse exception line into the file (R-P2-12, R-P2-13, R-P2-15); the alert worker shares one evaluation budget across passes, skips evaluations of an edited alert, records `last_error`, and opens and resolves incidents through one seam (R-P2-18, R-P2-19, R-P2-27); project-wide maintenance windows hold log alerts (R-P2-18, a ruling the controller may reverse); `Last-Event-ID` is length-capped before decoding (R-P2-20).
 - Coverage: the LOG-8 deferred items the first draft missed (error display, `<pre>` wrapping, a11y, a live-tail lifecycle test) are in T15 (R-P2-21). Part 1 deferred items without a target are listed in R-P2-22.
 
-**Execution:** per CLAUDE.md. Use one worktree per task under `.worktrees/NAMI-LOG-<n>/`, branched from the latest `origin/main`, with the branch named under each task heading. Commit with Conventional Commits, then run the task review, open the PR, and auto-merge on a clean review (pre-authorized for sub-projects 2-11). Tasks are sequential (each consumes earlier interfaces). Dependencies: T9 and T10 are independent of each other. T11 needs T10. T12 needs T9 (`slots`) and T10 (`query::parse_path`). T13 needs T10 (`parse_path`) only, so it may run beside T11/T12. T14 needs T13. T15's engine half is independent, but its UI half edits `log-proxy.ts` and `lib/logs.ts` like T12 and T17, so it lands after T12 (or rebases onto it). T16 needs T10 (and T11 for its walkthrough). T17 needs T9, T12, T13 and T15. T18 needs T14 and T16 (`relayJsonPost`). How changes are written down: new files appear in full where the code decides something (security-relevant logic, SQL, migrations, proxies). Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body. Tests always appear in full. Engine tests need `docker compose up -d postgres clickhouse mailpit` (never restart running containers). Build with `CARGO_PROFILE_DEV_DEBUG=0` and the shared `CARGO_TARGET_DIR=/Users/mitengineer/development/nami/.worktrees/.cargo-target` (ledger ruling).
+**Execution:** one phase, per CLAUDE.md and `docs/superpowers/plan-conventions.md`. Tasks 9-13 merged to `main` under the old one-PR-per-task flow. Everything left runs on the one branch `feat/logs-part2` in `.worktrees/logs-part2/`, in order: T14, T15, T16, T17, T18, then T19 (NAMI-LOG-19). Each task is one or more commits with its task ID in the message (Conventional Commits), followed by a task review (spec compliance and quality) with fix commits on the same branch until it is clean. T19 is the phase security review, its fix wave, the decisions doc, the roadmap ticks and the one phase PR. Dependencies among the remaining tasks: T14 needs T13 (merged). T15's engine half depends on nothing unmerged; its UI half edits `log-proxy.ts` and `lib/logs/logs.ts`, which T17 edits too, so T15 lands before T17. T16 needs T10 and T11 (merged). T17 needs T9, T12, T13 (merged) and T15. T18 needs T14 and T16 (`relayJsonPost`). Work run in parallel (for example T15's engine half beside T14) goes in an extra worktree on a short-lived local branch that is merged back into `feat/logs-part2` before its review (CLAUDE.md, rule 5). How changes are written down: new files appear in full where the code decides something (security-relevant logic, SQL, migrations, proxies). Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body. Tests always appear in full. Engine tests need `docker compose up -d postgres clickhouse mailpit` (never restart running containers).
 
-Engine test command, used by every task below (substitute the test binary):
+Engine test command, used by every task below (substitute the domain target and the test file):
 
 ```bash
-cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami CARGO_PROFILE_DEV_DEBUG=0 \
-  CARGO_TARGET_DIR=/Users/mitengineer/development/nami/.worktrees/.cargo-target cargo test --test <binary>
+cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test --test <domain> <file>::
 ```
 
-Unit tests use the same environment with `--lib` instead of `--test <binary>`. `cargo test` accepts **one** test-name filter before `--`. Several filters go after it: `cargo test --lib -- logs::export clickhouse::`.
+Unit tests use the same environment with `--lib` instead of `--test <domain>`. `cargo test` accepts **one** test-name filter before `--`. Several filters go after it: `cargo test --lib -- logs::query::export core::clickhouse::`.
 
 UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `svelte-check found 0 errors and 0 warnings`).
+
+## Roadmap coverage
+
+Roadmap §3 Part 2. Part 1's items (R3.01 to R3.12) are ticked. The items below stay unticked until the phase PR merges; NAMI-LOG-19 ticks them.
+
+| Roadmap | Item | Tasks |
+|---|---|---|
+| R3.13 | Per-source ingest pipeline: drop, remove fields, redact, rename, sample | NAMI-LOG-10 (#63), NAMI-LOG-11 (#67), NAMI-LOG-16 (editor UI) |
+| R3.14 | Message pattern grouping + explorer Patterns tab | NAMI-LOG-9 (#56), NAMI-LOG-17 (tab) |
+| R3.15 | Streamed CSV/NDJSON export, capped at 100k rows | NAMI-LOG-12 (#75), NAMI-LOG-17 (export menu and warning) |
+| R3.16 | Saved views | NAMI-LOG-13 (#76), NAMI-LOG-17 (UI) |
+| R3.17 | Log alerts (threshold over a window opens an incident) | NAMI-LOG-14 (engine), NAMI-LOG-18 (UI) |
+| R3.18 | Live-tail resume across reconnects, explorer fixes Part 1 deferred | NAMI-LOG-15 |
+| R3.19 | 30-day usage chart per source | NAMI-LOG-16 |
+| R3.20 | UI: pipeline editor, Patterns tab, saved views, alerts | NAMI-LOG-16, NAMI-LOG-17, NAMI-LOG-18 |
+| R3.21 | Part 2 security review + fix wave | NAMI-LOG-19 |
 
 ## Global Constraints
 
@@ -59,12 +78,12 @@ UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `sv
 - Regexes (spec): the `regex` crate on the Rust side (linear time). At most **256 characters**. Compiled with a size limit, once per rule-set version. Invalid patterns are rejected at write time with 400. Search regexes run in ClickHouse `match` (RE2, linear) with the pattern as a bound `String` parameter. The search side already limits them to 10 filters of 256 characters each.
 - RBAC: two levels, as in CLAUDE.md. An authorization failure is **403**, never 404. An id from another project inside an accessible project path is **404**. A `source_id` from another project matches nothing in reads, and is rejected with 400 when stored in a view or an alert.
 - Roles per feature: viewers read pipelines, patterns, export, views, alerts and usage. Members edit pipelines (PUT, test), create/edit/delete views and create/edit alerts. **Admins delete alerts** (as monitors). Ingestion is token only.
-- Every state-changing engine request carries a JSON body (`router::require_json_body`, already global). Every request body is parsed by a `deny_unknown_fields` struct.
+- Every state-changing engine request carries a JSON body (`core::router::require_json_body`, already global). Every request body is parsed by a `deny_unknown_fields` struct.
 - Pipeline (spec): at most **50** rules per source, replaced as a whole. Match is `{"field": path, "equals": value}` or `{"message_regex": pattern}`. Kinds are `drop`, `remove_fields`, `redact` (`keys` case-insensitive at any depth → `"[REDACTED]"`, `regex` over `message` and every string value of `fields`), `rename` (overwrites the target; a missing source is a no-op), and `sample` (`n` 2-10000, keep the 1st, (n+1)th, … per rule per engine instance). The first matching `drop` ends processing. Redaction runs before pattern extraction and storage. The test endpoint takes at most **100** sample events and stores nothing. Regex budget (R-P2-26): each regex compiles with `size_limit` and `dfa_size_limit` of **256 KiB**, and a pipeline holds at most **20** regexes. Compiling rules and running the preview are CPU work and go to `spawn_blocking`, never an async worker.
 - Patterns (spec): `GET /projects/{id}/logs/patterns` (search filters and window) returns the top **100** patterns by count as `{pattern_hash, pattern, count, first_seen, last_seen}`. `pattern_hash` is a decimal string.
 - Export (spec): `GET /projects/{id}/logs/export?format=csv|ndjson` (viewer, same filters and window as search) streams newest-first up to **100,000** rows, then stops. `X-Nami-Export-Limit: 100000`. NDJSON rows carry every stored column. CSV has `dt, level, source, message, trace_id` plus at most **10** `columns` field paths, extracted server-side. CSV is RFC 4180, and a cell starting with `=`, `+`, `-`, `@`, tab or CR gets a leading `'`. ClickHouse `max_execution_time` is **120 s**. At most **2** concurrent exports per user (third → 429) and **8** per engine instance (ninth → 429). An export task ends at a **150 s** deadline even when its client stops reading (R-P2-13), so a stalled download cannot hold a slot.
 - Saved views (spec): Postgres `log_views` (project, name, query JSON with the search parameters and picked columns, created_by). Members create/edit/delete, viewers read.
-- Log alerts (spec): Postgres `log_alerts` with `threshold` (count), `comparison` (`gt` | `lt`), `window_seconds` (**60-86400**), `interval_seconds` (**>= 60**), `enabled`, `state` (`ok` | `alerting`), `last_evaluated_at`, `next_evaluation_at`. The worker claims due alerts atomically. A met condition while `ok` → `alerting`, opens an incident (`incidents.log_alert_id`) and notifies through `alerts::notify_transition`. A cleared condition while `alerting` → `ok` and resolves the incident. While a **project-wide** maintenance window is in effect, the alert's state machine stands still, as for heartbeats (R-P2-18). Incidents are opened and resolved only through `logs::alerts::{open_alert_incident, resolve_alert_incident}` (R-P2-27).
+- Log alerts (spec): Postgres `log_alerts` with `threshold` (count), `comparison` (`gt` | `lt`), `window_seconds` (**60-86400**), `interval_seconds` (**>= 60**), `enabled`, `state` (`ok` | `alerting`), `last_evaluated_at`, `next_evaluation_at`. The worker claims due alerts atomically. A met condition while `ok` → `alerting`, opens an incident (`incidents.log_alert_id`) and notifies through `alerts::notify_transition`. A cleared condition while `alerting` → `ok` and resolves the incident. While a **project-wide** maintenance window is in effect, the alert's state machine stands still, as for heartbeats (R-P2-18). Incidents are opened and resolved only through `logs::alert::{open_alert_incident, resolve_alert_incident}` (R-P2-27).
 - Outbound requests: none of this plan's features makes one. Alert notifications go only through `alerts::notify_transition` (email today). When the Incident Management sub-project adds webhook/Slack channels to that function, it applies their link-local and private-address refusal (`uptime::checker::is_forbidden_destination`). Log alerts must never call a sender directly.
 - Crypto: no new secrets. Source tokens keep their per-row AAD (`sources.token:{id}`). The pipeline never touches the token.
 - nami-ui: every engine call goes through `callEngine` with `enginePath`. Route params use the `[id=uuid]`/`[...Id=uuid]` matchers and are checked with `isUuid` before reaching an engine path. Failed calls render through `engineFailure`/`engineErrorMessage`. A 401 redirects to `/login`. Deletes are two-step (a JS `confirm()` plus a `confirm=yes` field, and a bare POST asks first). Streams (export, tail) are relayed as bodies and never read or buffered in the BFF. Only allow-listed query keys and headers pass. Modules under `#lib/server` are never imported by components. Times are shown in UTC. Tokens never appear in a URL.
@@ -85,7 +104,7 @@ UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `sv
 
 ## Decisions the spec leaves open (rulings)
 
-- **R-P2-1 Names.** Migrations: `0042_add_sources_pipeline.sql`, `0043_create_log_views.sql`, `0044_create_log_alerts.sql`. Engine modules: `logs::pipeline`, `logs::pipeline_cache`, `logs::patterns`, `logs::export`, `logs::slots`, `logs::saved_query`, `logs::alerts`. Routes: `routes::log_views`, `routes::log_alerts`, with the pipeline and patterns endpoints added to the existing `routes::sources` / `routes::logs`. Models: `models::log_view`, `models::log_alert`.
+- **R-P2-1 Names.** Migrations: what LOG-10 (`sources.pipeline`) and LOG-13 (`log_views`) added is in the baseline `0005_logs.sql` (folded on 2026-10-19). T14 adds two phase files, `NNNN_logs_alerts.sql` (`log_alerts`) and then `NNNN_incidents_log_alerts.sql` (`incidents.log_alert_id`, its FK and indexes), where NNNN is the next free number in `nami-engine/migrations/` and the logs file takes the lower one, because the incidents FK references `log_alerts`. Engine modules: `logs::ingest::pipeline`, `logs::ingest::pipeline_cache`, `logs::query::patterns`, `logs::query::export`, `logs::query::slots`, `logs::view::saved_query`, `logs::alert`. Routes: `logs::view::routes`, `logs::alert::routes`, with the pipeline and patterns endpoints added to the existing `logs::source::routes` / `logs::query::routes`. Models: `logs::view::model`, `logs::alert::model`.
 - **R-P2-2 Rule wire format.** The spec names rules by kind. On the wire a rule is one flat object with a `type` key: `{"type":"drop","match":{...}}`, `{"type":"remove_fields","paths":[...]}`, `{"type":"redact","keys":[...],"regex":"..."}`, `{"type":"rename","from":"a","to":"b"}`, `{"type":"sample","n":10,"match":{...}}`. A key the kind does not use → 400. Errors name the rule by 0-based index: `rules[3]: regex must be at most 256 characters`.
 - **R-P2-3 Paths in rules.** Paths follow the search filter syntax (1-5 segments of `^[A-Za-z0-9_-]{1,64}$`). In `match.field` and `rename`, the single-segment paths `level` and `message` address the normalized values (spec). `rename` from `message` moves the message into a field and leaves the message empty. Renaming to `message` sets it (a non-string becomes its JSON text). Renaming to `level` goes through `normalize::level_from_name`, so an unknown name gives `info`. `remove_fields` addresses `fields` only, and `level`/`message` there → 400 (use `rename` or `redact`). `redact.keys` are key *names* (1-64 characters, no control characters, at most 50) and never paths. Redaction never changes `level`. At most 50 paths per `remove_fields`.
 - **R-P2-4 `equals` comparison** follows search's `eq`: a string field compares unquoted, any other JSON value by its JSON text (`200` matches `200` and `"200"`). A missing field never matches. `equals` is a string, number or boolean (≤ 1,024 characters of text), or 400.
@@ -99,99 +118,79 @@ UI commands: `cd nami-ui && npm run check && npx vitest run <paths>` (expect `sv
 - **R-P2-12 Export transport.** A new `ClickHouse::stream_rows_with` posts without `wait_end_of_query` (rows flow as ClickHouse produces them). It sends `max_execution_time=120`, `readonly=2`, `cancel_http_readonly_queries_on_client_close=1` and `http_write_exception_in_output_format=1`, and uses a per-request timeout of 150 s (reqwest's per-request timeout replaces the client's 30 s). It sends no `max_result_bytes` (the export's own caps bound it, R-P2-13). `http_write_exception_in_output_format` joins `RESERVED_SETTINGS`. A non-2xx answer is read through the capped reader and mapped by `search::user_error` *before* any response header is sent, so an invalid RE2 is a 400, not a broken file. After that, an error can only be reported in the body. It ends the stream with a trailer: NDJSON `{"_nami_export_error":"<reason>"}`, CSV a last record `# export stopped early: <reason>`. How ClickHouse marks a mid-stream error differs by version (a `{"exception":…}` line, or an `__exception__` block on newer servers, or a cut connection). The export therefore does not look for one shape. Every line must start with the first selected column's key (`{"id":` for NDJSON, `{"dt":` for CSV). A line that does not is never written to the file and ends it with the "query failed" trailer. A transport error ends it with the "interrupted" trailer.
 - **R-P2-13 Export caps.** `MAX_EXPORT_ROWS = 100_000` (also the SQL `LIMIT`), `MAX_EXPORT_BYTES = 512 MiB` written, `MAX_EXPORT_LINE_BYTES = 4 MiB` per ClickHouse line. A stored row is at most 64 KiB of message plus 256 KiB of fields; JSON escaping makes that at most about 2 MiB. Reaching the row cap ends the file normally. The UI warned first, and the header tells API clients. Reaching the byte or line cap writes the trailer. The output channel holds 16 chunks. **Deadline:** the streaming task has an overall deadline, `ExportLimits.deadline` (150 s, the same as the request timeout). Every `next_line` and every `tx.send` runs under `timeout_at(deadline, ..)`, so a client that stays connected but stops reading cannot hold the slot. reqwest's own timeout is only checked while the body is polled, so it would not end such a task. At the deadline the task tries the trailer for at most 1 s, then returns. A client that disconnects ends the task at once (`tx.closed()` / a failed send), which drops the ClickHouse response, and ClickHouse cancels the query (`cancel_http_readonly_queries_on_client_close`).
 - **R-P2-14 Export columns.** The repeatable key is `columns` (spec wording), up to 10 search-syntax paths, extracted in ClickHouse with the same text expression as `eq` filters (strings unquoted, other values as JSON text, missing → empty cell). The CSV `source` column is the source's name from Postgres, mapped once before streaming (at most `MAX_SOURCES_PER_PROJECT` names). A row of a since-deleted source shows its id. `Content-Disposition: attachment; filename="nami-logs-<to as %Y%m%dT%H%M%SZ>.<csv|ndjson>"` contains no user text.
-- **R-P2-15 Per-user slots for entry reads and exports.** A new counter, `logs::slots::UserSlots` (Task 9), separate from the fix wave's 4 search/histogram slots. Exports hold one of 2 per user and one of `MAX_EXPORTS_PER_INSTANCE = 8` in total (`UserSlots::acquire_capped(user, per_user, total)`, which counts a running total beside the per-user map), with the permit moved into the streaming task, so a slot is held for exactly as long as the stream runs (at most the deadline, R-P2-13). Each export runs a ClickHouse query for up to 120 s with no result-size setting, so without the total a crowd of users could fill ClickHouse with exports. Entry reads hold one of 8 per user (R-P2-23). The duplication with `search::QuerySlots` is left for the security wave to fold if it wants.
+- **R-P2-15 Per-user slots for entry reads and exports.** A new counter, `logs::query::slots::UserSlots` (Task 9), separate from the fix wave's 4 search/histogram slots. Exports hold one of 2 per user and one of `MAX_EXPORTS_PER_INSTANCE = 8` in total (`UserSlots::acquire_capped(user, per_user, total)`, which counts a running total beside the per-user map), with the permit moved into the streaming task, so a slot is held for exactly as long as the stream runs (at most the deadline, R-P2-13). Each export runs a ClickHouse query for up to 120 s with no result-size setting, so without the total a crowd of users could fill ClickHouse with exports. Entry reads hold one of 8 per user (R-P2-23). The duplication with `search::QuerySlots` is left for the security wave to fold if it wants.
 - **R-P2-16 UI export warning.** The browser downloads through a plain link, so it cannot read `X-Nami-Export-Limit` before the download. The UI therefore holds `EXPORT_ROW_LIMIT = 100_000` and compares it with the histogram total before starting. An engine test pins the header to 100000 and a UI test pins the constant. A `HEAD` probe was rejected: axum answers HEAD by running the GET handler, which would start an export.
-- **R-P2-17 Query shape shared by views and alerts.** `LogQuery { q, in_fields, levels, source_ids, filters, pattern_hashes }`. `filters` items are the explorer's `{path, op, value?}` objects. It is validated by converting to query pairs and running Part 1's `query::parse_filters`, so it is identical to search validation. `ViewQuery` adds `range` (`15m|1h|6h|24h|7d|custom`, default `1h`), `from`/`to` (custom only, from < to, ≤ 31 days) and `columns` (≤ 10 paths). Alerts store a `LogQuery`. Stored `source_ids` must belong to the project when written (400). A source deleted later just matches nothing. Names go through `models::validate_label("name", ..)`. View names are unique per project (409). At most **200** views and **100** alerts per project (409), to bound the evaluation load.
-- **R-P2-18 Alert semantics.** The window is `[now − window_seconds, now]` at evaluation. `gt` fires when `count > threshold`, `lt` when `count < threshold`. `lt` needs `threshold >= 1` (400), because `lt 0` can never fire. Thresholds go up to 10^12. A PATCH sets `next_evaluation_at = now()` so an edit takes effect at once. Disabling an `alerting` alert sets `ok` and resolves its open incident without a notification. Deleting an alert deletes its incidents (FK cascade, same as monitors). **Maintenance (ruling, reversible by the controller):** a *project-wide* maintenance window (`monitor_id` null) in effect at `started_at` holds the alert's state machine, as it holds heartbeats: the count, `last_count` and `last_evaluated_at` are recorded, but `state` does not change, no incident opens or resolves, and nothing is sent. The first evaluation after the window applies the transition normally. A monitor-scoped window does not apply. Reason: a project-wide window means "the whole project is under planned work", and log volume and error counts are what planned work changes most. Paging on them would make project-wide windows useless. The check is `models::maintenance::active_windows(&mut *tx, project_id, started_at).await?.covers_heartbeats()` (project-wide windows only). Add a `covers_project()` alias with that body so the call reads right. **Stale evaluations** are skipped: one that started no later than `last_evaluated_at`, or one whose claimed `updated_at` differs from the row's (the alert was edited while it ran, so its count used old settings; the PATCH already made the alert due again). A failed count changes nothing except `last_error` / `last_error_at` (a fixed, user-safe text: the `AppError::Validation` message from `search::user_error`, else `"the log store is unavailable"`), so an alert whose query keeps failing is visible in the UI instead of silently never evaluating. A successful evaluation clears `last_error`. Incident title: `Log alert: <name>`. Cause: `<count> matching events in the last <window> (threshold: > <n>)`, or `< <n>` for `lt`.
-- **R-P2-19 Alert worker.** `logs::alerts::run_forever` runs where the uptime worker runs (`UPTIME_WORKER_ENABLED`). It ticks every 5 s and claims due alerts with `for update skip locked`, rescheduled `interval_seconds` ahead in the claiming statement. Several engine instances can therefore run it at once: each alert is claimed by one of them per interval. Evaluations share one `Arc<Semaphore>` of `MAX_ALERT_EVALUATIONS = 8` across every pass of the instance (passes overlap when ClickHouse is slow). A tick claims at most `min(ALERT_CLAIM_BATCH = 50, available permits)` alerts, and none when no permit is free, so an alert is never claimed (and pushed one interval ahead) without capacity to evaluate it. Notifications go through a `Notifications` of its own. Per-evaluation budget: one `count()` under `READ_SETTINGS` and the client's 25 s `max_execution_time`, holding one permit. Alert storms are bounded by the state machine (an email only on a transition), the unique open incident per alert, `interval_seconds >= 60` (a flapping alert sends at most one email per interval) and 100 alerts per project. Confirmation periods arrive with Metrics' shared evaluator.
+- **R-P2-17 Query shape shared by views and alerts.** `LogQuery { q, in_fields, levels, source_ids, filters, pattern_hashes }`. `filters` items are the explorer's `{path, op, value?}` objects. It is validated by converting to query pairs and running Part 1's `query::parse_filters`, so it is identical to search validation. `ViewQuery` adds `range` (`15m|1h|6h|24h|7d|custom`, default `1h`), `from`/`to` (custom only, from < to, ≤ 31 days) and `columns` (≤ 10 paths). Alerts store a `LogQuery`. Stored `source_ids` must belong to the project when written (400). A source deleted later just matches nothing. Names go through `core::validate::validate_label("name", ..)`. View names are unique per project (409). At most **200** views and **100** alerts per project (409), to bound the evaluation load.
+- **R-P2-18 Alert semantics.** The window is `[now − window_seconds, now]` at evaluation. `gt` fires when `count > threshold`, `lt` when `count < threshold`. `lt` needs `threshold >= 1` (400), because `lt 0` can never fire. Thresholds go up to 10^12. A PATCH sets `next_evaluation_at = now()` so an edit takes effect at once. Disabling an `alerting` alert sets `ok` and resolves its open incident without a notification. Deleting an alert deletes its incidents (FK cascade, same as monitors). **Maintenance (ruling, reversible by the controller):** a *project-wide* maintenance window (`monitor_id` null) in effect at `started_at` holds the alert's state machine, as it holds heartbeats: the count, `last_count` and `last_evaluated_at` are recorded, but `state` does not change, no incident opens or resolves, and nothing is sent. The first evaluation after the window applies the transition normally. A monitor-scoped window does not apply. Reason: a project-wide window means "the whole project is under planned work", and log volume and error counts are what planned work changes most. Paging on them would make project-wide windows useless. The check is `uptime::maintenance::model::active_windows(&mut *tx, project_id, started_at).await?.covers_heartbeats()` (project-wide windows only). Add a `covers_project()` alias with that body so the call reads right. **Stale evaluations** are skipped: one that started no later than `last_evaluated_at`, or one whose claimed `updated_at` differs from the row's (the alert was edited while it ran, so its count used old settings; the PATCH already made the alert due again). A failed count changes nothing except `last_error` / `last_error_at` (a fixed, user-safe text: the `AppError::Validation` message from `search::user_error`, else `"the log store is unavailable"`), so an alert whose query keeps failing is visible in the UI instead of silently never evaluating. A successful evaluation clears `last_error`. Incident title: `Log alert: <name>`. Cause: `<count> matching events in the last <window> (threshold: > <n>)`, or `< <n>` for `lt`.
+- **R-P2-19 Alert worker.** `logs::alert::run_forever` runs where the uptime worker runs (`UPTIME_WORKER_ENABLED`). It ticks every 5 s and claims due alerts with `for update skip locked`, rescheduled `interval_seconds` ahead in the claiming statement. Several engine instances can therefore run it at once: each alert is claimed by one of them per interval. Evaluations share one `Arc<Semaphore>` of `MAX_ALERT_EVALUATIONS = 8` across every pass of the instance (passes overlap when ClickHouse is slow). A tick claims at most `min(ALERT_CLAIM_BATCH = 50, available permits)` alerts, and none when no permit is free, so an alert is never claimed (and pushed one interval ahead) without capacity to evaluate it. Notifications go through a `Notifications` of its own. Per-evaluation budget: one `count()` under `READ_SETTINGS` and the client's 25 s `max_execution_time`, holding one permit. Alert storms are bounded by the state machine (an email only on a transition), the unique open incident per alert, `interval_seconds >= 60` (a flapping alert sends at most one email per interval) and 100 alerts per project. Confirmation periods arrive with Metrics' shared evaluator.
 - **R-P2-20 Live-tail resume (deferred from Part 1).** Every `event: log` carries `id: <Cursor::encode()>` (opaque, `(dt, id)`). On connect, a `Last-Event-ID` header holding a valid cursor dated within the last **5 minutes** makes the first poll send the rows after that cursor (oldest first, at most `TAIL_BATCH`), instead of only remembering them. A cursor that is malformed, longer than 128 bytes (checked before decoding), older or in the future is ignored (normal start). The cursor is untrusted input and changes only two things: the lower `dt` bound of the first poll (never more than 5 minutes back) and a bound flag column. The project comes from the path, the filters from the query string, and the replay is capped at `TAIL_BATCH` rows, so a forged cursor cannot reach another project's rows or read more than a normal poll. When the resume poll fails, the next poll tries the resume again (resume ends only with the first poll that succeeds). With more than `TAIL_BATCH` rows after the cursor, the newest `TAIL_BATCH` are replayed and the older part of the gap is lost. Late rows dated at or before the cursor that arrived during the gap are not replayed either (both documented). nami-ui forwards `Last-Event-ID` only when it matches `^[A-Za-z0-9_-]{1,128}$`. The explorer leaves reconnects to `EventSource` (it closes the stream only on `end: session`), so the browser's own reconnect after the 30-minute `end: timeout` carries the header.
-- **R-P2-21 Explorer fixes (deferred from Part 1).** The tail effect depends only on the derived tail query string and the `live` flag, so changing columns or the tab does not restart it. "Load more" carries a generation number and an `AbortController`. Navigation aborts it, and a response from an older generation is discarded. Live rows are validated (`isLogEntry`), deduplicated by id and capped at `LIVE_ROW_CAP`. Turning live off clears them. The rest of the LOG-8 deferred line is also Part 2: a failed histogram or sources call shows a message instead of looking empty (`histogramError`, `sourcesError` from the load), `<pre>` fields wrap (`whitespace-pre-wrap break-words`), the live status is announced (`role="status" aria-live="polite"`), the results/patterns tabs are a labelled `nav`, and the live-tail lifecycle gets a test. For that test the EventSource handling moves out of `+page.svelte` into `nami-ui/src/lib/live-tail.ts` (`startLiveTail`), which takes the `EventSource` constructor as a parameter, so vitest drives it with a fake.
+- **R-P2-21 Explorer fixes (deferred from Part 1).** The tail effect depends only on the derived tail query string and the `live` flag, so changing columns or the tab does not restart it. "Load more" carries a generation number and an `AbortController`. Navigation aborts it, and a response from an older generation is discarded. Live rows are validated (`isLogEntry`), deduplicated by id and capped at `LIVE_ROW_CAP`. Turning live off clears them. The rest of the LOG-8 deferred line is also Part 2: a failed histogram or sources call shows a message instead of looking empty (`histogramError`, `sourcesError` from the load), `<pre>` fields wrap (`whitespace-pre-wrap wrap-anywhere`, as the message `<pre>` already does), the live status is announced (`role="status" aria-live="polite"`), the results/patterns tabs are a labelled `nav`, and the live-tail lifecycle gets a test. For that test the EventSource handling moves out of `+page.svelte` into `nami-ui/src/lib/logs/live-tail.ts` (`startLiveTail`), which takes the `EventSource` constructor as a parameter, so vitest drives it with a fake.
 - **R-P2-22 Not in Part 2.** Graceful shutdown and per-IP HTTP limits go to Platform (Part 1 ruling). Alert no-data handling, confirmation periods and per-series incidents go to Metrics (spec). Alert routing through escalation policies goes to Incident Management (roadmap §4). The "View trace" link waits for Traces (spec). Part 1 deferred items that the decisions log gives no target stay open, and the Part 2 final review decides each one: LOG-3 (2-permit large-body semaphore, `shrink_to_fit` on the prefix result, memory-test baseline, aggregate encoded bodies awaiting ClickHouse), LOG-4 (unreachable UDP oversize branch on IPv4), LOG-5 (numeric `eq` compares text, Rust pre-check stricter than RE2, `user_error` substring matching, paging window not in the cursor, about 32 histogram buckets at 31 days, empty `contains` matches all), LOG-6 (no test for `MAX_UNKNOWN_CHECKS`), LOG-7 (viewers see Reveal/Rotate, token panel and snippet a11y, rsyslog template token unescaped, no component tests). When Traces adds OTLP logs, its events must reach `RowBatch::push` with `trace_id`/`span_id` already checked (`normalize::checked_id`), so an invalid id is in `fields` before redaction runs (today `build_row` moves it after the pipeline; HTTP and syslog are unaffected because `from_json` checks ids and syslog sets none).
 - **R-P2-23 Entry reads get their own cap (controller follow-up from the fix wave).** One explorer page load takes 2 of the 4 query slots (search + histogram). A load-more and two expanded rows would then hit 429. `GET /projects/{id}/logs/{log_id}` therefore stops taking a `QueryPermit` and takes one of `MAX_ENTRY_READS_PER_USER = 8` entry slots instead. An entry read reads one granule by `dt` and `id` under `READ_SETTINGS`, so 8 at once cost little. The spec line "at most 4 searches, histograms and entry reads" becomes "at most 4 searches and histograms, and 8 entry reads", changed in the same PR (Task 9).
 - **R-P2-24 Syslog row chunking off the runtime (controller follow-up).** The batcher calls `store::chunk_rows` (which JSON-encodes every row to measure it) on the async task. Task 11 moves it into the blocking task that builds the `RowBatch`. That task returns the rows, the runs and the oversized count together, and only the per-run encode and the insert stay as they are.
 - **R-P2-25 A tail poll reads only new rows, pinned by a counter (controller follow-up).** `LogsState.tail_stats: tail::TailStats { id_polls: AtomicU64, rows_fetched: AtomicU64 }` counts id polls and list rows read by `fetch_rows`. Task 15's test asserts that 10 polls over 100 old rows read exactly the 2 new rows. The counters are cheap and are also what a later metrics endpoint would export.
 - **R-P2-26 Regex budget per pipeline.** Each pipeline regex compiles with `RegexBuilder::size_limit(REGEX_SIZE_LIMIT)` and `dfa_size_limit(REGEX_DFA_SIZE_LIMIT)`, both **256 KiB**. A pipeline holds at most `MAX_REGEXES = 20` regexes (`message_regex` and `redact.regex` together). The error names the rule holding the 21st: `rules[i]: a pipeline may hold at most 20 regular expressions`. A pattern over the size limit gets `"regex is too complex (compiled size limit)"` (`regex::Error::CompiledTooBig`), any other error `"regex is not a valid regular expression"`. Neither echoes the pattern. Bound: a cached pipeline holds at most 20 × 256 KiB of programs, plus one lazy-DFA cache of at most 256 KiB per regex per thread using it at once. Ingest decoding is capped at 4 threads, the preview at one blocking task per request. With the cache at 1,024 entries that is a bounded worst case. The spec's line "compiled once per rule-set version with a size limit" gains "at most 20 per pipeline" (Task 10). CPU stays bounded: a request decodes at most 50 MiB of values, each regex scans it once in linear time, and the decode places (4, at most 2 per project) bound how many such scans run at once.
-- **R-P2-27 One seam for log-alert incidents.** The Incident Management sub-project (next) replaces how incidents open and notify (escalation policies, severities, `source = 'log_alert'`). Log alerts touch incidents only through two functions in `logs::alerts`: `open_alert_incident(conn, alert, count, at) -> Result<Option<Transition>, sqlx::Error>` (calls `incident::open_for_log_alert` and builds the `Down` transition) and `resolve_alert_incident(conn, alert_id, project_id, name, at, notify: bool) -> Result<Option<Transition>, sqlx::Error>` (calls `incident::resolve_for_log_alert`, returns the `Recovered` transition only when `notify`). `apply_evaluation` and `models::log_alert::update` (disable) call these and nothing else. Transitions still leave only through `uptime::alerts::notify_transition`, so swapping in the unified incident API is a change to those two functions.
-
-## Roadmap §3 coverage (verified against `main` 95940ee, which already ticks Part 1's items)
-
-| Roadmap item | Status on `main` | Part 2 task |
-|---|---|---|
-| Sources with tokens | done (LOG-1, LOG-7) | — |
-| HTTP ingestion JSON/NDJSON, limits, rate limit | done (LOG-3) | — |
-| MessagePack ingestion | done (LOG-3, `logs/msgpack.rs`) | — |
-| Syslog RFC 5424 | done (LOG-4) | — |
-| Per-source ingest pipeline | missing | T10, T11, T16 |
-| ClickHouse storage + TTL | done (LOG-2) | — |
-| Search (range, level, full-text, filters, paging) | done (LOG-5, LOG-8) | — |
-| Filter ops regex/not_regex/gt/gte/lt/lte | done (`query.rs` `push_filter`, LOG-5) | — |
-| Pattern grouping + Patterns tab | column/hash only; no endpoint, no tab | T9, T17 |
-| `trace_id`/`span_id` columns | done (LOG-2, LOG-5) | — |
-| Shareable URLs, column picker | done (LOG-8) | T17 extends the URL state (`tab`, `pattern`) |
-| Streamed CSV/NDJSON export | missing | T12, T17 |
-| Per-source stats + daily byte quota | counting, flush, quota and `/usage` done (LOG-3); UI shows today only | T16 (30-day chart) |
-| Live tail (SSE via BFF) | done (LOG-6, LOG-8) | T15 (resume, fixes) |
-| Saved views | missing | T13, T17 |
-| Log alerts | missing | T14, T18 |
-| UI: sources, explorer, live tail, saved views, alerts | sources/explorer/tail done | T16, T17, T18 |
-
-After Task 18 merges, the controller ticks the six items still open: pipeline, patterns, export, saved views, log alerts, and the UI line.
+- **R-P2-27 One seam for log-alert incidents.** The Incident Management sub-project (next) replaces how incidents open and notify (escalation policies, severities, `source = 'log_alert'`). Log alerts touch incidents only through two functions in `logs::alert`: `open_alert_incident(conn, alert, count, at) -> Result<Option<Transition>, sqlx::Error>` (calls `incident::open_for_log_alert` and builds the `Down` transition) and `resolve_alert_incident(conn, alert_id, project_id, name, at, notify: bool) -> Result<Option<Transition>, sqlx::Error>` (calls `incident::resolve_for_log_alert`, returns the `Recovered` transition only when `notify`). `apply_evaluation` and `logs::alert::model::update` (disable) call these and nothing else. Transitions still leave only through `uptime::alerts::notify_transition`, so swapping in the unified incident API is a change to those two functions.
 
 ## File Structure
+
+New layout (`docs/superpowers/decisions/2026-10-19-domain-restructure.md`). Entries for T9-T13 are merged and listed as the record; T14-T18 create or change the rest.
 
 ```
 nami-engine/
   migrations/
-    0042_add_sources_pipeline.sql      T10 sources.pipeline jsonb (array, <= 50)
-    0043_create_log_views.sql          T13 log_views
-    0044_create_log_alerts.sql         T14 log_alerts + incidents.log_alert_id
+    0005_logs.sql                      baseline: holds what T10 (sources.pipeline) and T13 (log_views) added (merged)
+    NNNN_logs_alerts.sql               T14 log_alerts (lower number: the incidents file's FK needs it)
+    NNNN_incidents_log_alerts.sql      T14 incidents.log_alert_id, its partial unique index and lookup index
   src/
-    clickhouse.rs                      T12 stream_rows_with, RowStream, LineTooLong, reserved setting
-    state.rs / main.rs                 T14 spawn logs::alerts::run_forever
-    router.rs, routes/mod.rs           T13, T14 merge the new routers
-    logs/mod.rs                        T9..T15 module list; LogsState gains entry_slots (T9), pipelines (T11), export_slots + export_limits (T12), tail_stats (T15)
-    logs/pattern.rs                    T9 IPv6 over-match fix
-    logs/patterns.rs                   T9 top patterns query
-    logs/query.rs                      T10 pub parse_path; T12 pub push_field_text
-    logs/pipeline.rs                   T10 rules, compile, apply
-    logs/pipeline_cache.rs             T11 per-source compiled-rules cache
-    logs/store.rs                      T11 RowBatch::push runs the pipeline (the fix wave's shared step)
-    logs/syslog/mod.rs                 T11 pipelines per batch; chunk_rows moved into the blocking build (R-P2-24)
-    logs/usage.rs                      T11 record_pipeline
-    logs/slots.rs                      T9 UserSlots (entry reads); T12 adds export slots
-    logs/export.rs                     T12 params, SQL, CSV, streaming task
-    logs/saved_query.rs                T13 LogQuery, ViewQuery
-    logs/alerts.rs                     T14 claim, count, apply, worker loop
-    logs/tail.rs                       T15 event ids, resume, TailStats
-    models/source.rs                   T10 pipeline read/write, monotonic updated_at; T11 IngestSource.updated_at
-    models/maintenance.rs              T14 ActiveWindows::covers_project alias
-    models/log_view.rs                 T13
-    models/log_alert.rs                T14
-    models/incident.rs                 T14 open/resolve_for_log_alert, list joins log_alerts
-    uptime/alerts.rs                   T14 Subject::LogAlert + render
+    main.rs                            T14 spawn logs::alert::run_forever (uptime_worker_enabled branch)
+    core/clickhouse.rs                 T12 stream_rows_with, RowStream, LineTooLong, reserved setting (merged)
+    core/router.rs                     T13 merged logs::view routes; T14 merges logs::alert routes
+    logs/mod.rs                        module list; LogsState gained entry_slots (T9), pipelines (T11), export_slots + export_limits (T12), all merged; T14 adds `pub mod alert;`; T15 adds tail_stats
+    logs/ingest/pipeline.rs            T10 rules, compile, apply (merged)
+    logs/ingest/pipeline_cache.rs      T11 per-source compiled-rules cache (merged)
+    logs/ingest/store.rs               T11 RowBatch::push runs the pipeline (merged)
+    logs/ingest/usage.rs               T11 record_pipeline (merged)
+    logs/ingest/routes.rs              T11 pipeline lookup before Work (merged)
+    logs/syslog/mod.rs                 T11 pipelines per batch; chunk_rows in the blocking build (merged)
+    logs/query/mod.rs                  T10 pub parse_path; T12 pub push_field_text (merged)
+    logs/query/pattern.rs              T9 IPv6 over-match fix (merged)
+    logs/query/patterns.rs             T9 top patterns query (merged)
+    logs/query/slots.rs                T9 UserSlots; T12 export slots (merged)
+    logs/query/export.rs               T12 params, SQL, CSV, streaming task (merged)
+    logs/query/tail.rs                 T15 event ids, resume, TailStats
+    logs/query/routes.rs               T9 patterns, T12 export (merged); T15 Last-Event-ID
+    logs/source/model.rs               T10/T11 pipeline read/write, monotonic updated_at, IngestSource.updated_at (merged)
+    logs/source/routes.rs              T10 pipeline GET/PUT/test (merged)
+    logs/view/{mod,model,routes,saved_query}.rs   T13 saved views, LogQuery, ViewQuery (merged)
+    logs/alert/mod.rs                  T14 claim, count, apply, seam, worker loop
+    logs/alert/model.rs                T14 LogAlert, validate, CRUD
+    logs/alert/routes.rs               T14 CRUD + preview routes
+    incidents/model.rs                 T14 open/resolve_for_log_alert, list joins log_alerts
+    uptime/alerts.rs                   T14 Subject::LogAlert in render and still_down
     uptime/worker.rs                   T14 spawn_alerts made pub(crate)
-    routes/sources.rs                  T10 pipeline GET/PUT/test
-    routes/logs_ingest.rs              T11 pipeline lookup before Work
-    routes/logs.rs                     T9 patterns; T12 export; T15 Last-Event-ID
-    routes/log_views.rs                T13
-    routes/log_alerts.rs               T14
+    uptime/maintenance/model.rs        T14 ActiveWindows::covers_project alias
   tests/
-    logs_patterns.rs                   T9
-    logs_pipeline_api.rs               T10
-    logs_pipeline_ingest.rs            T11
-    logs_export.rs                     T12
-    log_views.rs                       T13
-    log_alerts.rs                      T14
-    logs_tail.rs                       T15 (+ resume tests)
-    migrations.rs, clickhouse.rs       T10/T13/T14 new tables; T12 reserved settings
+    logs/main.rs                       T14 adds `mod log_alerts;`
+    logs/logs_patterns.rs              T9 (merged)
+    logs/logs_pipeline_api.rs          T10 (merged)
+    logs/logs_pipeline_ingest.rs       T11 (merged)
+    logs/logs_export.rs                T12 (merged)
+    logs/log_views.rs                  T13 (merged)
+    logs/log_alerts.rs                 T14
+    logs/logs_tail.rs                  T15 (+ resume tests)
+    core/migrations.rs                 T10/T13 (merged); T14 log_alerts
+    core/clickhouse.rs                 T12 reserved settings (merged)
 
 nami-ui/src/
-  lib/logs.ts (+ test)                 T15 isLogEntry, mergeLiveRows; T17 tab/pattern state, view <-> state, export href
-  lib/live-tail.ts (+ test)            T15 startLiveTail (EventSource lifecycle, testable with a fake)
-  lib/pipeline.ts (+ test)             T16 rule types, drafts, sample parsing
-  lib/log-alerts.ts (+ test)           T18 types, describeCondition
-  lib/server/log-proxy.ts (+ test)     T12 EXPORT_PARAMS; T15 lastEventIdHeader
-  lib/server/log-alert-form.ts (+ test) T18
+  lib/logs/logs.ts (+ test)            T15 isLogEntry, mergeLiveRows, tailKey; T16 usageBars; T17 tab/pattern state, view <-> state, export href; T18 exports parseFilter
+  lib/logs/live-tail.ts (+ test)       T15 startLiveTail (EventSource lifecycle, testable with a fake)
+  lib/logs/pipeline.ts (+ test)        T16 rule types, drafts, sample parsing
+  lib/logs/log-alerts.ts (+ test)      T18 types, describeCondition
+  lib/server/core/json-relay.ts (+ test)        T16 relayJsonPost (T18 reuses it)
+  lib/server/logs/log-proxy.ts (+ test)         T12 EXPORT_PARAMS (merged); T15 lastEventIdHeader; T17 PATTERN_PARAMS
+  lib/server/logs/log-alert-form.ts (+ test)    T18
+  lib/uptime/uptime.ts                 T18 Incident.log_alert_id
   lib/components/UsageChart.svelte     T16
   lib/components/logs/PipelineEditor.svelte  T16
   lib/components/logs/PatternsTable.svelte   T17
@@ -203,7 +202,7 @@ nami-ui/src/
     logs/+layout.svelte                T18 Alerts sub-tab
     logs/+page.server.ts, +page.svelte T15 fixes; T17 tabs, views, export
     logs/tail/+server.ts               T15 Last-Event-ID
-    logs/export/+server.ts (+ test)    T12 streamed export proxy
+    logs/export/+server.ts (+ test)    T12 streamed export proxy (merged)
     logs/sources/[sourceId=uuid]/+page.*          T16 usage chart (days=30)
     logs/sources/[sourceId=uuid]/pipeline/+page.* T16 editor
     logs/sources/[sourceId=uuid]/pipeline/test/+server.ts (+ test) T16 preview proxy
@@ -212,29 +211,29 @@ nami-ui/src/
 ```
 
 ---
-### Task 9 (NAMI-LOG-9): Message patterns endpoint, the IPv6 over-match fix, and a separate cap for entry reads
+### Task 9 (NAMI-LOG-9): Message patterns endpoint, the IPv6 over-match fix, and a separate cap for entry reads (done, PR #56)
 
-Branch `feat/NAMI-LOG-9-log-patterns`, worktree `.worktrees/NAMI-LOG-9/`.
+Merged. Kept as the record of what landed; do not re-run its steps.
 
 **Files:**
-- Modify: `nami-engine/src/logs/pattern.rs` (`looks_like_ipv6`, tests)
-- Create: `nami-engine/src/logs/patterns.rs`, `nami-engine/src/logs/slots.rs`
-- Modify: `nami-engine/src/logs/mod.rs` (module list, `LogsState.entry_slots`), `nami-engine/src/routes/logs.rs` (patterns route; `log_entry` takes an entry slot instead of a `QueryPermit`), `docs/superpowers/specs/2026-10-13-log-management-design.md` (the per-user cap sentence, R-P2-23)
-- Test: `nami-engine/tests/logs_patterns.rs`, append to `nami-engine/tests/logs_search.rs` (+ unit tests in `pattern.rs`, `patterns.rs`, `slots.rs`)
+- Modify: `nami-engine/src/logs/query/pattern.rs` (`looks_like_ipv6`, tests)
+- Create: `nami-engine/src/logs/query/patterns.rs`, `nami-engine/src/logs/query/slots.rs`
+- Modify: `nami-engine/src/logs/mod.rs` (module list, `LogsState.entry_slots`), `nami-engine/src/logs/query/routes.rs` (patterns route; `log_entry` takes an entry slot instead of a `QueryPermit`), `docs/superpowers/specs/2026-10-13-log-management-design.md` (the per-user cap sentence, R-P2-23)
+- Test: `nami-engine/tests/logs/logs_patterns.rs`, append to `nami-engine/tests/logs/logs_search.rs` (+ unit tests in `pattern.rs`, `patterns.rs`, `slots.rs`)
 
 **Interfaces:**
 - Consumes: `query::{parse_window, parse_filters, push_where, push_window, query_pairs, Sql}`, `search::{READ_SETTINGS, user_error, QueryPermit}` (fix wave), `require_project_role`.
-- Produces: `logs::patterns::{TOP_PATTERNS: u32 = 100, PATTERN_SETTINGS, PatternCount, top_patterns}`; route `GET /projects/{id}/logs/patterns` → `{"patterns": [PatternCount]}`. Also (used by T12):
+- Produces: `logs::query::patterns::{TOP_PATTERNS: u32 = 100, PATTERN_SETTINGS, PatternCount, top_patterns}`; route `GET /projects/{id}/logs/patterns` → `{"patterns": [PatternCount]}`. Also (used by T12):
 
 ```rust
-// logs::slots
+// logs::query::slots
 #[derive(Debug, Default)] pub struct UserSlots { /* Mutex<HashMap<Uuid, usize>> */ }
 #[derive(Debug)] pub struct UserPermit { /* Arc<UserSlots>, user id */ }
 impl UserSlots {
     pub fn acquire(self: &Arc<Self>, user_id: Uuid, max: usize) -> Result<UserPermit, AppError>; // 429 RateLimited
     pub fn open(&self, user_id: Uuid) -> usize;
 }
-// logs::search
+// logs::query::search
 pub const MAX_ENTRY_READS_PER_USER: usize = 8;
 // logs::LogsState gains `pub entry_slots: Arc<slots::UserSlots>`
 ```
@@ -253,7 +252,7 @@ pub async fn top_patterns(ch: &ClickHouse, project_id: Uuid, window: &Window, fi
     -> Result<Vec<PatternCount>, AppError>;
 ```
 
-- [ ] **Step 1: Write the failing pattern unit tests** (append to `mod tests` in `src/logs/pattern.rs`)
+- [ ] **Step 1: Write the failing pattern unit tests** (append to `mod tests` in `src/logs/query/pattern.rs`)
 
 ```rust
 #[test]
@@ -279,7 +278,7 @@ fn real_ipv6_addresses_are_still_replaced() {
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: the engine command with `--lib logs::pattern` (i.e. `cargo test --lib logs::pattern`).
+Run: the engine command with `--lib logs::query::pattern` (i.e. `cargo test --lib logs::query::pattern`).
 Expected: FAIL. `a_number_before_a_double_colon_is_not_an_address` gets `retry <ip> next`. If `peer fe80::1%eth0` already differs today, fix the expectation to today's output for that case only and note it. The `%` handling is not part of this change.
 
 - [ ] **Step 3: Narrow `looks_like_ipv6` (R-P2-11)**
@@ -305,10 +304,10 @@ fn looks_like_ipv6(text: &str) -> bool {
 
 - [ ] **Step 4: Run the pattern tests to verify they pass**
 
-Run: `cargo test --lib logs::pattern` (engine command).
+Run: `cargo test --lib logs::query::pattern` (engine command).
 Expected: PASS, including every pre-existing pattern test.
 
-- [ ] **Step 5: Write the failing integration tests** (`nami-engine/tests/logs_patterns.rs`)
+- [ ] **Step 5: Write the failing integration tests** (`nami-engine/tests/logs/logs_patterns.rs`)
 
 ```rust
 // Top message patterns (`GET /projects/{id}/logs/patterns`).
@@ -449,7 +448,7 @@ async fn patterns_share_the_per_user_query_slots(pool: sqlx::PgPool) {
 
 - [ ] **Step 6: Run them to verify they fail**
 
-Run: engine command with `--test logs_patterns`.
+Run: engine command with `--test logs logs_patterns::`.
 Expected: FAIL. The route does not exist; the router answers 404 for the first assertion that expects 200.
 
 - [ ] **Step 7: Implement `logs/patterns.rs` and the route**
@@ -502,12 +501,12 @@ Order inside the handler: `require_project_role(.., "viewer")`, then parse windo
 
 - [ ] **Step 8: Run the tests to verify they pass**
 
-Run: engine command with `--test logs_patterns`, then `--lib logs::`.
+Run: engine command with `--test logs logs_patterns::`, then `--lib logs::`.
 Expected: PASS.
 
 - [ ] **Step 9: Write the failing entry-cap tests (R-P2-23)**
 
-`src/logs/slots.rs` `mod tests` (create the file with `todo!()` bodies first):
+`src/logs/query/slots.rs` `mod tests` (create the file with `todo!()` bodies first):
 
 ```rust
 use super::*;
@@ -526,7 +525,7 @@ fn slots_cap_each_user_and_come_back_on_drop() {
 }
 ```
 
-Append to `tests/logs_search.rs` (it needs no `fixture`; every import it uses, and the file's `encode` helper, are already there):
+Append to `tests/logs/logs_search.rs` (it needs no `fixture`; every import it uses, and the file's `encode` helper, are already there):
 
 ```rust
 #[sqlx::test]
@@ -563,7 +562,7 @@ async fn entry_reads_do_not_compete_with_searches(pool: sqlx::PgPool) {
 
 - [ ] **Step 10: Run them to verify they fail**
 
-Run: `cargo test --lib logs::slots` and the engine command with `--test logs_search`.
+Run: `cargo test --lib logs::query::slots` and the engine command with `--test logs logs_search::`.
 Expected: FAIL. The first panics at `todo!()`. The second gets 429 while the search slots are held, because entry reads still take a `QueryPermit`.
 
 - [ ] **Step 11: Implement `slots.rs` and switch the entry route**
@@ -578,8 +577,8 @@ Expected: all green, no warnings.
 - [ ] **Step 13: Commit**
 
 ```bash
-git add nami-engine/src/logs/pattern.rs nami-engine/src/logs/patterns.rs nami-engine/src/logs/slots.rs nami-engine/src/logs/search.rs \
-  nami-engine/src/logs/mod.rs nami-engine/src/routes/logs.rs nami-engine/tests/logs_patterns.rs nami-engine/tests/logs_search.rs \
+git add nami-engine/src/logs/query/pattern.rs nami-engine/src/logs/query/patterns.rs nami-engine/src/logs/query/slots.rs nami-engine/src/logs/query/search.rs \
+  nami-engine/src/logs/mod.rs nami-engine/src/logs/query/routes.rs nami-engine/tests/logs/logs_patterns.rs nami-engine/tests/logs/logs_search.rs \
   docs/superpowers/specs/2026-10-13-log-management-design.md
 git commit -m "feat(engine): top message patterns, IPv6 pattern fix, own cap for entry reads (NAMI-LOG-9)
 
@@ -588,24 +587,24 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-### Task 10 (NAMI-LOG-10): Ingest pipeline rules, compiler and editor API
+### Task 10 (NAMI-LOG-10): Ingest pipeline rules, compiler and editor API (done, PR #63)
 
-Branch `feat/NAMI-LOG-10-pipeline-rules`, worktree `.worktrees/NAMI-LOG-10/`.
+Merged. Kept as the record of what landed; do not re-run its steps.
 
 **Files:**
-- Create: `nami-engine/migrations/0042_add_sources_pipeline.sql`, `nami-engine/src/logs/pipeline.rs`
-- Modify: `nami-engine/src/logs/query.rs` (extract `pub fn parse_path`), `nami-engine/src/logs/mod.rs`, `nami-engine/src/models/source.rs` (pipeline read/write, `ingest_source`, monotonic `updated_at` in `update_in_project` and `rotate_token`), `nami-engine/src/routes/sources.rs` (3 routes), `nami-engine/tests/migrations.rs`, `docs/superpowers/specs/2026-10-13-log-management-design.md` (the regex line gains "at most 20 per pipeline", R-P2-26)
-- Test: `nami-engine/tests/logs_pipeline_api.rs` (+ unit tests in `pipeline.rs`)
+- Create: the `sources.pipeline` migration (now folded into the baseline `nami-engine/migrations/0005_logs.sql`), `nami-engine/src/logs/ingest/pipeline.rs`
+- Modify: `nami-engine/src/logs/query/mod.rs` (extract `pub fn parse_path`), `nami-engine/src/logs/mod.rs`, `nami-engine/src/logs/source/model.rs` (pipeline read/write, `ingest_source`, monotonic `updated_at` in `update_in_project` and `rotate_token`), `nami-engine/src/logs/source/routes.rs` (3 routes), `nami-engine/tests/core/migrations.rs`, `docs/superpowers/specs/2026-10-13-log-management-design.md` (the regex line gains "at most 20 per pipeline", R-P2-26)
+- Test: `nami-engine/tests/logs/logs_pipeline_api.rs` (+ unit tests in `pipeline.rs`)
 
 **Interfaces:**
-- Consumes: `normalize::{LogEvent, from_json, level_from_name}`, `store::build_row_at`, `models::source::IngestSource`.
+- Consumes: `normalize::{LogEvent, from_json, level_from_name}`, `store::build_row_at`, `logs::source::model::IngestSource`.
 - Produces (used by T11, T16):
 
 ```rust
 // logs::query
 pub fn parse_path(raw: &str) -> Result<Vec<String>, String>; // the filter path rule, now shared
 
-// logs::pipeline
+// logs::ingest::pipeline
 pub const MAX_RULES: usize = 50;
 pub const MAX_REGEX_CHARS: usize = 256;
 pub const REGEX_SIZE_LIMIT: usize = 256 * 1024;      // R-P2-26
@@ -662,7 +661,7 @@ impl std::fmt::Debug for CompiledPipeline { /* rule count only */ }
 pub fn parse_rules(value: &serde_json::Value) -> Result<Vec<Rule>, PipelineError>;
 pub fn compile(rules: &[Rule]) -> Result<CompiledPipeline, PipelineError>;
 
-// models::source
+// logs::source::model
 pub async fn get_pipeline(pool: &PgPool, project_id: Uuid, source_id: Uuid)
     -> Result<Option<(serde_json::Value, DateTime<Utc>)>, sqlx::Error>;
 /// Replaces the rules and bumps `updated_at`; `None` when the project has no such source.
@@ -673,24 +672,24 @@ pub async fn ingest_source(pool: &PgPool, project_id: Uuid, source_id: Uuid)
     -> Result<Option<IngestSource>, sqlx::Error>;
 ```
 
-- Routes (in `routes::sources::router`): `GET /projects/{id}/sources/{source_id}/pipeline` (viewer) → `{"rules": [...], "updated_at": "..."}`. `PUT` the same path (member), body `{"rules": [...]}` → 200 with the same shape. `POST /projects/{id}/sources/{source_id}/pipeline/test` (member), body `{"rules": [...], "events": [{...}]}` → `{"results": [{"outcome": "kept", "event": {dt, level, message, fields, trace_id, span_id, pattern}} | {"outcome": "dropped"} | {"outcome": "sampled_out"}]}`.
+- Routes (added to `router()` in `nami-engine/src/logs/source/routes.rs`): `GET /projects/{id}/sources/{source_id}/pipeline` (viewer) → `{"rules": [...], "updated_at": "..."}`. `PUT` the same path (member), body `{"rules": [...]}` → 200 with the same shape. `POST /projects/{id}/sources/{source_id}/pipeline/test` (member), body `{"rules": [...], "events": [{...}]}` → `{"results": [{"outcome": "kept", "event": {dt, level, message, fields, trace_id, span_id, pattern}} | {"outcome": "dropped"} | {"outcome": "sampled_out"}]}`.
 
 - [ ] **Step 1: Write the migration and its failing migration test**
 
-`nami-engine/migrations/0042_add_sources_pipeline.sql`:
+The `sources.pipeline` migration as written then (its statement is now part of the baseline `nami-engine/migrations/0005_logs.sql`):
 
 ```sql
 -- Per-source ingest pipeline (Logs part 2): an ordered list of at most 50
 -- rules, replaced as a whole by PUT .../pipeline and validated by the engine
--- (logs::pipeline::compile) before it is stored. The engine caches compiled
+-- (logs::ingest::pipeline::compile) before it is stored. The engine caches compiled
 -- rules per source keyed on sources.updated_at, so every write here must bump
--- updated_at (models::source::set_pipeline does).
+-- updated_at (logs::source::model::set_pipeline does).
 alter table sources
     add column pipeline jsonb not null default '[]'::jsonb
         check (jsonb_typeof(pipeline) = 'array' and jsonb_array_length(pipeline) <= 50);
 ```
 
-Add to `tests/migrations.rs`. That file has no `mod common;` (it tests the schema with plain SQL), so the test seeds its rows with SQL too. The `seed_source_row` helper is reused by the T13 and T14 migration tests:
+Add to `tests/core/migrations.rs`. That file has no `mod common;` (it tests the schema with plain SQL), so the test seeds its rows with SQL too. The `seed_source_row` helper is reused by the T13 and T14 migration tests:
 
 ```rust
 /// A project and one source in it, inserted with plain SQL (no engine code).
@@ -726,10 +725,10 @@ async fn sources_have_an_empty_pipeline_by_default_and_reject_non_arrays(pool: s
 
 - [ ] **Step 2: Run it to verify it fails, then passes after the migration file exists**
 
-Run: engine command with `--test migrations`.
+Run: engine command with `--test core migrations::`.
 Expected: FAIL before the file exists (`column "pipeline" does not exist`). PASS after.
 
-- [ ] **Step 3: Write the failing pipeline unit tests** (`mod tests` in `src/logs/pipeline.rs`; create the file with the public items above as `todo!()` bodies so it compiles)
+- [ ] **Step 3: Write the failing pipeline unit tests** (`mod tests` in `src/logs/ingest/pipeline.rs`; create the file with the public items above as `todo!()` bodies so it compiles)
 
 ```rust
 use std::time::{Duration, Instant};
@@ -738,7 +737,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::logs::normalize::from_json;
+use crate::logs::ingest::normalize::from_json;
 
 fn event(value: Value) -> LogEvent {
     from_json(value.as_object().unwrap().clone(), Utc::now())
@@ -939,7 +938,7 @@ fn rules_round_trip_through_json() {
 
 - [ ] **Step 4: Run them to verify they fail**
 
-Run: `cargo test --lib logs::pipeline` (engine command).
+Run: `cargo test --lib logs::ingest::pipeline` (engine command).
 Expected: FAIL (panics at `todo!()`).
 
 - [ ] **Step 5: Implement `logs/pipeline.rs`**
@@ -1000,10 +999,10 @@ Extract `pub fn parse_path(raw: &str) -> Result<Vec<String>, String>` in `query.
 
 - [ ] **Step 6: Run the unit tests to verify they pass**
 
-Run: `cargo test --lib logs::pipeline` and `cargo test --lib logs::query` (engine command).
+Run: `cargo test --lib logs::ingest::pipeline` and `cargo test --lib logs::query` (engine command).
 Expected: PASS.
 
-- [ ] **Step 7: Write the failing API tests** (`nami-engine/tests/logs_pipeline_api.rs`)
+- [ ] **Step 7: Write the failing API tests** (`nami-engine/tests/logs/logs_pipeline_api.rs`)
 
 ```rust
 // Pipeline editor API (`/projects/{id}/sources/{source_id}/pipeline`).
@@ -1131,16 +1130,16 @@ async fn the_test_endpoint_previews_without_storing(pool: sqlx::PgPool) {
 }
 ```
 
-If the existing JSON extractor rejection in this codebase maps to 400 (check `routes::sources` create tests), change `UNPROCESSABLE_ENTITY` above to match the established status. Do not invent a new mapping.
+If the existing JSON extractor rejection in this codebase maps to 400 (check `logs::source::routes` create tests), change `UNPROCESSABLE_ENTITY` above to match the established status. Do not invent a new mapping.
 
 - [ ] **Step 8: Run them to verify they fail**
 
-Run: engine command with `--test logs_pipeline_api`.
+Run: engine command with `--test logs logs_pipeline_api::`.
 Expected: FAIL (routes return 404/405).
 
 - [ ] **Step 9: Implement the model functions and routes**
 
-`models::source`:
+`logs::source::model`:
 
 ```rust
 pub async fn get_pipeline(pool: &PgPool, project_id: Uuid, source_id: Uuid)
@@ -1167,11 +1166,11 @@ In the same file, `update_in_project` and `rotate_token` change `updated_at = no
 Routes (`routes/sources.rs`), with request bodies `#[serde(deny_unknown_fields)] struct PipelineBody { rules: serde_json::Value }` and `struct PipelineTestBody { rules: serde_json::Value, events: Vec<serde_json::Value> }`:
 - GET: `require_project_role(viewer)`, then `get_pipeline`. `None` → `AppError::NotFound`.
 - PUT: `require_project_role(member)`, then `pipeline::parse_rules` + `compile` in `spawn_blocking` (error → `AppError::Validation(e.to_string())`), then `set_pipeline` with `serde_json::to_value(&parsed)` (the canonical form). `None` → 404.
-- POST test: `require_project_role(member)`, then `models::source::ingest_source(pool, project_id, source_id)` (404 when absent). `events.len() > MAX_TEST_EVENTS` → 400 `"at most 100 sample events"`. A non-object event → 400 `"events[i] must be a JSON object"` (checked before any CPU work). Then one `spawn_blocking` task compiles the rules (400) and, for each event, runs `from_json(object, now)`, `apply`, and on `Keep` `store::build_row_at(event, &source, now)`, serializing `{dt, level, message, fields: <parsed object>, trace_id, span_id, pattern}`. Up to 100 events of 2 MiB against 20 regexes is real CPU, which must not run on an async worker.
+- POST test: `require_project_role(member)`, then `logs::source::model::ingest_source(pool, project_id, source_id)` (404 when absent). `events.len() > MAX_TEST_EVENTS` → 400 `"at most 100 sample events"`. A non-object event → 400 `"events[i] must be a JSON object"` (checked before any CPU work). Then one `spawn_blocking` task compiles the rules (400) and, for each event, runs `from_json(object, now)`, `apply`, and on `Keep` `store::build_row_at(event, &source, now)`, serializing `{dt, level, message, fields: <parsed object>, trace_id, span_id, pattern}`. Up to 100 events of 2 MiB against 20 regexes is real CPU, which must not run on an async worker.
 
 - [ ] **Step 10: Run the tests to verify they pass**
 
-Run: engine command with `--test logs_pipeline_api`, `--test migrations`, `--test sources_api`.
+Run: engine command with `--test logs logs_pipeline_api::`, `--test core migrations::`, `--test logs sources_api::`.
 Expected: PASS.
 
 - [ ] **Step 11: Full engine suite + clippy, then commit**
@@ -1179,9 +1178,9 @@ Expected: PASS.
 Run: engine command (all), `cargo clippy --all-targets -- -D warnings`.
 
 ```bash
-git add nami-engine/Cargo.toml nami-engine/Cargo.lock nami-engine/migrations/0042_add_sources_pipeline.sql nami-engine/src/logs/pipeline.rs \
-  nami-engine/src/logs/query.rs nami-engine/src/logs/mod.rs nami-engine/src/models/source.rs \
-  nami-engine/src/routes/sources.rs nami-engine/tests/logs_pipeline_api.rs nami-engine/tests/migrations.rs \
+git add nami-engine/Cargo.toml nami-engine/Cargo.lock nami-engine/migrations nami-engine/src/logs/ingest/pipeline.rs \
+  nami-engine/src/logs/query/mod.rs nami-engine/src/logs/mod.rs nami-engine/src/logs/source/model.rs \
+  nami-engine/src/logs/source/routes.rs nami-engine/tests/logs/logs_pipeline_api.rs nami-engine/tests/core/migrations.rs \
   docs/superpowers/specs/2026-10-13-log-management-design.md
 git commit -m "feat(engine): ingest pipeline rules with validation and preview API (NAMI-LOG-10)
 
@@ -1189,28 +1188,28 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
-### Task 11 (NAMI-LOG-11): Run the pipeline on every ingest path
+### Task 11 (NAMI-LOG-11): Run the pipeline on every ingest path (done, PR #67)
 
-Branch `feat/NAMI-LOG-11-pipeline-ingest`, worktree `.worktrees/NAMI-LOG-11/`.
+Merged. Kept as the record of what landed; do not re-run its steps.
 
 **Files:**
-- Create: `nami-engine/src/logs/pipeline_cache.rs`
-- Modify: `nami-engine/src/models/source.rs` (`IngestSource.updated_at`, `load_pipeline`), `nami-engine/src/logs/store.rs` (`RowBatch::push` runs the pipeline, `RowBatch::pipeline_counts`), `nami-engine/src/logs/ingest.rs` (`prepare`/`build_batch`/`build_rows_within` take the pipeline), `nami-engine/src/routes/logs_ingest.rs` (look the pipeline up before `Work`), `nami-engine/src/logs/syslog/mod.rs` (pipelines per batch; `chunk_rows` moved into the blocking build, R-P2-24), `nami-engine/src/logs/usage.rs` (`record_pipeline`), `nami-engine/src/logs/mod.rs` (`LogsState.pipelines`)
-- Test: `nami-engine/tests/logs_pipeline_ingest.rs`; append to `nami-engine/tests/logs_syslog.rs`; unit tests in `pipeline_cache.rs`, `store.rs`, `usage.rs`
+- Create: `nami-engine/src/logs/ingest/pipeline_cache.rs`
+- Modify: `nami-engine/src/logs/source/model.rs` (`IngestSource.updated_at`, `load_pipeline`), `nami-engine/src/logs/ingest/store.rs` (`RowBatch::push` runs the pipeline, `RowBatch::pipeline_counts`), `nami-engine/src/logs/ingest/mod.rs` (`prepare`/`build_batch`/`build_rows_within` take the pipeline), `nami-engine/src/logs/ingest/routes.rs` (look the pipeline up before `Work`), `nami-engine/src/logs/syslog/mod.rs` (pipelines per batch; `chunk_rows` moved into the blocking build, R-P2-24), `nami-engine/src/logs/ingest/usage.rs` (`record_pipeline`), `nami-engine/src/logs/mod.rs` (`LogsState.pipelines`)
+- Test: `nami-engine/tests/logs/logs_pipeline_ingest.rs`; append to `nami-engine/tests/logs/logs_syslog.rs`; unit tests in `pipeline_cache.rs`, `store.rs`, `usage.rs`
 
 **Interfaces:**
 - Consumes: `pipeline::{parse_rules, compile, CompiledPipeline, Outcome}` (T10); the fix wave's shared step `store::RowBatch` (see the header table); `IngestLimits::queries` (Part 1).
 - Produces:
 
 ```rust
-// models::source
+// logs::source::model
 pub struct IngestSource { pub id: Uuid, pub project_id: Uuid, pub retention_days: i32,
     pub daily_byte_quota: Option<i64>, pub updated_at: DateTime<Utc> }   // + updated_at
 /// The stored rules of one source and the `updated_at` they belong to.
 pub async fn load_pipeline(pool: &PgPool, source_id: Uuid)
     -> Result<Option<(serde_json::Value, DateTime<Utc>)>, sqlx::Error>;
 
-// logs::pipeline_cache
+// logs::ingest::pipeline_cache
 pub const MAX_CACHED_PIPELINES: usize = 1024;   // R-P2-6, R-P2-26
 #[derive(Debug, Default)] pub struct PipelineCache { /* Mutex<HashMap<Uuid, (DateTime<Utc>, Arc<CompiledPipeline>)>> */ }
 #[derive(Debug, thiserror::Error)]
@@ -1230,10 +1229,10 @@ impl PipelineCache {
 
 // logs::LogsState gains `pub pipelines: pipeline_cache::PipelineCache`
 
-// logs::usage
+// logs::ingest::usage
 impl UsageTracker { pub fn record_pipeline(&self, source_id: Uuid, day: NaiveDate, dropped: u64, sampled_out: u64); }
 
-// logs::store (the fix wave's shared step, extended)
+// logs::ingest::store (the fix wave's shared step, extended)
 /// Per source: (events dropped, events sampled out) by the pipeline.
 pub type PipelineCounts = HashMap<Uuid, (u64, u64)>;
 impl RowBatch {
@@ -1366,7 +1365,7 @@ Expected: compile errors (`PipelineCache`, `record_pipeline` and the new `push` 
 Run: `cargo test --lib logs::` (engine command).
 Expected: PASS.
 
-- [ ] **Step 6: Write the failing ingest tests** (`nami-engine/tests/logs_pipeline_ingest.rs`)
+- [ ] **Step 6: Write the failing ingest tests** (`nami-engine/tests/logs/logs_pipeline_ingest.rs`)
 
 ```rust
 // The source pipeline on HTTP ingestion. Requires `docker compose up -d postgres clickhouse`.
@@ -1492,7 +1491,7 @@ async fn the_quota_counts_bytes_after_the_pipeline(pool: sqlx::PgPool) {
 }
 ```
 
-Append to `nami-engine/tests/logs_syslog.rs` (uses that file's helpers):
+Append to `nami-engine/tests/logs/logs_syslog.rs` (uses that file's helpers):
 
 ```rust
 #[sqlx::test]
@@ -1500,7 +1499,7 @@ async fn syslog_frames_go_through_the_pipeline(pool: sqlx::PgPool) {
     let (state, ch) = state_with_clickhouse(&pool).await;
     let project = seed_project(&pool).await;
     let (source, token) = seed_source(&pool, project, "syslog").await;
-    nami_engine::models::source::set_pipeline(&pool, project, source, &json!([
+    nami_engine::logs::source::model::set_pipeline(&pool, project, source, &json!([
         {"type":"drop","match":{"message_regex":"^noise"}},
         {"type":"redact","regex":"pw=\\S+"}
     ])).await.unwrap();
@@ -1539,7 +1538,7 @@ async fn syslog_frames_of_a_source_whose_pipeline_fails_are_dropped(pool: sqlx::
 
 - [ ] **Step 7: Run them to verify they fail**
 
-Run: engine command with `--test logs_pipeline_ingest`, then `--test logs_syslog`.
+Run: engine command with `--test logs logs_pipeline_ingest::`, then `--test logs logs_syslog::`.
 Expected: FAIL. Rules are stored but not applied (secrets present, `accepted` 5).
 
 - [ ] **Step 8: Wire the pipeline into both paths**
@@ -1551,30 +1550,30 @@ Expected: FAIL. Rules are stored but not applied (secrets present, `accepted` 5)
 
 - [ ] **Step 9: Run the tests to verify they pass**
 
-Run: engine command with `--test logs_pipeline_ingest`, `--test logs_syslog`, `--test logs_ingest`, `--test logs_quota`.
+Run: engine command with `--test logs logs_pipeline_ingest::`, `--test logs logs_syslog::`, `--test logs logs_ingest::`, `--test logs logs_quota::`.
 Expected: PASS.
 
 - [ ] **Step 10: Full engine suite + clippy, then commit**
 
 ```bash
-git add nami-engine/src nami-engine/tests/logs_pipeline_ingest.rs nami-engine/tests/logs_syslog.rs
+git add nami-engine/src nami-engine/tests/logs/logs_pipeline_ingest.rs nami-engine/tests/logs/logs_syslog.rs
 git commit -m "feat(engine): apply source pipelines to HTTP and syslog ingestion (NAMI-LOG-11)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
-### Task 12 (NAMI-LOG-12): Streamed CSV/NDJSON export
+### Task 12 (NAMI-LOG-12): Streamed CSV/NDJSON export (done, PR #75)
 
-Branch `feat/NAMI-LOG-12-log-export`, worktree `.worktrees/NAMI-LOG-12/`.
+Merged. Kept as the record of what landed; do not re-run its steps.
 
 **Files:**
-- Modify: `nami-engine/src/clickhouse.rs` (`send` split out of `post`, `stream_rows_with`, `RowStream`, `ClickHouseError::LineTooLong`, `EXPORT_MAX_EXECUTION_SECS`, `STREAM_REQUEST_TIMEOUT`, reserved setting)
-- Create: `nami-engine/src/logs/export.rs`
-- Modify: `nami-engine/src/logs/query.rs` (`pub fn push_field_text`, `pub(crate) fn last`/`values`), `nami-engine/src/logs/slots.rs` (`acquire_capped`, total count), `nami-engine/src/logs/mod.rs` (`export_slots`, `export_limits`), `nami-engine/src/models/source.rs` (`names_for_project`), `nami-engine/src/routes/logs.rs` (route), `nami-engine/tests/clickhouse.rs` (reserved list), `docs/superpowers/specs/2026-10-13-log-management-design.md` (Export: "and 8 per engine instance"; the task ends at its 150 s deadline)
+- Modify: `nami-engine/src/core/clickhouse.rs` (`send` split out of `post`, `stream_rows_with`, `RowStream`, `ClickHouseError::LineTooLong`, `EXPORT_MAX_EXECUTION_SECS`, `STREAM_REQUEST_TIMEOUT`, reserved setting)
+- Create: `nami-engine/src/logs/query/export.rs`
+- Modify: `nami-engine/src/logs/query/mod.rs` (`pub fn push_field_text`, `pub(crate) fn last`/`values`), `nami-engine/src/logs/query/slots.rs` (`acquire_capped`, total count), `nami-engine/src/logs/mod.rs` (`export_slots`, `export_limits`), `nami-engine/src/logs/source/model.rs` (`names_for_project`), `nami-engine/src/logs/query/routes.rs` (route), `nami-engine/tests/core/clickhouse.rs` (reserved list), `docs/superpowers/specs/2026-10-13-log-management-design.md` (Export: "and 8 per engine instance"; the task ends at its 150 s deadline)
 - Create (UI): `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/export/+server.ts`, `.../logs/export/server.test.ts`
-- Modify (UI): `nami-ui/src/lib/server/log-proxy.ts` (+ test): `EXPORT_PARAMS`
-- Test: `nami-engine/tests/logs_export.rs` (+ unit tests in `export.rs`, `clickhouse.rs`)
+- Modify (UI): `nami-ui/src/lib/server/logs/log-proxy.ts` (+ test): `EXPORT_PARAMS`
+- Test: `nami-engine/tests/logs/logs_export.rs` (+ unit tests in `export.rs`, `clickhouse.rs`)
 
 **Interfaces:**
 - Consumes: `query::{parse_window, parse_filters, parse_path, push_where, push_window, Sql}`, `search::user_error`, fix-wave `read_capped`/`max_response_bytes`, `slots::UserSlots` (T9).
@@ -1592,7 +1591,7 @@ impl ClickHouse {
 }
 // ClickHouseError::LineTooLong { limit: usize }
 
-// logs::export
+// logs::query::export
 pub const MAX_EXPORT_ROWS: u64 = 100_000;
 pub const MAX_EXPORT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_EXPORT_LINE_BYTES: usize = 4 * 1024 * 1024;
@@ -1616,12 +1615,12 @@ pub async fn stream(rows: RowStream, params: ExportParams, sources: HashMap<Uuid
     limits: ExportLimits, tx: mpsc::Sender<Result<Bytes, std::convert::Infallible>>);
 
 // logs::LogsState gains `pub export_slots: Arc<slots::UserSlots>`, `pub export_limits: export::ExportLimits`
-// logs::slots
+// logs::query::slots
 impl UserSlots {
     /// As `acquire`, and also refused (429) once `total` permits of every user are out.
     pub fn acquire_capped(self: &Arc<Self>, user_id: Uuid, per_user: usize, total: usize) -> Result<UserPermit, AppError>;
 }
-// models::source
+// logs::source::model
 pub async fn names_for_project(pool: &PgPool, project_id: Uuid) -> Result<HashMap<Uuid, String>, sqlx::Error>;
 // logs::query
 pub fn push_field_text(sql: &mut Sql, path: &[String]); // binds each segment, pushes the eq-filter text expression
@@ -1631,7 +1630,7 @@ pub fn push_field_text(sql: &mut Sql, path: &[String]); // binds each segment, p
 
 - [ ] **Step 1: Write the failing unit tests**
 
-`src/logs/export.rs` `mod tests`:
+`src/logs/query/export.rs` `mod tests`:
 
 ```rust
 use super::*;
@@ -1711,7 +1710,7 @@ fn the_default_limits_are_the_spec_values() {
 }
 ```
 
-`src/logs/slots.rs` `mod tests` (append):
+`src/logs/query/slots.rs` `mod tests` (append):
 
 ```rust
 #[test]
@@ -1724,7 +1723,7 @@ fn a_total_caps_every_user_together() {
 }
 ```
 
-`src/clickhouse.rs` `mod tests` (wiremock is already a dev-dependency there, see the existing `query_rows_with` wiremock test):
+`src/core/clickhouse.rs` `mod tests` (wiremock is already a dev-dependency there, see the existing `query_rows_with` wiremock test):
 
 ```rust
 #[tokio::test]
@@ -1759,11 +1758,11 @@ async fn a_streamed_query_error_is_returned_before_any_row() {
 }
 ```
 
-Also add `"http_write_exception_in_output_format"` to `RESERVED_SETTINGS` (length 11 → 12), and extend the existing reserved-settings drift test (`tests/clickhouse.rs`, the wiremock-derived names test) so the streamed request's owned names are in the list.
+Also add `"http_write_exception_in_output_format"` to `RESERVED_SETTINGS` (length 11 → 12), and extend the existing reserved-settings drift test (`tests/core/clickhouse.rs`, the wiremock-derived names test) so the streamed request's owned names are in the list.
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cargo test --lib -- logs::export logs::slots clickhouse::` (engine environment).
+Run: `cargo test --lib -- logs::query::export logs::query::slots clickhouse::` (engine environment).
 Expected: compile errors (items missing).
 
 - [ ] **Step 3: Implement the ClickHouse stream**
@@ -1849,10 +1848,10 @@ const COLUMN_ALIASES: [&str; MAX_EXPORT_COLUMNS] =
 
 - [ ] **Step 5: Run the unit tests to verify they pass**
 
-Run: `cargo test --lib -- logs::export logs::slots clickhouse::` (engine environment).
+Run: `cargo test --lib -- logs::query::export logs::query::slots clickhouse::` (engine environment).
 Expected: PASS.
 
-- [ ] **Step 6: Write the failing integration tests** (`nami-engine/tests/logs_export.rs`)
+- [ ] **Step 6: Write the failing integration tests** (`nami-engine/tests/logs/logs_export.rs`)
 
 ```rust
 // Streamed export (`GET /projects/{id}/logs/export`).
@@ -1864,7 +1863,7 @@ use std::{sync::Arc, time::Duration};
 use axum::{body::Body, http::{Request, StatusCode, header}};
 use chrono::{SecondsFormat, Utc};
 use common::{app, call, logs::{post_json, seed_source}, public_app, seed_project, state_with_clickhouse, user_with_role};
-use nami_engine::{clickhouse::ClickHouse, logs::{LogsState, export::ExportLimits}, state::AppState};
+use nami_engine::{core::clickhouse::ClickHouse, logs::{LogsState, export::ExportLimits}, core::state::AppState};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -2052,7 +2051,7 @@ async fn export_needs_access_and_valid_parameters(pool: sqlx::PgPool) {
 
 - [ ] **Step 7: Run them to verify they fail, then pass**
 
-Run: engine command with `--test logs_export`.
+Run: engine command with `--test logs logs_export::`.
 Expected: FAIL before the route is registered (404). PASS after Steps 3-4 are wired. `the_row_cap_holds_and_is_announced` takes a few seconds (100k rows).
 
 - [ ] **Step 8: Write the failing BFF tests** (`nami-ui/src/routes/(app)/projects/[id=uuid]/logs/export/server.test.ts`)
@@ -2159,9 +2158,9 @@ Expected: FAIL (module missing).
 
 ```ts
 import { error } from '@sveltejs/kit';
-import { callEngine, enginePath } from '#lib/server/engine';
-import { EXPORT_PARAMS, pickLogParams } from '#lib/server/log-proxy';
-import { isUuid } from '#lib/uuid';
+import { callEngine, enginePath } from '#lib/server/core/engine';
+import { EXPORT_PARAMS, pickLogParams } from '#lib/server/logs/log-proxy';
+import { isUuid } from '#lib/core/uuid';
 import type { RequestHandler } from './$types';
 
 const TYPES = new Set(['text/csv; charset=utf-8', 'application/x-ndjson']);
@@ -2226,9 +2225,9 @@ Run: engine command (all) + clippy; `cd nami-ui && npm run check && npx vitest r
 Expected: green; svelte-check 0/0.
 
 ```bash
-git add nami-engine/src nami-engine/tests/logs_export.rs nami-engine/tests/clickhouse.rs \
+git add nami-engine/src nami-engine/tests/logs/logs_export.rs nami-engine/tests/core/clickhouse.rs \
   docs/superpowers/specs/2026-10-13-log-management-design.md \
-  nami-ui/src/lib/server/log-proxy.ts nami-ui/src/lib/server/log-proxy.test.ts \
+  nami-ui/src/lib/server/logs/log-proxy.ts nami-ui/src/lib/server/log-proxy.test.ts \
   "nami-ui/src/routes/(app)/projects/[id=uuid]/logs/export"
 git commit -m "feat: streamed CSV/NDJSON log export with caps, proxied by nami-ui (NAMI-LOG-12)
 
@@ -2236,21 +2235,21 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
-### Task 13 (NAMI-LOG-13): Saved views and the shared query shape
+### Task 13 (NAMI-LOG-13): Saved views and the shared query shape (done, PR #76)
 
-Branch `feat/NAMI-LOG-13-saved-views`, worktree `.worktrees/NAMI-LOG-13/`. Needs T10 (`query::parse_path`). Independent of T11 and T12.
+Merged. Kept as the record of what landed; do not re-run its steps.
 
 **Files:**
-- Create: `nami-engine/migrations/0043_create_log_views.sql`, `nami-engine/src/logs/saved_query.rs`, `nami-engine/src/models/log_view.rs`, `nami-engine/src/routes/log_views.rs`
-- Modify: `nami-engine/src/logs/mod.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs` (merge router), `nami-engine/tests/migrations.rs`
-- Test: `nami-engine/tests/log_views.rs` (+ unit tests in `saved_query.rs`)
+- Create: the `log_views` migration (now folded into the baseline `nami-engine/migrations/0005_logs.sql`), `nami-engine/src/logs/view/saved_query.rs`, `nami-engine/src/logs/view/model.rs`, `nami-engine/src/logs/view/routes.rs`
+- Modify: `nami-engine/src/logs/mod.rs`, `nami-engine/src/core/validate.rs`, `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs` (merge router), `nami-engine/tests/core/migrations.rs`
+- Test: `nami-engine/tests/logs/log_views.rs` (+ unit tests in `saved_query.rs`)
 
 **Interfaces:**
-- Consumes: `query::{parse_filters, parse_path, MAX_WINDOW}`, `models::validate_label`.
+- Consumes: `query::{parse_filters, parse_path, MAX_WINDOW}`, `core::validate::validate_label`.
 - Produces (T14 and T17 rely on these shapes):
 
 ```rust
-// logs::saved_query
+// logs::view::saved_query
 pub const VIEW_RANGES: [&str; 6] = ["15m", "1h", "6h", "24h", "7d", "custom"];
 pub const MAX_VIEW_COLUMNS: usize = 10;
 
@@ -2292,7 +2291,7 @@ impl ViewQuery {
 /// 400 unless every id is a source of the project.
 pub async fn check_sources(pool: &PgPool, project_id: Uuid, ids: &[Uuid]) -> Result<(), AppError>;
 
-// models::log_view
+// logs::view::model
 pub const MAX_VIEWS_PER_PROJECT: i64 = 200;
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct LogView { pub id: Uuid, pub project_id: Uuid, pub name: String,
@@ -2311,10 +2310,10 @@ pub async fn delete(pool: &PgPool, project_id: Uuid, view_id: Uuid) -> Result<bo
 
 - [ ] **Step 1: Migration + failing migration test**
 
-`nami-engine/migrations/0043_create_log_views.sql`:
+The `log_views` migration as written then (its statement is now part of the baseline `nami-engine/migrations/0005_logs.sql`):
 
 ```sql
--- Saved explorer views (Logs part 2). `query` is a logs::saved_query::ViewQuery
+-- Saved explorer views (Logs part 2). `query` is a logs::view::saved_query::ViewQuery
 -- validated by the engine; members create, edit and delete, viewers read.
 create table log_views (
     id uuid primary key default gen_random_uuid(),
@@ -2328,11 +2327,11 @@ create table log_views (
 );
 ```
 
-Test in `tests/migrations.rs`: `log_views_names_are_unique_per_project`. Seed two projects with T10's `seed_source_row` (plain SQL; the file has no `mod common`). Insert two views with one name in one project → the second fails with code `23505`. The same name in another project succeeds. Add `"log_views"` to the table list of `all_tables_exist`.
+Test in `tests/core/migrations.rs`: `log_views_names_are_unique_per_project`. Seed two projects with T10's `seed_source_row` (plain SQL; the file has no `mod common`). Insert two views with one name in one project → the second fails with code `23505`. The same name in another project succeeds. Add `"log_views"` to the table list of `all_tables_exist`.
 
-Run: engine command with `--test migrations`. Expected: FAIL, then PASS once the file exists.
+Run: engine command with `--test core migrations::`. Expected: FAIL, then PASS once the file exists.
 
-- [ ] **Step 2: Write the failing unit tests** (`src/logs/saved_query.rs`)
+- [ ] **Step 2: Write the failing unit tests** (`src/logs/view/saved_query.rs`)
 
 ```rust
 use serde_json::json;
@@ -2385,11 +2384,11 @@ fn queries_round_trip_without_defaults() {
 
 - [ ] **Step 3: Run them to verify they fail; implement `saved_query.rs`; run them to verify they pass**
 
-Run: `cargo test --lib logs::saved_query` (engine command). FAIL → implement → PASS.
+Run: `cargo test --lib logs::view::saved_query` (engine command). FAIL → implement → PASS.
 
 `pairs()`: `("q", q)` when non-empty, `("in_fields", "true")` when set, each level as `level`, each source as `source_id`, each filter as `("filter", value.to_string())`, each hash as `pattern_hash`. `ViewQuery::validate`: `range ∈ VIEW_RANGES` else `"range must be one of 15m, 1h, 6h, 24h, 7d, custom"`. `custom` needs `from` and `to`, `from < to`, `to - from <= query::MAX_WINDOW` (the messages of `parse_window`). Any other range with `from`/`to` set → `"from and to are only used with range custom"`. Columns go through `parse_path` and are at most `MAX_VIEW_COLUMNS`. Then `self.log_query().to_filters().map(|_| ())`. `check_sources`: `select count(*) from sources where project_id = $1 and id = any($2)` against the number of distinct ids → `AppError::Validation("source_ids: every source must belong to this project")`.
 
-- [ ] **Step 4: Write the failing API tests** (`nami-engine/tests/log_views.rs`)
+- [ ] **Step 4: Write the failing API tests** (`nami-engine/tests/logs/log_views.rs`)
 
 ```rust
 // Saved log views (`/projects/{id}/log-views`). Requires `docker compose up -d postgres`.
@@ -2497,14 +2496,14 @@ async fn a_relative_view_stays_relative_and_a_deleted_source_is_kept(pool: sqlx:
 
 - [ ] **Step 5: Run them to verify they fail; implement the model and routes; run them to verify they pass**
 
-Run: engine command with `--test log_views`. FAIL (404) → implement → PASS.
+Run: engine command with `--test logs log_views::`. FAIL (404) → implement → PASS.
 
 `create` runs in a transaction: `select id from projects where id = $1 for no key update` (absent → `NoProject` → 404), then `select count(*) from log_views where project_id = $1` ≥ `MAX_VIEWS_PER_PROJECT` → `ProjectFull` (409 `"a project may have at most 200 saved views"`), then insert. A unique violation (`23505`) → `NameTaken` (409 `"a view with this name already exists"`). `update` binds `coalesce($3, name)`, `coalesce($4, query)` and `updated_at = now()` in `where id = $1 and project_id = $2`, mapping `23505` to `AppError::Conflict`. Handlers check the role, then `validate_label("name", ..)`, then `query.validate()`, then `check_sources`, then the model call.
 
 - [ ] **Step 6: Full engine suite + clippy, then commit**
 
 ```bash
-git add nami-engine/migrations/0043_create_log_views.sql nami-engine/src nami-engine/tests/log_views.rs nami-engine/tests/migrations.rs
+git add nami-engine/migrations nami-engine/src nami-engine/tests/logs/log_views.rs nami-engine/tests/core/migrations.rs
 git commit -m "feat(engine): saved log views (NAMI-LOG-13)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -2514,12 +2513,20 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 14 (NAMI-LOG-14): Log alerts — API, evaluation worker, incidents and notifications
 
-Branch `feat/NAMI-LOG-14-log-alerts`, worktree `.worktrees/NAMI-LOG-14/`.
+On `feat/logs-part2`. Commits carry `(NAMI-LOG-14)`.
 
 **Files:**
-- Create: `nami-engine/migrations/0044_create_log_alerts.sql`, `nami-engine/src/models/log_alert.rs`, `nami-engine/src/logs/alerts.rs`, `nami-engine/src/routes/log_alerts.rs`
-- Modify: `nami-engine/src/models/incident.rs` (open/resolve for log alerts, list join + `log_alert_id`), `nami-engine/src/uptime/alerts.rs` (`Subject::LogAlert`, render), `nami-engine/src/uptime/worker.rs` (`spawn_alerts` → `pub(crate)`), `nami-engine/src/models/maintenance.rs` (`ActiveWindows::covers_project`), `nami-engine/src/main.rs` (spawn), `nami-engine/src/logs/mod.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/tests/migrations.rs`, `docs/superpowers/specs/2026-10-13-log-management-design.md` (Log alerts: the project-wide maintenance sentence, `last_error`)
-- Test: `nami-engine/tests/log_alerts.rs` (+ unit tests in `alerts.rs` (uptime) and `logs/alerts.rs`)
+- Create: `nami-engine/migrations/NNNN_logs_alerts.sql` (`log_alerts`), `nami-engine/migrations/NNNN_incidents_log_alerts.sql` (`incidents.log_alert_id` and its indexes; numbered after the logs file, R-P2-1), `nami-engine/src/logs/alert/mod.rs`, `nami-engine/src/logs/alert/model.rs`, `nami-engine/src/logs/alert/routes.rs`
+- Modify: `nami-engine/src/incidents/model.rs` (open/resolve for log alerts, list join + `log_alert_id`), `nami-engine/src/uptime/alerts.rs` (`Subject::LogAlert` in `render` and `still_down`), `nami-engine/src/uptime/worker.rs` (`spawn_alerts` → `pub(crate)`), `nami-engine/src/uptime/maintenance/model.rs` (`ActiveWindows::covers_project`), `nami-engine/src/main.rs` (spawn), `nami-engine/src/logs/mod.rs` (`pub mod alert;`), `nami-engine/src/core/router.rs` (merge the `logs::alert` routes), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/logs/main.rs` (`mod log_alerts;`), `docs/superpowers/specs/2026-10-13-log-management-design.md` (Log alerts: the project-wide maintenance sentence, `last_error`)
+- Test: `nami-engine/tests/logs/log_alerts.rs` (+ unit tests in `nami-engine/src/uptime/alerts.rs` and `nami-engine/src/logs/alert/mod.rs`)
+
+**Drift (2026-10-24):**
+- `uptime::alerts::Transition` gained `details: Option<String>` (heartbeat output, `nami-engine/src/uptime/alerts.rs:30-40`). Every log-alert transition sets `details: None`; `render` ignores it for `Subject::LogAlert`.
+- `notify_transition` now runs flap control first (`state.alert_throttle.decide`, `nami-engine/src/uptime/alerts.rs:53-64`, `nami-engine/src/uptime/alert_throttle.rs`): at most one DOWN and one recovery email per subject per `ALERT_FLAP_WINDOW` (5 min), and a DOWN held back is sent later by `send_deferred` if `still_down` says so. Log-alert transitions go through it unchanged (the tests below send a trigger and then a recovery, which flap control lets through). `still_down` (`nami-engine/src/uptime/alerts.rs:117-142`) holds the two exhaustive `match`es on `Subject` besides `render` (`:218`); `log_dropped` in the worker only prints subjects and has no match. `still_down` gains a `LogAlert(id)` arm: `select exists (select 1 from log_alerts where id = $1 and enabled and state = 'alerting')`, and for maintenance `maintenance::heartbeat_in_maintenance` (project-wide windows only, as R-P2-18).
+- `incidents::model::open_for_heartbeat` now reopens an incident resolved less than `HEARTBEAT_REOPEN_WINDOW_SECS` ago (`nami-engine/src/incidents/model.rs:95-155`, Uptime Phase 3 flap control). Log alerts do not reopen (the spec has no such rule): `open_for_log_alert` / `resolve_for_log_alert` mirror `open_for_monitor` / `resolve_for_monitor` (`nami-engine/src/incidents/model.rs:55-92`), a plain insert with `on conflict (log_alert_id) where status = 'open' do nothing`.
+- Views cap a stored query at `saved_query::MAX_QUERY_BYTES` (16 KiB, `nami-engine/src/logs/view/saved_query.rs:18`, checked at the end of `ViewQuery::validate`). `logs::alert::model::validate` applies the same ceiling to the alert's `LogQuery` (`serde_json::to_vec(&query)` at most `MAX_QUERY_BYTES`, else `"query must be at most 16384 bytes"`).
+- The saved-view model is `logs::view::model` (`create` with `CreatedView`, `nami-engine/src/logs/view/model.rs:80-121`), its routes `nami-engine/src/logs/view/routes.rs` (mounted at `nami-engine/src/core/router.rs:85`). The log-alert model, routes and mount follow them.
+- Integration tests are modules of the `logs` target: the file starts with `use crate::common;` (as `nami-engine/tests/logs/log_views.rs:2`), not `mod common;`, and `nami-engine/tests/logs/main.rs` declares `mod log_alerts;`. The module is `logs::alert` (R-P2-1), so the tests call `alert::...`.
 
 **Interfaces:**
 - Consumes: `saved_query::{LogQuery, check_sources}` (T13), `query::{push_where, push_window, Sql, Window}`, `search::{READ_SETTINGS, user_error, QueryPermit}`, `uptime::alerts::{notify_transition, Transition, TransitionKind, Subject, sanitize_cause}`, `uptime::worker::Notifications`.
@@ -2529,14 +2536,14 @@ Branch `feat/NAMI-LOG-14-log-alerts`, worktree `.worktrees/NAMI-LOG-14/`.
 // uptime::alerts
 pub enum Subject { Monitor(Uuid), Heartbeat(Uuid), LogAlert(Uuid) }
 
-// models::incident
+// incidents::model
 pub async fn open_for_log_alert(conn: &mut PgConnection, project_id: Uuid, log_alert_id: Uuid, title: &str,
     cause: Option<&str>, started_at: DateTime<Utc>) -> Result<Option<Uuid>, sqlx::Error>;
 pub async fn resolve_for_log_alert(conn: &mut PgConnection, log_alert_id: Uuid, resolved_at: DateTime<Utc>)
     -> Result<Option<Uuid>, sqlx::Error>;
 // IncidentListItem gains `pub log_alert_id: Option<Uuid>`; source_name = coalesce(m.name, h.name, la.name)
 
-// models::log_alert
+// logs::alert::model
 pub const MAX_LOG_ALERTS_PER_PROJECT: i64 = 100;
 pub const MAX_THRESHOLD: i64 = 1_000_000_000_000;
 pub const WINDOW_RANGE: std::ops::RangeInclusive<i32> = 60..=86_400;
@@ -2556,7 +2563,7 @@ pub fn validate(config: LogAlertConfig) -> Result<LogAlertConfig, String>;
 pub enum CreatedAlert { Created(LogAlert), ProjectFull, NoProject }
 pub async fn list_for_project(..) / get(..) / create(..) / update(pool, project_id, alert_id, config) -> Result<Option<LogAlert>, sqlx::Error> / delete(..) -> Result<bool, sqlx::Error>;
 
-// logs::alerts
+// logs::alert
 pub const ALERT_TICK: Duration = Duration::from_secs(5);
 pub const ALERT_CLAIM_BATCH: i64 = 50;
 pub const MAX_ALERT_EVALUATIONS: usize = 8;
@@ -2592,7 +2599,9 @@ pub async fn run_forever(state: AppState);
 
 - [ ] **Step 1: Migration + failing migration test**
 
-`nami-engine/migrations/0044_create_log_alerts.sql`:
+Two phase files (R-P2-1). NNNN is the next free number in `nami-engine/migrations/` at phase start; the logs file takes it and the incidents file the one after, because `incidents.log_alert_id` references `log_alerts`. No other task of this phase changes the schema.
+
+`nami-engine/migrations/NNNN_logs_alerts.sql`:
 
 ```sql
 -- Log alerts (Logs part 2): a count of matching log rows over a window,
@@ -2603,7 +2612,7 @@ create table log_alerts (
     id uuid primary key default gen_random_uuid(),
     project_id uuid not null references projects(id) on delete cascade,
     name text not null,
-    -- logs::saved_query::LogQuery, validated by the engine.
+    -- logs::view::saved_query::LogQuery, validated by the engine.
     query jsonb not null default '{}'::jsonb check (jsonb_typeof(query) = 'object'),
     threshold bigint not null check (threshold between 0 and 1000000000000),
     comparison text not null check (comparison in ('gt', 'lt')),
@@ -2626,20 +2635,28 @@ create table log_alerts (
 create index log_alerts_project_idx on log_alerts (project_id);
 -- The worker's claim: due, enabled alerts, most overdue first.
 create index log_alerts_due_idx on log_alerts (next_evaluation_at) where enabled;
+```
 
+`nami-engine/migrations/NNNN_incidents_log_alerts.sql` (after the logs file):
+
+```sql
+-- Incidents opened by log alerts (Logs part 2): logs::alert opens and
+-- resolves them through incidents::model::{open,resolve}_for_log_alert.
 alter table incidents add column log_alert_id uuid references log_alerts(id) on delete cascade;
 -- At most one open incident per log alert (mirrors monitors and heartbeats).
 create unique index incidents_one_open_per_log_alert on incidents (log_alert_id) where status = 'open';
+-- Every incident of one log alert (the per-alert list and the delete cascade),
+-- like incidents_monitor_idx and incidents_heartbeat_idx in 0004_incidents.sql.
 create index incidents_log_alert_idx on incidents (log_alert_id) where log_alert_id is not null;
 ```
 
-Test in `tests/migrations.rs`: `log_alerts_allow_one_open_incident_each`. Seed a project with `seed_source_row` (plain SQL). Insert an alert, insert an open incident for it (`insert into incidents (project_id, log_alert_id, title) values ($1, $2, 't')`), and expect a second open insert to fail with `23505`. Expect `comparison = 'lt'` with `threshold = 0` to be refused by the check. Add `"log_alerts"` to the table list of `all_tables_exist`.
+Test in `nami-engine/tests/core/migrations.rs`: `log_alerts_allow_one_open_incident_each`. Seed a project with `seed_source_row` (plain SQL). Insert an alert, insert an open incident for it (`insert into incidents (project_id, log_alert_id, title) values ($1, $2, 't')`), and expect a second open insert to fail with `23505`. Expect `comparison = 'lt'` with `threshold = 0` to be refused by the check. Add `"log_alerts"` to the table list of `all_tables_exist`.
 
-Run: engine command with `--test migrations`. FAIL → add the file → PASS.
+Run: engine command with `--test core migrations::`. FAIL → add the two files → PASS.
 
 - [ ] **Step 2: Failing unit tests**
 
-In `uptime/alerts.rs` `mod tests`:
+In `nami-engine/src/uptime/alerts.rs` `mod tests` (its `transition(kind, name)` helper already sets `details: None` and `at` = 2026-10-14 17:46:40 UTC):
 
 ```rust
 #[test]
@@ -2663,7 +2680,7 @@ fn log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert() {
 }
 ```
 
-In `logs/alerts.rs` `mod tests`:
+In `nami-engine/src/logs/alert/mod.rs` `mod tests`:
 
 ```rust
 #[test]
@@ -2678,7 +2695,8 @@ fn conditions_compare_strictly() {
 #[test]
 fn the_cause_names_count_window_and_threshold() {
     let alert = DueAlert { id: Uuid::nil(), project_id: Uuid::nil(), name: "n".into(),
-        query: sqlx::types::Json(LogQuery::default()), threshold: 10, comparison: "gt".into(), window_seconds: 300 };
+        query: sqlx::types::Json(LogQuery::default()), threshold: 10, comparison: "gt".into(), window_seconds: 300,
+        updated_at: chrono::DateTime::from_timestamp(1_792_000_000, 0).unwrap() };
     assert_eq!(describe(&alert, 12), "12 matching events in the last 5 min (threshold: > 10)");
     let hourly = DueAlert { comparison: "lt".into(), window_seconds: 3600, threshold: 1, ..alert.clone() };
     assert_eq!(describe(&hourly, 0), "0 matching events in the last 1 h (threshold: < 1)");
@@ -2687,24 +2705,24 @@ fn the_cause_names_count_window_and_threshold() {
 }
 ```
 
-(`describe` writes the window as `N h` when it divides by 3600, `N min` when it divides by 60, otherwise `N s`.)
+(`describe` writes the window as `N h` when it divides by 3600, `N min` when it divides by 60, otherwise `N s`. Drift (2026-10-24): the literal sets `updated_at`, which the plan's own `DueAlert` declares; without it the test would not compile. The assertions are unchanged.)
 
-Run: `cargo test --lib -- uptime::alerts logs::alerts` (engine environment). Expected: FAIL to compile, then PASS after Step 3.
+Run: `cargo test --lib -- uptime::alerts logs::alert` (engine environment). Expected: FAIL to compile, then PASS after Step 3.
 
 - [ ] **Step 3: Implement `Subject::LogAlert`, its rendering, `condition_met` and `describe`**
 
-`render` for `Subject::LogAlert(id)`: link `{base}/projects/{project}/logs/alerts/{id}`. `Down` → subject `[Nami] Log alert {name} triggered`, body `Log alert {name} triggered.\n\nCondition: {cause or "unknown"}\nSince: {at}\n\nDetails: {link}\n`. `Recovered` → subject `[Nami] Log alert {name} resolved`, body `Log alert {name} resolved.\n\nResolved at: {at}\n\nDetails: {link}\n`. Names and causes go through the same `is_unsafe_in_text` / `sanitize_cause` filters as monitor emails. Fix every exhaustive `match` on `Subject` (`log_dropped` in the worker, for example).
+`render` for `Subject::LogAlert(id)`: link `{base}/projects/{project}/logs/alerts/{id}`. `Down` → subject `[Nami] Log alert {name} triggered`, body `Log alert {name} triggered.\n\nCondition: {cause or "unknown"}\nSince: {at}\n\nDetails: {link}\n`. `Recovered` → subject `[Nami] Log alert {name} resolved`, body `Log alert {name} resolved.\n\nResolved at: {at}\n\nDetails: {link}\n`. Names and causes go through the same `is_unsafe_in_text` / `sanitize_cause` filters as monitor emails. `details` is ignored for log alerts. Fix every exhaustive `match` on `Subject`: `render` and the two in `still_down` (`nami-engine/src/uptime/alerts.rs:117-142`, see the Drift note above for the `LogAlert` arm).
 
-- [ ] **Step 4: Write the failing API + worker tests** (`nami-engine/tests/log_alerts.rs`)
+- [ ] **Step 4: Write the failing API + worker tests** (`nami-engine/tests/logs/log_alerts.rs`)
 
 ```rust
 // Log alerts: API, evaluation, incidents and email. Requires
 // `docker compose up -d postgres clickhouse mailpit`.
-mod common;
+use crate::common;
 
 use axum::http::StatusCode;
 use common::{app, call, logs::{post_json, seed_source}, public_app, seed_project, settled_mail, state_with_clickhouse, test_app, user_with_role};
-use nami_engine::{logs::alerts, state::AppState};
+use nami_engine::{logs::alert, core::state::AppState};
 use serde_json::{Value, json};
 
 fn alert_body(name: &str) -> Value {
@@ -2805,22 +2823,22 @@ async fn an_alert_opens_and_resolves_its_incident_and_emails_once_each(pool: sql
 
     // Another project's errors never count.
     post_json(&public, &foreign, json!(vec![json!({"level":"error","message":"x"}); 5])).await;
-    alerts::evaluate_due_alerts(&state).await.unwrap();
+    alert::evaluate_due_alerts(&state).await.unwrap();
     assert_eq!(alert_row(&pool, &id).await, ("ok".to_string(), Some(0)));
 
     post_json(&public, &token, json!(vec![json!({"level":"error","message":"boom"}); 3])).await;
     make_due(&pool, &id).await;
-    assert_eq!(alerts::evaluate_due_alerts(&state).await.unwrap(), 1);
+    assert_eq!(alert::evaluate_due_alerts(&state).await.unwrap(), 1);
     assert_eq!(alert_row(&pool, &id).await, ("alerting".to_string(), Some(3)));
     assert_eq!(incidents(&pool, &id).await, [("open".to_string(), "Log alert: Checkout errors".to_string())]);
 
     make_due(&pool, &id).await;
-    alerts::evaluate_due_alerts(&state).await.unwrap();
+    alert::evaluate_due_alerts(&state).await.unwrap();
     assert_eq!(incidents(&pool, &id).await.len(), 1, "still alerting: no second incident");
 
     let (status, _) = call(&app, "PATCH", &format!("/projects/{project}/log-alerts/{id}"), Some(&member), Some(json!({"threshold": 10}))).await;
     assert_eq!(status, StatusCode::OK);
-    alerts::evaluate_due_alerts(&state).await.unwrap();
+    alert::evaluate_due_alerts(&state).await.unwrap();
     assert_eq!(alert_row(&pool, &id).await.0, "ok");
     assert_eq!(incidents(&pool, &id).await[0].0, "resolved");
 
@@ -2846,7 +2864,7 @@ async fn a_failed_count_changes_nothing(pool: sqlx::PgPool) {
     let (_, created) = call(&app, "POST", &format!("/projects/{project}/log-alerts"), Some(&member), Some(alert_body("E"))).await;
     let id = created["id"].as_str().unwrap().to_string();
     post_json(&public, &token, json!(vec![json!({"level":"error","message":"boom"}); 3])).await;
-    alerts::evaluate_due_alerts(&state).await.unwrap();
+    alert::evaluate_due_alerts(&state).await.unwrap();
     assert_eq!(alert_row(&pool, &id).await.0, "alerting");
     let evaluated: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar("select last_evaluated_at from log_alerts where id = $1::uuid")
         .bind(&id).fetch_one(&pool).await.unwrap();
@@ -2854,7 +2872,7 @@ async fn a_failed_count_changes_nothing(pool: sqlx::PgPool) {
     // ClickHouse unreachable: AppState::for_test's client points at a database that does not exist.
     let broken = AppState::for_test(pool.clone());
     make_due(&pool, &id).await;
-    alerts::evaluate_due_alerts(&broken).await.unwrap();
+    alert::evaluate_due_alerts(&broken).await.unwrap();
     assert_eq!(alert_row(&pool, &id).await, ("alerting".to_string(), Some(3)));
     assert_eq!(incidents(&pool, &id).await[0].0, "open");
     let (after, error): (Option<chrono::DateTime<chrono::Utc>>, Option<String>) =
@@ -2864,7 +2882,7 @@ async fn a_failed_count_changes_nothing(pool: sqlx::PgPool) {
     // Only the failure itself is recorded, as a fixed text (never ClickHouse's own message).
     assert_eq!(error.as_deref(), Some("the log store is unavailable"));
     make_due(&pool, &id).await;
-    alerts::evaluate_due_alerts(&state).await.unwrap();
+    alert::evaluate_due_alerts(&state).await.unwrap();
     let error: Option<String> = sqlx::query_scalar("select last_error from log_alerts where id = $1::uuid")
         .bind(&id).fetch_one(&pool).await.unwrap();
     assert_eq!(error, None, "a successful evaluation clears it");
@@ -2885,13 +2903,13 @@ async fn a_project_wide_maintenance_window_holds_the_alert_state(pool: sqlx::PgP
                  values ($1, 'deploy', 'once', now() - interval '1 minute', now() + interval '1 hour')")
         .bind(project).execute(&pool).await.unwrap();
     post_json(&public, &token, json!(vec![json!({"level":"error","message":"boom"}); 3])).await;
-    alerts::evaluate_due_alerts(&state).await.unwrap();
+    alert::evaluate_due_alerts(&state).await.unwrap();
     assert_eq!(alert_row(&pool, &id).await, ("ok".to_string(), Some(3)), "counted, but the state stands still");
     assert!(incidents(&pool, &id).await.is_empty());
 
     sqlx::query("delete from maintenance_windows where project_id = $1").bind(project).execute(&pool).await.unwrap();
     make_due(&pool, &id).await;
-    alerts::evaluate_due_alerts(&state).await.unwrap();
+    alert::evaluate_due_alerts(&state).await.unwrap();
     assert_eq!(alert_row(&pool, &id).await.0, "alerting", "the first evaluation after the window applies");
     assert_eq!(settled_mail(&email, 1).await.len(), 1);
     ch.drop_database().await.unwrap();
@@ -2906,12 +2924,12 @@ async fn an_evaluation_of_an_edited_alert_is_dropped(pool: sqlx::PgPool) {
     let (_, created) = call(&app, "POST", &format!("/projects/{project}/log-alerts"), Some(&member),
         Some(json!({ "name": "Quiet", "query": {}, "threshold": 1, "comparison": "lt", "window_seconds": 300, "interval_seconds": 60 }))).await;
     let id = created["id"].as_str().unwrap().to_string();
-    let claimed = alerts::claim_due_alerts(&pool, 10).await.unwrap();
+    let claimed = alert::claim_due_alerts(&pool, 10).await.unwrap();
     assert_eq!(claimed.len(), 1);
     // Edited while the count runs: the old settings ("< 1") must not open an incident.
     let (status, _) = call(&app, "PATCH", &format!("/projects/{project}/log-alerts/{id}"), Some(&member), Some(json!({"name": "Renamed"}))).await;
     assert_eq!(status, StatusCode::OK);
-    let applied = alerts::apply_evaluation(&pool, &claimed[0], 0, chrono::Utc::now()).await.unwrap();
+    let applied = alert::apply_evaluation(&pool, &claimed[0], 0, chrono::Utc::now()).await.unwrap();
     assert!(applied.is_none());
     assert_eq!(alert_row(&pool, &id).await, ("ok".to_string(), None));
     assert!(incidents(&pool, &id).await.is_empty());
@@ -2929,12 +2947,12 @@ async fn disabled_alerts_are_skipped_and_disabling_resolves_quietly(pool: sqlx::
     let (_, created) = call(&app, "POST", &format!("/projects/{project}/log-alerts"), Some(&member), Some(alert_body("Quiet"))).await;
     let id = created["id"].as_str().unwrap().to_string();
     post_json(&public, &token, json!(vec![json!({"level":"error","message":"boom"}); 3])).await;
-    alerts::evaluate_due_alerts(&state).await.unwrap();
+    alert::evaluate_due_alerts(&state).await.unwrap();
     let (status, body) = call(&app, "PATCH", &format!("/projects/{project}/log-alerts/{id}"), Some(&member), Some(json!({"enabled": false}))).await;
     assert_eq!((status, body["state"].clone()), (StatusCode::OK, json!("ok")));
     assert_eq!(incidents(&pool, &id).await[0].0, "resolved");
     make_due(&pool, &id).await;
-    assert_eq!(alerts::evaluate_due_alerts(&state).await.unwrap(), 0, "a disabled alert is never claimed");
+    assert_eq!(alert::evaluate_due_alerts(&state).await.unwrap(), 0, "a disabled alert is never claimed");
     assert_eq!(settled_mail(&email, 1).await.len(), 1, "only the trigger email: disabling sends nothing");
     ch.drop_database().await.unwrap();
 }
@@ -2950,7 +2968,7 @@ async fn overlapping_passes_evaluate_each_alert_once(pool: sqlx::PgPool) {
     let (_, created) = call(&app, "POST", &format!("/projects/{project}/log-alerts"), Some(&member), Some(alert_body("Once"))).await;
     let id = created["id"].as_str().unwrap().to_string();
     post_json(&public, &token, json!(vec![json!({"level":"error","message":"boom"}); 3])).await;
-    let (a, b) = tokio::join!(alerts::evaluate_due_alerts(&state), alerts::evaluate_due_alerts(&state));
+    let (a, b) = tokio::join!(alert::evaluate_due_alerts(&state), alert::evaluate_due_alerts(&state));
     assert_eq!(a.unwrap() + b.unwrap(), 1);
     assert_eq!(incidents(&pool, &id).await.len(), 1);
     assert_eq!(settled_mail(&email, 1).await.len(), 1);
@@ -2962,7 +2980,7 @@ async fn overlapping_passes_evaluate_each_alert_once(pool: sqlx::PgPool) {
 
 - [ ] **Step 5: Run them to verify they fail**
 
-Run: engine command with `--test log_alerts`.
+Run: engine command with `--test logs log_alerts::`.
 Expected: FAIL (routes 404, module missing).
 
 - [ ] **Step 6: Implement models, worker and routes**
@@ -3011,27 +3029,27 @@ sqlx::query("update log_alerts set state = $2, last_count = $3, last_evaluated_a
     .bind(alert.id).bind(next_state).bind(count as i64).bind(started_at).execute(&mut *tx).await?;
 ```
 
-Then, unless `held`: `met && state == "ok"` → `open_alert_incident(&mut tx, alert, count, started_at)`. `!met && state == "alerting"` → `resolve_alert_incident(&mut tx, alert.id, alert.project_id, &alert.name, started_at, true)`. Otherwise `None`. Commit. The seam (R-P2-27): `open_alert_incident` calls `incident::open_for_log_alert(conn, project_id, alert.id, &format!("Log alert: {}", alert.name), Some(&describe(alert, count)), at)` and returns `Transition { kind: Down, subject: Subject::LogAlert(alert.id), project_id, name, cause, at }`. `resolve_alert_incident` calls `incident::resolve_for_log_alert` and returns the `Recovered` transition only when `notify`. No other code path calls the two `incident::*_for_log_alert` functions. `ActiveWindows::covers_project` is a new alias of `covers_heartbeats` in `models/maintenance.rs` (project-wide windows only).
+Then, unless `held`: `met && state == "ok"` → `open_alert_incident(&mut tx, alert, count, started_at)`. `!met && state == "alerting"` → `resolve_alert_incident(&mut tx, alert.id, alert.project_id, &alert.name, started_at, true)`. Otherwise `None`. Commit. The seam (R-P2-27): `open_alert_incident` calls `incident::open_for_log_alert(conn, project_id, alert.id, &format!("Log alert: {}", alert.name), Some(&describe(alert, count)), at)` and returns `Transition { kind: Down, subject: Subject::LogAlert(alert.id), project_id, name, cause, details: None, at }`. `resolve_alert_incident` calls `incident::resolve_for_log_alert` and returns the `Recovered` transition only when `notify`. No other code path calls the two `incident::*_for_log_alert` functions. `ActiveWindows::covers_project` is a new alias of `covers_heartbeats` in `nami-engine/src/uptime/maintenance/model.rs` (project-wide windows only). Imports: `crate::incidents::model as incident`, `crate::uptime::maintenance::model as maintenance`.
 
 `record_failure`: `update log_alerts set last_error = $2, last_error_at = now() where id = $1` (nothing else).
 
 `run_pass_with(state, notifications, budget)`: `let free = budget.available_permits().min(ALERT_CLAIM_BATCH as usize)`; `free == 0` → return 0 without claiming. Otherwise `claim_due_alerts(.., free as i64)` then, for each alert, in a `JoinSet`, holding an owned permit of `budget` (`acquire_owned`, which may briefly wait when another pass took permits meanwhile): take `started_at = Utc::now()`, convert `alert.query.to_filters()` (a stored query that no longer validates → `record_failure(.., "the alert's query is no longer valid")` and skip), set the window `[started_at − window_seconds, started_at]`, then `count_matches`. An error → `tracing::warn!(alert_id, error)`, `record_failure` with the `AppError::Validation` message or `"the log store is unavailable"`, and no state change (R-P2-18). Otherwise `apply_evaluation`. `run_pass` is `run_pass_with` over a fresh `Arc::new(Semaphore::new(MAX_ALERT_EVALUATIONS))`. Transitions are handed to `notifications.spawn(..)`, which calls `notify_transition` for each, as `uptime::worker::spawn_alerts` does (make that helper `pub(crate)` and reuse it). Returns the number of alerts claimed. `run_forever`: one `Arc<Semaphore>` of `MAX_ALERT_EVALUATIONS` and one `Notifications` for its lifetime, an interval of `ALERT_TICK` with `MissedTickBehavior::Delay`, each pass (`run_pass_with` over the shared semaphore) spawned so that a panic is logged and not fatal (as `run_checks`). `main.rs` spawns it inside the `uptime_worker_enabled` branch, logging `"log alert worker started"`.
 
-`models::log_alert::update` (transaction): lock the row (`for update`, scoped to the project, absent → `None`), merge and validate in the handler before the call, then write every field, `updated_at = now()` and `next_evaluation_at = now()`. When `enabled` becomes false and `state = 'alerting'`, set `state = 'ok'` and call `logs::alerts::resolve_alert_incident(.., now, false)` in the same transaction (no transition). `create` follows `log_view::create` (cap `MAX_LOG_ALERTS_PER_PROJECT`, 409 `"a project may have at most 100 log alerts"`). `validate`: `validate_label("name", ..)`. `comparison ∈ {gt, lt}`. `threshold ∈ 0..=MAX_THRESHOLD`, and `>= 1` for `lt` (`"lt needs a threshold of at least 1"`). `window_seconds ∈ WINDOW_RANGE`, `interval_seconds ∈ INTERVAL_RANGE`, and `query.to_filters()` must pass. The handler also calls `check_sources`.
+`logs::alert::model::update` (transaction): lock the row (`for update`, scoped to the project, absent → `None`), merge and validate in the handler before the call, then write every field, `updated_at = now()` and `next_evaluation_at = now()`. When `enabled` becomes false and `state = 'alerting'`, set `state = 'ok'` and call `logs::alert::resolve_alert_incident(.., now, false)` in the same transaction (no transition). `create` follows `logs::view::model::create` (project row locked `for no key update`, cap `MAX_LOG_ALERTS_PER_PROJECT`, 409 `"a project may have at most 100 log alerts"`, `NoProject` → 404; alert names are not unique, so there is no `NameTaken`). `validate`: `validate_label("name", ..)`. `comparison ∈ {gt, lt}`. `threshold ∈ 0..=MAX_THRESHOLD`, and `>= 1` for `lt` (`"lt needs a threshold of at least 1"`). `window_seconds ∈ WINDOW_RANGE`, `interval_seconds ∈ INTERVAL_RANGE`, and `query.to_filters()` must pass, with the serialized query at most `saved_query::MAX_QUERY_BYTES` (Drift note above). The handler also calls `check_sources`. The routes are `router()` in `nami-engine/src/logs/alert/routes.rs`, merged in `build_router` (`nami-engine/src/core/router.rs`) beside the view routes.
 
 Preview handler: `require_project_role(viewer)` → `window_seconds ∈ WINDOW_RANGE` (400) → `query.to_filters()` (400) → `check_sources` → `QueryPermit::acquire` (429) → `count_matches` over `[now − window, now]` → `{count, from, to}`.
 
-`models::incident`: `open_for_log_alert` / `resolve_for_log_alert` mirror the heartbeat functions with `on conflict (log_alert_id) where status = 'open' do nothing`. `list_for_project` adds `left join log_alerts la on la.id = i.log_alert_id`, selects `i.log_alert_id` and uses `coalesce(m.name, h.name, la.name) as source_name`.
+`incidents::model`: `open_for_log_alert` / `resolve_for_log_alert` mirror `open_for_monitor` / `resolve_for_monitor` (not the heartbeat pair, which reopens recent incidents; Drift note above) with `on conflict (log_alert_id) where status = 'open' do nothing`. `list_for_project` adds `left join log_alerts la on la.id = i.log_alert_id`, selects `i.log_alert_id` and uses `coalesce(m.name, h.name, la.name) as source_name`.
 
 - [ ] **Step 7: Run the tests to verify they pass**
 
-Run: engine command with `--test log_alerts`, `--test incidents`, `--test uptime_worker`, `--test migrations`, `--lib uptime::alerts`.
+Run: engine command with `--test logs log_alerts::`, `--test incidents`, `--test uptime uptime_worker::`, `--test core migrations::`, `--lib uptime::alerts`.
 Expected: PASS.
 
 - [ ] **Step 8: Full engine suite + clippy, then commit**
 
 ```bash
-git add nami-engine/migrations/0044_create_log_alerts.sql nami-engine/src nami-engine/tests/log_alerts.rs nami-engine/tests/migrations.rs \
+git add nami-engine/migrations nami-engine/src nami-engine/tests/logs/log_alerts.rs nami-engine/tests/logs/main.rs nami-engine/tests/core/migrations.rs \
   docs/superpowers/specs/2026-10-13-log-management-design.md
 git commit -m "feat(engine): log alerts with incident and email notifications (NAMI-LOG-14)
 
@@ -3041,20 +3059,27 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ---
 ### Task 15 (NAMI-LOG-15): Live-tail resume and the explorer's deferred fixes
 
-Branch `feat/NAMI-LOG-15-tail-resume`, worktree `.worktrees/NAMI-LOG-15/`.
+On `feat/logs-part2`. Commits carry `(NAMI-LOG-15)`.
 
 **Files:**
-- Modify: `nami-engine/src/logs/tail.rs` (event ids, `RESUME_WINDOW`, `resume_cursor`, first-poll resume, `TailStats`), `nami-engine/src/logs/mod.rs` (`LogsState.tail_stats`), `nami-engine/src/routes/logs.rs` (read `Last-Event-ID`)
-- Modify (UI): `nami-ui/src/lib/server/log-proxy.ts` (+ test) `lastEventIdHeader`; `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/tail/+server.ts` (+ `server.test.ts`); `nami-ui/src/lib/logs.ts` (+ test) `isLogEntry`, `mergeLiveRows`, `tailKey`; `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/+page.svelte`, `+page.server.ts`, `explorer.test.ts` (histogram/sources errors)
-- Create (UI): `nami-ui/src/lib/live-tail.ts` (+ `live-tail.test.ts`), R-P2-21
-- Test: `nami-engine/tests/logs_tail.rs` (helper extension + 3 tests), unit tests in `tail.rs`
+- Modify: `nami-engine/src/logs/query/tail.rs` (event ids, `RESUME_WINDOW`, `resume_cursor`, first-poll resume, `TailStats`), `nami-engine/src/logs/mod.rs` (`LogsState.tail_stats`), `nami-engine/src/logs/query/routes.rs` (read `Last-Event-ID`)
+- Modify (UI): `nami-ui/src/lib/server/logs/log-proxy.ts` (+ test) `lastEventIdHeader`; `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/tail/+server.ts` (+ `server.test.ts`); `nami-ui/src/lib/logs/logs.ts` (+ test) `isLogEntry`, `mergeLiveRows`, `tailKey`; `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/+page.svelte`, `+page.server.ts`, `explorer.test.ts` (histogram/sources errors)
+- Create (UI): `nami-ui/src/lib/logs/live-tail.ts` (+ `live-tail.test.ts`), R-P2-21
+- Test: `nami-engine/tests/logs/logs_tail.rs` (helper extension + 3 tests), unit tests in `tail.rs`
+
+**Drift (2026-10-24):**
+- `tail::run` today takes `(state, session, project_id, filters, tx)` (`nami-engine/src/logs/query/tail.rs:330-336`) and the handler `tail_logs` (`nami-engine/src/logs/query/routes.rs:133-160`) has no `HeaderMap` extractor yet: add one and pass `resume` as the new fifth argument. The id poll uses `timings.batch` (`TailTimings.batch`, `TAIL_BATCH` by default), so the resume poll does too.
+- The explorer's "Load more" keeps no `extraRows`: `rows` and `nextCursor` are writable `$derived` values of `data.logs` / `data.nextCursor` that reset on every navigation, and it fetches the BFF route `${path}/search` (`nami-ui/src/routes/(app)/projects/[id=uuid]/logs/+page.svelte:53-84`, `.../logs/search/+server.ts`). Keep that: the new `$effect` that reads `data.logs` only bumps `generation` and aborts `controller`; `loadMore` passes `signal` to its `fetch` and drops a result whose generation is stale.
+- The message `<pre>` of an expanded row already wraps (`whitespace-pre-wrap wrap-anywhere`, `+page.svelte:528`); only the fields `<pre>` beside it (`:529-530`) does not. Give it the same two classes (Tailwind 4's `wrap-anywhere`, not `break-words`).
+- The live notice already has `role="status"` (`+page.svelte:446`). Move `role="status" aria-live="polite"` to the element holding both the status text and the notice, so each change is announced once.
+- Turning live off today sets the status to `off` but keeps the live rows (`+page.svelte:92-97`); clearing them is part of this task (R-P2-21).
 
 **Interfaces:**
 - Consumes: `query::Cursor` (`encode`/`decode`), the fix wave's two-step tail poll (`fetch_ids` then `fetch_rows`).
 - Produces:
 
 ```rust
-// logs::tail
+// logs::query::tail
 pub const RESUME_WINDOW: Duration = Duration::from_secs(300);
 /// A `Last-Event-ID` worth resuming from: a cursor dated within the last
 /// RESUME_WINDOW (and not past FUTURE_ALLOWANCE ahead); anything else is None.
@@ -3069,10 +3094,10 @@ pub struct TailStats { pub id_polls: AtomicU64, pub rows_fetched: AtomicU64 }
 ```
 
 ```ts
-// nami-ui lib/server/log-proxy.ts
+// nami-ui lib/server/logs/log-proxy.ts
 /** The Last-Event-ID to forward, or null when absent or not a plausible cursor. */
 export function lastEventIdHeader(value: string | null): string | null;
-// nami-ui lib/logs.ts
+// nami-ui lib/logs/logs.ts
 export function isLogEntry(value: unknown): value is LogEntry;
 /** `incoming` (oldest first) prepended newest-first to `existing`, without duplicate ids, at most `cap` rows. */
 export function mergeLiveRows(existing: LogEntry[], incoming: LogEntry[], cap: number): LogEntry[];
@@ -3098,7 +3123,7 @@ fn only_recent_well_formed_cursors_resume() {
 }
 ```
 
-In `tests/logs_tail.rs`, extend the helper: `SseStream` gains `last_id: Option<String>` (set by `next` whenever a block has an `id:` line; `parse_block` returns the id alongside), and `open_with(app, uri, cookie, last_event_id: Option<&str>)` adds the `Last-Event-ID` header (`open` calls it with `None`). Then:
+In `tests/logs/logs_tail.rs`, extend the helper: `SseStream` gains `last_id: Option<String>` (set by `next` whenever a block has an `id:` line; `parse_block` returns the id alongside), and `open_with(app, uri, cookie, last_event_id: Option<&str>)` adds the `Last-Event-ID` header (`open` calls it with `None`). Then:
 
 ```rust
 #[sqlx::test]
@@ -3163,7 +3188,7 @@ async fn an_unusable_last_event_id_starts_a_normal_tail(pool: sqlx::PgPool) {
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cargo test --lib logs::tail` and engine command with `--test logs_tail`.
+Run: `cargo test --lib logs::query::tail` and engine command with `--test logs logs_tail::`.
 Expected: FAIL (`resume_cursor` missing; `last_id` stays `None`).
 
 - [ ] **Step 3: Implement resume**
@@ -3189,7 +3214,7 @@ Run: same as Step 2. Expected: PASS, and the existing tail tests unchanged.
 
 - [ ] **Step 4b: Pin "a poll reads only new rows" (R-P2-25; controller follow-up)**
 
-Append to `tests/logs_tail.rs`:
+Append to `tests/logs/logs_tail.rs`:
 
 ```rust
 #[sqlx::test]
@@ -3220,11 +3245,11 @@ async fn polls_read_the_list_rows_of_new_ids_only(pool: sqlx::PgPool) {
 }
 ```
 
-Run: engine command with `--test logs_tail`. Expected: FAIL to compile (`tail_stats` missing). Implement: `fetch_ids` bumps `id_polls` after each successful query, and `fetch_rows` adds the number of rows it returned to `rows_fetched`, both with `Ordering::Relaxed`. Run again: PASS.
+Run: engine command with `--test logs logs_tail::`. Expected: FAIL to compile (`tail_stats` missing). Implement: `fetch_ids` bumps `id_polls` after each successful query, and `fetch_rows` adds the number of rows it returned to `rows_fetched`, both with `Ordering::Relaxed`. Run again: PASS.
 
 - [ ] **Step 5: Write the failing UI tests**
 
-`log-proxy.test.ts`:
+`nami-ui/src/lib/server/logs/log-proxy.test.ts`:
 
 ```ts
 describe('lastEventIdHeader', () => {
@@ -3238,7 +3263,7 @@ describe('lastEventIdHeader', () => {
 });
 ```
 
-`logs/tail/server.test.ts` (append):
+`nami-ui/src/routes/(app)/projects/[id=uuid]/logs/tail/server.test.ts` (append):
 
 ```ts
 it('forwards a valid Last-Event-ID and nothing else from the browser', async () => {
@@ -3259,7 +3284,7 @@ it('forwards a valid Last-Event-ID and nothing else from the browser', async () 
 
 (Reuse the file's existing `fakeEvent`/`PROJECT`. `callEngine` copies `init.headers` into a fresh `Headers` and passes it on, so the assertion reads what the engine really receives.)
 
-`lib/logs.test.ts`:
+`nami-ui/src/lib/logs/logs.test.ts`:
 
 ```ts
 const row = (id: string, message = id): LogEntry => ({
@@ -3289,7 +3314,7 @@ describe('live rows', () => {
 
 (`LogEntry.truncated` is optional in the UI type since the fix wave. `isLogEntry` accepts it absent or boolean.)
 
-`lib/live-tail.test.ts` (the lifecycle test LOG-8 deferred, R-P2-21):
+`nami-ui/src/lib/logs/live-tail.test.ts` (the lifecycle test LOG-8 deferred, R-P2-21):
 
 ```ts
 import { describe, expect, it } from 'vitest';
@@ -3374,8 +3399,8 @@ describe('startLiveTail', () => {
 
 - [ ] **Step 6: Run them to verify they fail**
 
-Run: `cd nami-ui && npx vitest run src/lib src/routes/\(app\)/projects/\[id=uuid\]/logs`.
-Expected: FAIL (exports and `lib/live-tail.ts` missing).
+Run: `cd nami-ui && npx vitest run src/lib/logs src/lib/server/logs "src/routes/(app)/projects/[id=uuid]/logs"`.
+Expected: FAIL (exports and `lib/logs/live-tail.ts` missing).
 
 - [ ] **Step 7: Implement the UI changes**
 
@@ -3384,22 +3409,22 @@ Expected: FAIL (exports and `lib/live-tail.ts` missing).
 - `isLogEntry`: an object with string `id`, `source_id`, `dt`, `level`, `message`, `trace_id`, `span_id`, `pattern_hash`, and `fields` an object.
 - `mergeLiveRows`: `[...incoming].reverse()` concatenated with `existing`, keeping the first occurrence of each id, sliced to `cap`.
 - `tailKey(state)`: `tailParams(state).toString()`.
-- `lib/live-tail.ts`: `export type LiveStatus = 'connecting' | 'live' | 'reconnecting' | 'ended'` and `startLiveTail(url, { EventSourceImpl = EventSource, cap = LIVE_ROW_CAP, onStatus(status, notice), onRows(rows) }): () => void`. It holds the live rows itself and moves today's `$effect` body there unchanged in behaviour: `log` events parsed, kept only when `isLogEntry`, merged with `mergeLiveRows(rows, [row], cap)` and handed to `onRows`; `end` with `session` closes and reports `ended`, any other `end` reports `reconnecting` and leaves the reconnect to `EventSource` (which resends `Last-Event-ID`); `onerror` as today, comparing `readyState` with `EventSourceImpl.CLOSED`; `pagehide` closes (registered only when `typeof window !== 'undefined'`: vitest runs in Node). The returned function removes the `pagehide` listener and closes the stream.
+- `lib/logs/live-tail.ts`: `export type LiveStatus = 'connecting' | 'live' | 'reconnecting' | 'ended'` and `startLiveTail(url, { EventSourceImpl = EventSource, cap = LIVE_ROW_CAP, onStatus(status, notice), onRows(rows) }): () => void`. It holds the live rows itself and moves today's `$effect` body there unchanged in behaviour: `log` events parsed, kept only when `isLogEntry`, merged with `mergeLiveRows(rows, [row], cap)` and handed to `onRows`; `end` with `session` closes and reports `ended`, any other `end` reports `reconnecting` and leaves the reconnect to `EventSource` (which resends `Last-Event-ID`); `onerror` as today, comparing `readyState` with `EventSourceImpl.CLOSED`; `pagehide` closes (registered only when `typeof window !== 'undefined'`: vitest runs in Node). The returned function removes the `pagehide` listener and closes the stream.
 - `+page.svelte`:
   - `const liveKey = $derived(data.state.live ? tailKey(data.state) : null)`. The tail `$effect` reads only `liveKey` (`null` → status `off`, live rows cleared) and otherwise returns `startLiveTail(\`${path}/tail?${liveKey}\`, { onStatus, onRows })` as its cleanup.
-  - LOG-8 leftovers: `+page.server.ts` returns `histogramError` and `sourcesError` (`engineErrorMessage` on a failed call, else null) and the page shows them where the chart and the source picker would be. Field `<pre>` blocks get `whitespace-pre-wrap break-words`. The live status line gets `role="status" aria-live="polite"`. Append to `explorer.test.ts`: a 500 histogram and a 500 sources call give `histogramError`/`sourcesError` strings and the page data still loads.
-  - "Load more": `let generation = 0; let controller: AbortController | null = null;`. An `$effect` that reads `data.logs` (a new navigation) runs `generation += 1; controller?.abort(); extraRows = []; nextCursor = data.nextCursor`. `loadMore` captures `const mine = generation`, creates a controller, passes `signal`, and drops the result if `mine !== generation`. An `AbortError` is silent.
+  - LOG-8 leftovers: `+page.server.ts` returns `histogramError` and `sourcesError` (`engineErrorMessage` on a failed call, else null) and the page shows them where the chart and the source picker would be. The fields `<pre>` gets `whitespace-pre-wrap wrap-anywhere` (the message `<pre>` has them already). The live status line gets `role="status" aria-live="polite"`. Append to `explorer.test.ts`: a 500 histogram and a 500 sources call give `histogramError`/`sourcesError` strings and the page data still loads.
+  - "Load more": `let generation = 0; let controller: AbortController | null = null;`. An `$effect` that reads `data.logs` (a new navigation) runs `generation += 1; controller?.abort()` (`rows` and `nextCursor` are writable `$derived` values and reset by themselves, see the Drift note). `loadMore` captures `const mine = generation`, creates a controller, passes `signal`, and drops the result if `mine !== generation`. An `AbortError` is silent.
 
 - [ ] **Step 8: Run all checks; do a manual walkthrough; commit**
 
 Run: engine command (all) + clippy, `cd nami-ui && npm run check && npx vitest run`.
-Walkthrough (engine + nami-ui dev on spare ports, per the ledger's per-worktree isolation):
+Walkthrough (engine + nami-ui dev on spare ports, so other worktrees' servers are not disturbed):
 1. Start live tail. Change the columns: the "Connecting…" state does not reappear.
 2. Click "Load more", then immediately change the level: no stale rows appear.
 3. Stop the engine for 10 s and restart it: after the reconnect, rows sent meanwhile appear once.
 
 ```bash
-git add nami-engine/src/logs/tail.rs nami-engine/src/logs/mod.rs nami-engine/src/routes/logs.rs nami-engine/tests/logs_tail.rs nami-ui/src
+git add nami-engine/src/logs/query/tail.rs nami-engine/src/logs/mod.rs nami-engine/src/logs/query/routes.rs nami-engine/tests/logs/logs_tail.rs nami-ui/src
 git commit -m "feat: live tail resumes after reconnects; explorer tail and load-more fixes (NAMI-LOG-15)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -3408,20 +3433,24 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ---
 ### Task 16 (NAMI-LOG-16): UI — pipeline editor with live preview, 30-day usage chart
 
-Branch `feat/NAMI-LOG-16-pipeline-ui`, worktree `.worktrees/NAMI-LOG-16/`.
+On `feat/logs-part2`. Commits carry `(NAMI-LOG-16)`.
 
 **Files:**
-- Create: `nami-ui/src/lib/pipeline.ts` (+ `pipeline.test.ts`), `nami-ui/src/lib/server/json-relay.ts` (+ `json-relay.test.ts`), `nami-ui/src/lib/components/logs/PipelineEditor.svelte`, `nami-ui/src/lib/components/UsageChart.svelte`
+- Create: `nami-ui/src/lib/logs/pipeline.ts` (+ `pipeline.test.ts`), `nami-ui/src/lib/server/core/json-relay.ts` (+ `json-relay.test.ts`; generic BFF code beside `relay-stream.ts`, T18 reuses it), `nami-ui/src/lib/components/logs/PipelineEditor.svelte`, `nami-ui/src/lib/components/UsageChart.svelte`
 - Create: `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/sources/[sourceId=uuid]/pipeline/+page.server.ts`, `+page.svelte`, `pipeline.test.ts`, `pipeline/test/+server.ts`, `pipeline/test/server.test.ts`
-- Modify: `.../logs/sources/[sourceId=uuid]/+page.server.ts`, `+page.svelte`, `source-detail.test.ts` (usage `days=30`, link to the pipeline page); `nami-ui/src/lib/logs.ts` (+ test) `usageBars`
+- Modify: `.../logs/sources/[sourceId=uuid]/+page.server.ts`, `+page.svelte`, `source-detail.test.ts` (usage `days=30`, link to the pipeline page); `nami-ui/src/lib/logs/logs.ts` (+ test) `usageBars`
 - Test: the files above
+
+**Drift (2026-10-24):**
+- `DailyUsage` (`nami-ui/src/lib/logs/logs.ts:32-40`) already carries every counter the engine returns (`day`, `events`, `bytes`, `events_dropped`, `events_sampled_out`, `requests_rate_limited`, `requests_over_quota`; engine `nami-engine/src/logs/ingest/usage.rs:57-62`). The usage endpoint answers the last `days` days oldest first and zero-filled (`usage.rs:273-296`), so `usage.at(-1)` is today. The source page asks `usage?days=1` and takes `[0]` today (`.../logs/sources/[sourceId=uuid]/+page.server.ts`, `source-detail.test.ts:24`).
+- The Part 1 chart palette is gone: charts use design tokens (`nami-ui/src/routes/layout.css:53-59`, `--color-series-1..6`; `LogVolumeChart.svelte:22-26` uses `fill-danger`, `fill-warning`, `fill-accent-periwinkle`), and CLAUDE.md forbids raw hex in pages. `UsageChart` draws events with `fill-primary` and bytes with `fill-accent-cyan` (the colours of `--color-series-1` and `--color-series-2`), with a `Legend` of tones `primary` and `cyan` (`Legend` takes a `tone`, `#lib/components/ui/Legend.svelte:5`), the way `LogVolumeChart` pairs fill classes with tones, instead of `#2dd4bf` / `#737373`.
 
 **Interfaces:**
 - Consumes: engine `GET/PUT .../pipeline`, `POST .../pipeline/test` (T10), `GET .../usage?days=30` (Part 1).
 - Produces (T18 reuses `relayJsonPost`):
 
 ```ts
-// lib/pipeline.ts
+// lib/logs/pipeline.ts
 export type RuleKind = 'drop' | 'remove_fields' | 'redact' | 'rename' | 'sample';
 export const RULE_KINDS: { value: RuleKind; label: string }[];
 export type Match = { field?: string; equals?: string; message_regex?: string };
@@ -3441,12 +3470,12 @@ export type TestResult =
   | { outcome: 'kept'; event: { dt: string; level: string; message: string; fields: Record<string, unknown>; trace_id: string; span_id: string; pattern: string } }
   | { outcome: 'dropped' } | { outcome: 'sampled_out' };
 
-// lib/server/json-relay.ts
+// lib/server/core/json-relay.ts
 export const MAX_RELAY_BYTES = 1024 * 1024;
 /** Same-origin JSON POST → engine `path`, answered with the engine's status and JSON. */
 export async function relayJsonPost(event: RequestEvent, path: string): Promise<Response>;
 
-// lib/logs.ts
+// lib/logs/logs.ts
 export type UsageBar = { day: string; events: number; bytes: number; eventsShare: number; bytesShare: number;
   dropped: number; sampledOut: number; rejected: number };
 export function usageBars(days: DailyUsage[]): UsageBar[];
@@ -3454,7 +3483,7 @@ export function usageBars(days: DailyUsage[]): UsageBar[];
 
 `equals` is always sent as a string. The engine compares a string with a field's JSON text (R-P2-4), so `"200"` matches both `200` and `"200"`, and the UI needs no type picker.
 
-- [ ] **Step 1: Write the failing lib tests** (`nami-ui/src/lib/pipeline.test.ts`)
+- [ ] **Step 1: Write the failing lib tests** (`nami-ui/src/lib/logs/pipeline.test.ts`)
 
 ```ts
 import { describe, expect, it } from 'vitest';
@@ -3513,7 +3542,7 @@ describe('sample events', () => {
 });
 ```
 
-`lib/logs.test.ts` (append):
+`nami-ui/src/lib/logs/logs.test.ts` (append):
 
 ```ts
 describe('usageBars', () => {
@@ -3529,14 +3558,14 @@ describe('usageBars', () => {
 });
 ```
 
-(`DailyUsage` in `lib/logs.ts` must carry every counter the engine returns. Add the missing fields if Part 1 typed only some.)
+(`DailyUsage` in `lib/logs/logs.ts` must carry every counter the engine returns; it already does, see the Drift note.)
 
 - [ ] **Step 2: Run them to verify they fail**
 
-Run: `cd nami-ui && npx vitest run src/lib/pipeline.test.ts src/lib/logs.test.ts`.
+Run: `cd nami-ui && npx vitest run src/lib/logs/pipeline.test.ts src/lib/logs/logs.test.ts`.
 Expected: FAIL (module missing).
 
-- [ ] **Step 3: Implement `lib/pipeline.ts` and `usageBars`**
+- [ ] **Step 3: Implement `lib/logs/pipeline.ts` and `usageBars`**
 
 Client checks mirror the engine (path rule = `isFieldPath`, regex length ≤ 256, at most 20 regexes in the whole list (`MAX_REGEXES`, shown on the "Add rule" button state), `n` 2-10000, ≤ 50 keys/paths, `level`/`message` not removable). Regex validity is left to the engine; the preview shows its 400. `paths` and `keys` drafts are comma- or newline-separated. `parseSampleEvents`: trimmed text; `[`… → `JSON.parse` array; `{`… → try one object, else split lines and parse each non-empty line. Every element must be a plain object, and there are at most `MAX_TEST_EVENTS`. `describeRule` texts: `Drop when <field> = <value>` / `Drop when message matches /<re>/` / `Remove <paths>` / `Redact keys <keys>` + ` and /<re>/` / `Rename <from> → <to>` / `Keep 1 in <n> events` (+ ` when …`).
 
@@ -3546,11 +3575,11 @@ Run: same as Step 2. Expected: PASS.
 
 - [ ] **Step 5: Write the failing relay and page tests**
 
-`lib/server/json-relay.test.ts`:
+`nami-ui/src/lib/server/core/json-relay.test.ts`:
 
 ```ts
 import { describe, expect, it } from 'vitest';
-import { fakeEvent, PROJECT_ID } from '#lib/server/fake-event';
+import { fakeEvent, PROJECT_ID } from '#lib/server/core/fake-event';
 import { MAX_RELAY_BYTES, relayJsonPost } from './json-relay';
 
 function post(event: any, body: string, headers: Record<string, string> = {}) {
@@ -3598,11 +3627,11 @@ describe('relayJsonPost', () => {
 });
 ```
 
-`pipeline/pipeline.test.ts` (page server):
+`.../logs/sources/[sourceId=uuid]/pipeline/pipeline.test.ts` (page server):
 
 ```ts
 import { describe, expect, it } from 'vitest';
-import { fakeEvent, PROJECT_ID } from '#lib/server/fake-event';
+import { fakeEvent, PROJECT_ID } from '#lib/server/core/fake-event';
 import { actions, load } from './+page.server';
 
 const SOURCE = '0b6f3f3e-6d2a-4c1e-9b7a-2f1d3c4b5a69';
@@ -3643,16 +3672,16 @@ describe('pipeline page', () => {
 
 - [ ] **Step 6: Run them to verify they fail**
 
-Run: `cd nami-ui && npx vitest run src/lib/server/json-relay.test.ts "src/routes/(app)/projects/[id=uuid]/logs/sources"`.
+Run: `cd nami-ui && npx vitest run src/lib/server/core/json-relay.test.ts "src/routes/(app)/projects/[id=uuid]/logs/sources"`.
 Expected: FAIL.
 
 - [ ] **Step 7: Implement the relay, routes and components**
 
-`json-relay.ts`:
+`nami-ui/src/lib/server/core/json-relay.ts`:
 
 ```ts
 import type { RequestEvent } from '@sveltejs/kit';
-import { callEngine } from '#lib/server/engine';
+import { callEngine } from '#lib/server/core/engine';
 
 export const MAX_RELAY_BYTES = 1024 * 1024;
 
@@ -3707,7 +3736,7 @@ export async function relayJsonPost(event: RequestEvent, path: string): Promise<
 
 `+page.svelte`: the title `Pipeline · <source name>`, a short help text in spec order ("Rules run top to bottom after parsing and size caps, before patterns and storage; edits reach ingestion on the next request; redacted values are never stored; a redact rule covers what is there at its position, so put it after any rename that moves a secret"), the editor, and a form posting `?/save` with `use:enhance` and a submit guard.
 
-Source detail page: the `load` asks for `usage?days=30`, `today = usage.at(-1) ?? null`, and also returns `usage`. A "Pipeline" link goes to `./<sourceId>/pipeline`. `UsageChart.svelte` (props `days: DailyUsage[]`) draws two rows of 30 bars (events per day, bytes per day, `formatBytes`). Each bar has a `title` tooltip with the UTC date, events, bytes, dropped, sampled out and rejected. A visually hidden `<table>` repeats the data for screen readers. Colors: events `#2dd4bf`, bytes `#737373`, as in the Part 1 chart palette.
+Source detail page: the `load` asks for `usage?days=30`, `today = usage.at(-1) ?? null`, and also returns `usage`. A "Pipeline" link goes to `./<sourceId>/pipeline`. `UsageChart.svelte` (props `days: DailyUsage[]`) draws two rows of 30 bars (events per day, bytes per day, `formatBytes`). Each bar has a `title` tooltip with the UTC date, events, bytes, dropped, sampled out and rejected. A visually hidden `<table>` repeats the data for screen readers. Colours: events `fill-primary`, bytes `fill-accent-cyan`, with a `Legend` of tones `primary` / `cyan` (Drift note above).
 
 - [ ] **Step 8: Run all checks; walkthrough; commit**
 
@@ -3730,18 +3759,22 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 17 (NAMI-LOG-17): UI — explorer Patterns tab, export and saved views
 
-Branch `feat/NAMI-LOG-17-explorer-p2`, worktree `.worktrees/NAMI-LOG-17/`.
+On `feat/logs-part2`. Commits carry `(NAMI-LOG-17)`.
 
 **Files:**
-- Modify: `nami-ui/src/lib/logs.ts` (+ test), `nami-ui/src/lib/server/log-proxy.ts` (+ test) `PATTERN_PARAMS`, `.../logs/+page.server.ts`, `.../logs/+page.svelte`, `.../logs/explorer.test.ts`
+- Modify: `nami-ui/src/lib/logs/logs.ts` (+ test), `nami-ui/src/lib/server/logs/log-proxy.ts` (+ test) `PATTERN_PARAMS`, `.../logs/+page.server.ts`, `.../logs/+page.svelte`, `.../logs/explorer.test.ts`
 - Create: `nami-ui/src/lib/components/logs/PatternsTable.svelte`, `ExportMenu.svelte`, `SavedViews.svelte`. The full-entry proxy and the expand-to-full-row behaviour already shipped with the fix wave (`f3b358f`) and are reused unchanged.
+
+**Drift (2026-10-24):**
+- The UI conventions (CLAUDE.md, "UI conventions") came after this task was written. The Results | Patterns tabs use `SegmentedTabs` in link mode (`#lib/components/ui/SegmentedTabs.svelte`, as `logs/+layout.svelte` does for its sections), which renders the labelled `<nav>` R-P2-21 asks for; the pattern share bar and chips use tokens (`bg-primary`, `.badge-*`), never raw hex or stock Tailwind colours.
+- Export already has its BFF route and allow-list from T12 (`.../logs/export/+server.ts`, `EXPORT_PARAMS` in `nami-ui/src/lib/server/logs/log-proxy.ts:28-35`); this task only adds the explorer side (`exportHref`, `exportWarning`, `ExportMenu`).
 
 **Interfaces:**
 - Consumes: engine `/logs/patterns` (T9), `/logs/export` via the T12 proxy, `/log-views` (T13).
 - Produces:
 
 ```ts
-// lib/logs.ts
+// lib/logs/logs.ts
 export type ExplorerTab = 'results' | 'patterns';
 // ExplorerState gains: tab: ExplorerTab (URL `tab=patterns`; default results) and
 // patterns: string[] (URL `pattern`, repeatable, at most 100, deduplicated; `isPatternHash`:
@@ -3764,7 +3797,7 @@ export function stateFromViewQuery(query: ViewQuery): ExplorerState;  // through
 
 `tailParams` (and so `engineParams`) appends one `pattern_hash` per `state.patterns`. `exportHref` = `${path}/export?` + `engineParams(state, window)` + `format` + one `columns` per `state.columns` (CSV only).
 
-- [ ] **Step 1: Write the failing lib tests** (append to `lib/logs.test.ts`)
+- [ ] **Step 1: Write the failing lib tests** (append to `nami-ui/src/lib/logs/logs.test.ts`)
 
 ```ts
 describe('explorer state, part 2', () => {
@@ -3817,7 +3850,7 @@ describe('explorer state, part 2', () => {
 
 - [ ] **Step 2: Run them to verify they fail; implement; run them to verify they pass**
 
-Run: `cd nami-ui && npx vitest run src/lib/logs.test.ts`. FAIL → implement in `lib/logs.ts` → PASS. `stateFromViewQuery` builds a `URLSearchParams` from the query and calls `parseExplorerState` on it, so every validation rule stays in one place. `exportWarning` uses `toLocaleString('en-US')`.
+Run: `cd nami-ui && npx vitest run src/lib/logs/logs.test.ts`. FAIL → implement in `lib/logs/logs.ts` → PASS. `stateFromViewQuery` builds a `URLSearchParams` from the query and calls `parseExplorerState` on it, so every validation rule stays in one place. `exportWarning` uses `toLocaleString('en-US')`.
 
 - [ ] **Step 3: Write the failing load/action/proxy tests** (append to `logs/explorer.test.ts`; extend the `engine()` helper with `patterns` and `views` responses)
 
@@ -3917,19 +3950,25 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ### Task 18 (NAMI-LOG-18): UI — log alerts
 
-Branch `feat/NAMI-LOG-18-alerts-ui`, worktree `.worktrees/NAMI-LOG-18/`.
+On `feat/logs-part2`. Commits carry `(NAMI-LOG-18)`.
 
 **Files:**
-- Create: `nami-ui/src/lib/log-alerts.ts` (+ test), `nami-ui/src/lib/server/log-alert-form.ts` (+ test), `nami-ui/src/lib/components/logs/LogAlertForm.svelte`
+- Create: `nami-ui/src/lib/logs/log-alerts.ts` (+ test), `nami-ui/src/lib/server/logs/log-alert-form.ts` (+ test), `nami-ui/src/lib/components/logs/LogAlertForm.svelte`
 - Create: `nami-ui/src/routes/(app)/projects/[id=uuid]/logs/alerts/+page.server.ts`, `+page.svelte`, `alerts.test.ts`; `alerts/new/+page.server.ts`, `+page.svelte`; `alerts/[alertId=uuid]/+page.server.ts`, `+page.svelte`, `alert-detail.test.ts`; `alerts/preview/+server.ts` (+ `server.test.ts`)
-- Modify: `.../logs/+layout.svelte` (Alerts sub-tab), `.../logs/+page.svelte` ("Create alert from this search" link), `.../incidents/+page.svelte` and `nami-ui/src/lib/uptime.ts` (`log_alert_id`, link), the incidents tests
+- Modify: `.../logs/+layout.svelte` (Alerts sub-tab), `.../logs/+page.svelte` ("Create alert from this search" link), `.../incidents/+page.svelte` and `nami-ui/src/lib/uptime/uptime.ts` (`log_alert_id`, link), the incidents tests (`.../incidents/incidents.test.ts`, `.../incidents/incidents-page.test.ts`)
+
+**Drift (2026-10-24):**
+- The incident type is `Incident` in `nami-ui/src/lib/uptime/uptime.ts:151-164` (`monitor_id`, `heartbeat_id`, `source_name`); it gains `log_alert_id: string | null`. The page builds its link in `.../incidents/+page.svelte:32-33` (monitor, then heartbeat); a third branch links `log_alert_id` to `/projects/<id>/logs/alerts/<log_alert_id>`. The typed `incident()` fixture in `.../incidents/incidents-page.test.ts:9` gains `log_alert_id: null`.
+- The UI conventions forbid raw hex: the `alerting` badge is `Badge tone="danger"` and `ok` and "disabled" are `tone="neutral"` (`#lib/components/ui/Badge.svelte`), not `#d03b3b`.
+- `parseFilter` exists unexported in `nami-ui/src/lib/logs/logs.ts:262-273`; export it as planned. `relayJsonPost` is imported from `#lib/server/core/json-relay` (T16).
+- The logs layout already uses `SegmentedTabs` with an `Explorer | Sources` list (`.../logs/+layout.svelte:8-18`); Alerts is a third entry (`exact: false`).
 
 **Interfaces:**
-- Consumes: engine `/log-alerts*` (T14), `relayJsonPost` (T16), `parseExplorerState`/`FieldFilter`/`isFieldPath` (`lib/logs.ts`).
+- Consumes: engine `/log-alerts*` (T14), `relayJsonPost` (T16), `parseExplorerState`/`FieldFilter`/`isFieldPath` (`lib/logs/logs.ts`).
 - Produces:
 
 ```ts
-// lib/log-alerts.ts
+// lib/logs/log-alerts.ts
 export type LogAlertQuery = { q?: string; in_fields?: boolean; levels?: LogLevel[]; source_ids?: string[]; filters?: FieldFilter[]; pattern_hashes?: string[] };
 export type LogAlert = { id: string; name: string; query: LogAlertQuery; threshold: number; comparison: 'gt' | 'lt';
   window_seconds: number; interval_seconds: number; enabled: boolean; state: 'ok' | 'alerting';
@@ -3941,7 +3980,7 @@ export function formatSeconds(seconds: number): string;              // "5 min",
 export function describeCondition(alert: Pick<LogAlert, 'comparison' | 'threshold' | 'window_seconds'>): string;
 export function alertQueryFromExplorer(params: URLSearchParams): LogAlertQuery; // prefill from an explorer link
 
-// lib/server/log-alert-form.ts
+// lib/server/logs/log-alert-form.ts
 export type LogAlertPayload = { name: string; query: LogAlertQuery; threshold: number; comparison: 'gt' | 'lt';
   window_seconds: number; interval_seconds: number; enabled: boolean };
 export function logAlertPayloadFromForm(form: FormData): { ok: true; payload: LogAlertPayload } | { ok: false; message: string };
@@ -3949,7 +3988,7 @@ export function logAlertPayloadFromForm(form: FormData): { ok: true; payload: Lo
 
 - [ ] **Step 1: Write the failing lib and form tests**
 
-`lib/log-alerts.test.ts`:
+`nami-ui/src/lib/logs/log-alerts.test.ts`:
 
 ```ts
 import { describe, expect, it } from 'vitest';
@@ -3969,7 +4008,7 @@ describe('log alerts', () => {
 });
 ```
 
-`lib/server/log-alert-form.test.ts`:
+`nami-ui/src/lib/server/logs/log-alert-form.test.ts`:
 
 ```ts
 import { describe, expect, it } from 'vitest';
@@ -4016,7 +4055,7 @@ describe('logAlertPayloadFromForm', () => {
 
 - [ ] **Step 2: Run them to verify they fail; implement; run them to verify they pass**
 
-Run: `cd nami-ui && npx vitest run src/lib/log-alerts.test.ts src/lib/server/log-alert-form.test.ts`. FAIL → implement → PASS. Export `parseFilter` from `lib/logs.ts` for the form parser (it already exists, unexported). Single-valued keys read the last value. The name is trimmed (1-200 characters). The threshold is a non-negative integer ≤ 10^12, and `lt` needs ≥ 1. The window is 60-86400, the interval 60-86400. Levels must be in `LEVELS`. Sources must pass `isUuid`. Filters go through `parseFilter` (at most 10). Patterns go through T17's `isPatternHash` (u64 range).
+Run: `cd nami-ui && npx vitest run src/lib/logs/log-alerts.test.ts src/lib/server/logs/log-alert-form.test.ts`. FAIL → implement → PASS. Export `parseFilter` from `lib/logs/logs.ts` for the form parser (it already exists, unexported). Single-valued keys read the last value. The name is trimmed (1-200 characters). The threshold is a non-negative integer ≤ 10^12, and `lt` needs ≥ 1. The window is 60-86400, the interval 60-86400. Levels must be in `LEVELS`. Sources must pass `isUuid`. Filters go through `parseFilter` (at most 10). Patterns go through T17's `isPatternHash` (u64 range).
 
 - [ ] **Step 3: Write the failing route tests**
 
@@ -4048,7 +4087,7 @@ Implementation notes:
   - enabled checkbox;
   - query section: search text, "also search fields", level checkboxes, source checkboxes, field filters (repeatable rows of path/op/value, serialized into `filter` inputs as JSON), and active pattern chips (`pattern` inputs).
 - The live preview count: 500 ms after the last change, a debounced `fetch(previewUrl, POST {query, window_seconds})` with abort-previous. It shows "N matching events in the last <window>", and "would trigger now" when `describeCondition` holds. 429 → "Too many queries; the preview will retry."
-- List page: name, state badge (`alerting` red `#d03b3b`, `ok` neutral), condition text, last count, last evaluated (UTC), a disabled badge, and `last_error` (as text, with its UTC time) when set, so an alert that cannot evaluate is visible. "New alert" button.
+- List page: name, state badge (`alerting` `Badge tone="danger"`, `ok` neutral), condition text, last count, last evaluated (UTC), a disabled badge, and `last_error` (as text, with its UTC time) when set, so an alert that cannot evaluate is visible. "New alert" button.
 - Detail page: the form (update), a two-step delete, and a link to the alert's incidents (`/projects/<id>/incidents`).
 - Explorer: a "Create alert from this search" link → `/projects/<id>/logs/alerts/new?` + `explorerParams(state)`.
 - Layout: sections `Explorer | Sources | Alerts`.
@@ -4071,18 +4110,22 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 ---
 
-## After Task 18: final review and security wave
+### Task 19 (NAMI-LOG-19): Part 2 security review, fix wave and phase PR
 
-Per CLAUDE.md, every sub-project ends with a dedicated security review and fix wave. After NAMI-LOG-18 merges, the controller:
+**Covers:** R3.21.  **Depends on:** NAMI-LOG-18.
 
-1. **Whole-Part-2 review (opus)** over the Logs Part 2 range (merge parent of NAMI-LOG-9 … NAMI-LOG-18), with engine + UI suites green and a live walkthrough of every feature as admin, member and viewer.
+On `feat/logs-part2`. Per CLAUDE.md, every phase ends with a dedicated security review and fix wave, then the one phase PR. Fix commits carry `(NAMI-LOG-19)`.
+
+1. **Whole-Part-2 review (opus)** over all of Part 2: what merged to `main` under the old flow (PRs #56, #63, #67, #75, #76; the range starts at the parent of #56's merge commit) and the branch diff `origin/main...feat/logs-part2` (NAMI-LOG-14 to NAMI-LOG-18), with engine + UI suites green and a live walkthrough of every feature as admin, member and viewer.
 2. **Security focus list for that review** (each item names the test that should already pin it; a gap is a finding):
    - Pipeline: ReDoS (`catastrophic_patterns_run_in_linear_time`), empty-match and growth (`a_regex_that_matches_the_empty_string_is_rejected`, `redaction_that_grows_a_message_is_capped_again`), redaction completeness across message/fields/pattern/nested/mixed-case on HTTP and syslog (`a_redacted_value_never_reaches_clickhouse`, `syslog_frames_go_through_the_pipeline`), fail-closed (`a_stored_pipeline_that_does_not_compile_fails_closed`), redaction of numbers (R-P2-5), the regex budget and cache bound (`a_pipeline_holds_at_most_twenty_regexes`, R-P2-26), compile and preview off the runtime, cache freshness across instances with monotonic `updated_at` (R-P2-6), preview stores nothing, regex text never logged or echoed in errors (`Debug for CompiledPipeline`, `compile_regex` messages).
-   - Query safety: every new SQL text (`patterns.rs`, `export.rs`, `alerts.rs`, the tail resume query) is built only from `&'static str` fragments. Grep for `format!` near `Sql`. RESERVED_SETTINGS gains `http_write_exception_in_output_format`, and the drift test covers it.
+   - Query safety: every new SQL text (`logs/query/patterns.rs`, `logs/query/export.rs`, `logs/alert/mod.rs`, the tail resume query) is built only from `&'static str` fragments. Grep for `format!` near `Sql`. RESERVED_SETTINGS gains `http_write_exception_in_output_format`, and the drift test covers it.
    - Read budgets: patterns hold a query slot and use `READ_SETTINGS`-based settings. Export holds its own slot (2 per user, 8 per instance), streams with row/byte/line caps and a deadline that holds when the client stops reading (`a_stalled_export_gives_its_slot_back_at_the_deadline`), never writes a ClickHouse exception line into the file, never buffers in the engine or the BFF, and the BFF forwards only allow-listed headers. Alert counts use `READ_SETTINGS`. The per-project source cap bounds the export's name map.
    - Confinement: patterns, export, preview and alert counts never read another project's rows. Views and alerts reject foreign `source_ids`. Every id inside a project path is 404 when foreign. Roles: viewer/member/admin per the Global Constraints, 403 never 404.
    - Export output: the CSV formula guard on every cell (header included), RFC 4180 quoting, fixed `Content-Disposition`, `nosniff`, `no-store`.
    - Alerts: atomic claim (`overlapping_passes_evaluate_each_alert_once`), outage safety (`a_failed_count_changes_nothing`), email header-injection safety for alert names (`log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert`), the evaluation-load bound (100 alerts per project, 8 concurrent across every pass of an instance, claims never beyond free capacity, 25 s query limit), edited-alert evaluations dropped (`an_evaluation_of_an_edited_alert_is_dropped`), project-wide maintenance holding the state (`a_project_wide_maintenance_window_holds_the_alert_state`), `last_error` carrying only fixed text, incidents only through the R-P2-27 seam. No outbound call other than `notify_transition`.
    - UI: JSON relays refuse cross-origin and non-JSON. Tail `Last-Event-ID` is validated. No `{@html}` on log, pattern, view or alert text. Two-step deletes. `[id=uuid]`/`isUuid` on every new id.
-3. **Fix wave** on `fix/NAMI-LOG-part2-final-review` for every Important finding and for the Minor findings the reviewer marks fix-now. Then a scoped re-review, merge, the roadmap §3 ticks (the open items, see "Roadmap §3 coverage") and a decisions log `docs/superpowers/decisions/2026-10-13-log-management-part2.md` recording R-P2-1 … R-P2-27 (same format as the Part 1 log).
-4. **Known follow-ups and accepted risks to carry, not fix here:** fold `search::QuerySlots` and `slots::UserSlots` into one type (R-P2-15). The 512-connection caps (`serve::MAX_PUBLIC_CONNECTIONS`, `MAX_API_CONNECTIONS`) are global per listener: one client holding many connections can fill the public listener for everyone until the header deadline drops them. Per-IP limits and graceful shutdown → Platform. Alert no-data/confirmation periods → Metrics' shared evaluator. Escalation routing → Incident Management. "View trace" → Traces.
+3. **Fix wave** on `feat/logs-part2` for every Important finding and for the Minor findings the reviewer marks fix-now, one or more commits per finding. Then a scoped re-review of the fixes, repeated until clean.
+4. **Record:** commit the decisions doc `docs/superpowers/decisions/<date>-log-management-part2.md` (R-P2-1 to R-P2-27 with their final values, the Drift (2026-10-24) adaptations, the follow-ups below and the Part 1 deferred items decided under R-P2-22; same format as the Part 1 log), and tick R3.13 to R3.21 in `docs/superpowers/roadmap.md` §3 (see "Roadmap coverage").
+5. **Phase PR:** push `feat/logs-part2` and open one PR (purpose and scope, the task list with commit ranges for NAMI-LOG-14 to NAMI-LOG-19 and the merged PRs of NAMI-LOG-9 to NAMI-LOG-13, implementation summary, tests run locally with results since no CI is configured, breaking changes, risks and follow-ups). It is auto-merged when the review is clean (pre-authorized, CLAUDE.md). Then delete the branch and the worktree.
+6. **Known follow-ups and accepted risks to carry, not fix here:** fold `search::QuerySlots` and `slots::UserSlots` into one type (R-P2-15). The 512-connection caps (`core::serve::MAX_PUBLIC_CONNECTIONS`, `MAX_API_CONNECTIONS`) are global per listener: one client holding many connections can fill the public listener for everyone until the header deadline drops them. Per-IP limits and graceful shutdown → Platform. Alert no-data/confirmation periods → Metrics' shared evaluator. Escalation routing → Incident Management. "View trace" → Traces.

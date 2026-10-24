@@ -10,18 +10,21 @@ const json = (body: unknown, status = 200) => new Response(JSON.stringify(body),
 const source = { id: SOURCE_ID, name: 'api', platform: 'http', retention_days: 30, daily_byte_quota: null };
 
 describe('source detail load', () => {
-	it('sends no-store once, loads the source and today usage, and never carries a token', async () => {
-		const usage = { day: '2026-10-13', events: 3, bytes: 90 };
+	it('sends no-store once, loads the source and 30 days of usage, and never carries a token', async () => {
+		const usage = [
+			{ day: '2026-10-12', events: 1, bytes: 30 },
+			{ day: '2026-10-13', events: 3, bytes: 90 }
+		];
 		const { event, setHeaders, calls } = fakeEvent({
 			params,
-			respond: (url) => (url.pathname.endsWith('/usage') ? json([usage]) : json(source))
+			respond: (url) => (url.pathname.endsWith('/usage') ? json(usage) : json(source))
 		});
 		const data = await load(event);
-		expect(data).toMatchObject({ source, today: usage, syslog: { port: 5140 } });
+		expect(data).toMatchObject({ source, today: usage[1], usage, syslog: { port: 5140 } });
 		expect(JSON.stringify(data)).not.toContain(TOKEN);
 		expect(setHeaders).toHaveBeenCalledTimes(1);
 		expect(setHeaders).toHaveBeenCalledWith({ 'cache-control': 'private, no-store' });
-		expect(calls().map((c) => c.path + c.search)).toEqual([PATH, `${PATH}/usage?days=1`]);
+		expect(calls().map((c) => c.path + c.search)).toEqual([PATH, `${PATH}/usage?days=30`]);
 	});
 
 	it('still loads when usage is unavailable', async () => {
@@ -29,7 +32,7 @@ describe('source detail load', () => {
 			params,
 			respond: (url) => (url.pathname.endsWith('/usage') ? json({}, 500) : json(source))
 		});
-		expect(await load(event)).toMatchObject({ today: null });
+		expect(await load(event)).toMatchObject({ today: null, usage: [] });
 	});
 
 	it('maps 401 to login, 403 to 403, 404 to 404', async () => {
@@ -92,6 +95,22 @@ describe('source delete and update actions', () => {
 
 		const denied = await actions.delete(fakeEvent({ params, form: { confirm: 'yes' }, status: 403 }).event);
 		expect(denied).toMatchObject({ status: 403, data: { message: 'Only project admins can delete a source.' } });
+	});
+
+	it('update shows a viewer the member-only message and relays other failures', async () => {
+		const form = { name: 'api', platform: 'http', retention_days: '7' };
+		const denied = await actions.update(fakeEvent({ params, form, status: 403, body: '{"error":"forbidden"}' }).event);
+		expect(denied).toMatchObject({
+			status: 403,
+			data: { action: 'update', message: 'Only project members and admins can change a source.' }
+		});
+		const clash = await actions.update(
+			fakeEvent({ params, form, status: 409, body: '{"error":"a source with this name already exists"}' }).event
+		);
+		expect(clash).toMatchObject({
+			status: 409,
+			data: { action: 'update', message: 'a source with this name already exists' }
+		});
 	});
 
 	it('update sends the quota as null when cleared', async () => {

@@ -287,12 +287,23 @@ viewers read.
 
 Postgres `log_alerts`: project, name, query JSON (same shape as a view),
 `threshold` (count), `comparison` (`gt` | `lt`), `window_seconds`
-(60-86400), `interval_seconds` (>= 60), `enabled`, `state`
-(`ok` | `alerting`), `last_evaluated_at`, `next_evaluation_at`.
+(60-86400), `interval_seconds` (60-86400), `enabled`, `state`
+(`ok` | `alerting`), `last_evaluated_at`, `last_count`, `last_error`,
+`last_error_at`, `next_evaluation_at`.
 The worker evaluates due alerts (atomic claim, same pattern as monitors):
 condition met while `ok` → `alerting`, opens an incident
 (`incidents.log_alert_id`), notifies through `alerts::notify_transition`;
 condition clears while `alerting` → `ok`, resolves the incident.
+While a project-wide maintenance window (one with no monitor) is in
+effect, the alert's state machine stands still, as for heartbeats: the
+count is recorded, but the state does not change, no incident opens or
+resolves and nothing is sent. A monitor-scoped window does not hold it.
+The first evaluation after the window applies the transition. A failed
+count (ClickHouse unavailable, or a query error) changes nothing except
+`last_error` / `last_error_at`, a fixed, user-safe text (never
+ClickHouse's own message), so an alert whose query keeps failing is
+visible instead of silently never evaluating. The next successful
+evaluation clears `last_error`.
 No-data handling, confirmation/recovery periods and per-series incidents
 arrive with the Metrics sub-project's shared alert evaluator.
 

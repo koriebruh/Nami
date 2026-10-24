@@ -1,5 +1,7 @@
 # Uptime Monitoring — Phase 3 Implementation Plan
 
+> **Status:** done. Historical record of a merged phase. Paths, module names and migration numbers below predate the 2026-10-19 restructure; translate them with `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. Do not execute this plan again.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the last BetterStack uptime gaps: heartbeat failure pings (`/fail`, exit codes) with captured, sanitized job output attached to incidents; heartbeat groups shared with monitor groups; bulk monitor import (URL list, Uptime Kuma backup JSON, UptimeRobot CSV); per-monitor IP version, a per-check cookie jar and an HTTP(S) proxy with encrypted credentials; an availability (SLA) report over any range; a CSV export of check history; and the nami-ui screens for all of it.

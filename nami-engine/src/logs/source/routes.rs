@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     core::error::AppError,
-    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::middleware::rbac::{CurrentUser, Role, require_project_role},
     core::state::AppState,
     logs::ingest::{
         normalize, pipeline,
@@ -70,7 +70,7 @@ async fn list_sources(
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<Vec<Source>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     Ok(Json(source::list_for_project(&state.db, project_id).await?))
 }
 
@@ -80,7 +80,7 @@ async fn create_source(
     Path(project_id): Path<Uuid>,
     Json(payload): Json<CreateSourceRequest>,
 ) -> Result<(StatusCode, NoStore, Json<SourceWithToken>), AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let config = source::validate(payload.into_config()).map_err(AppError::Validation)?;
     let max = state.config.max_sources_per_project;
     let created =
@@ -102,7 +102,7 @@ async fn get_source(
     user: CurrentUser,
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Source>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let found = source::find_in_project(&state.db, project_id, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -115,7 +115,7 @@ async fn patch_source(
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PatchSourceRequest>,
 ) -> Result<Json<Source>, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let updated = source::update_in_project(&state.db, project_id, source_id, payload)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -127,7 +127,7 @@ async fn delete_source(
     user: CurrentUser,
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, AppError> {
-    require_project_role(&state.db, &user, project_id, "admin").await?;
+    require_project_role(&state.db, &user, project_id, Role::Admin).await?;
     if !source::delete_in_project(&state.db, project_id, source_id).await? {
         return Err(AppError::NotFound);
     }
@@ -139,7 +139,7 @@ async fn reveal_token(
     user: CurrentUser,
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> Result<(NoStore, Json<Value>), AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let token = source::reveal_token(&state.db, &state.cipher, project_id, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -151,7 +151,7 @@ async fn rotate_token(
     user: CurrentUser,
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> Result<(NoStore, Json<SourceWithToken>), AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let rotated = source::rotate_token(&state.db, &state.cipher, project_id, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -172,7 +172,7 @@ async fn source_usage(
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
     query: Result<Query<UsageQuery>, QueryRejection>,
 ) -> Result<Json<Vec<DailyUsage>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     source::find_in_project(&state.db, project_id, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -238,7 +238,7 @@ async fn get_pipeline(
     user: CurrentUser,
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let (rules, updated_at) = source::get_pipeline(&state.db, project_id, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -253,7 +253,7 @@ async fn put_pipeline(
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PipelineBody>,
 ) -> Result<Json<Value>, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     // 404 for a source outside this project before any CPU is spent on the
     // rules, as the preview does.
     source::find_in_project(&state.db, project_id, source_id)
@@ -269,16 +269,28 @@ async fn put_pipeline(
 /// Runs `rules` (not necessarily the stored ones) over at most
 /// [`pipeline::MAX_TEST_EVENTS`] sample events and shows what each would
 /// become. Nothing is stored and no sample counter outlives the request.
+/// At most [`pipeline::MAX_PIPELINE_PREVIEWS_PER_USER`] previews per user and
+/// [`pipeline::MAX_PIPELINE_PREVIEWS_PER_INSTANCE`] in all run at once; past
+/// either, 429.
 async fn test_pipeline(
     State(state): State<AppState>,
     user: CurrentUser,
     Path((project_id, source_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PipelineTestBody>,
 ) -> Result<Json<Value>, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let source = source::ingest_source(&state.db, project_id, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
+    let permit = state
+        .logs
+        .pipeline_previews
+        .acquire_capped(
+            user.id,
+            pipeline::MAX_PIPELINE_PREVIEWS_PER_USER,
+            pipeline::MAX_PIPELINE_PREVIEWS_PER_INSTANCE,
+        )
+        .map_err(|_| AppError::RateLimited)?;
     if payload.events.len() > pipeline::MAX_TEST_EVENTS {
         return Err(AppError::Validation(format!(
             "at most {} sample events",
@@ -299,6 +311,9 @@ async fn test_pipeline(
         .collect::<Result<_, _>>()?;
     let rules = payload.rules;
     let results = blocking(move || -> Result<Vec<Value>, AppError> {
+        // Held by the work itself: a client that hangs up drops the handler,
+        // not the blocking thread, so the slot lasts as long as the CPU use.
+        let _permit = permit;
         let compiled = pipeline::parse_rules(&rules)
             .and_then(|parsed| pipeline::compile(&parsed))
             .map_err(|error| AppError::Validation(error.to_string()))?;

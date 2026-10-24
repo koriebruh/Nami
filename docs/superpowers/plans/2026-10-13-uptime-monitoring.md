@@ -1,5 +1,7 @@
 # Uptime Monitoring Implementation Plan
 
+> **Status:** done. Historical record of a merged phase. Paths, module names and migration numbers below predate the 2026-10-19 restructure; translate them with `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. Do not execute this plan again.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add uptime monitoring to Nami — http/keyword/tcp monitors checked on an interval, cron-job heartbeats, automatic incidents with email alerts, and uptime/response-time history — plus the nami-ui pages to manage and watch them.

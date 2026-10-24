@@ -1,5 +1,7 @@
 # Uptime Monitoring — Phase 2 Implementation Plan
 
+> **Status:** done. Historical record of a merged phase. Paths, module names and migration numbers below predate the 2026-10-19 restructure; translate them with `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. Do not execute this plan again.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the remaining BetterStack uptime gaps in Nami — request configuration with encrypted write-only secrets, eight more monitor types (ping, DNS, SSL and domain expiry, SMTP/POP3/IMAP, UDP), a recovery threshold, one-off and weekly maintenance windows, and monitor groups — with the nami-ui screens to manage them.

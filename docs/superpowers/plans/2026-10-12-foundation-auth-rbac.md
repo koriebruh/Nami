@@ -1,5 +1,7 @@
 # Foundation: Auth, Sessions, RBAC Implementation Plan
 
+> **Status:** done. Historical record of a merged phase. Paths, module names and migration numbers below predate the 2026-10-19 restructure; translate them with `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. Do not execute this plan again.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build `nami-engine` (Rust/Axum) auth: registration, email verification, password login with optional TOTP 2FA, OAuth (Google/GitHub), password reset, server-side sessions, and two-level RBAC (global role + per-project role) — plus the `nami-ui` BFF wiring that proxies to it.

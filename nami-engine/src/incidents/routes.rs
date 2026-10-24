@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     core::error::AppError,
-    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::middleware::rbac::{CurrentUser, Role, require_project_role},
     core::state::AppState,
     incidents::model::{self as incident, IncidentListItem},
 };
@@ -29,7 +29,7 @@ async fn list_incidents(
     Path(project_id): Path<Uuid>,
     Query(query): Query<IncidentsQuery>,
 ) -> Result<Json<Vec<IncidentListItem>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     if let Some(status) = query.status.as_deref()
         && !matches!(status, "open" | "resolved")
     {

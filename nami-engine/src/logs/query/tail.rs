@@ -11,6 +11,21 @@
 //! already shown) is still delivered, as long as its `dt` is within the
 //! look-back. Rows already stored when the tail starts are not sent.
 //!
+//! Every `event: log` carries `id:` [`Cursor::encode`] of its row. A client
+//! that reconnects with that `Last-Event-ID` ([`resume_cursor`]: dated within
+//! the last [`RESUME_WINDOW`]) gets the rows after it on its first poll,
+//! oldest first, at most [`TailTimings::batch`] of them (with more, the
+//! newest are replayed and the older part of the gap is lost). Late rows
+//! dated at or before the cursor that arrived during the gap are not
+//! replayed. The id is the row's own, so after a late row (sent after newer
+//! ones) the resume sends those newer rows again; the explorer drops them by
+//! id. A quiet tail whose last row is older than [`RESUME_WINDOW`] when it
+//! reconnects (the 30-minute timeout included) starts normally, and rows
+//! stored during the reconnect delay are not sent. The cursor only moves the
+//! first poll's lower `dt` bound (never more than [`RESUME_WINDOW`] back)
+//! and sets a bound flag column: the project and filters are the request's,
+//! as for any poll.
+//!
 //! The session is re-checked every [`TailTimings::recheck`] (logged out,
 //! password changed, or removed from the project ends the stream with
 //! `event: end` / `{"reason":"session"}`), and the stream ends after
@@ -26,7 +41,10 @@
 use std::{
     collections::HashMap,
     convert::Infallible,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -40,11 +58,11 @@ use uuid::Uuid;
 use crate::logs::{
     LogsState,
     query::search::{self, ENTRY_COLUMNS, LogEntry, RawEntry},
-    query::{self, LogFilters, Sql},
+    query::{self, Cursor, LogFilters, Sql},
 };
 use crate::{
     core::error::AppError,
-    core::middleware::rbac::{require_project_role, user_from_session},
+    core::middleware::rbac::{Role, require_project_role, user_from_session},
     core::state::AppState,
 };
 
@@ -72,6 +90,36 @@ pub const MAX_TAILS_GLOBAL: usize = 200;
 /// to the rows of one window; this is the hard ceiling (the oldest rows go
 /// first, so the worst case is a repeated old row, never unbounded memory).
 pub const MAX_SENT_IDS: usize = 20_000;
+
+/// How far back a `Last-Event-ID` may point and still be resumed from.
+pub const RESUME_WINDOW: Duration = Duration::from_secs(300);
+
+/// Longest `Last-Event-ID` decoded; anything longer is ignored unread.
+pub const MAX_RESUME_ID_BYTES: usize = 128;
+
+/// A `Last-Event-ID` worth resuming from: a cursor of at most
+/// [`MAX_RESUME_ID_BYTES`], dated within the last [`RESUME_WINDOW`] and not
+/// more than [`FUTURE_ALLOWANCE`] ahead of `now`. Anything else is `None`
+/// (a normal start).
+pub fn resume_cursor(header: Option<&str>, now: DateTime<Utc>) -> Option<Cursor> {
+    let raw = header?;
+    if raw.len() > MAX_RESUME_ID_BYTES {
+        return None;
+    }
+    let cursor = Cursor::decode(raw)?;
+    let age_ms = now.timestamp_millis().checked_sub(cursor.dt_ms)?;
+    let window_ms = i64::try_from(RESUME_WINDOW.as_millis()).ok()?;
+    let ahead_ms = i64::try_from(FUTURE_ALLOWANCE.as_millis()).ok()?;
+    (-ahead_ms..=window_ms).contains(&age_ms).then_some(cursor)
+}
+
+/// What the tails of this instance read (R-P2-25): id polls that succeeded
+/// and list rows fetched. Relaxed counters, for tests and later metrics.
+#[derive(Debug, Default)]
+pub struct TailStats {
+    pub id_polls: AtomicU64,
+    pub rows_fetched: AtomicU64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TailTimings {
@@ -224,11 +272,15 @@ fn end_event(reason: &str) -> Event {
 struct IdRow {
     id: Uuid,
     dt: DateTime<Utc>,
+    /// After the resume cursor (only read by a resume poll).
+    #[serde(default)]
+    after: bool,
 }
 
 /// The ids (and `dt`) of the newest rows of the project matching `filters`
-/// with `dt` in `since..=until`, newest first. Same builder and the same
-/// read-only, time-limited client path as search.
+/// with `dt` in `since..=until`, newest first, each flagged `after` when it
+/// comes after `resume`. Same builder and the same read-only, time-limited
+/// client path as search.
 async fn fetch_ids(
     state: &AppState,
     project_id: Uuid,
@@ -236,18 +288,34 @@ async fn fetch_ids(
     since: DateTime<Utc>,
     until: DateTime<Utc>,
     batch: u32,
+    resume: Option<Cursor>,
 ) -> Result<Vec<IdRow>, AppError> {
     let mut sql = Sql::new();
-    sql.push("SELECT id, dt FROM logs");
+    match resume {
+        // ClickHouse compares the tuple: its UUID order is the ids'
+        // generation order, which Rust's `Uuid` order is not.
+        Some(cursor) => {
+            sql.push("SELECT id, dt, toBool((dt, id) > (fromUnixTimestamp64Milli(")
+                .value("Int64", cursor.dt_ms.to_string())
+                .push(", 'UTC'), ")
+                .value("UUID", cursor.id.to_string())
+                .push(")) AS after FROM logs");
+        }
+        None => {
+            sql.push("SELECT id, dt FROM logs");
+        }
+    }
     query::push_where(&mut sql, project_id, filters);
     push_range(&mut sql, since, until);
     sql.push(" ORDER BY dt DESC, id DESC LIMIT ")
         .value("UInt32", batch.to_string());
-    state
+    let rows = state
         .clickhouse
         .query_rows_with(sql.text(), &sql.params(), &search::READ_SETTINGS)
         .await
-        .map_err(search::user_error)
+        .map_err(search::user_error)?;
+    state.logs.tail_stats.id_polls.fetch_add(1, Ordering::Relaxed);
+    Ok(rows)
 }
 
 /// The list rows of `ids` (rows of the project with `dt` in
@@ -272,6 +340,11 @@ async fn fetch_rows(
         .query_rows_with(sql.text(), &sql.params(), &search::READ_SETTINGS)
         .await
         .map_err(search::user_error)?;
+    state
+        .logs
+        .tail_stats
+        .rows_fetched
+        .fetch_add(rows.len() as u64, Ordering::Relaxed);
     Ok(rows.into_iter().map(LogEntry::from).collect())
 }
 
@@ -302,7 +375,7 @@ async fn check_session(state: &AppState, session: &Session, project_id: Uuid) ->
         Err(AppError::Unauthorized) => return SessionCheck::Gone,
         Err(_) => return SessionCheck::Unknown,
     };
-    match require_project_role(&state.db, &user, project_id, "viewer").await {
+    match require_project_role(&state.db, &user, project_id, Role::Viewer).await {
         Ok(_) => SessionCheck::Valid,
         Err(AppError::Forbidden) => SessionCheck::Gone,
         Err(_) => SessionCheck::Unknown,
@@ -326,22 +399,24 @@ async fn send_bounded(
 }
 
 /// Streams into `tx` until the client goes away, the session becomes
-/// invalid, or the maximum duration passes.
+/// invalid, or the maximum duration passes. With `resume` (see
+/// [`resume_cursor`]) the first poll sends the rows after it.
 pub async fn run(
     state: AppState,
     session: Session,
     project_id: Uuid,
     filters: LogFilters,
+    mut resume: Option<Cursor>,
     tx: EventSender,
 ) {
     let timings = state.logs.tail;
     let lookback = chrono::Duration::from_std(timings.lookback)
         .unwrap_or_else(|_| chrono::Duration::seconds(60));
+    let resume_window =
+        chrono::Duration::from_std(RESUME_WINDOW).unwrap_or_else(|_| chrono::Duration::minutes(5));
     let deadline = Instant::now() + timings.max_duration;
     let mut next_recheck = Instant::now() + timings.recheck;
     let mut sent = SentIds::default();
-    // Until one poll succeeded, rows are only remembered, never sent: they
-    // were stored before the tail started.
     let mut primed = false;
     let mut unknown_checks = 0u32;
     let mut ticker = tokio::time::interval(timings.poll);
@@ -400,8 +475,17 @@ pub async fn run(
         let now = Utc::now();
         let since = now - lookback;
         let until = now + chrono::Duration::from_std(FUTURE_ALLOWANCE).unwrap_or_default();
+        // A resume poll reads back to the cursor, and at least the usual
+        // look-back, so every row a later poll can see is sent or remembered.
+        // A resume retried for a while never reaches past RESUME_WINDOW.
+        let poll_since = match resume {
+            Some(cursor) => DateTime::from_timestamp_millis(cursor.dt_ms)
+                .map_or(since, |at| at.min(since))
+                .max(now - resume_window),
+            None => since,
+        };
         let polled = tokio::select! {
-            polled = fetch_ids(&state, project_id, &filters, since, until, timings.batch) => polled,
+            polled = fetch_ids(&state, project_id, &filters, poll_since, until, timings.batch, resume) => polled,
             _ = tx.closed() => return,
         };
         let ids = match polled {
@@ -411,38 +495,51 @@ pub async fn run(
                 continue;
             }
         };
-        let fresh: Vec<&IdRow> = ids.iter().filter(|row| !sent.contains(&row.id)).collect();
-        if !primed || fresh.is_empty() {
-            // Rows stored before the tail started are only remembered.
-            for row in fresh {
+        // Until one poll succeeded, rows are only remembered (they were stored
+        // before the tail started), except those after a resume cursor.
+        let (fresh, known): (Vec<&IdRow>, Vec<&IdRow>) = ids
+            .iter()
+            .filter(|row| !sent.contains(&row.id))
+            .partition(|row| primed || row.after);
+        if fresh.is_empty() {
+            for row in known {
                 sent.insert(row.id, row.dt);
             }
             primed = true;
+            resume = None;
             sent.prune(since, MAX_SENT_IDS);
             continue;
         }
         let fresh_ids: Vec<Uuid> = fresh.iter().map(|row| row.id).collect();
         let fetched = tokio::select! {
-            fetched = fetch_rows(&state, project_id, &fresh_ids, since, until) => fetched,
+            fetched = fetch_rows(&state, project_id, &fresh_ids, poll_since, until) => fetched,
             _ = tx.closed() => return,
         };
         let rows = match fetched {
             Ok(rows) => rows,
             Err(error) => {
-                // Not remembered: the next poll tries these rows again.
+                // Not remembered (and a resume is kept): the next poll tries
+                // these rows again.
                 tracing::warn!(error = ?error, "live tail poll failed");
                 continue;
             }
         };
         // Remembered even when not returned (gone in between): asked once.
-        for row in fresh {
+        for row in fresh.into_iter().chain(known) {
             sent.insert(row.id, row.dt);
         }
+        primed = true;
+        resume = None;
         for row in rows {
             let Ok(data) = serde_json::to_string(&row) else {
                 continue;
             };
-            let event = Event::default().event("log").data(data);
+            let id = Cursor {
+                dt_ms: row.dt.timestamp_millis(),
+                id: row.id,
+            }
+            .encode();
+            let event = Event::default().event("log").id(id).data(data);
             if !send_bounded(&tx, event, deadline, timings.send_timeout).await {
                 return;
             }
@@ -476,6 +573,59 @@ mod tests {
         drop(first);
         assert_eq!(logs.tail_slots.open(a), (2, 1));
         let _again = TailPermit::acquire_with(&logs, b, 2, 3).unwrap();
+    }
+
+    #[test]
+    fn only_recent_well_formed_cursors_resume() {
+        let now = Utc::now();
+        let at = |offset: chrono::Duration| {
+            Cursor {
+                dt_ms: (now + offset).timestamp_millis(),
+                id: Uuid::new_v4(),
+            }
+            .encode()
+        };
+        assert!(resume_cursor(Some(&at(-chrono::Duration::seconds(30))), now).is_some());
+        assert!(
+            resume_cursor(Some(&at(-chrono::Duration::minutes(6))), now).is_none(),
+            "too old"
+        );
+        assert!(
+            resume_cursor(Some(&at(chrono::Duration::minutes(5))), now).is_none(),
+            "in the future"
+        );
+        assert!(resume_cursor(Some("not a cursor"), now).is_none());
+        assert!(
+            resume_cursor(Some(&"A".repeat(129)), now).is_none(),
+            "over 128 bytes: not even decoded"
+        );
+        assert!(resume_cursor(None, now).is_none());
+
+        let ms = chrono::Duration::milliseconds;
+        let window = chrono::Duration::from_std(RESUME_WINDOW).unwrap();
+        let ahead = chrono::Duration::from_std(FUTURE_ALLOWANCE).unwrap();
+        assert!(resume_cursor(Some(&at(-window)), now).is_some(), "at the window");
+        assert!(resume_cursor(Some(&at(-window - ms(1))), now).is_none());
+        assert!(resume_cursor(Some(&at(ahead)), now).is_some(), "at the allowance");
+        assert!(resume_cursor(Some(&at(ahead + ms(1))), now).is_none());
+    }
+
+    #[test]
+    fn a_resume_id_is_read_up_to_its_length_cap() {
+        use base64::Engine as _;
+        let now = Utc::now();
+        // Leading zeros still parse as the same `dt_ms`, so a valid cursor
+        // can be padded to any length.
+        let padded = |encoded_len: usize| {
+            let raw_len = encoded_len * 3 / 4;
+            let tail = format!("{}:{}", now.timestamp_millis(), Uuid::new_v4());
+            let text = format!("{}{tail}", "0".repeat(raw_len - tail.len()));
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(text);
+            assert_eq!(encoded.len(), encoded_len);
+            encoded
+        };
+        assert!(resume_cursor(Some(&padded(MAX_RESUME_ID_BYTES)), now).is_some());
+        assert!(resume_cursor(Some(&padded(MAX_RESUME_ID_BYTES + 4)), now).is_none());
     }
 
     #[test]

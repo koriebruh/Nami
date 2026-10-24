@@ -371,7 +371,11 @@ fn log_dropped(affected: &[(TransitionKind, Subject)]) {
 /// task sends one alert after the other. Never waits: when
 /// `MAX_NOTIFICATION_BATCHES` batches are still sending, the new batch is
 /// refused and its alerts are logged as dropped.
-fn spawn_alerts(state: &AppState, notifications: &Notifications, transitions: Vec<Transition>) {
+pub(crate) fn spawn_alerts(
+    state: &AppState,
+    notifications: &Notifications,
+    transitions: Vec<Transition>,
+) {
     if transitions.is_empty() {
         return;
     }

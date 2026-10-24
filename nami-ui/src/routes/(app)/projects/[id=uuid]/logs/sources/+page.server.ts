@@ -38,6 +38,9 @@ export const actions: Actions = {
 			method: 'POST',
 			body: JSON.stringify(parsed.payload)
 		});
+		if (response.status === 403) {
+			return fail(403, { message: 'Only project members and admins can create a source.' });
+		}
 		if (!response.ok) return engineFailure(response, 'Could not create the source.');
 		const created: SourceWithToken = await response.json();
 		return { created: { id: created.id, name: created.name, token: created.token } };

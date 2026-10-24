@@ -173,6 +173,33 @@ export type LogEntry = {
 	truncated?: boolean;
 };
 
+const ENTRY_STRINGS = ['id', 'source_id', 'dt', 'level', 'message', 'trace_id', 'span_id', 'pattern_hash'] as const;
+
+/** A row as the live tail sends it (the stream is not trusted to keep its shape). */
+export function isLogEntry(value: unknown): value is LogEntry {
+	if (!value || typeof value !== 'object') return false;
+	const entry = value as Record<string, unknown>;
+	return (
+		ENTRY_STRINGS.every((key) => typeof entry[key] === 'string') &&
+		typeof entry.fields === 'object' &&
+		entry.fields !== null &&
+		(entry.truncated === undefined || typeof entry.truncated === 'boolean')
+	);
+}
+
+/** `incoming` (oldest first) prepended newest-first to `existing`, without duplicate ids, at most `cap` rows. */
+export function mergeLiveRows(existing: LogEntry[], incoming: LogEntry[], cap: number): LogEntry[] {
+	const seen = new Set<string>();
+	const merged: LogEntry[] = [];
+	for (const row of [...[...incoming].reverse(), ...existing]) {
+		if (merged.length >= cap) break;
+		if (seen.has(row.id)) continue;
+		seen.add(row.id);
+		merged.push(row);
+	}
+	return merged;
+}
+
 /** The BFF URL of one whole row, from the explorer at `explorerPath`. */
 export function entryHref(explorerPath: string, row: Pick<LogEntry, 'id' | 'dt'>): string {
 	return `${explorerPath}/entry/${encodeURIComponent(row.id)}?${new URLSearchParams({ dt: row.dt })}`;
@@ -226,6 +253,10 @@ export const PAGE_SIZE = 100;
 /** Live rows kept in the page; older ones fall off. */
 export const LIVE_ROW_CAP = 1000;
 
+export type ExplorerTab = 'results' | 'patterns';
+/** Pattern filters per explorer URL. */
+export const MAX_PATTERNS = 100;
+
 /** Everything the explorer shows, as it lives in the URL (never a token). */
 export type ExplorerState = {
 	range: TimePreset | 'custom';
@@ -239,6 +270,9 @@ export type ExplorerState = {
 	filters: FieldFilter[];
 	columns: string[];
 	live: boolean;
+	tab: ExplorerTab;
+	/** Pattern hashes (decimal u64 strings) the results are limited to. */
+	patterns: string[];
 };
 
 const SEGMENT = /^[A-Za-z0-9_-]{1,64}$/;
@@ -253,13 +287,20 @@ export function filterNeedsValue(op: FilterOp): boolean {
 	return op !== 'exists';
 }
 
+const U64_MAX = BigInt('18446744073709551615');
+
+/** A decimal pattern hash within the engine's u64 range. */
+export function isPatternHash(value: string): boolean {
+	return /^\d{1,20}$/.test(value) && BigInt(value) <= U64_MAX;
+}
+
 function isoOrNull(raw: string | null): string | null {
 	if (!raw) return null;
 	const time = Date.parse(raw);
 	return Number.isNaN(time) ? null : new Date(time).toISOString();
 }
 
-function parseFilter(raw: string): FieldFilter | null {
+export function parseFilter(raw: string): FieldFilter | null {
 	try {
 		const value = JSON.parse(raw);
 		if (!value || typeof value.path !== 'string' || !isFieldPath(value.path)) return null;
@@ -300,7 +341,9 @@ export function parseExplorerState(params: URLSearchParams): ExplorerState {
 			.filter((filter): filter is FieldFilter => filter !== null)
 			.slice(0, MAX_FILTERS),
 		columns: unique(params.getAll('col').filter(isFieldPath)).slice(0, MAX_COLUMNS),
-		live: params.get('live') === '1'
+		live: params.get('live') === '1',
+		tab: params.get('tab') === 'patterns' ? 'patterns' : 'results',
+		patterns: unique(params.getAll('pattern').filter(isPatternHash)).slice(0, MAX_PATTERNS)
 	};
 }
 
@@ -320,6 +363,8 @@ export function explorerParams(state: ExplorerState): URLSearchParams {
 	for (const source of state.sources) params.append('source', source);
 	for (const filter of state.filters) params.append('filter', JSON.stringify(filter));
 	for (const column of state.columns) params.append('col', column);
+	if (state.tab === 'patterns') params.set('tab', 'patterns');
+	for (const pattern of state.patterns) params.append('pattern', pattern);
 	if (state.live) params.set('live', '1');
 	return params;
 }
@@ -347,7 +392,13 @@ export function tailParams(state: ExplorerState): URLSearchParams {
 	if (state.q) params.set('q', state.q);
 	if (state.q && state.inFields) params.set('in_fields', 'true');
 	for (const filter of state.filters) params.append('filter', JSON.stringify(filter));
+	for (const pattern of state.patterns) params.append('pattern_hash', pattern);
 	return params;
+}
+
+/** What restarts the live tail: only the filters it sends. */
+export function tailKey(state: ExplorerState): string {
+	return tailParams(state).toString();
 }
 
 /** Search and histogram parameters: the filters plus the window. */
@@ -356,6 +407,85 @@ export function engineParams(state: ExplorerState, window: { from: string; to: s
 	params.set('from', window.from);
 	params.set('to', window.to);
 	return params;
+}
+
+/** One row of `GET /logs/patterns` (the top 100 of the window). */
+export type PatternCount = {
+	pattern_hash: string;
+	pattern: string;
+	count: number;
+	first_seen: string;
+	last_seen: string;
+};
+
+/** The engine's export cap (`X-Nami-Export-Limit`); a link cannot read the header first (R-P2-16). */
+export const EXPORT_ROW_LIMIT = 100_000;
+export type ExportFormat = 'csv' | 'ndjson';
+
+/** The BFF export link of the shown window; CSV also carries the picked columns. */
+export function exportHref(
+	path: string,
+	state: ExplorerState,
+	window: { from: string; to: string },
+	format: ExportFormat
+): string {
+	const params = engineParams(state, window);
+	params.set('format', format);
+	if (format === 'csv') for (const column of state.columns) params.append('columns', column);
+	return `${path}/export?${params}`;
+}
+
+/** The warning to show before an export of `total` rows, or null. */
+export function exportWarning(total: number): string | null {
+	if (total <= EXPORT_ROW_LIMIT) return null;
+	return `Only the newest ${EXPORT_ROW_LIMIT.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} matching rows will be exported.`;
+}
+
+/** A saved view's query as the engine stores it (R-P2-17); empty parts are left out. */
+export type ViewQuery = {
+	range: TimePreset | 'custom';
+	from?: string;
+	to?: string;
+	q?: string;
+	in_fields?: boolean;
+	levels?: LogLevel[];
+	source_ids?: string[];
+	filters?: FieldFilter[];
+	pattern_hashes?: string[];
+	columns?: string[];
+};
+export type LogView = { id: string; name: string; query: ViewQuery; created_at: string; updated_at: string };
+
+/** The view query of a state. Never `live` or `tab`; a preset stays relative. */
+export function viewQueryFromState(state: ExplorerState): ViewQuery {
+	const query: ViewQuery = { range: state.range };
+	if (state.range === 'custom' && state.from && state.to) {
+		query.from = state.from;
+		query.to = state.to;
+	}
+	if (state.q) query.q = state.q;
+	if (state.inFields) query.in_fields = true;
+	if (state.levels.length) query.levels = state.levels;
+	if (state.sources.length) query.source_ids = state.sources;
+	if (state.filters.length) query.filters = state.filters;
+	if (state.patterns.length) query.pattern_hashes = state.patterns;
+	if (state.columns.length) query.columns = state.columns;
+	return query;
+}
+
+/** The state a view opens: through the URL rules, so a stored value is checked like a typed one. */
+export function stateFromViewQuery(query: ViewQuery): ExplorerState {
+	const params = new URLSearchParams({ range: String(query.range) });
+	if (query.from) params.set('from', query.from);
+	if (query.to) params.set('to', query.to);
+	if (query.q) params.set('q', query.q);
+	if (query.in_fields) params.set('in_fields', '1');
+	for (const level of query.levels ?? []) params.append('level', level);
+	for (const source of query.source_ids ?? []) params.append('source', source);
+	for (const filter of query.filters ?? []) params.append('filter', JSON.stringify(filter));
+	for (const pattern of query.pattern_hashes ?? []) params.append('pattern', pattern);
+	for (const column of query.columns ?? []) params.append('col', column);
+	return parseExplorerState(params);
 }
 
 /** The value at a dot path inside a row's fields (`undefined` when absent). */
@@ -435,4 +565,31 @@ export function bucketParts(bucket: HistogramBucket): {
 /** The end of a bucket (exclusive): its start plus one step. */
 export function bucketEnd(bucket: HistogramBucket, stepSeconds: number): string {
 	return new Date(Date.parse(bucket.start) + stepSeconds * 1000).toISOString();
+}
+
+/** One day of the source usage chart: each series scaled to its own maximum. */
+export type UsageBar = {
+	day: string;
+	events: number;
+	bytes: number;
+	eventsShare: number;
+	bytesShare: number;
+	dropped: number;
+	sampledOut: number;
+	rejected: number;
+};
+
+export function usageBars(days: DailyUsage[]): UsageBar[] {
+	const maxEvents = Math.max(0, ...days.map((d) => d.events));
+	const maxBytes = Math.max(0, ...days.map((d) => d.bytes));
+	return days.map((d) => ({
+		day: d.day,
+		events: d.events,
+		bytes: d.bytes,
+		eventsShare: maxEvents > 0 ? d.events / maxEvents : 0,
+		bytesShare: maxBytes > 0 ? d.bytes / maxBytes : 0,
+		dropped: d.events_dropped,
+		sampledOut: d.events_sampled_out,
+		rejected: d.requests_rate_limited + d.requests_over_quota
+	}));
 }

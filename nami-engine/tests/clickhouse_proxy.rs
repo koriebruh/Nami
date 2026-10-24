@@ -1,3 +1,5 @@
+#![allow(unsafe_code)] // `std::env::set_var` is `unsafe` in edition 2024; this binary owns its process.
+
 //! Proxy environment variables must never reroute ClickHouse requests: they
 //! carry the ClickHouse credentials (and every query parameter), which have no
 //! business passing through a proxy the engine's environment happens to name.

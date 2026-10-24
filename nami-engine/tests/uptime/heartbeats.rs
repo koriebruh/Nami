@@ -745,6 +745,7 @@ fn heartbeat_of(transition: &Transition) -> Uuid {
     match transition.subject {
         Subject::Heartbeat(id) => id,
         Subject::Monitor(id) => panic!("a monitor ({id}) in a heartbeat sweep"),
+        Subject::LogAlert(id) => panic!("a log alert ({id}) in a heartbeat sweep"),
     }
 }
 

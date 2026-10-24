@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::{
     core::error::AppError,
     core::middleware::rbac::{
-        CurrentUser, ProjectReader, require_project_reader, require_project_role,
+        CurrentUser, ProjectReader, Role, require_project_reader, require_project_role,
     },
     core::state::AppState,
     logs::ingest::rate_limit::{InFlight, TokenBuckets},
@@ -94,7 +94,7 @@ async fn get_availability(
     Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
     Query(range): Query<RangeQuery>,
 ) -> Result<Json<Availability>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     availability::check_range(range.from, range.to).map_err(AppError::Validation)?;
     availability::for_heartbeat(
         &state.db,
@@ -115,7 +115,7 @@ async fn list_pings(
     Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<PingsQuery>,
 ) -> Result<Json<Vec<HeartbeatPingRow>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     heartbeat::find_in_project(&state.db, project_id, heartbeat_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -265,7 +265,7 @@ async fn create_heartbeat(
     Path(project_id): Path<Uuid>,
     Json(payload): Json<CreateHeartbeatRequest>,
 ) -> Result<(StatusCode, Json<HeartbeatView>), AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let config = heartbeat::validate(payload.into_config()).map_err(AppError::Validation)?;
     // A group of another project is a 404, like any foreign id.
     if let Some(group_id) = config.group_id
@@ -277,7 +277,7 @@ async fn create_heartbeat(
         .await
         .map_err(|e| match &e {
             // Global admins bypass membership: the project may not exist.
-            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
+            sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
                 AppError::NotFound
             }
             _ => AppError::Database(e),
@@ -307,7 +307,7 @@ async fn patch_heartbeat(
     Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PatchHeartbeatRequest>,
 ) -> Result<Json<HeartbeatView>, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let updated = heartbeat::update_in_project(&state.db, project_id, heartbeat_id, payload)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -321,7 +321,7 @@ async fn rotate_heartbeat_token(
     user: CurrentUser,
     Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<HeartbeatView>, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let rotated = heartbeat::rotate_token(&state.db, project_id, heartbeat_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -333,7 +333,7 @@ async fn delete_heartbeat(
     user: CurrentUser,
     Path((project_id, heartbeat_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, AppError> {
-    require_project_role(&state.db, &user, project_id, "admin").await?;
+    require_project_role(&state.db, &user, project_id, Role::Admin).await?;
     if !heartbeat::delete_in_project(&state.db, project_id, heartbeat_id).await? {
         return Err(AppError::NotFound);
     }

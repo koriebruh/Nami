@@ -81,6 +81,12 @@ impl UserSlots {
         counts.per_user.get(&user_id).copied().unwrap_or(0)
     }
 
+    /// Every key holding at least one slot, with how many it holds.
+    pub fn counts(&self) -> Vec<(Uuid, usize)> {
+        let counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        counts.per_user.iter().map(|(&key, &n)| (key, n)).collect()
+    }
+
     /// Requests running, all users together.
     pub fn total(&self) -> usize {
         self.counts

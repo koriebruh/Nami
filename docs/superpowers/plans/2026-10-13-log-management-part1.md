@@ -1,5 +1,7 @@
 # Log Management — Part 1 Implementation Plan
 
+> **Status:** done. Historical record of a merged phase. Paths, module names and migration numbers below predate the 2026-10-19 restructure; translate them with `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. Do not execute this plan again.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give Nami BetterStack-style log management, part 1: per-project log sources with ingest tokens, HTTP ingestion (JSON, NDJSON, MessagePack, gzip) and RFC 5424 syslog ingestion into ClickHouse, per-source rate limits, usage stats and daily quotas, structured search with a volume histogram, live tail over Server-Sent Events, and the nami-ui sources pages and explorer.

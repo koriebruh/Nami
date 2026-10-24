@@ -35,11 +35,11 @@ export const load: PageServerLoad = async (event) => {
 	}
 	const source: Source = await response.json();
 	// Usage is a nicety: the page works without it.
-	const usageResponse = await callEngine(event, `${path}/usage?days=1`);
-	const today: DailyUsage | null = usageResponse.ok
-		? (((await usageResponse.json()) as DailyUsage[])[0] ?? null)
-		: null;
-	return { source, today, engineUrl: publicEngineUrl(), syslog: publicSyslogAddress() };
+	// The engine answers oldest first and zero-filled, so the last day is today.
+	const usageResponse = await callEngine(event, `${path}/usage?days=30`);
+	const usage: DailyUsage[] = usageResponse.ok ? await usageResponse.json() : [];
+	const today: DailyUsage | null = usage.at(-1) ?? null;
+	return { source, today, usage, engineUrl: publicEngineUrl(), syslog: publicSyslogAddress() };
 };
 
 type ActionName = 'update' | 'reveal' | 'rotate' | 'delete';
@@ -71,6 +71,12 @@ export const actions: Actions = {
 			method: 'PATCH',
 			body: JSON.stringify(parsed.payload)
 		});
+		if (response.status === 403) {
+			return fail(403, {
+				action: 'update' as const,
+				message: 'Only project members and admins can change a source.'
+			});
+		}
 		if (!response.ok) return failure('update', response, 'Could not save the source.');
 		return { saved: true as const };
 	},

@@ -4,6 +4,7 @@
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import Icon from '#lib/components/ui/Icon.svelte';
 	import SegmentedTabs from '#lib/components/ui/SegmentedTabs.svelte';
+	import { isUuid } from '#lib/core/uuid';
 	import { formatDuration, formatUtc } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
@@ -27,10 +28,11 @@
 		tabs.map((tab) => ({ href: `?status=${tab.status}`, label: tab.label, active: data.status === tab.status }))
 	);
 
-	// An incident belongs to a monitor or to a heartbeat (one of the two ids is null).
+	// An incident belongs to a monitor, a heartbeat or a log alert (the other ids are null).
 	function sourceHref(incident: (typeof data.incidents)[number]): string | null {
 		if (incident.monitor_id) return `/projects/${data.project.id}/monitors/${incident.monitor_id}`;
 		if (incident.heartbeat_id) return `/projects/${data.project.id}/heartbeats/${incident.heartbeat_id}`;
+		if (isUuid(incident.log_alert_id)) return `/projects/${data.project.id}/logs/alerts/${incident.log_alert_id}`;
 		return null;
 	}
 </script>

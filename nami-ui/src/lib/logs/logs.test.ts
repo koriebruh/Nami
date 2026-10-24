@@ -6,6 +6,9 @@ import {
 	dockerSnippet,
 	engineParams,
 	entryHref,
+	EXPORT_ROW_LIMIT,
+	exportHref,
+	exportWarning,
 	explorerHref,
 	explorerParams,
 	fieldAt,
@@ -16,17 +19,23 @@ import {
 	fromInputValue,
 	ingestUrl,
 	isFieldPath,
+	isLogEntry,
 	levelClasses,
+	mergeLiveRows,
 	MIB,
 	parseExplorerState,
 	quotaInMib,
 	resolveWindow,
 	rsyslogSnippet,
+	stateFromViewQuery,
+	tailKey,
 	tailParams,
 	toggled,
 	toInputValue,
 	vectorSnippet,
-	type ExplorerState
+	viewQueryFromState,
+	type ExplorerState,
+	type LogEntry
 } from './logs';
 
 describe('formatBytes', () => {
@@ -95,7 +104,9 @@ describe('explorer URL state', () => {
 			sources: [],
 			filters: [],
 			columns: [],
-			live: false
+			live: false,
+			tab: 'results',
+			patterns: []
 		});
 		expect(explorerParams(state).toString()).toBe('');
 		expect(explorerHref('/p/logs', state)).toBe('/p/logs');
@@ -115,7 +126,9 @@ describe('explorer URL state', () => {
 				{ path: 'trace', op: 'exists' }
 			],
 			columns: ['user.id', 'status'],
-			live: true
+			live: true,
+			tab: 'patterns',
+			patterns: ['7']
 		};
 		const url = explorerParams(state);
 		expect(parseExplorerState(url)).toEqual(state);
@@ -179,6 +192,53 @@ describe('explorer URL state', () => {
 	});
 });
 
+describe('explorer state, part 2', () => {
+	it('reads the tab and pattern filters from the URL', () => {
+		// 18446744073709551615 is u64::MAX; one more is not a pattern hash (the engine would answer 400).
+		const state = parseExplorerState(new URLSearchParams(
+			'tab=patterns&pattern=123&pattern=123&pattern=x&pattern=18446744073709551615&pattern=18446744073709551616'
+		));
+		expect(state.tab).toBe('patterns');
+		expect(state.patterns).toEqual(['123', '18446744073709551615']);
+		expect(parseExplorerState(new URLSearchParams('tab=weird')).tab).toBe('results');
+		expect(explorerParams(state).toString()).toBe('tab=patterns&pattern=123&pattern=18446744073709551615');
+		expect(tailParams(state).getAll('pattern_hash')).toEqual(['123', '18446744073709551615']);
+	});
+
+	it('builds export links with the absolute window and the picked columns', () => {
+		const state = parseExplorerState(new URLSearchParams('level=error&col=user.id&live=1&tab=patterns'));
+		const window = { from: '2026-10-19T07:00:00.000Z', to: '2026-10-19T08:00:00.000Z' };
+		const csv = new URL(exportHref('/projects/p/logs', state, window, 'csv'), 'http://ui.test');
+		expect(csv.pathname).toBe('/projects/p/logs/export');
+		expect(Object.fromEntries(csv.searchParams)).toMatchObject({ level: 'error', from: window.from, to: window.to, format: 'csv', columns: 'user.id' });
+		expect(csv.searchParams.has('live') || csv.searchParams.has('tab')).toBe(false);
+		const ndjson = new URL(exportHref('/projects/p/logs', state, window, 'ndjson'), 'http://ui.test');
+		expect(ndjson.searchParams.has('columns')).toBe(false);
+	});
+
+	it('warns before a truncated export', () => {
+		expect(EXPORT_ROW_LIMIT).toBe(100_000);
+		expect(exportWarning(100_000)).toBeNull();
+		expect(exportWarning(250_000)).toBe('Only the newest 100,000 of 250,000 matching rows will be exported.');
+	});
+
+	it('view state round-trips and stays relative', () => {
+		const state = parseExplorerState(new URLSearchParams(
+			'range=6h&q=disk&in_fields=1&level=error&source=c13bc10a-d17f-443b-8976-c6d9b54e2798&col=a.b&pattern=7&live=1&tab=patterns&filter=' +
+				encodeURIComponent('{"path":"a","op":"gt","value":"5"}')
+		));
+		const query = viewQueryFromState(state);
+		expect(query).toEqual({
+			range: '6h', q: 'disk', in_fields: true, levels: ['error'], source_ids: ['c13bc10a-d17f-443b-8976-c6d9b54e2798'],
+			filters: [{ path: 'a', op: 'gt', value: '5' }], pattern_hashes: ['7'], columns: ['a.b']
+		});
+		expect(stateFromViewQuery(query)).toEqual({ ...state, live: false, tab: 'results' });
+		const custom = viewQueryFromState(parseExplorerState(new URLSearchParams('range=custom&from=2026-10-01T00:00:00.000Z&to=2026-10-02T00:00:00.000Z')));
+		expect(custom).toEqual({ range: 'custom', from: '2026-10-01T00:00:00.000Z', to: '2026-10-02T00:00:00.000Z' });
+		expect(stateFromViewQuery({ range: '1h', levels: ['loud' as any] }).levels).toEqual([]);
+	});
+});
+
 describe('row helpers', () => {
 	it('reads field paths', () => {
 		const fields = { user: { id: 42, tags: ['a'] }, status: 'ok' };
@@ -235,5 +295,57 @@ describe('entryHref', () => {
 				dt: '2026-10-13T12:00:00.123Z'
 			})
 		).toBe('/projects/p/logs/entry/1c7f4f4e-7e3b-4d2f-8c8b-3a2e4d5c6b70?dt=2026-10-13T12%3A00%3A00.123Z');
+	});
+});
+
+const row = (id: string, message = id): LogEntry =>
+	({
+		id,
+		source_id: 'c13bc10a-d17f-443b-8976-c6d9b54e2798',
+		dt: '2026-10-19T08:00:00.000Z',
+		level: 'info',
+		message,
+		fields: {},
+		trace_id: '',
+		span_id: '',
+		pattern_hash: '1',
+		truncated: false
+	}) as LogEntry;
+
+describe('live rows', () => {
+	it('validates incoming rows', () => {
+		expect(isLogEntry(row('a'))).toBe(true);
+		const { truncated: _, ...untruncated } = row('a');
+		expect(isLogEntry(untruncated)).toBe(true);
+		expect(isLogEntry({ id: 'a' })).toBe(false);
+		expect(isLogEntry({ ...row('a'), message: 5 })).toBe(false);
+		expect(isLogEntry({ ...row('a'), truncated: 'yes' })).toBe(false);
+		expect(isLogEntry({ ...row('a'), fields: null })).toBe(false);
+		expect(isLogEntry(null)).toBe(false);
+	});
+	it('prepends newest first, drops duplicates and caps', () => {
+		const merged = mergeLiveRows([row('b'), row('a')], [row('b'), row('c'), row('d')], 3);
+		expect(merged.map((r) => r.id)).toEqual(['d', 'c', 'b']);
+	});
+	it('restarts the tail only for filter changes', () => {
+		const base = parseExplorerState(new URLSearchParams('level=error&live=1'));
+		expect(tailKey({ ...base, columns: ['a.b'] })).toBe(tailKey(base));
+		expect(tailKey({ ...base, range: '7d' })).toBe(tailKey(base));
+		expect(tailKey({ ...base, q: 'disk' })).not.toBe(tailKey(base));
+	});
+});
+
+// Separate import so the block above stays as it is (NAMI-LOG-16).
+import { usageBars } from './logs';
+
+describe('usageBars', () => {
+	it('scales each series to its own maximum and sums the rejections', () => {
+		const day = (d: string, events: number, bytes: number) => ({
+			day: d, events, bytes, events_dropped: 1, events_sampled_out: 2, requests_rate_limited: 3, requests_over_quota: 4
+		});
+		const bars = usageBars([day('2026-10-18', 50, 4000), day('2026-10-19', 100, 1000)]);
+		expect(bars.map((b) => [b.eventsShare, b.bytesShare])).toEqual([[0.5, 1], [1, 0.25]]);
+		expect(bars[0]).toMatchObject({ dropped: 1, sampledOut: 2, rejected: 7 });
+		expect(usageBars([day('2026-10-19', 0, 0)])[0].eventsShare).toBe(0);
 	});
 });

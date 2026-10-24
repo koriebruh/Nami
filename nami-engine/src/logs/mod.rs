@@ -1,8 +1,9 @@
 //! Log management: sources and their pipelines (`source`), saved views
-//! (`view`), ingestion (`ingest`: HTTP bodies, normalization, per-source
+//! (`view`), log alerts (`alert`), ingestion (`ingest`: HTTP bodies, normalization, per-source
 //! pipelines, rate limits, storage in ClickHouse and usage accounting),
 //! syslog ingestion over TCP and UDP (`syslog`), and reading (`query`:
 //! search, patterns, the live tail and the streamed export).
+pub mod alert;
 pub mod ingest;
 pub mod query;
 pub mod source;
@@ -31,6 +32,8 @@ pub struct LogsState {
     /// Live-tail timings (tests shorten them) and open-stream counts.
     pub tail: tail::TailTimings,
     pub tail_slots: tail::TailSlots,
+    /// What the tails read: id polls and list rows (see [`tail::TailStats`]).
+    pub tail_stats: tail::TailStats,
     /// Searches and histograms running per user (see
     /// [`search::MAX_QUERIES_PER_USER`]).
     pub query_slots: search::QuerySlots,
@@ -45,4 +48,10 @@ pub struct LogsState {
     pub export_slots: std::sync::Arc<slots::UserSlots>,
     /// The caps of every export (tests shrink them).
     pub export_limits: export::ExportLimits,
+    /// Pipeline previews running per user and in all (see
+    /// [`ingest::pipeline::MAX_PIPELINE_PREVIEWS_PER_USER`]).
+    pub pipeline_previews: std::sync::Arc<slots::UserSlots>,
+    /// Log alert evaluations running per project on this instance, keyed by
+    /// project id (see [`alert::MAX_ALERT_EVALUATIONS_PER_PROJECT`]).
+    pub alert_evaluations: std::sync::Arc<slots::UserSlots>,
 }

@@ -23,7 +23,7 @@ several independent products, too large for one spec/plan):
 
 1. **Foundation: auth, org, RBAC, session** — done
 2. **Uptime monitoring** (Phases 1-3) — done
-3. Log management — Part 1 done, Part 2 in progress
+3. **Log management** (Parts 1-2) — done
 4. Incident management + on-call alerting
 5. Status page
 6. Metrics + dashboards (+ collector bundle)
@@ -51,15 +51,18 @@ Completed sub-projects:
   phase 2 and 3 specs); decisions
   `docs/superpowers/decisions/2026-10-13-uptime-phase{1,2,3}.md`.
 
-Current sub-project: **Log management, Part 2**
-- Spec: `docs/superpowers/specs/2026-10-13-log-management-design.md`
-- Plan: `docs/superpowers/plans/2026-10-13-log-management-part2.md`
-- NAMI-LOG-9..13 are merged (PRs #56, #63, #67, #75, #76, under the old
-  one-PR-per-task flow). NAMI-LOG-14..18 remain (log alerts, live-tail
-  resume and explorer fixes, and the UI tasks 16-18), then the Part 2
-  security review + fix wave. They ship as one phase PR (branch
-  `feat/logs-part2`).
-- Part 1 decisions: `docs/superpowers/decisions/2026-10-13-log-management-part1.md`.
+Completed: **Log management** (Parts 1-2). Decisions
+`docs/superpowers/decisions/2026-10-13-log-management-part1.md` and
+`docs/superpowers/decisions/2026-10-25-log-management-part2.md`.
+
+Current sub-project: **Incident management + on-call, Part 1**
+- Spec: `docs/superpowers/specs/2026-10-13-incident-management-design.md`
+- Plan: `docs/superpowers/plans/2026-10-13-incident-management-part1.md`
+  (branch `feat/incidents-part1`).
+- Every remaining phase, in order, is in the "Plans and execution order"
+  table of `docs/superpowers/roadmap.md`. Plan rules:
+  `docs/superpowers/plan-conventions.md`; engineering rules:
+  `docs/STANDARDS.md`. `python3 scripts/check-plans.py` must stay green.
 
 Plans written before 2026-10-19 use the old file layout and migration
 numbers: translate them with
