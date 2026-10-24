@@ -132,14 +132,15 @@ async fn a_failing_receiver_is_retried_with_backoff_then_marked_failed(pool: sql
     .await
     .unwrap();
     assert!((25.0..=31.0).contains(&wait), "first retry after ~30 s, got {wait}");
-    for _ in 0..4 {
+    for _ in 1..deliveries::MAX_ATTEMPTS {
         make_due(&pool).await;
         run_incident_ticks(&state).await;
     }
     assert_eq!(delivery(&pool, incident).await.0, "failed");
-    assert_eq!(hook.received_requests().await.unwrap().len(), 5);
+    let attempts = deliveries::MAX_ATTEMPTS as usize;
+    assert_eq!(hook.received_requests().await.unwrap().len(), attempts);
     let events = timeline(&pool, incident).await;
-    assert_eq!(events.len(), 5, "one event per attempt");
+    assert_eq!(events.len(), attempts, "one event per attempt");
     for (_, message) in &events {
         let message = message.as_deref().unwrap();
         assert!(!message.contains("SECRET") && !message.contains("127.0.0.1"), "{message}");
@@ -529,4 +530,95 @@ async fn a_disabled_incidents_worker_sends_nothing(pool: sqlx::PgPool) {
     queue(&pool, incident, "p0r0s0", Target::Email { user_id: user }).await;
     run_incident_ticks(&state).await;
     assert_eq!(delivery(&pool, incident).await, ("pending".into(), 0, None));
+}
+
+#[sqlx::test]
+async fn a_name_refused_at_connect_time_fails_at_once_without_a_retry(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (user, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let incident = open_test_incident(&pool, project, user).await;
+    let receiver = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&receiver).await;
+    // A name, not a literal: the send-time URL check passes it, and the
+    // personal webhook's PublicOnlyResolver refuses it when connecting.
+    let port = receiver.address().port();
+    let personal = insert_channel(
+        &pool,
+        None,
+        Some(user),
+        "mine",
+        ChannelConfig::Webhook { url: format!("http://localhost:{port}/in") },
+    )
+    .await;
+    queue(&pool, incident, "p0r0s0", Target::Channel { channel_id: personal, user_id: Some(user) }).await;
+    run_incident_ticks(&state).await;
+    assert_eq!(delivery(&pool, incident).await, ("failed".into(), 1, Some("destination not allowed".into())));
+    assert_eq!(
+        timeline(&pool, incident).await,
+        [("notification_failed".into(), Some("Webhook: mine: destination not allowed".into()))]
+    );
+    assert!(receiver.received_requests().await.unwrap().is_empty());
+}
+
+#[sqlx::test]
+async fn one_drain_claims_at_most_its_batch(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (user, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let incident = open_test_incident(&pool, project, user).await;
+    let slack = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&slack).await;
+    // Two channels, so the per-channel cap does not bind before the batch.
+    let mut channels = Vec::new();
+    for name in ["a", "b"] {
+        let config = ChannelConfig::Slack { webhook_url: format!("{}/services/{name}", slack.uri()) };
+        channels.push(insert_channel(&pool, Some(project), None, name, config).await);
+    }
+    for n in 0..=deliveries::DRAIN_BATCH {
+        let channel_id = channels[n as usize % 2];
+        queue(&pool, incident, &format!("batch{n}"), Target::Channel { channel_id, user_id: None }).await;
+    }
+    // Older than anything else the drain may find, so these are claimed first.
+    sqlx::query("update notification_deliveries set next_attempt_at = now() - interval '1 hour' where round like 'batch%'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    run_incident_ticks(&state).await;
+    assert_eq!(slack.received_requests().await.unwrap().len() as i64, deliveries::DRAIN_BATCH);
+    let left: (i64, i64) = sqlx::query_as(
+        "select count(*), coalesce(sum(attempts), 0) from notification_deliveries
+         where round like 'batch%' and status = 'pending'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, (1, 0), "the one past the batch waits for the next drain, unattempted");
+}
+
+#[sqlx::test]
+async fn a_personal_channel_of_someone_who_left_the_project_is_not_sent(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (user, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (left, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let slack = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).expect(0).mount(&slack).await;
+    let personal = insert_channel(
+        &pool,
+        None,
+        Some(left),
+        "phone",
+        ChannelConfig::Slack { webhook_url: format!("{}/services/x", slack.uri()) },
+    )
+    .await;
+    let incident = open_test_incident(&pool, project, user).await;
+    sqlx::query("delete from project_members where user_id = $1").bind(left).execute(&pool).await.unwrap();
+    // The owner is found from the channel even when the row names no user.
+    queue(&pool, incident, "p0r0s0", Target::Channel { channel_id: personal, user_id: None }).await;
+    run_incident_ticks(&state).await;
+    assert_eq!(delivery(&pool, incident).await.0, "cancelled");
 }

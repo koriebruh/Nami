@@ -254,13 +254,16 @@ struct Context {
 
 // $1 = incident, $2 = user (or null), $3 = channel (or null). Membership is
 // `project_members` only: a global admin who is not a member is not paged (R7).
+// A personal channel's owner is checked even when the row names no user.
 const CONTEXT: &str = "select i.project_id, p.name as project_name, i.title, i.cause, i.status, i.source,
         coalesce(s.name, 'unknown') as severity, i.started_at, i.details,
         (select e.metadata->>'reason' from incident_events e
          where e.incident_id = i.id and e.kind = 'resolved' order by e.id desc limit 1) as resolution_reason,
         u.email as user_email, u.email_verified_at is not null as user_verified,
-        exists (select 1 from project_members pm
-                where pm.project_id = i.project_id and pm.user_id = $2) as user_is_member,
+        coalesce($2, c.user_id) is null
+            or exists (select 1 from project_members pm
+                       where pm.project_id = i.project_id and pm.user_id = coalesce($2, c.user_id))
+            as user_is_member,
         c.kind as channel_kind, c.name as channel_name, c.enabled as channel_enabled
     from incidents i
     join projects p on p.id = i.project_id
@@ -276,6 +279,8 @@ enum Outcome {
     /// `label` names the target in the timeline: `Slack: <name>`, `Email: <address>`.
     Sent { label: String },
     Failed { label: String, error: SendError },
+    /// Not sent and not recorded: a later claim took the row over.
+    Lost,
 }
 
 impl Outcome {
@@ -307,7 +312,7 @@ async fn attempt(state: &AppState, senders: &Senders, row: &Claimed) -> Result<O
         "resolved" => NotifyEvent::Resolved,
         _ => NotifyEvent::Triggered,
     };
-    if (event == NotifyEvent::Triggered && c.status != "open") || (row.user_id.is_some() && !c.user_is_member) {
+    if (event == NotifyEvent::Triggered && c.status != "open") || !c.user_is_member {
         return Ok(Outcome::Cancelled);
     }
     let message = Message {
@@ -334,6 +339,9 @@ async fn attempt(state: &AppState, senders: &Senders, row: &Claimed) -> Result<O
         actions: None,
     };
 
+    if !renew_lease(&state.db, row).await? {
+        return Ok(Outcome::Lost);
+    }
     let Some(channel_id) = row.channel_id else {
         let email = c.user_email.unwrap_or_default();
         let result = if c.user_verified {
@@ -368,6 +376,25 @@ fn kind_label(kind: &str) -> &str {
     }
 }
 
+// Only while this attempt still holds the row.
+const RENEW: &str = "update notification_deliveries set locked_until = now() + make_interval(secs => $3)
+    where id = $1 and status = 'sending' and attempts = $2";
+
+/// Restarts the lease just before the request, so it covers the send itself
+/// (at most the 10 s client or SMTP timeout) however long the row waited for
+/// a send slot or the database. `false` = a later claim took the row over, and
+/// this attempt must not send it a second time.
+async fn renew_lease(pool: &PgPool, row: &Claimed) -> Result<bool, sqlx::Error> {
+    let renewed = sqlx::query(RENEW)
+        .bind(row.id)
+        .bind(row.attempts)
+        .bind(LEASE.as_secs_f64())
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(renewed == 1)
+}
+
 fn recorded(text: &str) -> String {
     text.chars().take(MAX_RECORDED_CHARS).collect()
 }
@@ -385,6 +412,7 @@ const RECORD: &str = "update notification_deliveries
 /// (never retryable, or the last attempt) or `cancelled` (no event).
 async fn record(pool: &PgPool, row: &Claimed, outcome: Outcome) -> Result<(), sqlx::Error> {
     let (status, error, retry_in, event) = match outcome {
+        Outcome::Lost => return Ok(()),
         Outcome::Cancelled => ("cancelled", None, None, None),
         Outcome::Sent { label } => ("sent", None, None, Some((EventKind::NotificationSent, label))),
         Outcome::Failed { label, error } => {
@@ -424,6 +452,13 @@ mod tests {
     fn backoff_is_30s_times_4_to_the_attempt_capped_at_an_hour() {
         let secs: Vec<u64> = (1..=6).map(|a| backoff(a).as_secs()).collect();
         assert_eq!(secs, [30, 120, 480, 1920, 3600, 3600]);
+    }
+
+    #[test]
+    fn recorded_text_is_cut_at_its_char_limit() {
+        let at = "é".repeat(MAX_RECORDED_CHARS);
+        assert_eq!(recorded(&at), at);
+        assert_eq!(recorded(&format!("{at}x")), at);
     }
 
     #[test]

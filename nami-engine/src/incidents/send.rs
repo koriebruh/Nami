@@ -17,7 +17,7 @@ use crate::{
         outbound::{self, OutboundPolicy, Reach, UrlRule},
     },
     projects::model as projects,
-    uptime::checker::DESTINATION_NOT_ALLOWED,
+    uptime::checker::{DESTINATION_NOT_ALLOWED, DestinationNotAllowed, caused_by},
 };
 
 /// The longest wait a `Retry-After` from a 429 may ask for.
@@ -78,8 +78,9 @@ impl Senders {
 
 /// One request (or one email) to `channel`. Checks the destination again
 /// (`check_url_for_send` with the channel's reach and `s.policy`; a refusal is
-/// `destination not allowed`, never retried), then sends to the URL that check
-/// returns with `outbound::public_client()` for `Reach::PublicOnly` and
+/// `destination not allowed`, never retried, as is a name the client's resolver
+/// refuses at connect time), then sends to the URL that check returns with
+/// `outbound::public_client()` for `Reach::PublicOnly` and
 /// `outbound::client()` otherwise. A webhook carries `X-Nami-Timestamp`,
 /// `X-Nami-Signature: sha256=...` over `{timestamp}.{body}`, `X-Nami-Delivery:
 /// <delivery_id>` and `X-Nami-Event`. 2xx is success; the body of any response
@@ -133,11 +134,15 @@ pub async fn send_to_channel(
     }
     // With no idle pool, dropping the response unread closes the connection:
     // nothing of the body is ever read or kept.
-    let response = request
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| SendError::retry(outbound::describe_error(&e)))?;
+    let response = request.body(body).send().await.map_err(|e| {
+        // A name the resolver refuses (internal for this reach) is refused
+        // again next time: fail it now instead of knocking five times.
+        if caused_by::<DestinationNotAllowed>(&e) {
+            SendError::never(DESTINATION_NOT_ALLOWED)
+        } else {
+            SendError::retry(outbound::describe_error(&e))
+        }
+    })?;
     classify(response.status(), retry_after(response.headers()))
 }
 
