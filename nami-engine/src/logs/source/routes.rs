@@ -269,6 +269,9 @@ async fn put_pipeline(
 /// Runs `rules` (not necessarily the stored ones) over at most
 /// [`pipeline::MAX_TEST_EVENTS`] sample events and shows what each would
 /// become. Nothing is stored and no sample counter outlives the request.
+/// At most [`pipeline::MAX_PIPELINE_PREVIEWS_PER_USER`] previews per user and
+/// [`pipeline::MAX_PIPELINE_PREVIEWS_PER_INSTANCE`] in all run at once; past
+/// either, 429.
 async fn test_pipeline(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -279,6 +282,15 @@ async fn test_pipeline(
     let source = source::ingest_source(&state.db, project_id, source_id)
         .await?
         .ok_or(AppError::NotFound)?;
+    let permit = state
+        .logs
+        .pipeline_previews
+        .acquire_capped(
+            user.id,
+            pipeline::MAX_PIPELINE_PREVIEWS_PER_USER,
+            pipeline::MAX_PIPELINE_PREVIEWS_PER_INSTANCE,
+        )
+        .map_err(|_| AppError::RateLimited)?;
     if payload.events.len() > pipeline::MAX_TEST_EVENTS {
         return Err(AppError::Validation(format!(
             "at most {} sample events",
@@ -299,6 +311,9 @@ async fn test_pipeline(
         .collect::<Result<_, _>>()?;
     let rules = payload.rules;
     let results = blocking(move || -> Result<Vec<Value>, AppError> {
+        // Held by the work itself: a client that hangs up drops the handler,
+        // not the blocking thread, so the slot lasts as long as the CPU use.
+        let _permit = permit;
         let compiled = pipeline::parse_rules(&rules)
             .and_then(|parsed| pipeline::compile(&parsed))
             .map_err(|error| AppError::Validation(error.to_string()))?;

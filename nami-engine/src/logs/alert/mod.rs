@@ -40,6 +40,14 @@ pub const ALERT_CLAIM_BATCH: i64 = 50;
 /// claims only as many alerts as there are free places, so an alert is never
 /// pushed one interval ahead without the capacity to evaluate it.
 pub const MAX_ALERT_EVALUATIONS: usize = 8;
+/// Evaluations of one project running at once on one instance, so a project
+/// with many slow alerts cannot hold every place of [`MAX_ALERT_EVALUATIONS`]
+/// while other projects' alerts wait. Enforced by the claim
+/// ([`claim_due_alerts`]).
+pub const MAX_ALERT_EVALUATIONS_PER_PROJECT: usize = 2;
+// A pass reserves every free place before it claims (`run_pass_with`), which
+// keeps the claims of one instance apart only while one claim can take them all.
+const _: () = assert!(MAX_ALERT_EVALUATIONS as i64 <= ALERT_CLAIM_BATCH);
 
 /// What the worker shows when a count fails for any reason a user cannot fix.
 const STORE_UNAVAILABLE: &str = "the log store is unavailable";
@@ -93,14 +101,44 @@ pub fn describe(alert: &DueAlert, count: u64) -> String {
 
 /// Atomically claims up to `limit` due, enabled alerts and reschedules them
 /// `interval_seconds` ahead in one statement (`for update skip locked`), so
-/// two passes or two engine instances never claim the same alert.
-pub async fn claim_due_alerts(pool: &PgPool, limit: i64) -> Result<Vec<DueAlert>, sqlx::Error> {
+/// two passes or two engine instances never claim the same alert. `running`
+/// is how many evaluations each project already has running here: a project
+/// is given at most [`MAX_ALERT_EVALUATIONS_PER_PROJECT`] minus that, its
+/// most overdue alerts first, so one project never takes every place.
+pub async fn claim_due_alerts(
+    pool: &PgPool,
+    limit: i64,
+    running: &[(Uuid, usize)],
+) -> Result<Vec<DueAlert>, sqlx::Error> {
+    let (projects, counts): (Vec<Uuid>, Vec<i64>) = running
+        .iter()
+        .map(|&(project, n)| (project, i64::try_from(n).unwrap_or(i64::MAX)))
+        .unzip();
+    // Postgres allows no window function at the level that locks rows, so
+    // the per-project ranking is a subquery of its own. It ranks every due
+    // alert (no limit before it), or one project's older alerts could fill
+    // the candidates and leave the others out. The due predicate is repeated
+    // at the locking level so a row another claim just rescheduled is
+    // rechecked out.
     sqlx::query_as(
         "update log_alerts a
          set next_evaluation_at = now() + make_interval(secs => a.interval_seconds)
          where a.id in (
              select id from log_alerts
              where enabled and next_evaluation_at <= now()
+               and id in (
+                   select due.id
+                   from (
+                       select id, project_id,
+                              row_number() over (partition by project_id
+                                                 order by next_evaluation_at, id) as place
+                       from log_alerts
+                       where enabled and next_evaluation_at <= now()
+                   ) due
+                   left join unnest($2::uuid[], $3::bigint[]) as busy(project_id, running)
+                       on busy.project_id = due.project_id
+                   where due.place <= $4 - coalesce(busy.running, 0)
+               )
              order by next_evaluation_at
              limit $1
              for update skip locked
@@ -109,6 +147,9 @@ pub async fn claim_due_alerts(pool: &PgPool, limit: i64) -> Result<Vec<DueAlert>
                    a.window_seconds, a.updated_at",
     )
     .bind(limit)
+    .bind(&projects)
+    .bind(&counts)
+    .bind(MAX_ALERT_EVALUATIONS_PER_PROJECT as i64)
     .fetch_all(pool)
     .await
 }
@@ -119,8 +160,11 @@ struct CountRow {
 }
 
 /// How many of the project's rows match `filters` in `window`, under
-/// [`READ_SETTINGS`] and the client's time limit. Input errors ClickHouse
-/// reports become `Validation` ([`user_error`]).
+/// [`READ_SETTINGS`]. The server stops the count after `max_execution_time`
+/// ([`crate::core::clickhouse::QUERY_MAX_EXECUTION_SECS`], 25 s), which
+/// `query_rows_with` always sends; the client's 30 s timeout is only the
+/// outer backstop. Input errors ClickHouse reports become `Validation`
+/// ([`user_error`]).
 pub async fn count_matches(
     ch: &ClickHouse,
     project_id: Uuid,
@@ -319,7 +363,8 @@ pub async fn run_pass(state: &AppState, notifications: &Notifications) -> Result
 }
 
 /// Claims as many due alerts as `budget` has free places (at most
-/// [`ALERT_CLAIM_BATCH`], none when no place is free), evaluates them at
+/// [`ALERT_CLAIM_BATCH`], none when no place is free, and at most
+/// [`MAX_ALERT_EVALUATIONS_PER_PROJECT`] running per project), evaluates them at
 /// once, each holding one place, and hands their transitions to
 /// `notifications` once every evaluation has ended. Returns how many alerts
 /// were claimed.
@@ -340,16 +385,26 @@ pub async fn run_pass_with(
     let Ok(mut reserved) = Arc::clone(budget).try_acquire_many_owned(room as u32) else {
         return Ok(0);
     };
-    let alerts = claim_due_alerts(&state.db, room as i64).await?;
+    // `running` is read and the claimed alerts counted while this pass holds
+    // every free place of the budget, so no other pass sharing it (every pass
+    // of `run_forever`) claims in between: it finds no room. A project then
+    // never gets more than its share.
+    let running = &state.logs.alert_evaluations;
+    let alerts = claim_due_alerts(&state.db, room as i64, &running.counts()).await?;
     let claimed = alerts.len();
     let mut evaluations = JoinSet::new();
     for alert in alerts {
         let place = reserved
             .split(1)
             .expect("a reserved place for every claimed alert");
+        // Counted, not capped: the claim already applied the cap, and the
+        // alert is rescheduled, so refusing here would skip it.
+        let project_place = running
+            .acquire(alert.project_id, usize::MAX)
+            .expect("an uncapped count always has room");
         let state = state.clone();
         evaluations.spawn(async move {
-            let _place = place;
+            let (_place, _project_place) = (place, project_place);
             evaluate(&state, &alert).await
         });
     }

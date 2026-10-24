@@ -681,6 +681,56 @@ async fn a_reconnect_with_last_event_id_gets_the_rows_it_missed(pool: sqlx::PgPo
     ch.drop_database().await.unwrap();
 }
 
+/// The replay after a reconnect reads the same project and filters as the
+/// live tail: rows of another project, and rows that miss the filters, sent
+/// in the gap are never replayed.
+#[sqlx::test]
+async fn a_resume_replays_only_this_projects_matching_rows(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let state = AppState {
+        logs: fast(|_| {}),
+        ..state
+    };
+    let public = public_app(state.clone());
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let other = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let (_, foreign) = seed_source(&pool, other, "theirs").await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let uri = format!("/projects/{project}/logs/tail?level=error");
+
+    let mut stream = SseStream::open(&app, &uri, Some(&viewer)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    post_json(&public, &token, json!({ "level": "error", "message": "seen" })).await;
+    assert_eq!(
+        stream.next_log(Duration::from_secs(5)).await.unwrap()["message"],
+        "seen"
+    );
+    let last = stream.last_id.clone().expect("log events carry an id");
+    drop(stream);
+
+    // The gap: another project's error and this project's info row come
+    // before the one row the resumed tail may replay.
+    post_json(&public, &foreign, json!({ "level": "error", "message": "theirs" })).await;
+    post_json(&public, &token, json!({ "level": "info", "message": "filtered out" })).await;
+    post_json(&public, &token, json!({ "level": "error", "message": "missed" })).await;
+    let mut resumed = SseStream::open_with(&app, &uri, Some(&viewer), Some(&last))
+        .await
+        .unwrap();
+    assert_eq!(
+        resumed.next_log(Duration::from_secs(5)).await.unwrap()["message"],
+        "missed"
+    );
+    post_json(&public, &token, json!({ "level": "error", "message": "live again" })).await;
+    assert_eq!(
+        resumed.next_log(Duration::from_secs(5)).await.unwrap()["message"],
+        "live again",
+        "nothing else from the gap is sent"
+    );
+    ch.drop_database().await.unwrap();
+}
+
 #[sqlx::test]
 async fn an_unusable_last_event_id_starts_a_normal_tail(pool: sqlx::PgPool) {
     let (state, ch) = state_with_clickhouse(&pool).await;

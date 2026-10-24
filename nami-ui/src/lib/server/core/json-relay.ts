@@ -40,7 +40,8 @@ async function boundedText(request: Request, limit: number): Promise<string | nu
  * without a CORS preflight, which this app never answers, and an `Origin`
  * from elsewhere is refused outright. The body is read once, bounded, and
  * checked to be JSON before the engine sees it. The engine's status and JSON
- * are passed through (a 401 tells the page to go to the login page).
+ * are passed through (a 401 tells the page to go to the login page). The
+ * browser hanging up aborts the engine request too.
  */
 export async function relayJsonPost(event: RequestEvent, path: string): Promise<Response> {
 	const type = event.request.headers.get('content-type') ?? '';
@@ -58,8 +59,10 @@ export async function relayJsonPost(event: RequestEvent, path: string): Promise<
 	}
 	let response: Response;
 	try {
-		response = await callEngine(event, path, { method: 'POST', body });
-	} catch {
+		response = await callEngine(event, path, { method: 'POST', body, signal: event.request.signal });
+	} catch (cause) {
+		// The browser leaving aborts the request: nothing to answer then.
+		if (event.request.signal.aborted) throw cause;
 		return reply(502, 'the log service is unreachable');
 	}
 	return new Response(await response.text(), {

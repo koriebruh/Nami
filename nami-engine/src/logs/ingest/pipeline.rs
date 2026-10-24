@@ -44,6 +44,12 @@ pub const MAX_EQUALS_CHARS: usize = 1024;
 pub const SAMPLE_RANGE: std::ops::RangeInclusive<u32> = 2..=10_000;
 /// Most sample events one `POST .../pipeline/test` takes.
 pub const MAX_TEST_EVENTS: usize = 100;
+/// `POST .../pipeline/test` previews one user may have running; the next is
+/// refused with 429. Each compiles regexes and runs up to
+/// [`MAX_TEST_EVENTS`] events on a blocking thread.
+pub const MAX_PIPELINE_PREVIEWS_PER_USER: usize = 2;
+/// Previews running on one instance, every user together; past it, 429.
+pub const MAX_PIPELINE_PREVIEWS_PER_INSTANCE: usize = 8;
 pub const REDACTED: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

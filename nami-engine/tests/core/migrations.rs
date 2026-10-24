@@ -246,3 +246,31 @@ async fn log_alerts_allow_one_open_incident_each(pool: sqlx::PgPool) {
     .await;
     assert!(never_fires.is_err(), "lt 0 can never fire and must be refused");
 }
+
+/// Every constraint of `log_alerts` carries the name its migration gives it
+/// (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn log_alerts_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid = 'public.log_alerts'::regclass order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "log_alerts_comparison_known",
+            "log_alerts_created_by_fkey",
+            "log_alerts_interval_range",
+            "log_alerts_lt_needs_a_threshold",
+            "log_alerts_pkey",
+            "log_alerts_project_id_fkey",
+            "log_alerts_query_is_object",
+            "log_alerts_state_known",
+            "log_alerts_threshold_range",
+            "log_alerts_window_range",
+        ]
+    );
+}

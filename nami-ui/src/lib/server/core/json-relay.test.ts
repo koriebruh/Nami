@@ -2,11 +2,12 @@ import { describe, expect, it } from 'vitest';
 import { fakeEvent, PROJECT_ID } from '#lib/server/core/fake-event';
 import { MAX_RELAY_BYTES, relayJsonPost } from './json-relay';
 
-function post(event: any, body: string, headers: Record<string, string> = {}) {
+function post(event: any, body: string, headers: Record<string, string> = {}, signal?: AbortSignal) {
 	event.request = new Request('http://ui.test/x', {
 		method: 'POST',
 		body,
-		headers: { 'content-type': 'application/json', origin: 'http://ui.test', ...headers }
+		headers: { 'content-type': 'application/json', origin: 'http://ui.test', ...headers },
+		signal
 	});
 	event.url = new URL('http://ui.test/x');
 	return event;
@@ -34,6 +35,28 @@ describe('relayJsonPost', () => {
 			expect(response.status, JSON.stringify(headers)).toBe(status);
 			expect(calls()).toHaveLength(0);
 		}
+	});
+
+	it('aborts the engine call when the browser leaves, and answers 502 only when the engine failed', async () => {
+		const abortError = () => new DOMException('This operation was aborted', 'AbortError');
+		const controller = new AbortController();
+		const { event: leaving } = fakeEvent({
+			respond: (_url, init) => {
+				expect(init.signal).toBe(leaving.request.signal);
+				controller.abort();
+				throw abortError();
+			}
+		});
+		await expect(relayJsonPost(post(leaving, '{}', {}, controller.signal), '/x')).rejects.toThrow('aborted');
+
+		const { event: failing } = fakeEvent({
+			respond: () => {
+				throw abortError();
+			}
+		});
+		const response = await relayJsonPost(post(failing, '{}', {}, new AbortController().signal), '/x');
+		expect(response.status).toBe(502);
+		expect(await response.json()).toEqual({ error: 'the log service is unreachable' });
 	});
 
 	it('passes engine errors through with their message', async () => {

@@ -19,8 +19,8 @@ use crate::{
     logs::alert::{
         count_matches,
         model::{
-            self as log_alert, Comparison, CreatedAlert, LogAlert, LogAlertConfig,
-            MAX_LOG_ALERTS_PER_PROJECT, WINDOW_RANGE,
+            self as log_alert, Comparison, CreatedAlert, LogAlert, LogAlertConfig, LogAlertPatch,
+            MAX_LOG_ALERTS_PER_PROJECT, UpdatedAlert, WINDOW_RANGE,
         },
     },
     logs::query::{Window, search::QueryPermit},
@@ -147,6 +147,9 @@ async fn get_alert(
         .ok_or(AppError::NotFound)
 }
 
+/// Merged with the stored alert under its row lock ([`log_alert::update`]).
+/// Only the sources the PATCH itself names are checked against the project:
+/// a stored source deleted since does not block other edits.
 async fn patch_alert(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -154,30 +157,29 @@ async fn patch_alert(
     Json(payload): Json<PatchLogAlertRequest>,
 ) -> Result<Json<LogAlert>, AppError> {
     require_project_role(&state.db, &user, project_id, Role::Member).await?;
-    let stored = log_alert::get(&state.db, project_id, alert_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
-    let config = checked(
-        &state,
-        project_id,
-        LogAlertConfig {
-            name: payload.name.unwrap_or(stored.name),
-            query: payload.query.unwrap_or(stored.query.0),
-            threshold: payload.threshold.unwrap_or(stored.threshold),
-            comparison: match payload.comparison {
-                Some(comparison) => Comparison::parse(&comparison).map_err(AppError::Validation)?,
-                None => stored.comparison,
-            },
-            window_seconds: payload.window_seconds.unwrap_or(stored.window_seconds),
-            interval_seconds: payload.interval_seconds.unwrap_or(stored.interval_seconds),
-            enabled: payload.enabled.unwrap_or(stored.enabled),
-        },
-    )
-    .await?;
-    log_alert::update(&state.db, project_id, alert_id, &config)
-        .await?
-        .map(Json)
-        .ok_or(AppError::NotFound)
+    let comparison = payload
+        .comparison
+        .as_deref()
+        .map(Comparison::parse)
+        .transpose()
+        .map_err(AppError::Validation)?;
+    if let Some(query) = &payload.query {
+        saved_query::check_sources(&state.db, project_id, &query.source_ids).await?;
+    }
+    let patch = LogAlertPatch {
+        name: payload.name,
+        query: payload.query,
+        threshold: payload.threshold,
+        comparison,
+        window_seconds: payload.window_seconds,
+        interval_seconds: payload.interval_seconds,
+        enabled: payload.enabled,
+    };
+    match log_alert::update(&state.db, project_id, alert_id, patch).await? {
+        UpdatedAlert::Updated(alert) => Ok(Json(alert)),
+        UpdatedAlert::NotFound => Err(AppError::NotFound),
+        UpdatedAlert::Invalid(message) => Err(AppError::Validation(message)),
+    }
 }
 
 async fn delete_alert(

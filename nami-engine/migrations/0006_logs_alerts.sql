@@ -3,8 +3,9 @@
 -- (for update skip locked) and opens/resolves incidents through
 -- incidents.log_alert_id.
 create table log_alerts (
-    id uuid primary key default gen_random_uuid(),
-    project_id uuid not null references projects(id) on delete cascade,
+    id uuid default gen_random_uuid() constraint log_alerts_pkey primary key,
+    project_id uuid not null
+        constraint log_alerts_project_id_fkey references projects(id) on delete cascade,
     name text not null,
     -- logs::view::saved_query::LogQuery, validated by the engine.
     query jsonb not null default '{}'::jsonb
@@ -26,7 +27,8 @@ create table log_alerts (
     last_error text,
     last_error_at timestamptz,
     next_evaluation_at timestamptz not null default now(),
-    created_by uuid references users(id) on delete set null,
+    created_by uuid
+        constraint log_alerts_created_by_fkey references users(id) on delete set null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     -- `lt 0` can never fire.

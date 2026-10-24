@@ -48,4 +48,10 @@ pub struct LogsState {
     pub export_slots: std::sync::Arc<slots::UserSlots>,
     /// The caps of every export (tests shrink them).
     pub export_limits: export::ExportLimits,
+    /// Pipeline previews running per user and in all (see
+    /// [`ingest::pipeline::MAX_PIPELINE_PREVIEWS_PER_USER`]).
+    pub pipeline_previews: std::sync::Arc<slots::UserSlots>,
+    /// Log alert evaluations running per project on this instance, keyed by
+    /// project id (see [`alert::MAX_ALERT_EVALUATIONS_PER_PROJECT`]).
+    pub alert_evaluations: std::sync::Arc<slots::UserSlots>,
 }

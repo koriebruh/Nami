@@ -268,28 +268,76 @@ pub async fn create(
     Ok(CreatedAlert::Created(alert))
 }
 
-/// Writes the whole (already merged and validated) config in a transaction
-/// under the row lock, bumps `updated_at` (an evaluation already running
-/// is then dropped) and makes the alert due at once. Disabling an
-/// `alerting` alert sets it `ok` and resolves its incident without a
-/// notification. `Ok(None)` = no such alert in the project.
+/// A PATCH: `None` keeps the stored value.
+#[derive(Debug)]
+pub struct LogAlertPatch {
+    pub name: Option<String>,
+    pub query: Option<LogQuery>,
+    pub threshold: Option<i64>,
+    pub comparison: Option<Comparison>,
+    pub window_seconds: Option<i32>,
+    pub interval_seconds: Option<i32>,
+    pub enabled: Option<bool>,
+}
+
+impl LogAlertPatch {
+    /// The stored alert's config with the patched fields replaced.
+    fn merge(self, stored: LogAlert) -> LogAlertConfig {
+        LogAlertConfig {
+            name: self.name.unwrap_or(stored.name),
+            query: self.query.unwrap_or(stored.query.0),
+            threshold: self.threshold.unwrap_or(stored.threshold),
+            comparison: self.comparison.unwrap_or(stored.comparison),
+            window_seconds: self.window_seconds.unwrap_or(stored.window_seconds),
+            interval_seconds: self.interval_seconds.unwrap_or(stored.interval_seconds),
+            enabled: self.enabled.unwrap_or(stored.enabled),
+        }
+    }
+}
+
+/// What [`update`] did.
+// Short-lived return value; boxing would change the interface callers use.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum UpdatedAlert {
+    Updated(LogAlert),
+    /// No such alert in the project (404).
+    NotFound,
+    /// The merged config is invalid: the message for a 400 ([`validate`]).
+    Invalid(String),
+}
+
+/// Reads the alert under its row lock, merges `patch` into it, validates
+/// the result and writes it, all in one transaction, so two PATCHes of
+/// different fields never undo each other. Bumps `updated_at` (an
+/// evaluation already running is then dropped) and makes the alert due at
+/// once. Disabling an `alerting` alert sets it `ok` and resolves its
+/// incident without a notification. Whether the patch's sources belong to
+/// the project is checked by the caller.
 pub async fn update(
     pool: &PgPool,
     project_id: Uuid,
     alert_id: Uuid,
-    config: &LogAlertConfig,
-) -> Result<Option<LogAlert>, sqlx::Error> {
+    patch: LogAlertPatch,
+) -> Result<UpdatedAlert, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let state: Option<String> =
-        sqlx::query_scalar("select state from log_alerts where id = $1 and project_id = $2 for update")
-            .bind(alert_id)
-            .bind(project_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    let Some(state) = state else {
-        return Ok(None);
+    let stored: Option<LogAlert> = sqlx::query_as(concat!(
+        "select ",
+        columns!(),
+        " from log_alerts where id = $1 and project_id = $2 for update"
+    ))
+    .bind(alert_id)
+    .bind(project_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(stored) = stored else {
+        return Ok(UpdatedAlert::NotFound);
     };
-    let state = AlertState::parse(&state).map_err(|e| sqlx::Error::Decode(e.into()))?;
+    let was = stored.state;
+    let config = match validate(patch.merge(stored)) {
+        Ok(config) => config,
+        Err(message) => return Ok(UpdatedAlert::Invalid(message)),
+    };
     let alert: LogAlert = sqlx::query_as(concat!(
         "update log_alerts
          set name = $3, query = $4, threshold = $5, comparison = $6, window_seconds = $7,
@@ -311,12 +359,12 @@ pub async fn update(
     .bind(config.enabled)
     .fetch_one(&mut *tx)
     .await?;
-    if !config.enabled && state == AlertState::Alerting {
+    if !config.enabled && was == AlertState::Alerting {
         super::resolve_alert_incident(&mut tx, alert_id, project_id, &alert.name, Utc::now(), false)
             .await?;
     }
     tx.commit().await?;
-    Ok(Some(alert))
+    Ok(UpdatedAlert::Updated(alert))
 }
 
 /// Deletes the alert and, by cascade, its incidents. `false` = no such
