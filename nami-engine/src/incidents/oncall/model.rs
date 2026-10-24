@@ -794,13 +794,18 @@ pub async fn replace(
 pub enum Deleted {
     Deleted,
     NotFound,
-    /// An escalation step targets the schedule (checked once escalation
-    /// policies exist).
+    /// An escalation step of this policy targets the schedule.
     InUse { policy: String },
 }
 
-/// Deletes a schedule with its participants and overrides.
+/// Deletes a schedule with its participants and overrides, unless an
+/// escalation step targets it (`InUse`).
 pub async fn delete(pool: &PgPool, project_id: Uuid, id: Uuid) -> Result<Deleted, sqlx::Error> {
+    if let Some(policy) =
+        crate::incidents::escalation::model::policy_targeting_schedule(pool, project_id, id).await?
+    {
+        return Ok(Deleted::InUse { policy });
+    }
     let result = sqlx::query("delete from on_call_schedules where id = $1 and project_id = $2")
         .bind(id)
         .bind(project_id)

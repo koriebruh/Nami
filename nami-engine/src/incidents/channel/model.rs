@@ -16,6 +16,7 @@ use crate::{
     core::crypto::{Cipher, DecryptError},
     core::error::AppError,
     core::validate::has_invisible_or_bidi,
+    incidents::escalation,
     incidents::outbound::{self, DISCORD, Reach, SLACK, UrlRule},
 };
 
@@ -399,13 +400,19 @@ pub async fn update(
 pub enum Deleted {
     Deleted,
     NotFound,
-    /// An escalation step targets the channel (returned once escalation
-    /// policies exist, Task 8).
+    /// An escalation step of this policy targets the channel.
     InUse { policy: String },
 }
 
-/// Deletes the owner's channel `id`; another owner's is `NotFound`.
+/// Deletes the owner's channel `id`; another owner's is `NotFound`, and a
+/// project channel an escalation step targets is `InUse`.
 pub async fn delete(pool: &PgPool, owner: &Owner, id: Uuid) -> Result<Deleted, sqlx::Error> {
+    if let Owner::Project(project_id) = owner
+        && let Some(policy) =
+            escalation::model::policy_targeting_channel(pool, *project_id, id).await?
+    {
+        return Ok(Deleted::InUse { policy });
+    }
     let (project_id, user_id) = owner.ids();
     let result = sqlx::query(
         "delete from notification_channels where id = $1 and (project_id = $2 or user_id = $3)",

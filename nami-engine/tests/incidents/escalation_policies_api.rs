@@ -48,9 +48,8 @@ async fn admins_build_multi_step_policies_with_conditions_and_a_fallback(pool: s
     assert_eq!(created["steps"][1]["delay_minutes"], 15);
     let id = created["id"].as_str().unwrap();
 
-    // The 409 on deleting the targeted channel lands with the channel and
-    // schedule `delete` wiring; the lookup it uses is checked here.
-    assert_eq!(policy_targeting_channel(&pool, project, room).await.unwrap().as_deref(), Some("Business hours"));
+    let (status, _) = call(&app, "DELETE", &format!("/projects/{project}/notification-channels/{room}"), Some(&admin), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a targeted channel cannot be deleted");
     assert_eq!(policy_targeting_channel(&pool, seed_project(&pool).await, room).await.unwrap(), None,
         "another project never learns the policy's name");
     let (status, _) = call(&app, "POST", &format!("{path}/{id}/default"), Some(&admin), Some(json!({}))).await;
@@ -220,4 +219,22 @@ async fn a_manual_incident_cannot_use_another_projects_policy(pool: sqlx::PgPool
     let (status, _) = call(&app, "POST", &format!("/projects/{project}/incidents"), Some(&member),
         Some(json!({"title": "x", "escalation_policy_id": foreign}))).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test]
+async fn a_targeted_schedule_cannot_be_deleted(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (alice, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (status, schedule) = call(&app, "POST", &format!("/projects/{project}/schedules"), Some(&admin), Some(json!({
+        "name": "primary", "timezone": "UTC", "rotation": "weekly", "handoff_time": "09:00",
+        "start_date": chrono::Utc::now().date_naive(), "participants": [alice]}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{schedule}");
+    let sid = schedule["id"].as_str().unwrap();
+    let (status, _) = call(&app, "POST", &format!("/projects/{project}/escalation-policies"), Some(&admin),
+        Some(json!({"name": "on call", "steps": [{"delay_minutes": 0, "targets": [{"type": "schedule", "id": sid}]}]}))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = call(&app, "DELETE", &format!("/projects/{project}/schedules/{sid}"), Some(&admin), None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "schedule is used by escalation policy \"on call\"");
 }
