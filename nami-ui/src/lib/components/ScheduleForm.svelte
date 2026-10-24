@@ -3,7 +3,7 @@
      repeated `participant` fields; restrictions as `restriction_<i>_*`. -->
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { WEEKDAYS } from '#lib/uptime/maintenance';
 	import type { Member, Participant, Restriction, Schedule } from '#lib/incidents/oncall';
 
@@ -53,16 +53,35 @@
 		}
 	});
 
+	// Moving and removing re-render the list: focus goes back where a
+	// keyboard user expects it, and the change is announced.
+	let announcement = $state('');
+	async function focusLater(elementId: string) {
+		await tick();
+		document.getElementById(elementId)?.focus();
+	}
 	function add() {
 		const member = members.find((m) => m.user_id === pick);
 		if (!member) return;
 		participants.push({ user_id: member.user_id, email: member.email, is_member: true });
 		pick = '';
+		announcement = `${member.email} added at position ${participants.length}.`;
 	}
 	function move(i: number, by: -1 | 1) {
 		const j = i + by;
 		if (j < 0 || j >= participants.length) return;
 		[participants[i], participants[j]] = [participants[j], participants[i]];
+		const moved = participants[j];
+		announcement = `${moved.email} moved to position ${j + 1} of ${participants.length}.`;
+		// At the top or bottom the pressed button is disabled; use the other one.
+		const atEdge = by < 0 ? j === 0 : j === participants.length - 1;
+		focusLater(id(`${by < 0 !== atEdge ? 'up' : 'down'}-${moved.user_id}`));
+	}
+	function remove(i: number) {
+		const [removed] = participants.splice(i, 1);
+		announcement = `${removed.email} removed.`;
+		const next = participants[i] ?? participants[i - 1];
+		focusLater(next ? id(`remove-${next.user_id}`) : id('pick'));
 	}
 
 	let submitting = $state(false);
@@ -150,12 +169,13 @@
 							<span class="badge badge-warning ml-2">not a project member: never paged</span>
 						{/if}
 					</span>
-					<button type="button" class="btn btn-ghost btn-sm" disabled={i === 0} onclick={() => move(i, -1)} aria-label="Move {participant.email} up">↑</button>
-					<button type="button" class="btn btn-ghost btn-sm" disabled={i === participants.length - 1} onclick={() => move(i, 1)} aria-label="Move {participant.email} down">↓</button>
-					<button type="button" class="btn btn-ghost btn-sm" onclick={() => participants.splice(i, 1)} aria-label="Remove {participant.email}">Remove</button>
+					<button type="button" id={id(`up-${participant.user_id}`)} class="btn btn-ghost btn-sm" disabled={i === 0} onclick={() => move(i, -1)} aria-label="Move {participant.email} up">↑</button>
+					<button type="button" id={id(`down-${participant.user_id}`)} class="btn btn-ghost btn-sm" disabled={i === participants.length - 1} onclick={() => move(i, 1)} aria-label="Move {participant.email} down">↓</button>
+					<button type="button" id={id(`remove-${participant.user_id}`)} class="btn btn-ghost btn-sm" onclick={() => remove(i)} aria-label="Remove {participant.email}">Remove</button>
 				</li>
 			{/each}
 		</ol>
+		<p class="sr-only" role="status" aria-live="polite">{announcement}</p>
 		<div class="flex flex-wrap items-end gap-2">
 			<div class="min-w-[14rem] flex-1">
 				<label for={id('pick')} class="sr-only">Member to add</label>

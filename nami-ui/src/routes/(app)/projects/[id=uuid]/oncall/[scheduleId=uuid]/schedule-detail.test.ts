@@ -216,6 +216,9 @@ describe('schedule detail page', () => {
 		for (const action of ['save', 'addOverride', 'deleteOverride', 'delete']) expect(body).toContain(`action="?/${action}"`);
 		// The zone of the override inputs is stated next to them.
 		expect(body).toContain('(Europe/Berlin)');
+		// Reordering is announced, and focus finds its way back to the buttons.
+		expect(body).toMatch(/role="status" aria-live="polite"/);
+		expect(body).toContain(`id="${SCHEDULE_ID}-down-`);
 	});
 
 	it('flags participants who are no longer project members', () => {
