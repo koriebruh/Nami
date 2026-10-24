@@ -25,7 +25,7 @@ RID = re.compile(r"\bR\d+\.\d{2}\b")
 TASK = re.compile(r"\bNAMI-[A-Z]+-\d+\b")
 
 BASELINES = {"0001_auth.sql", "0002_projects.sql", "0003_uptime.sql", "0004_incidents.sql", "0005_logs.sql"}
-STANDALONE_TESTS = {"clickhouse_proxy", "uptime_checker_proxy", "logs_decode_memory"}
+STANDALONE_TESTS = {"clickhouse_proxy", "uptime_checker_proxy", "logs_decode_memory", "traces_decode_memory"}
 
 OLD_LOGS = "store|normalize|msgpack|pipeline|pipeline_cache|rate_limit|budget|usage|search|tail|export|pattern|patterns|slots|saved_query"
 OLD_UPTIME = "dns|ping|tls|expiry|mail|udp|pings|heartbeat|checker"
