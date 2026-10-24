@@ -3,7 +3,7 @@
 import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 import { HEARTBEAT_ID, MONITOR_ID, PROJECT_ID } from '#lib/server/core/fake-event';
-import type { Incident } from '#lib/uptime/uptime';
+import type { Incident } from '#lib/incidents/incidents';
 import Page from './+page.svelte';
 
 function incident(overrides: Partial<Incident> = {}): Incident {
@@ -13,11 +13,16 @@ function incident(overrides: Partial<Incident> = {}): Incident {
 		monitor_id: MONITOR_ID,
 		heartbeat_id: null,
 		log_alert_id: null,
+		source: 'monitor',
 		source_name: 'API',
 		title: 'API is down',
 		cause: 'connection refused',
 		status: 'resolved',
+		severity: 'high',
+		severity_rank: 2,
 		started_at: '2026-10-13T10:00:00Z',
+		acknowledged_at: null,
+		acknowledged_by_email: null,
 		resolved_at: '2026-10-13T10:01:11Z',
 		details: null,
 		...overrides
@@ -81,6 +86,17 @@ describe('incidents page', () => {
 		const { body } = renderPage([incident({ status: 'open', resolved_at: null })], 'open');
 		expect(body).toContain('Ongoing · ');
 		expect(body).not.toContain('· resolved');
+	});
+
+	// The open tab lists unresolved incidents: an acknowledged one is ongoing too.
+	it('shows an acknowledged incident as ongoing', () => {
+		const { body } = renderPage(
+			[incident({ status: 'acknowledged', acknowledged_at: '2026-10-13T10:00:30Z', resolved_at: null })],
+			'open'
+		);
+		expect(body).toContain('Ongoing · ');
+		expect(body).not.toContain('Resolved · ');
+		expect(body).toContain('bg-danger-soft');
 	});
 
 	it('marks the current tab', () => {

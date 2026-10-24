@@ -58,12 +58,12 @@
 				<li class="flex flex-wrap items-start justify-between gap-3 px-5 py-4 sm:px-6">
 					<div class="flex min-w-0 gap-3">
 						<span
-							class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full {incident.status === 'open'
+							class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full {incident.status !== 'resolved'
 								? 'bg-danger-soft text-danger-ink'
 								: 'bg-success-soft text-success-ink'}"
 							aria-hidden="true"
 						>
-							<Icon name={incident.status === 'open' ? 'incident' : 'heartbeat'} size={16} />
+							<Icon name={incident.status !== 'resolved' ? 'incident' : 'heartbeat'} size={16} />
 						</span>
 						<div class="min-w-0 space-y-1">
 							<!-- Titles and causes carry text from the target (a name, an error
@@ -91,8 +91,8 @@
 							</p>
 						</div>
 					</div>
-					<span class="badge {incident.status === 'open' ? 'badge-danger' : 'badge-neutral'}">
-						{incident.status === 'open' ? 'Ongoing' : 'Resolved'} · {formatDuration(
+					<span class="badge {incident.status !== 'resolved' ? 'badge-danger' : 'badge-neutral'}">
+						{incident.status !== 'resolved' ? 'Ongoing' : 'Resolved'} · {formatDuration(
 							incident.started_at,
 							incident.resolved_at,
 							now

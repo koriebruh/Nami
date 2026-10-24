@@ -56,7 +56,7 @@ describe('detail page load', () => {
 		[monitorPath]: monitor,
 		[`${monitorPath}/stats`]: { uptime_24h: 1, series: [] },
 		[`${monitorPath}/checks`]: [{ checked_at: '2026-10-13T10:00:00Z' }],
-		[`/projects/${PROJECT_ID}/incidents`]: [{ id: 'incident-1' }],
+		[`/projects/${PROJECT_ID}/incidents`]: { incidents: [{ id: 'incident-1' }], next_cursor: null },
 		[`${monitorPath}/availability`]: { uptime_pct: 99.5, incidents: 2 }
 	};
 	const view30d = { key: '30d', from: expect.any(String), to: expect.any(String), error: null };
@@ -67,7 +67,7 @@ describe('detail page load', () => {
 			monitor,
 			stats: answers[`${monitorPath}/stats`],
 			checks: answers[`${monitorPath}/checks`],
-			incidents: answers[`/projects/${PROJECT_ID}/incidents`],
+			incidents: [{ id: 'incident-1' }],
 			availability: {
 				range: expect.objectContaining(view30d),
 				data: answers[`${monitorPath}/availability`],

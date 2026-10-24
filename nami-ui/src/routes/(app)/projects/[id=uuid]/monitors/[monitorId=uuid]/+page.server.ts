@@ -8,7 +8,8 @@ import {
 } from '#lib/server/core/engine';
 import { loadAvailability } from '#lib/server/uptime/availability';
 import { formText } from '#lib/server/uptime/monitor-form';
-import type { Incident, Monitor, MonitorStats, UptimeCheck } from '#lib/uptime/uptime';
+import type { Incident, IncidentPage } from '#lib/incidents/incidents';
+import type { Monitor, MonitorStats, UptimeCheck } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad, RequestEvent } from './$types';
 
 export const load: PageServerLoad = async (event) => {
@@ -39,7 +40,7 @@ export const load: PageServerLoad = async (event) => {
 	// monitor (its status comes from Postgres) with the history sections empty.
 	const stats: MonitorStats | null = statsRes.ok ? await statsRes.json() : null;
 	const checks: UptimeCheck[] = checksRes.ok ? await checksRes.json() : [];
-	const incidents: Incident[] = incidentsRes.ok ? await incidentsRes.json() : [];
+	const incidents: Incident[] = incidentsRes.ok ? ((await incidentsRes.json()) as IncidentPage).incidents : [];
 	return { monitor, stats, checks, incidents, availability };
 };
 

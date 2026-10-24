@@ -3,6 +3,7 @@ import { fakeEvent, HEARTBEAT_ID, MONITOR_ID, PROJECT_ID } from '#lib/server/cor
 import { load } from './+page.server';
 
 const incidentsPath = `/projects/${PROJECT_ID}/incidents`;
+const EMPTY_PAGE = JSON.stringify({ incidents: [], next_cursor: null });
 
 describe('incidents load', () => {
 	const incidents = [
@@ -10,21 +11,20 @@ describe('incidents load', () => {
 		{ id: 'i2', monitor_id: null, heartbeat_id: HEARTBEAT_ID, title: 'Backup missed its heartbeat', status: 'open' }
 	];
 
-	it('lists the open incidents by default', async () => {
-		const { event, calls } = fakeEvent({ body: JSON.stringify(incidents) });
+	it('lists the unresolved incidents on the open tab by default', async () => {
+		const { event, calls } = fakeEvent({ body: JSON.stringify({ incidents, next_cursor: 'c' }) });
 		expect(await load(event)).toEqual({ incidents, status: 'open' });
-		expect(calls()).toEqual([{ method: 'GET', path: incidentsPath, search: '?status=open', body: undefined }]);
+		expect(calls()).toEqual([{ method: 'GET', path: incidentsPath, search: '?status=unresolved', body: undefined }]);
 	});
 
 	it('lists the resolved incidents for ?status=resolved', async () => {
-		const { event, calls } = fakeEvent({ url: 'http://ui.test/?status=resolved', body: '[]' });
+		const { event, calls } = fakeEvent({ url: 'http://ui.test/?status=resolved', body: EMPTY_PAGE });
 		expect(await load(event)).toEqual({ incidents: [], status: 'resolved' });
 		expect(calls()).toEqual([{ method: 'GET', path: incidentsPath, search: '?status=resolved', body: undefined }]);
 	});
 
-	// The engine only accepts open or resolved, and the query value is user
-	// input: whatever else it holds, the engine is asked for the open ones and
-	// the raw value never reaches the request.
+	// The query value is user input: whatever else it holds, the engine is
+	// asked for the unresolved ones and the raw value never reaches the request.
 	it.each([
 		['all'],
 		[''],
@@ -37,19 +37,19 @@ describe('incidents load', () => {
 		['resolved#x'],
 		['../auth/me?'],
 		['%00']
-	])('forwards only "open" or "resolved", never %j', async (value) => {
+	])('forwards only "unresolved" or "resolved", never %j', async (value) => {
 		const { event, calls } = fakeEvent({
 			url: `http://ui.test/?status=${encodeURIComponent(value)}`,
-			body: '[]'
+			body: EMPTY_PAGE
 		});
 		expect(await load(event)).toEqual({ incidents: [], status: 'open' });
-		expect(calls()).toEqual([{ method: 'GET', path: incidentsPath, search: '?status=open', body: undefined }]);
+		expect(calls()).toEqual([{ method: 'GET', path: incidentsPath, search: '?status=unresolved', body: undefined }]);
 	});
 
-	it('shows the open incidents when the query has no status at all', async () => {
-		const { event, calls } = fakeEvent({ url: 'http://ui.test/?other=1', body: '[]' });
+	it('shows the open tab when the query has no status at all', async () => {
+		const { event, calls } = fakeEvent({ url: 'http://ui.test/?other=1', body: EMPTY_PAGE });
 		await load(event);
-		expect(calls().map((call) => call.search)).toEqual(['?status=open']);
+		expect(calls().map((call) => call.search)).toEqual(['?status=unresolved']);
 	});
 
 	it('keeps a 403 a 403', async () => {
@@ -73,14 +73,14 @@ describe('incidents load', () => {
 	});
 
 	it('keeps a hostile id inside one path segment', async () => {
-		const { event, calls } = fakeEvent({ params: { id: '../auth/me?' }, body: '[]' });
+		const { event, calls } = fakeEvent({ params: { id: '../auth/me?' }, body: EMPTY_PAGE });
 		await load(event);
-		expect(calls().map((call) => call.path + call.search)).toEqual(['/projects/..%2Fauth%2Fme%3F/incidents?status=open']);
+		expect(calls().map((call) => call.path + call.search)).toEqual(['/projects/..%2Fauth%2Fme%3F/incidents?status=unresolved']);
 	});
 
 	// Incident details carry job output: never cached, whatever the engine says.
 	it.each([
-		['a listing', { body: '[]' }, null],
+		['a listing', { body: EMPTY_PAGE }, null],
 		['a caller the engine refuses', { status: 403, body: '{"error":"forbidden"}' }, { status: 403 }],
 		['an engine failure', { status: 500, body: '{"error":"internal error"}' }, { status: 500 }],
 		['a session that is gone', { status: 401, body: '{"error":"unauthorized"}' }, { status: 303 }]

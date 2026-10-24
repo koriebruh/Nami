@@ -2,6 +2,11 @@
 // the monitor and incident pages. All times render in UTC so server- and
 // client-rendered markup agree (and match the alert emails).
 
+import type { Incident } from '#lib/incidents/incidents';
+
+// Existing imports of the incident list type keep working from here.
+export type { Incident };
+
 export type Status = 'pending' | 'up' | 'down';
 export type CheckType =
 	| 'http'
@@ -146,22 +151,6 @@ export type MonitorStats = {
 	uptime_30d: number | null;
 	avg_response_ms_24h: number | null;
 	series: SeriesBucket[];
-};
-
-export type Incident = {
-	id: string;
-	project_id: string;
-	monitor_id: string | null;
-	heartbeat_id: string | null;
-	log_alert_id: string | null;
-	source_name: string | null;
-	title: string;
-	cause: string | null;
-	status: 'open' | 'resolved';
-	started_at: string;
-	resolved_at: string | null;
-	/** Job output a failing heartbeat reported; plain text, already truncated by the engine. */
-	details: string | null;
 };
 
 export type Heartbeat = {
@@ -452,8 +441,8 @@ export function niceTicks(max: number, count = 4): number[] {
 
 /**
  * When the monitor entered its current status. The engine stores no
- * state-change timestamp, so derive it from incidents: down since the open
- * incident started; up since the latest recovery (or creation, if it never
+ * state-change timestamp, so derive it from incidents: down since the
+ * unresolved (open or acknowledged) incident started; up since the latest recovery (or creation, if it never
  * went down); pending since creation.
  */
 export function statusSince(
@@ -461,7 +450,7 @@ export function statusSince(
 	incidents: Incident[]
 ): string {
 	if (monitor.current_status === 'down') {
-		return incidents.find((i) => i.status === 'open')?.started_at ?? monitor.created_at;
+		return incidents.find((i) => i.status !== 'resolved')?.started_at ?? monitor.created_at;
 	}
 	if (monitor.current_status === 'up') {
 		let latest: string | null = null;
