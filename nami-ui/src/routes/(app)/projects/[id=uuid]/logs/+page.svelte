@@ -479,9 +479,12 @@
 	</div>
 
 	{#if data.state.tab === 'patterns'}
-		<div class="card">
-			<PatternsTable patterns={data.patterns} href={patternHref} />
-		</div>
+		<!-- A failed patterns call is the alert above, never an empty table. -->
+		{#if !data.patternsError}
+			<div class="card">
+				<PatternsTable patterns={data.patterns} href={patternHref} />
+			</div>
+		{/if}
 	{:else}
 		<div class="card">
 			<div class="flex flex-wrap items-center justify-end gap-2 border-b border-border px-4 py-3">

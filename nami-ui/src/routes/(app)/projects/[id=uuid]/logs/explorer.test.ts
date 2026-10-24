@@ -151,4 +151,45 @@ describe('explorer, part 2', () => {
 		expect(await actions.deleteView(forged.event)).toMatchObject({ status: 400 });
 		expect(forged.calls()).toHaveLength(0);
 	});
+
+	it('opens a view only on an explicit Open, relative presets staying relative', async () => {
+		const VIEW = '0b9d1f6c-5a3e-4c2f-9d47-6e8a1c3b7f25';
+		const open = fakeEvent({
+			url: `http://ui.test/projects/${PROJECT_ID}/logs?range=24h&/openView`,
+			form: { view_id: VIEW, state: 'range=24h' },
+			respond: () => json({ id: VIEW, name: 'Errors', query: { range: '6h', levels: ['error'] } })
+		});
+		await expect(actions.openView(open.event)).rejects.toMatchObject({
+			status: 303,
+			location: `/projects/${PROJECT_ID}/logs?range=6h&level=error`
+		});
+		expect(open.calls()[0]).toMatchObject({ method: 'GET', path: `/projects/${PROJECT_ID}/log-views/${VIEW}` });
+		const gone = fakeEvent({ form: { view_id: VIEW }, respond: () => json({ error: 'not found' }, 404) });
+		expect(await actions.openView(gone.event)).toMatchObject({ status: 404, data: { message: 'That view no longer exists.' } });
+		const none = fakeEvent({ form: { view_id: '' } });
+		expect(await actions.openView(none.event)).toMatchObject({ status: 400 });
+		expect(none.calls()).toHaveLength(0);
+	});
+
+	it('tells a viewer that views are for members', async () => {
+		const VIEW = '0b9d1f6c-5a3e-4c2f-9d47-6e8a1c3b7f25';
+		const forbidden = () => json({ error: 'forbidden' }, 403);
+		const message = 'Only project members and admins can save, update or delete views.';
+		const save = fakeEvent({ form: { name: 'Errors', state: '' }, respond: forbidden });
+		expect(await actions.saveView(save.event)).toMatchObject({ status: 403, data: { message } });
+		const update = fakeEvent({ form: { view_id: VIEW, state: '' }, respond: forbidden });
+		expect(await actions.updateView(update.event)).toMatchObject({ status: 403, data: { message } });
+		const remove = fakeEvent({ form: { view_id: VIEW, confirm: 'yes' }, respond: forbidden });
+		expect(await actions.deleteView(remove.event)).toMatchObject({ status: 403, data: { message } });
+	});
+
+	it('shows a failed patterns call as an error, not as no patterns', async () => {
+		const { event } = fakeEvent({
+			url: 'http://ui.test/p?tab=patterns',
+			respond: engine({ patterns: json({ error: 'too many queries' }, 429) })
+		});
+		const data: any = await load(event);
+		expect(data.patternsError).toBe('too many queries');
+		expect(data.patterns).toEqual([]);
+	});
 });

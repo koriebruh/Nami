@@ -1,4 +1,4 @@
-import { error, fail } from '@sveltejs/kit';
+import { error, fail, redirect } from '@sveltejs/kit';
 import {
 	callEngine,
 	engineErrorMessage,
@@ -11,9 +11,11 @@ import { formText } from '#lib/server/uptime/monitor-form';
 import { isUuid } from '#lib/core/uuid';
 import {
 	engineParams,
+	explorerHref,
 	PAGE_SIZE,
 	parseExplorerState,
 	resolveWindow,
+	stateFromViewQuery,
 	viewQueryFromState,
 	type Histogram,
 	type LogEntry,
@@ -105,7 +107,29 @@ function viewQuery(form: FormData) {
 	return viewQueryFromState(parseExplorerState(new URLSearchParams(formText(form, 'state'))));
 }
 
+/**
+ * A failed view write. Viewers see the buttons too (the page does not know
+ * the role until NAMI-INC-7), so the engine's bare 403 gets a clear message.
+ */
+function viewFailure(response: Response, fallback: string) {
+	if (response.status === 403) {
+		return fail(403, { message: 'Only project members and admins can save, update or delete views.' });
+	}
+	return engineFailure(response, fallback);
+}
+
 export const actions: Actions = {
+	/** "Open" on the saved views form: the view's state, through the URL rules (presets stay relative). */
+	openView: async (event) => {
+		const form = await event.request.formData();
+		const viewId = form.get('view_id');
+		if (!isUuid(viewId)) return fail(400, { message: 'Pick a saved view.' });
+		const response = await callEngine(event, enginePath`/projects/${event.params.id}/log-views/${viewId}`);
+		if (response.status === 404) return fail(404, { message: 'That view no longer exists.' });
+		if (!response.ok) return engineFailure(response, 'Could not open the view.');
+		const view: LogView = await response.json();
+		throw redirect(303, explorerHref(event.url.pathname, stateFromViewQuery(view.query)));
+	},
 	saveView: async (event) => {
 		const form = await event.request.formData();
 		const name = formText(form, 'name').trim();
@@ -114,7 +138,7 @@ export const actions: Actions = {
 			method: 'POST',
 			body: JSON.stringify({ name, query: viewQuery(form) })
 		});
-		if (!response.ok) return engineFailure(response, 'Could not save the view.');
+		if (!response.ok) return viewFailure(response, 'Could not save the view.');
 		return { savedView: name };
 	},
 	updateView: async (event) => {
@@ -126,7 +150,7 @@ export const actions: Actions = {
 			enginePath`/projects/${event.params.id}/log-views/${viewId}`,
 			{ method: 'PATCH', body: JSON.stringify({ query: viewQuery(form) }) }
 		);
-		if (!response.ok) return engineFailure(response, 'Could not update the view.');
+		if (!response.ok) return viewFailure(response, 'Could not update the view.');
 		return { updatedView: true as const };
 	},
 	deleteView: async (event) => {
@@ -141,7 +165,7 @@ export const actions: Actions = {
 			enginePath`/projects/${event.params.id}/log-views/${viewId}`,
 			{ method: 'DELETE' }
 		);
-		if (!response.ok) return engineFailure(response, 'Could not delete the view.');
+		if (!response.ok) return viewFailure(response, 'Could not delete the view.');
 		return { deletedView: true as const };
 	}
 };

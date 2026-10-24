@@ -1,11 +1,12 @@
 <script lang="ts">
-	// Saved views: open one (its query through the URL rules), save the
-	// current explorer state as a new one, update or delete the picked one.
-	// The forms send the explorer query string (`query`, as the field
-	// `state`); the action turns it into a view query without `live` or `tab`.
+	// Saved views: open, update or delete the picked one, or save the current
+	// explorer state as a new one. Picking a view in the select does nothing
+	// by itself (arrow keys must not navigate); "Open" does. All of it is
+	// plain form posts, so it works without JavaScript too. The forms send
+	// the explorer query string (`query`, as the field `state`); the action
+	// turns it into a view query without `live` or `tab`.
 	import { enhance, type SubmitFunction } from '$app/forms';
-	import { goto } from '$app/navigation';
-	import { explorerHref, stateFromViewQuery, type LogView } from '#lib/logs/logs';
+	import type { LogView } from '#lib/logs/logs';
 
 	type ViewForm = {
 		message?: string;
@@ -22,59 +23,50 @@
 		form
 	}: { views: LogView[]; path: string; query: string; form: ViewForm | null | undefined } = $props();
 
-	let selected = $state('');
-	const picked = $derived(views.find((view) => view.id === selected));
 	const pending = $derived(form?.confirmDeleteView ? views.find((view) => view.id === form.confirmDeleteView) : undefined);
 	// The forms keep the explorer state in their action URL, so a post without
 	// JavaScript comes back to the same explorer.
 	const action = (name: string) => `?${query ? `${query}&` : ''}/${name}`;
 
 	let busy = $state(false);
-	const submit: SubmitFunction = () => {
-		busy = true;
-		return async ({ update }) => {
-			try {
-				await update();
-			} finally {
-				busy = false;
+	const submit =
+		(reset: boolean): SubmitFunction =>
+		(submission) => {
+			if (submission.action.searchParams.has('/deleteView') && !submission.formData.has('confirm')) {
+				const view = views.find((other) => other.id === submission.formData.get('view_id'));
+				if (!confirm(`Delete view "${view?.name ?? ''}"?`)) {
+					submission.cancel();
+					return;
+				}
+				submission.formData.set('confirm', 'yes');
 			}
+			busy = true;
+			return async ({ update }) => {
+				try {
+					await update({ reset });
+				} finally {
+					busy = false;
+				}
+			};
 		};
-	};
-	const confirmDelete: SubmitFunction = (submission) => {
-		if (!confirm(`Delete view "${picked?.name ?? ''}"?`)) {
-			submission.cancel();
-			return;
-		}
-		submission.formData.set('confirm', 'yes');
-		return submit(submission);
-	};
-
-	function open(event: Event) {
-		const view = views.find((other) => other.id === (event.currentTarget as HTMLSelectElement).value);
-		if (view) void goto(explorerHref(path, stateFromViewQuery(view.query)));
-	}
 </script>
 
 <div class="flex flex-wrap items-center gap-2">
-	<label class="sr-only" for="saved-view">Saved view</label>
-	<select id="saved-view" bind:value={selected} onchange={open} class="select w-auto py-1.5 text-sm">
-		<option value="">{views.length ? 'Saved views…' : 'No saved views'}</option>
-		{#each views as view (view.id)}
-			<option value={view.id}>{view.name}</option>
-		{/each}
-	</select>
-	{#if picked}
-		<form method="POST" action={action('updateView')} use:enhance={submit}>
-			<input type="hidden" name="view_id" value={picked.id} />
-			<input type="hidden" name="state" value={query} />
-			<button type="submit" disabled={busy} class="btn btn-secondary btn-sm">Update</button>
-		</form>
-		<form method="POST" action={action('deleteView')} use:enhance={confirmDelete}>
-			<input type="hidden" name="view_id" value={picked.id} />
-			<button type="submit" disabled={busy} class="btn btn-danger btn-sm">Delete</button>
-		</form>
-	{/if}
-	<form method="POST" action={action('saveView')} use:enhance={submit} class="flex items-center gap-1">
+	<!-- Not reset after a post: the picked view stays picked. -->
+	<form method="POST" action={action('openView')} use:enhance={submit(false)} class="flex flex-wrap items-center gap-1">
+		<label class="sr-only" for="saved-view">Saved view</label>
+		<select id="saved-view" name="view_id" required class="select w-auto py-1.5 text-sm">
+			<option value="">{views.length ? 'Saved views…' : 'No saved views'}</option>
+			{#each views as view (view.id)}
+				<option value={view.id}>{view.name}</option>
+			{/each}
+		</select>
+		<input type="hidden" name="state" value={query} />
+		<button type="submit" disabled={busy} class="btn btn-secondary btn-sm">Open</button>
+		<button type="submit" formaction={action('updateView')} disabled={busy} class="btn btn-secondary btn-sm">Update</button>
+		<button type="submit" formaction={action('deleteView')} disabled={busy} class="btn btn-danger btn-sm">Delete</button>
+	</form>
+	<form method="POST" action={action('saveView')} use:enhance={submit(true)} class="flex items-center gap-1">
 		<label class="sr-only" for="view-name">View name</label>
 		<input id="view-name" name="name" required maxlength="200" placeholder="View name" class="input w-40 py-1 text-xs" />
 		<input type="hidden" name="state" value={query} />
@@ -92,7 +84,7 @@
 {/if}
 <!-- The second step of a delete without JavaScript (see the deleteView action). -->
 {#if pending}
-	<form method="POST" action={action('deleteView')} use:enhance={submit} class="alert alert-danger flex flex-wrap items-center gap-3">
+	<form method="POST" action={action('deleteView')} use:enhance={submit(true)} class="alert alert-danger flex flex-wrap items-center gap-3">
 		<input type="hidden" name="view_id" value={pending.id} />
 		<input type="hidden" name="confirm" value="yes" />
 		<span class="wrap-anywhere">Delete view "{pending.name}"?</span>
