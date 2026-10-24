@@ -58,6 +58,13 @@
 <!-- Monitor groups, then the member forms (moved unchanged from the old
      project page). -->
 <div class="space-y-6">
+	<a href="/projects/{data.project.id}/settings/notifications" class="card flex items-center justify-between p-5 hover:border-primary sm:p-6">
+		<span>
+			<span class="block text-lg font-light text-ink">Notification channels</span>
+			<span class="block text-sm text-muted">Email, webhook, Slack, Teams, Telegram and Discord channels for escalation.</span>
+		</span>
+		<span class="link text-sm" aria-hidden="true">→</span>
+	</a>
 	<div class="card p-5 sm:p-6">
 		<h2 class="text-lg font-light text-ink">Monitor groups</h2>
 		<p class="mt-1 text-sm text-muted">

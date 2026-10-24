@@ -47,7 +47,8 @@
 	});
 
 	const bottomItems = $derived<NavItem[]>([
-		{ href: '/security', label: 'Security', icon: 'shield', active: pathname === '/security' }
+		{ href: '/security', label: 'Security', icon: 'shield', active: pathname === '/security' },
+		{ href: '/account/notifications', label: 'Notifications', icon: 'bell', active: pathname === '/account/notifications' }
 	]);
 
 	let expanded = $state(false);
@@ -261,6 +262,9 @@
 							<div class="my-1 border-t border-border"></div>
 							<a href="/security" class="menu-item">
 								<Icon name="shield" size={16} /> Security
+							</a>
+							<a href="/account/notifications" class="menu-item">
+								<Icon name="bell" size={16} /> Notifications
 							</a>
 							<form method="POST" action="/logout">
 								<button type="submit" class="menu-item menu-item-danger">
