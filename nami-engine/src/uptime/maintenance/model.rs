@@ -256,6 +256,12 @@ impl ActiveWindows {
     pub fn covers_heartbeats(&self) -> bool {
         self.0.iter().any(MaintenanceWindow::applies_to_heartbeats)
     }
+
+    /// Whether one of these windows covers the whole project (a project-wide
+    /// one): what holds log alerts. Same windows as [`Self::covers_heartbeats`].
+    pub fn covers_project(&self) -> bool {
+        self.covers_heartbeats()
+    }
 }
 
 /// A window as API responses show it: `active` = in effect right now.

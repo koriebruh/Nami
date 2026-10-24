@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod log_alerts;
 mod log_views;
 mod logs_export;
 mod logs_ingest;

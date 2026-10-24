@@ -10,7 +10,8 @@ pub struct IncidentListItem {
     pub project_id: Uuid,
     pub monitor_id: Option<Uuid>,
     pub heartbeat_id: Option<Uuid>,
-    /// Name of the monitor (or heartbeat) the incident belongs to.
+    pub log_alert_id: Option<Uuid>,
+    /// Name of the monitor, heartbeat or log alert the incident belongs to.
     pub source_name: Option<String>,
     pub title: String,
     pub cause: Option<String>,
@@ -30,12 +31,13 @@ pub async fn list_for_project(
     monitor_id: Option<Uuid>,
 ) -> Result<Vec<IncidentListItem>, sqlx::Error> {
     sqlx::query_as(
-        "select i.id, i.project_id, i.monitor_id, i.heartbeat_id,
-                coalesce(m.name, h.name) as source_name, i.title, i.cause, i.details, i.status,
-                i.started_at, i.resolved_at
+        "select i.id, i.project_id, i.monitor_id, i.heartbeat_id, i.log_alert_id,
+                coalesce(m.name, h.name, la.name) as source_name, i.title, i.cause, i.details,
+                i.status, i.started_at, i.resolved_at
          from incidents i
          left join monitors m on m.id = i.monitor_id
          left join heartbeats h on h.id = i.heartbeat_id
+         left join log_alerts la on la.id = i.log_alert_id
          where i.project_id = $1
            and ($2::text is null or i.status = $2)
            and ($3::uuid is null or i.monitor_id = $3)
@@ -87,6 +89,51 @@ pub async fn resolve_for_monitor(
          returning id",
     )
     .bind(monitor_id)
+    .bind(resolved_at)
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+/// Log-alert counterpart of [`open_for_monitor`], guarded by
+/// `incidents_one_open_per_log_alert`. Never reopens a resolved incident
+/// (unlike [`open_for_heartbeat`]). Called only through
+/// `logs::alert::open_alert_incident`.
+pub async fn open_for_log_alert(
+    conn: &mut PgConnection,
+    project_id: Uuid,
+    log_alert_id: Uuid,
+    title: &str,
+    cause: Option<&str>,
+    started_at: DateTime<Utc>,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "insert into incidents (project_id, log_alert_id, title, cause, started_at)
+         values ($1, $2, $3, $4, $5)
+         on conflict (log_alert_id) where status = 'open' do nothing
+         returning id",
+    )
+    .bind(project_id)
+    .bind(log_alert_id)
+    .bind(title)
+    .bind(cause)
+    .bind(started_at)
+    .fetch_optional(&mut *conn)
+    .await
+}
+
+/// Log-alert counterpart of [`resolve_for_monitor`]. Called only through
+/// `logs::alert::resolve_alert_incident`.
+pub async fn resolve_for_log_alert(
+    conn: &mut PgConnection,
+    log_alert_id: Uuid,
+    resolved_at: DateTime<Utc>,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "update incidents set status = 'resolved', resolved_at = $2
+         where log_alert_id = $1 and status = 'open'
+         returning id",
+    )
+    .bind(log_alert_id)
     .bind(resolved_at)
     .fetch_optional(&mut *conn)
     .await

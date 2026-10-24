@@ -24,6 +24,7 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "maintenance_windows",
         "monitor_groups",
         "log_views",
+        "log_alerts",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -211,4 +212,37 @@ async fn log_views_names_are_unique_per_project(pool: sqlx::PgPool) {
         .execute(&pool)
         .await;
     assert!(bad.is_err(), "a non-object query must be refused");
+}
+
+#[sqlx::test]
+async fn log_alerts_allow_one_open_incident_each(pool: sqlx::PgPool) {
+    let (project, _) = seed_source_row(&pool).await;
+    let alert: uuid::Uuid = sqlx::query_scalar(
+        "insert into log_alerts (project_id, name, threshold, comparison, window_seconds, interval_seconds)
+         values ($1, 'Errors', 10, 'gt', 300, 60) returning id",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let open = || {
+        sqlx::query("insert into incidents (project_id, log_alert_id, title) values ($1, $2, 't')")
+            .bind(project)
+            .bind(alert)
+            .execute(&pool)
+    };
+    open().await.unwrap();
+    let error = open().await.unwrap_err();
+    assert_eq!(
+        error.as_database_error().and_then(|e| e.code()).as_deref(),
+        Some("23505")
+    );
+    let never_fires = sqlx::query(
+        "insert into log_alerts (project_id, name, threshold, comparison, window_seconds, interval_seconds)
+         values ($1, 'Quiet', 0, 'lt', 300, 60)",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await;
+    assert!(never_fires.is_err(), "lt 0 can never fire and must be refused");
 }

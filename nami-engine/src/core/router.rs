@@ -83,6 +83,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(uptime::group::routes::router())
         .merge(logs::query::routes::router())
         .merge(logs::view::routes::router())
+        .merge(logs::alert::routes::router())
         .layer(middleware::from_fn(require_json_body))
         .with_state(state)
 }

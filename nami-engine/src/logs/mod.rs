@@ -1,8 +1,9 @@
 //! Log management: sources and their pipelines (`source`), saved views
-//! (`view`), ingestion (`ingest`: HTTP bodies, normalization, per-source
+//! (`view`), log alerts (`alert`), ingestion (`ingest`: HTTP bodies, normalization, per-source
 //! pipelines, rate limits, storage in ClickHouse and usage accounting),
 //! syslog ingestion over TCP and UDP (`syslog`), and reading (`query`:
 //! search, patterns, the live tail and the streamed export).
+pub mod alert;
 pub mod ingest;
 pub mod query;
 pub mod source;

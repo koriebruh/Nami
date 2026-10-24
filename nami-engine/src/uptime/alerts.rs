@@ -22,6 +22,7 @@ pub enum TransitionKind {
 pub enum Subject {
     Monitor(Uuid),
     Heartbeat(Uuid),
+    LogAlert(Uuid),
 }
 
 /// A state change worth telling people about: something went down (an
@@ -124,6 +125,10 @@ async fn still_down(pool: &sqlx::PgPool, transition: &Transition) -> Result<bool
             "select exists (select 1 from heartbeats where id = $1 and not paused and current_status = 'down')",
             id,
         ),
+        Subject::LogAlert(id) => (
+            "select exists (select 1 from log_alerts where id = $1 and enabled and state = 'alerting')",
+            id,
+        ),
     };
     let down: bool = sqlx::query_scalar(sql).bind(id).fetch_one(pool).await?;
     if !down {
@@ -134,7 +139,8 @@ async fn still_down(pool: &sqlx::PgPool, transition: &Transition) -> Result<bool
         Subject::Monitor(id) => {
             maintenance::monitor_in_maintenance(pool, transition.project_id, id, now).await?
         }
-        Subject::Heartbeat(_) => {
+        // Log alerts, like heartbeats, are held only by project-wide windows.
+        Subject::Heartbeat(_) | Subject::LogAlert(_) => {
             maintenance::heartbeat_in_maintenance(pool, transition.project_id, now).await?
         }
     };
@@ -220,8 +226,33 @@ pub fn render(ui_base_url: &str, transition: &Transition) -> (String, String) {
         Subject::Heartbeat(id) => {
             format!("{base}/projects/{}/heartbeats/{id}", transition.project_id)
         }
+        Subject::LogAlert(id) => {
+            format!("{base}/projects/{}/logs/alerts/{id}", transition.project_id)
+        }
     };
     let at = transition.at.format("%Y-%m-%d %H:%M:%S UTC");
+    let cause = || {
+        transition
+            .cause
+            .as_deref()
+            .map(sanitize_cause)
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    if let Subject::LogAlert(_) = transition.subject {
+        return match transition.kind {
+            TransitionKind::Down => (
+                format!("[Nami] Log alert {name} triggered"),
+                format!(
+                    "Log alert {name} triggered.\n\nCondition: {}\nSince: {at}\n\nDetails: {link}\n",
+                    cause()
+                ),
+            ),
+            TransitionKind::Recovered => (
+                format!("[Nami] Log alert {name} resolved"),
+                format!("Log alert {name} resolved.\n\nResolved at: {at}\n\nDetails: {link}\n"),
+            ),
+        };
+    }
     // Quoted line by line, so no line of a job's output can start a
     // header-looking line of its own. Sanitized again for a Transition built
     // any other way.
@@ -240,16 +271,12 @@ pub fn render(ui_base_url: &str, transition: &Transition) -> (String, String) {
     match transition.kind {
         TransitionKind::Down => (
             format!("[Nami] {name} is DOWN"),
+            // The cause is already one line when it comes from
+            // `apply_outcome`; the same filter covers a Transition built any
+            // other way.
             format!(
                 "{name} is DOWN.\n\nCause: {}\nSince: {at}\n{output}\nDetails: {link}\n",
-                // Already one line when it comes from `apply_outcome`; the
-                // same filter here covers a Transition built any other way.
-                transition
-                    .cause
-                    .as_deref()
-                    .map(sanitize_cause)
-                    .as_deref()
-                    .unwrap_or("unknown")
+                cause()
             ),
         ),
         TransitionKind::Recovered => (
@@ -336,6 +363,38 @@ mod tests {
             "Since: 2026-10-14 17:46:40 UTC\n\nOutput:\n> <script>alert(1)</script>\n> Bcc: x@evil.test\n> \tdisk full\n\nDetails: "
         ), "{body:?}");
         assert!(!body.lines().any(|l| l.starts_with("Bcc:")), "{body:?}");
+    }
+
+    #[test]
+    fn log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert() {
+        let triggered = Transition {
+            subject: Subject::LogAlert(Uuid::nil()),
+            cause: Some("12 matching events in the last 5 min (threshold: > 10)".to_string()),
+            ..transition(TransitionKind::Down, "Checkout errors")
+        };
+        let (subject, body) = render("http://ui.test", &triggered);
+        assert_eq!(subject, "[Nami] Log alert Checkout errors triggered");
+        assert!(
+            body.contains("Condition: 12 matching events in the last 5 min (threshold: > 10)"),
+            "{body}"
+        );
+        let nil = Uuid::nil();
+        assert!(
+            body.contains(&format!("http://ui.test/projects/{nil}/logs/alerts/{nil}")),
+            "{body}"
+        );
+        let resolved = Transition {
+            kind: TransitionKind::Recovered,
+            ..triggered
+        };
+        let (subject, body) = render("http://ui.test", &resolved);
+        assert_eq!(subject, "[Nami] Log alert Checkout errors resolved");
+        assert!(body.contains("Resolved at: 2026-10-14 17:46:40 UTC"), "{body}");
+        let evil = Transition {
+            name: "x\r\nBcc: a@evil.test".into(),
+            ..resolved
+        };
+        assert!(!render("http://ui.test", &evil).0.contains('\n'));
     }
 
     #[test]

@@ -105,6 +105,8 @@ async fn main() {
     if state.config.uptime_worker_enabled {
         tokio::spawn(nami_engine::uptime::worker::run_forever(state.clone()));
         tracing::info!("uptime worker started");
+        tokio::spawn(nami_engine::logs::alert::run_forever(state.clone()));
+        tracing::info!("log alert worker started");
     } else {
         tracing::info!("uptime worker disabled (UPTIME_WORKER_ENABLED=false)");
     }
