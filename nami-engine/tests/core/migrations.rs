@@ -1,3 +1,5 @@
+use crate::common;
+
 #[sqlx::test]
 async fn all_tables_exist(pool: sqlx::PgPool) {
     let rows: Vec<(String,)> = sqlx::query_as(
@@ -25,6 +27,8 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "monitor_groups",
         "log_views",
         "log_alerts",
+        "incident_severities",
+        "incident_events",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -271,6 +275,124 @@ async fn log_alerts_constraints_are_all_named(pool: sqlx::PgPool) {
             "log_alerts_state_known",
             "log_alerts_threshold_range",
             "log_alerts_window_range",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn every_project_gets_the_three_default_severities(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let rows: Vec<(String, i32, bool)> = sqlx::query_as(
+        "select name, rank, is_default from incident_severities where project_id = $1 order by rank",
+    )
+    .bind(project)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("critical".into(), 1, false),
+            ("high".into(), 2, true),
+            ("low".into(), 3, false)
+        ]
+    );
+    let second_default = sqlx::query(
+        "insert into incident_severities (project_id, name, rank, is_default) values ($1, 'x', 9, true)",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        second_default.as_database_error().unwrap().code().as_deref(),
+        Some("23505")
+    );
+}
+
+#[sqlx::test]
+async fn an_acknowledged_incident_still_blocks_a_second_one_for_its_monitor(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let monitor = common::seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    sqlx::query(
+        "insert into incidents (project_id, monitor_id, title, status, acknowledged_at, source)
+         values ($1, $2, 'down', 'acknowledged', now(), 'monitor')",
+    )
+    .bind(project)
+    .bind(monitor)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let second = sqlx::query(
+        "insert into incidents (project_id, monitor_id, title, source) values ($1, $2, 'down', 'monitor')",
+    )
+    .bind(project)
+    .bind(monitor)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        second.as_database_error().unwrap().code().as_deref(),
+        Some("23505")
+    );
+}
+
+#[sqlx::test]
+async fn a_plain_insert_takes_its_source_from_its_foreign_key(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let monitor = common::seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    let source: String = sqlx::query_scalar(
+        "insert into incidents (project_id, monitor_id, title) values ($1, $2, 'down') returning source",
+    )
+    .bind(project)
+    .bind(monitor)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(source, "monitor");
+}
+
+/// Every constraint of the incident lifecycle tables carries the name its
+/// migration gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn incident_lifecycle_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid in ('public.incident_severities'::regclass, 'public.incident_events'::regclass)
+            or (conrelid = 'public.incidents'::regclass
+                and conname not in ('incidents_pkey', 'incidents_project_id_fkey',
+                                    'incidents_monitor_id_fkey', 'incidents_heartbeat_id_fkey',
+                                    'incidents_details_check', 'incidents_log_alert_id_fkey'))
+         order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "incident_events_actor_id_fkey",
+            "incident_events_incident_id_fkey",
+            "incident_events_kind_known",
+            "incident_events_message_size",
+            "incident_events_metadata_is_object",
+            "incident_events_pkey",
+            "incident_severities_name_format",
+            "incident_severities_name_unique",
+            "incident_severities_pkey",
+            "incident_severities_project_id_fkey",
+            "incident_severities_rank_range",
+            "incident_severities_rank_unique",
+            "incidents_acknowledged_by_fkey",
+            "incidents_acknowledged_has_time",
+            "incidents_created_by_fkey",
+            "incidents_metadata_is_object",
+            "incidents_postmortem_size",
+            "incidents_resolved_by_fkey",
+            "incidents_resolved_has_time",
+            "incidents_severity_id_fkey",
+            "incidents_source_known",
+            "incidents_status_check",
         ]
     );
 }

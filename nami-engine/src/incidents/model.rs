@@ -3,6 +3,8 @@ use serde::Serialize;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
+use crate::incidents::lifecycle::{self, IncidentSource, OpenIncident};
+
 /// One row of `GET /projects/{id}/incidents`.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow, Serialize)]
 pub struct IncidentListItem {
@@ -51,9 +53,8 @@ pub async fn list_for_project(
     .await
 }
 
-/// Opens an incident for the monitor unless one is already open (the
-/// `incidents_one_open_per_monitor` index turns a duplicate into a no-op).
-/// Returns the new incident's id, or `None` if one was already open.
+/// Opens an incident for the monitor unless it already has an unresolved
+/// one (`lifecycle::open`). Returns the new incident's id, or `None`.
 pub async fn open_for_monitor(
     conn: &mut PgConnection,
     project_id: Uuid,
@@ -62,41 +63,32 @@ pub async fn open_for_monitor(
     cause: Option<&str>,
     started_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "insert into incidents (project_id, monitor_id, title, cause, started_at)
-         values ($1, $2, $3, $4, $5)
-         on conflict (monitor_id) where status = 'open' do nothing
-         returning id",
+    lifecycle::open(
+        conn,
+        &OpenIncident {
+            project_id,
+            source: IncidentSource::Monitor(monitor_id),
+            title,
+            cause,
+            severity_id: None,
+            metadata: None,
+            started_at,
+        },
     )
-    .bind(project_id)
-    .bind(monitor_id)
-    .bind(title)
-    .bind(cause)
-    .bind(started_at)
-    .fetch_optional(&mut *conn)
     .await
 }
 
-/// Resolves the monitor's open incident, if there is one. Returns its id.
+/// Resolves the monitor's unresolved incident, if there is one. Returns its id.
 pub async fn resolve_for_monitor(
     conn: &mut PgConnection,
     monitor_id: Uuid,
     resolved_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "update incidents set status = 'resolved', resolved_at = $2
-         where monitor_id = $1 and status = 'open'
-         returning id",
-    )
-    .bind(monitor_id)
-    .bind(resolved_at)
-    .fetch_optional(&mut *conn)
-    .await
+    lifecycle::resolve_source(conn, &IncidentSource::Monitor(monitor_id), resolved_at).await
 }
 
-/// Log-alert counterpart of [`open_for_monitor`], guarded by
-/// `incidents_one_open_per_log_alert`. Never reopens a resolved incident
-/// (unlike [`open_for_heartbeat`]). Called only through
+/// Log-alert counterpart of [`open_for_monitor`]. Never reopens a resolved
+/// incident (unlike [`open_for_heartbeat`]). Called only through
 /// `logs::alert::open_alert_incident`.
 pub async fn open_for_log_alert(
     conn: &mut PgConnection,
@@ -106,18 +98,18 @@ pub async fn open_for_log_alert(
     cause: Option<&str>,
     started_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "insert into incidents (project_id, log_alert_id, title, cause, started_at)
-         values ($1, $2, $3, $4, $5)
-         on conflict (log_alert_id) where status = 'open' do nothing
-         returning id",
+    lifecycle::open(
+        conn,
+        &OpenIncident {
+            project_id,
+            source: IncidentSource::LogAlert(log_alert_id),
+            title,
+            cause,
+            severity_id: None,
+            metadata: None,
+            started_at,
+        },
     )
-    .bind(project_id)
-    .bind(log_alert_id)
-    .bind(title)
-    .bind(cause)
-    .bind(started_at)
-    .fetch_optional(&mut *conn)
     .await
 }
 
@@ -128,15 +120,7 @@ pub async fn resolve_for_log_alert(
     log_alert_id: Uuid,
     resolved_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "update incidents set status = 'resolved', resolved_at = $2
-         where log_alert_id = $1 and status = 'open'
-         returning id",
-    )
-    .bind(log_alert_id)
-    .bind(resolved_at)
-    .fetch_optional(&mut *conn)
-    .await
+    lifecycle::resolve_source(conn, &IncidentSource::LogAlert(log_alert_id), resolved_at).await
 }
 
 /// A heartbeat incident resolved less than this long ago is reopened, not
@@ -145,17 +129,16 @@ pub async fn resolve_for_log_alert(
 /// (`uptime::alert_throttle::ALERT_FLAP_WINDOW`).
 pub const HEARTBEAT_REOPEN_WINDOW_SECS: i32 = 5 * 60;
 
-/// Heartbeat counterpart of [`open_for_monitor`], guarded by
-/// `incidents_one_open_per_heartbeat`, with flap control: when the
+/// Heartbeat counterpart of [`open_for_monitor`], with flap control: when the
 /// heartbeat's latest incident was resolved less than
 /// [`HEARTBEAT_REOPEN_WINDOW_SECS`] before `started_at`, that incident is
-/// reopened (status open, `resolved_at` cleared, title and cause replaced,
-/// details cleared for the caller to attach the new ones; its id and
-/// `started_at` stay) and its id returned, instead of a new row. A job that
-/// fails and succeeds in turn (`/fail`, then `/0`, as fast as the ping rate
-/// limit allows) therefore keeps one incident row, however long it flaps,
-/// and its downtime counts from the first failure until it stays up. Called
-/// under the heartbeat's row lock (the ping and the sweep both hold it).
+/// reopened (`lifecycle::reopen_source_within`: status open, title and cause
+/// replaced, details cleared for the caller to attach the new ones; its id
+/// and `started_at` stay) and its id returned, instead of a new row. A job
+/// that fails and succeeds in turn (`/fail`, then `/0`, as fast as the ping
+/// rate limit allows) therefore keeps one incident row, however long it
+/// flaps, and its downtime counts from the first failure until it stays up.
+/// Called under the heartbeat's row lock (the ping and the sweep both hold it).
 pub async fn open_for_heartbeat(
     conn: &mut PgConnection,
     project_id: Uuid,
@@ -164,40 +147,31 @@ pub async fn open_for_heartbeat(
     cause: Option<&str>,
     started_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    let reopened: Option<Uuid> = sqlx::query_scalar(
-        "update incidents i
-         set status = 'open', resolved_at = null, title = $2, cause = $3, details = null
-         from (select id, status, resolved_at from incidents
-               where heartbeat_id = $1
-               order by started_at desc
-               limit 1) latest
-         where i.id = latest.id
-           and latest.status = 'resolved'
-           and latest.resolved_at > $4 - make_interval(secs => $5)
-         returning i.id",
+    let source = IncidentSource::Heartbeat(heartbeat_id);
+    let reopened = lifecycle::reopen_source_within(
+        conn,
+        &source,
+        HEARTBEAT_REOPEN_WINDOW_SECS,
+        title,
+        cause,
+        started_at,
     )
-    .bind(heartbeat_id)
-    .bind(title)
-    .bind(cause)
-    .bind(started_at)
-    .bind(HEARTBEAT_REOPEN_WINDOW_SECS)
-    .fetch_optional(&mut *conn)
     .await?;
     if reopened.is_some() {
         return Ok(reopened);
     }
-    sqlx::query_scalar(
-        "insert into incidents (project_id, heartbeat_id, title, cause, started_at)
-         values ($1, $2, $3, $4, $5)
-         on conflict (heartbeat_id) where status = 'open' do nothing
-         returning id",
+    lifecycle::open(
+        conn,
+        &OpenIncident {
+            project_id,
+            source,
+            title,
+            cause,
+            severity_id: None,
+            metadata: None,
+            started_at,
+        },
     )
-    .bind(project_id)
-    .bind(heartbeat_id)
-    .bind(title)
-    .bind(cause)
-    .bind(started_at)
-    .fetch_optional(&mut *conn)
     .await
 }
 
@@ -207,15 +181,7 @@ pub async fn resolve_for_heartbeat(
     heartbeat_id: Uuid,
     resolved_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    sqlx::query_scalar(
-        "update incidents set status = 'resolved', resolved_at = $2
-         where heartbeat_id = $1 and status = 'open'
-         returning id",
-    )
-    .bind(heartbeat_id)
-    .bind(resolved_at)
-    .fetch_optional(&mut *conn)
-    .await
+    lifecycle::resolve_source(conn, &IncidentSource::Heartbeat(heartbeat_id), resolved_at).await
 }
 
 /// Stores the output of the ping that opened (or reopened) the incident.

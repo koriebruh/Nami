@@ -205,6 +205,28 @@ pub async fn seed_http_monitor(
     .unwrap()
 }
 
+/// Opens a manual incident in `project` (title "test incident") through
+/// `incidents::lifecycle::open` and returns its id.
+pub async fn open_test_incident(pool: &sqlx::PgPool, project: Uuid, created_by: Uuid) -> Uuid {
+    use nami_engine::incidents::lifecycle::{self, IncidentSource, OpenIncident};
+    let mut conn = pool.acquire().await.unwrap();
+    lifecycle::open(
+        &mut conn,
+        &OpenIncident {
+            project_id: project,
+            source: IncidentSource::Manual { created_by },
+            title: "test incident",
+            cause: None,
+            severity_id: None,
+            metadata: None,
+            started_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap()
+    .expect("a manual incident has no conflict target, so it always opens")
+}
+
 /// AppState whose ClickHouse client is bound to a fresh per-test database.
 /// Call `clickhouse.drop_database()` at the end of the test.
 pub async fn state_with_clickhouse(
