@@ -7,11 +7,14 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use uuid::Uuid;
 
+use crate::core::validate::is_invisible_or_bidi_char;
 use crate::incidents::model::MAX_TEXT_BYTES;
 use crate::uptime::{checker::is_unsafe_in_text, heartbeat::sanitize_output};
 
 /// Chars of a cause a chat message carries; longer causes are cut and end in `…`.
 pub const MAX_CHAT_CAUSE_CHARS: usize = 1000;
+/// Slack's cap on a section block's `text`, counted after escaping.
+pub const MAX_SLACK_SECTION_CHARS: usize = 3000;
 /// Discord's cap on a message's `content`.
 pub const MAX_DISCORD_CHARS: usize = 2000;
 /// Telegram's cap on a message's `text`.
@@ -53,10 +56,17 @@ pub struct IncidentSummary {
 }
 
 /// The recipient's own single-use acknowledge/resolve links (email only, R16).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ActionLinks {
     pub acknowledge: String,
     pub resolve: String,
+}
+
+/// The links carry bearer tokens, so `Debug` never prints them.
+impl std::fmt::Debug for ActionLinks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ActionLinks { .. }")
+    }
 }
 
 /// One notification, before it is formatted for a channel. `incident_url`
@@ -71,19 +81,20 @@ pub struct Message {
     pub actions: Option<ActionLinks>,
 }
 
-/// Text as one line: every char that could start a line of its own or
-/// reorder how the text reads becomes a space.
+/// Control, text-direction and invisible chars: they can start a line,
+/// reorder how text reads, or hide text that escaping leaves intact.
+fn is_unsafe(c: char) -> bool {
+    is_unsafe_in_text(c) || is_invisible_or_bidi_char(c)
+}
+
+/// Text as one line: every unsafe char becomes a space.
 fn one_line(s: &str) -> String {
-    s.chars()
-        .map(|c| if is_unsafe_in_text(c) { ' ' } else { c })
-        .collect()
+    s.chars().map(|c| if is_unsafe(c) { ' ' } else { c }).collect()
 }
 
 /// A cause keeps its line breaks and loses every other unsafe char.
 fn clean_cause(s: &str) -> String {
-    s.chars()
-        .filter(|&c| c == '\n' || !is_unsafe_in_text(c))
-        .collect()
+    s.chars().filter(|&c| c == '\n' || !is_unsafe(c)).collect()
 }
 
 /// At most `max` chars; a cut text ends in `…` (counted in `max`).
@@ -234,20 +245,26 @@ pub fn email(m: &Message) -> (String, String) {
     (subject, body)
 }
 
+/// `verbatim` stops Slack from auto-linking bare URLs and auto-parsing
+/// mentions (`@here`) in plain text; the manual `<url|…>` still renders.
 fn mrkdwn(text: String) -> Value {
-    json!({"type": "section", "text": {"type": "mrkdwn", "text": text}})
+    json!({"type": "section", "text": {"type": "mrkdwn", "text": text, "verbatim": true}})
 }
 
-/// A Slack incoming-webhook payload. The only `<url|…>` link is the incident.
+/// A Slack incoming-webhook payload. The only `<url|…>` link is the incident,
+/// and each section's text is at most [`MAX_SLACK_SECTION_CHARS`] chars.
 pub fn slack(m: &Message) -> Value {
     let p = parts(m);
     let headline = escape_slack(&p.headline);
+    let summary = summary_line(&p, escape_slack);
+    // "*", "*" and "\n" around the headline.
+    let room = MAX_SLACK_SECTION_CHARS.saturating_sub(summary.chars().count() + 3);
     let mut blocks = vec![mrkdwn(format!(
-        "*{headline}*\n{}",
-        summary_line(&p, escape_slack)
+        "*{}*\n{summary}",
+        escape_within(&p.headline, escape_slack, room)
     ))];
     if let Some(cause) = &p.chat_cause {
-        blocks.push(mrkdwn(escape_slack(cause)));
+        blocks.push(mrkdwn(escape_within(cause, escape_slack, MAX_SLACK_SECTION_CHARS)));
     }
     blocks.push(mrkdwn(format!("<{}|View incident>", m.incident_url)));
     json!({
@@ -368,7 +385,8 @@ pub fn signature(secret: &[u8], timestamp: i64, body: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Lowercase hex HMAC-SHA256(secret, bytes); `signature` is built on it.
+/// Lowercase hex HMAC-SHA256(secret, bytes), the MAC `signature` applies to
+/// `{timestamp}.{body}`.
 pub fn hmac_hex(secret: &[u8], bytes: &[u8]) -> String {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC takes a key of any length");
     mac.update(bytes);
@@ -691,5 +709,112 @@ mod tests {
         assert!(content.chars().count() <= MAX_DISCORD_CHARS);
         assert!(content.ends_with(&format!("\n{url}")), "{content}");
         assert!(!content.contains("\\…"), "a backslash was left dangling");
+    }
+
+    fn slack_section(v: &Value, i: usize) -> String {
+        v["blocks"][i]["text"]["text"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn slack_sections_stay_within_slacks_cap_without_splitting_an_entity() {
+        // At the bound: 600 "&" escape to exactly 3,000 chars and are kept whole.
+        let at = "&".repeat(MAX_SLACK_SECTION_CHARS / 5);
+        let v = slack(&message("API", Some(&at)));
+        assert_eq!(slack_section(&v, 1), "&amp;".repeat(MAX_SLACK_SECTION_CHARS / 5));
+        // One past: 3,001 escaped chars, so the raw cause is cut before escaping.
+        let past = format!("y{at}");
+        let v = slack(&message("API", Some(&past)));
+        let cause = slack_section(&v, 1);
+        assert!(cause.chars().count() <= MAX_SLACK_SECTION_CHARS, "{}", cause.len());
+        assert!(cause.ends_with("&amp;…") && !cause.contains("&am…"), "{cause}");
+        let blocks = v["blocks"].as_array().unwrap();
+        assert!(slack_section(&v, blocks.len() - 1).starts_with("<http://ui.test/"));
+        assert!(blocks.iter().all(|b| b["text"]["verbatim"] == true), "{v}");
+
+        // A 1,000-char cause of "&<>" escapes to about 5,000.
+        let v = slack(&message("API", Some(&"&<>".repeat(400))));
+        assert!(slack_section(&v, 1).chars().count() <= MAX_SLACK_SECTION_CHARS);
+
+        // Title, project and reason all at their caps and all escaping 5x.
+        let mut m = Message {
+            event: NotifyEvent::Resolved,
+            ..message(&"&".repeat(255), None)
+        };
+        m.project_name = "<".repeat(200);
+        m.incident.resolution_reason = Some(">".repeat(200));
+        let first = slack_section(&slack(&m), 0);
+        assert!(first.chars().count() <= MAX_SLACK_SECTION_CHARS, "{}", first.len());
+        assert!(first.ends_with(&format!(" · Reason: {}", "&gt;".repeat(200))));
+        assert!(!first.contains("&am…"), "{first}");
+    }
+
+    #[test]
+    fn discord_and_telegram_fill_their_caps_exactly_and_cut_one_past() {
+        // (render, cap, an escaping char, its escaped width)
+        type Render = fn(&Message) -> String;
+        let cases: [(Render, usize, char, usize); 2] = [
+            (
+                |m| discord(m)["content"].as_str().unwrap().to_string(),
+                MAX_DISCORD_CHARS,
+                '*',
+                2,
+            ),
+            (
+                |m| telegram(m, "1")["text"].as_str().unwrap().to_string(),
+                MAX_TELEGRAM_CHARS,
+                '&',
+                5,
+            ),
+        ];
+        for (render, cap, c, width) in cases {
+            let base = render(&message("API", None));
+            let tail = &base[base.rfind('\n').unwrap() + 1..];
+            // The cause and its "\n" fill what the message without a cause leaves.
+            let room = cap - base.chars().count() - 1;
+            let cause = c.to_string().repeat(room / width) + &"y".repeat(room % width);
+            let at = render(&message("API", Some(&cause)));
+            assert_eq!(at.chars().count(), cap);
+            assert!(!at.contains('…') && at.ends_with(tail), "{at}");
+            let past = render(&message("API", Some(&format!("{c}{cause}"))));
+            assert!(past.chars().count() <= cap, "{}", past.chars().count());
+            assert!(past.contains('…') && past.ends_with(tail), "{past}");
+            assert!(!past.contains("\\…") && !past.contains("&am…"), "{past}");
+        }
+    }
+
+    #[test]
+    fn invisible_and_direction_chars_never_reach_a_message() {
+        let hidden = "a\u{202E}b\u{2066}c\u{200B}d\u{2060}e\u{00AD}f\u{FEFF}g\u{E0041}h";
+        let mut m = message(hidden, Some(hidden));
+        m.project_name = hidden.into();
+        let (subject, body) = email(&m);
+        let outputs = [
+            subject,
+            body,
+            slack(&m).to_string(),
+            discord(&m).to_string(),
+            telegram(&m, "1").to_string(),
+            teams(&m).to_string(),
+            String::from_utf8(webhook_body(&m)).unwrap(),
+        ];
+        for out in outputs {
+            assert!(
+                !out.chars().any(|c| is_invisible_or_bidi_char(c) || c == '\u{E0041}'),
+                "{out:?}"
+            );
+        }
+        assert_eq!(one_line(hidden), "a b c d e f g h");
+        assert_eq!(clean_cause(hidden), "abcdefgh");
+    }
+
+    #[test]
+    fn action_links_never_print_their_tokens() {
+        let links = ActionLinks {
+            acknowledge: "http://ui.test/incidents/action?token=secret-a".into(),
+            resolve: "http://ui.test/incidents/action?token=secret-r".into(),
+        };
+        let mut m = message("API", None);
+        m.actions = Some(links);
+        assert!(!format!("{m:?}").contains("secret"));
     }
 }
