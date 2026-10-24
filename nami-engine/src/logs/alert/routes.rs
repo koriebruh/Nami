@@ -19,8 +19,8 @@ use crate::{
     logs::alert::{
         count_matches,
         model::{
-            self as log_alert, CreatedAlert, LogAlert, LogAlertConfig, MAX_LOG_ALERTS_PER_PROJECT,
-            WINDOW_RANGE,
+            self as log_alert, Comparison, CreatedAlert, LogAlert, LogAlertConfig,
+            MAX_LOG_ALERTS_PER_PROJECT, WINDOW_RANGE,
         },
     },
     logs::query::{Window, search::QueryPermit},
@@ -32,7 +32,8 @@ fn yes() -> bool {
 }
 
 // Numbers and the comparison are taken as plain values so an out-of-range
-// one reaches `validate` (400) instead of failing to deserialize (422).
+// one is a 400 (`validate`, `Comparison::parse`) instead of failing to
+// deserialize (422).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateLogAlertRequest {
@@ -117,7 +118,7 @@ async fn create_alert(
             name: payload.name,
             query: payload.query,
             threshold: payload.threshold,
-            comparison: payload.comparison,
+            comparison: Comparison::parse(&payload.comparison).map_err(AppError::Validation)?,
             window_seconds: payload.window_seconds,
             interval_seconds: payload.interval_seconds,
             enabled: payload.enabled,
@@ -163,7 +164,10 @@ async fn patch_alert(
             name: payload.name.unwrap_or(stored.name),
             query: payload.query.unwrap_or(stored.query.0),
             threshold: payload.threshold.unwrap_or(stored.threshold),
-            comparison: payload.comparison.unwrap_or(stored.comparison),
+            comparison: match payload.comparison {
+                Some(comparison) => Comparison::parse(&comparison).map_err(AppError::Validation)?,
+                None => stored.comparison,
+            },
             window_seconds: payload.window_seconds.unwrap_or(stored.window_seconds),
             interval_seconds: payload.interval_seconds.unwrap_or(stored.interval_seconds),
             enabled: payload.enabled.unwrap_or(stored.enabled),

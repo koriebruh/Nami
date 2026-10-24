@@ -12,9 +12,91 @@ use crate::{
 
 /// Most log alerts a project may hold (bounds the evaluation load).
 pub const MAX_LOG_ALERTS_PER_PROJECT: i64 = 100;
+/// Largest threshold (count) an alert may compare with.
 pub const MAX_THRESHOLD: i64 = 1_000_000_000_000;
+/// Allowed `window_seconds` (1 min to 24 h).
 pub const WINDOW_RANGE: std::ops::RangeInclusive<i32> = 60..=86_400;
+/// Allowed `interval_seconds` (1 min to 24 h).
 pub const INTERVAL_RANGE: std::ops::RangeInclusive<i32> = 60..=86_400;
+
+/// How the count compares with the threshold; Postgres `text`
+/// (`log_alerts_comparison_known`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Comparison {
+    /// Fires when `count > threshold`.
+    Gt,
+    /// Fires when `count < threshold`.
+    Lt,
+}
+
+impl Comparison {
+    /// The comparison named `value`, or a message for a 400.
+    pub fn parse(value: &str) -> Result<Comparison, String> {
+        match value {
+            "gt" => Ok(Comparison::Gt),
+            "lt" => Ok(Comparison::Lt),
+            _ => Err("comparison must be gt or lt".to_string()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Comparison::Gt => "gt",
+            Comparison::Lt => "lt",
+        }
+    }
+}
+
+impl TryFrom<String> for Comparison {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Comparison::parse(&value)
+    }
+}
+
+/// An alert's state; Postgres `text` (`log_alerts_state_known`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlertState {
+    Ok,
+    Alerting,
+}
+
+impl AlertState {
+    /// The state stored as `value`, or an error for any other text.
+    pub fn parse(value: &str) -> Result<AlertState, String> {
+        match value {
+            "ok" => Ok(AlertState::Ok),
+            "alerting" => Ok(AlertState::Alerting),
+            _ => Err(format!("unknown log alert state {value:?}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AlertState::Ok => "ok",
+            AlertState::Alerting => "alerting",
+        }
+    }
+
+    /// The state after an evaluation (R-P2-18): a project-wide maintenance
+    /// window (`held`) keeps it, otherwise it follows the condition.
+    pub fn next(self, met: bool, held: bool) -> AlertState {
+        match (held, met) {
+            (true, _) => self,
+            (false, true) => AlertState::Alerting,
+            (false, false) => AlertState::Ok,
+        }
+    }
+}
+
+impl TryFrom<String> for AlertState {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        AlertState::parse(&value)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, sqlx::FromRow)]
 pub struct LogAlert {
@@ -23,13 +105,13 @@ pub struct LogAlert {
     pub name: String,
     pub query: sqlx::types::Json<LogQuery>,
     pub threshold: i64,
-    /// `gt` or `lt`.
-    pub comparison: String,
+    #[sqlx(try_from = "String")]
+    pub comparison: Comparison,
     pub window_seconds: i32,
     pub interval_seconds: i32,
     pub enabled: bool,
-    /// `ok` or `alerting`.
-    pub state: String,
+    #[sqlx(try_from = "String")]
+    pub state: AlertState,
     pub last_evaluated_at: Option<DateTime<Utc>>,
     pub last_count: Option<i64>,
     /// Why the last evaluation failed (a fixed, user-safe text); `None`
@@ -48,7 +130,7 @@ pub struct LogAlertConfig {
     pub name: String,
     pub query: LogQuery,
     pub threshold: i64,
-    pub comparison: String,
+    pub comparison: Comparison,
     pub window_seconds: i32,
     pub interval_seconds: i32,
     pub enabled: bool,
@@ -60,13 +142,10 @@ pub struct LogAlertConfig {
 /// checked by the caller (`saved_query::check_sources`).
 pub fn validate(config: LogAlertConfig) -> Result<LogAlertConfig, String> {
     let name = validate_label("name", &config.name)?;
-    if !matches!(config.comparison.as_str(), "gt" | "lt") {
-        return Err("comparison must be gt or lt".to_string());
-    }
     if !(0..=MAX_THRESHOLD).contains(&config.threshold) {
         return Err(format!("threshold must be between 0 and {MAX_THRESHOLD}"));
     }
-    if config.comparison == "lt" && config.threshold < 1 {
+    if config.comparison == Comparison::Lt && config.threshold < 1 {
         return Err("lt needs a threshold of at least 1".to_string());
     }
     if !WINDOW_RANGE.contains(&config.window_seconds) {
@@ -90,6 +169,8 @@ pub fn validate(config: LogAlertConfig) -> Result<LogAlertConfig, String> {
     }
 }
 
+/// What [`create`] did: created, refused at [`MAX_LOG_ALERTS_PER_PROJECT`]
+/// (409), or the project does not exist (404).
 // Short-lived return value; boxing would change the interface callers use.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -108,6 +189,7 @@ macro_rules! columns {
     };
 }
 
+/// Every alert of the project, by name.
 pub async fn list_for_project(
     pool: &PgPool,
     project_id: Uuid,
@@ -122,6 +204,7 @@ pub async fn list_for_project(
     .await
 }
 
+/// The alert, or `None` when it is not in the project.
 pub async fn get(
     pool: &PgPool,
     project_id: Uuid,
@@ -174,7 +257,7 @@ pub async fn create(
     .bind(&config.name)
     .bind(sqlx::types::Json(&config.query))
     .bind(config.threshold)
-    .bind(&config.comparison)
+    .bind(config.comparison.as_str())
     .bind(config.window_seconds)
     .bind(config.interval_seconds)
     .bind(config.enabled)
@@ -206,6 +289,7 @@ pub async fn update(
     let Some(state) = state else {
         return Ok(None);
     };
+    let state = AlertState::parse(&state).map_err(|e| sqlx::Error::Decode(e.into()))?;
     let alert: LogAlert = sqlx::query_as(concat!(
         "update log_alerts
          set name = $3, query = $4, threshold = $5, comparison = $6, window_seconds = $7,
@@ -221,13 +305,13 @@ pub async fn update(
     .bind(&config.name)
     .bind(sqlx::types::Json(&config.query))
     .bind(config.threshold)
-    .bind(&config.comparison)
+    .bind(config.comparison.as_str())
     .bind(config.window_seconds)
     .bind(config.interval_seconds)
     .bind(config.enabled)
     .fetch_one(&mut *tx)
     .await?;
-    if !config.enabled && state == "alerting" {
+    if !config.enabled && state == AlertState::Alerting {
         super::resolve_alert_incident(&mut tx, alert_id, project_id, &alert.name, Utc::now(), false)
             .await?;
     }
@@ -255,7 +339,7 @@ mod tests {
             name: " Errors ".to_string(),
             query: LogQuery::default(),
             threshold: 0,
-            comparison: "gt".to_string(),
+            comparison: Comparison::Gt,
             window_seconds: *WINDOW_RANGE.start(),
             interval_seconds: *INTERVAL_RANGE.start(),
             enabled: true,
@@ -272,16 +356,15 @@ mod tests {
             ..config()
         };
         assert!(validate(at_the_top).is_ok());
-        assert!(validate(LogAlertConfig { comparison: "lt".into(), threshold: 1, ..config() }).is_ok());
+        assert!(validate(LogAlertConfig { comparison: Comparison::Lt, threshold: 1, ..config() }).is_ok());
         for bad in [
             LogAlertConfig { threshold: MAX_THRESHOLD + 1, ..config() },
             LogAlertConfig { threshold: -1, ..config() },
-            LogAlertConfig { comparison: "lt".into(), ..config() },
+            LogAlertConfig { comparison: Comparison::Lt, ..config() },
             LogAlertConfig { window_seconds: WINDOW_RANGE.start() - 1, ..config() },
             LogAlertConfig { window_seconds: WINDOW_RANGE.end() + 1, ..config() },
             LogAlertConfig { interval_seconds: INTERVAL_RANGE.start() - 1, ..config() },
             LogAlertConfig { interval_seconds: INTERVAL_RANGE.end() + 1, ..config() },
-            LogAlertConfig { comparison: "eq".into(), ..config() },
             LogAlertConfig { name: String::new(), ..config() },
             LogAlertConfig {
                 query: LogQuery { levels: vec!["loud".into()], ..LogQuery::default() },
@@ -290,5 +373,23 @@ mod tests {
         ] {
             assert!(validate(bad.clone()).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn only_known_comparisons_and_states_parse() {
+        assert_eq!(Comparison::parse("gt"), Ok(Comparison::Gt));
+        assert_eq!(Comparison::parse("lt"), Ok(Comparison::Lt));
+        assert!(Comparison::parse("eq").is_err());
+        assert_eq!(AlertState::parse("alerting"), Ok(AlertState::Alerting));
+        assert!(AlertState::parse("paused").is_err());
+    }
+
+    #[test]
+    fn maintenance_holds_the_state_and_otherwise_the_condition_decides() {
+        use AlertState::{Alerting, Ok as Fine};
+        assert_eq!(Fine.next(true, false), Alerting);
+        assert_eq!(Alerting.next(false, false), Fine);
+        assert_eq!(Fine.next(true, true), Fine);
+        assert_eq!(Alerting.next(false, true), Alerting);
     }
 }

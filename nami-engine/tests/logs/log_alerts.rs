@@ -4,7 +4,13 @@ use crate::common;
 
 use axum::http::StatusCode;
 use common::{app, call, logs::{post_json, seed_source}, public_app, seed_project, settled_mail, state_with_clickhouse, test_app, user_with_role};
-use nami_engine::{logs::alert, core::state::AppState};
+use nami_engine::{
+    core::state::AppState,
+    logs::{alert::{self, model::MAX_LOG_ALERTS_PER_PROJECT}, view::saved_query::{LogQuery, MAX_QUERY_BYTES}},
+    uptime::worker::Notifications,
+};
+use std::sync::Arc;
+use tokio::sync::Semaphore;
 use serde_json::{Value, json};
 
 fn alert_body(name: &str) -> Value {
@@ -255,4 +261,73 @@ async fn overlapping_passes_evaluate_each_alert_once(pool: sqlx::PgPool) {
     assert_eq!(incidents(&pool, &id).await.len(), 1);
     assert_eq!(settled_mail(&email, 1).await.len(), 1);
     ch.drop_database().await.unwrap();
+}
+
+async fn insert_alerts(pool: &sqlx::PgPool, project: uuid::Uuid, count: i64) {
+    sqlx::query(
+        "insert into log_alerts (project_id, name, threshold, comparison, window_seconds, interval_seconds)
+         select $1, 'filler ' || n, 1, 'gt', 300, 60 from generate_series(1, $2::int) n",
+    )
+    .bind(project)
+    .bind(count)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn a_project_holds_at_most_the_alert_cap(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    insert_alerts(&pool, project, MAX_LOG_ALERTS_PER_PROJECT - 1).await;
+    let base = format!("/projects/{project}/log-alerts");
+    let (status, body) = call(&app, "POST", &base, Some(&member), Some(alert_body("Last"))).await;
+    assert_eq!(status, StatusCode::CREATED, "the alert at the cap: {body}");
+    let (status, body) = call(&app, "POST", &base, Some(&member), Some(alert_body("One more"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+}
+
+#[sqlx::test]
+async fn a_stored_query_is_capped_in_bytes(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    // A level is trimmed before it is checked, so padding keeps it valid
+    // and grows only the stored JSON.
+    let query = |pad: usize| json!({ "levels": [format!("error{}", " ".repeat(pad))] });
+    let size = |pad: usize| serde_json::to_vec(&serde_json::from_value::<LogQuery>(query(pad)).unwrap()).unwrap().len();
+    let pad = MAX_QUERY_BYTES - size(0);
+    assert_eq!(size(pad), MAX_QUERY_BYTES);
+    let base = format!("/projects/{project}/log-alerts");
+    let body = |pad: usize| json!({ "name": "Big", "query": query(pad), "threshold": 2, "comparison": "gt",
+                                     "window_seconds": 300, "interval_seconds": 60 });
+    let (status, created) = call(&app, "POST", &base, Some(&member), Some(body(pad))).await;
+    assert_eq!(status, StatusCode::CREATED, "at the bound: {created}");
+    let (status, refused) = call(&app, "POST", &base, Some(&member), Some(body(pad + 1))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(refused["error"], format!("query must be at most {MAX_QUERY_BYTES} bytes"), "{refused}");
+}
+
+#[sqlx::test]
+async fn a_pass_claims_no_more_alerts_than_its_budget_has_places(pool: sqlx::PgPool) {
+    // ClickHouse is unreachable here: each claimed count fails, which is
+    // enough to see what was claimed.
+    let state = AppState::for_test(pool.clone());
+    let project = seed_project(&pool).await;
+    insert_alerts(&pool, project, 2).await;
+    let due = || async {
+        sqlx::query_scalar::<_, i64>("select count(*) from log_alerts where next_evaluation_at <= now()")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let notifications = Notifications::new();
+    let none = Arc::new(Semaphore::new(0));
+    assert_eq!(alert::run_pass_with(&state, &notifications, &none).await.unwrap(), 0);
+    assert_eq!(due().await, 2);
+    let one = Arc::new(Semaphore::new(1));
+    assert_eq!(alert::run_pass_with(&state, &notifications, &one).await.unwrap(), 1);
+    assert_eq!(due().await, 1);
+    assert_eq!(one.available_permits(), 1, "the place is given back");
 }

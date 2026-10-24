@@ -26,6 +26,7 @@ use crate::{
         search::{READ_SETTINGS, user_error},
     },
     logs::view::saved_query::LogQuery,
+    logs::alert::model::{AlertState, Comparison},
     uptime::alerts::{Subject, Transition, TransitionKind},
     uptime::maintenance::model as maintenance,
     uptime::worker::{Notifications, spawn_alerts},
@@ -52,21 +53,20 @@ pub struct DueAlert {
     pub name: String,
     pub query: sqlx::types::Json<LogQuery>,
     pub threshold: i64,
-    pub comparison: String,
+    #[sqlx(try_from = "String")]
+    pub comparison: Comparison,
     pub window_seconds: i32,
     /// As claimed: an evaluation is dropped when the row's differs (edited
     /// meanwhile, R-P2-18).
     pub updated_at: DateTime<Utc>,
 }
 
-/// `gt`: `count > threshold`; `lt`: `count < threshold`. Any other
-/// comparison never fires.
-pub fn condition_met(comparison: &str, count: u64, threshold: i64) -> bool {
+/// `gt`: `count > threshold`; `lt`: `count < threshold`.
+pub fn condition_met(comparison: Comparison, count: u64, threshold: i64) -> bool {
     let (count, threshold) = (i128::from(count), i128::from(threshold));
     match comparison {
-        "gt" => count > threshold,
-        "lt" => count < threshold,
-        _ => false,
+        Comparison::Gt => count > threshold,
+        Comparison::Lt => count < threshold,
     }
 }
 
@@ -81,7 +81,10 @@ pub fn describe(alert: &DueAlert, count: u64) -> String {
     } else {
         format!("{seconds} s")
     };
-    let op = if alert.comparison == "lt" { "<" } else { ">" };
+    let op = match alert.comparison {
+        Comparison::Gt => ">",
+        Comparison::Lt => "<",
+    };
     format!(
         "{count} matching events in the last {window} (threshold: {op} {})",
         alert.threshold
@@ -158,47 +161,42 @@ pub async fn apply_evaluation(
     let Some((state, enabled, last, updated_at)) = row else {
         return Ok(None);
     };
+    let state = AlertState::parse(&state).map_err(|e| sqlx::Error::Decode(e.into()))?;
     if !enabled || updated_at != alert.updated_at || last.is_some_and(|last| last >= started_at) {
         return Ok(None);
     }
     let held = maintenance::active_windows(&mut *tx, alert.project_id, started_at)
         .await?
         .covers_project();
-    let met = condition_met(&alert.comparison, count, alert.threshold);
-    let next_state = if held {
-        state.as_str()
-    } else if met {
-        "alerting"
-    } else {
-        "ok"
-    };
+    let met = condition_met(alert.comparison, count, alert.threshold);
+    let next_state = state.next(met, held);
     sqlx::query(
         "update log_alerts set state = $2, last_count = $3, last_evaluated_at = $4,
                 last_error = null, last_error_at = null
          where id = $1",
     )
     .bind(alert.id)
-    .bind(next_state)
+    .bind(next_state.as_str())
     .bind(i64::try_from(count).unwrap_or(i64::MAX))
     .bind(started_at)
     .execute(&mut *tx)
     .await?;
-    let transition = if held {
-        None
-    } else if met && state == "ok" {
-        open_alert_incident(&mut tx, alert, count, started_at).await?
-    } else if !met && state == "alerting" {
-        resolve_alert_incident(
-            &mut tx,
-            alert.id,
-            alert.project_id,
-            &alert.name,
-            started_at,
-            true,
-        )
-        .await?
-    } else {
-        None
+    let transition = match (state, next_state) {
+        (AlertState::Ok, AlertState::Alerting) => {
+            open_alert_incident(&mut tx, alert, count, started_at).await?
+        }
+        (AlertState::Alerting, AlertState::Ok) => {
+            resolve_alert_incident(
+                &mut tx,
+                alert.id,
+                alert.project_id,
+                &alert.name,
+                started_at,
+                true,
+            )
+            .await?
+        }
+        _ => None,
     };
     tx.commit().await?;
     Ok(transition)
@@ -412,11 +410,11 @@ mod tests {
 
     #[test]
     fn conditions_compare_strictly() {
-        assert!(condition_met("gt", 11, 10));
-        assert!(!condition_met("gt", 10, 10));
-        assert!(condition_met("lt", 0, 1));
-        assert!(!condition_met("lt", 1, 1));
-        assert!(!condition_met("eq", 5, 5), "unknown comparisons never fire");
+        assert!(condition_met(Comparison::Gt, 11, 10));
+        assert!(!condition_met(Comparison::Gt, 10, 10));
+        assert!(condition_met(Comparison::Lt, 0, 1));
+        assert!(!condition_met(Comparison::Lt, 1, 1));
+        assert!(Comparison::parse("eq").is_err(), "unknown comparisons are refused");
     }
 
     #[test]
@@ -427,7 +425,7 @@ mod tests {
             name: "n".into(),
             query: sqlx::types::Json(LogQuery::default()),
             threshold: 10,
-            comparison: "gt".into(),
+            comparison: Comparison::Gt,
             window_seconds: 300,
             updated_at: chrono::DateTime::from_timestamp(1_792_000_000, 0).unwrap(),
         };
@@ -436,7 +434,7 @@ mod tests {
             "12 matching events in the last 5 min (threshold: > 10)"
         );
         let hourly = DueAlert {
-            comparison: "lt".into(),
+            comparison: Comparison::Lt,
             window_seconds: 3600,
             threshold: 1,
             ..alert.clone()
