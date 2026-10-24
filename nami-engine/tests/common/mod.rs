@@ -262,6 +262,36 @@ pub async fn run_incident_ticks(state: &AppState) {
     nami_engine::incidents::worker::kick(state).await
 }
 
+/// Makes the incident's next escalation step due now, only if one is
+/// scheduled (unconditionally, it would resurrect an exhausted escalation).
+pub async fn make_escalation_due(pool: &sqlx::PgPool, incident: Uuid) {
+    sqlx::query(
+        "update incidents set next_escalation_at = now()
+         where id = $1 and next_escalation_at is not null",
+    )
+    .bind(incident)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Replaces the project's default policy with `body` through the API as
+/// `admin`; returns its id.
+pub async fn set_policy(app: &Router, project: Uuid, admin: &HeaderValue, body: Value) -> Uuid {
+    let path = format!("/projects/{project}/escalation-policies");
+    let (status, policies) = call(app, "GET", &path, Some(admin), None).await;
+    assert_eq!(status, StatusCode::OK, "{policies}");
+    let id = policies
+        .as_array()
+        .and_then(|all| all.iter().find(|p| p["is_default"] == true))
+        .and_then(|p| p["id"].as_str())
+        .expect("every project has a default policy")
+        .to_string();
+    let (status, saved) = call(app, "PUT", &format!("{path}/{id}"), Some(admin), Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    id.parse().unwrap()
+}
+
 /// AppState whose ClickHouse client is bound to a fresh per-test database.
 /// Call `clickhouse.drop_database()` at the end of the test.
 pub async fn state_with_clickhouse(

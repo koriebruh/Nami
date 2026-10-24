@@ -8,6 +8,8 @@ use serde_json::json;
 use sqlx::{Connection, PgConnection};
 use uuid::Uuid;
 
+use crate::{core::validate::is_invisible_or_bidi_char, uptime::checker::is_unsafe_in_text};
+
 /// What an incident belongs to. Each source other than `Manual` has at most
 /// one unresolved incident (the `incidents_one_unresolved_per_*` indexes).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,31 +240,76 @@ pub async fn acknowledge(
     Ok(done)
 }
 
+/// Most chars of a resolution reason (R30).
+pub const MAX_REASON_CHARS: usize = 200;
+
 /// open|acknowledged -> resolved at `at`, which stops escalation. `actor:
-/// None` = automatic. `false` when it was already resolved (or does not
-/// exist).
+/// None` = automatic. Queues a `resolved` notice for every target the
+/// current escalation generation has notified (`QUEUE_RESOLVED`; for a
+/// legacy incident, every verified member). `false` when it was already
+/// resolved (or does not exist).
 pub async fn resolve(
     conn: &mut PgConnection,
     incident_id: Uuid,
     actor: Option<Uuid>,
     at: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
-    let done = sqlx::query(
+    resolve_with_reason(conn, incident_id, actor, at, None).await
+}
+
+// One `resolved` notice per target with a sent step notification in the
+// current generation ($2): its rounds start `g{generation}p`, and the `p`
+// keeps g1 from matching g10.
+const QUEUE_RESOLVED: &str = "insert into notification_deliveries
+        (incident_id, event, round, target_key, user_id, channel_id)
+    select distinct incident_id, 'resolved', 'resolved:g' || $2, target_key, user_id, channel_id
+    from notification_deliveries
+    where incident_id = $1 and event = 'triggered' and status = 'sent'
+      and round like 'g' || $2 || 'p%'
+    on conflict on constraint notification_deliveries_target_unique do nothing";
+
+// A legacy incident (unresolved at deploy, R6) was emailed to every member by
+// the old path, which recorded no deliveries: each verified member is told.
+const QUEUE_RESOLVED_LEGACY: &str = "insert into notification_deliveries
+        (incident_id, event, round, target_key, user_id)
+    select i.id, 'resolved', 'resolved:g' || $2, 'email:' || m.user_id, m.user_id
+    from incidents i
+    join project_members m on m.project_id = i.project_id
+    join users u on u.id = m.user_id and u.email_verified_at is not null
+    where i.id = $1
+    on conflict on constraint notification_deliveries_target_unique do nothing";
+
+/// [`resolve`], with the `resolved` event carrying `reason` as its message
+/// and `metadata.reason` (R30).
+async fn resolve_with_reason(
+    conn: &mut PgConnection,
+    incident_id: Uuid,
+    actor: Option<Uuid>,
+    at: DateTime<Utc>,
+    reason: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let resolved: Option<(i32, bool)> = sqlx::query_as(
         "update incidents set status = 'resolved', resolved_at = $3, resolved_by = $2,
                 next_escalation_at = null
-         where id = $1 and status <> 'resolved'",
+         where id = $1 and status <> 'resolved'
+         returning escalation_generation, escalation_legacy",
     )
     .bind(incident_id)
     .bind(actor)
     .bind(at)
-    .execute(&mut *conn)
-    .await?
-    .rows_affected()
-        == 1;
-    if done {
-        record_event(conn, incident_id, EventKind::Resolved, actor, None, json!({})).await?;
-    }
-    Ok(done)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some((generation, legacy)) = resolved else {
+        return Ok(false);
+    };
+    let metadata = reason.map_or_else(|| json!({}), |r| json!({ "reason": r }));
+    record_event(conn, incident_id, EventKind::Resolved, actor, reason, metadata).await?;
+    sqlx::query(if legacy { QUEUE_RESOLVED_LEGACY } else { QUEUE_RESOLVED })
+        .bind(incident_id)
+        .bind(generation)
+        .execute(&mut *conn)
+        .await?;
+    Ok(true)
 }
 
 /// Resolves the source's unresolved incident, automatically (no resolver).
@@ -271,6 +318,32 @@ pub async fn resolve_source(
     conn: &mut PgConnection,
     source: &IncidentSource,
     at: DateTime<Utc>,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    resolve_source_inner(conn, source, at, None).await
+}
+
+/// R17/R30: [`resolve_source`] with a reason, cut to [`MAX_REASON_CHARS`]
+/// with every unsafe char (control, invisible, text direction) made a
+/// space. Queues the normal `resolved` notices, which carry the reason.
+pub async fn resolve_source_with_reason(
+    conn: &mut PgConnection,
+    source: &IncidentSource,
+    at: DateTime<Utc>,
+    reason: &str,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let reason: String = reason
+        .chars()
+        .take(MAX_REASON_CHARS)
+        .map(|c| if is_unsafe_in_text(c) || is_invisible_or_bidi_char(c) { ' ' } else { c })
+        .collect();
+    resolve_source_inner(conn, source, at, Some(&reason)).await
+}
+
+async fn resolve_source_inner(
+    conn: &mut PgConnection,
+    source: &IncidentSource,
+    at: DateTime<Utc>,
+    reason: Option<&str>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let (monitor, heartbeat, log_alert) = source.keys();
     let id: Option<Uuid> = sqlx::query_scalar(
@@ -287,7 +360,7 @@ pub async fn resolve_source(
     let Some(id) = id else {
         return Ok(None);
     };
-    Ok(resolve(conn, id, None, at).await?.then_some(id))
+    Ok(resolve_with_reason(conn, id, None, at, reason).await?.then_some(id))
 }
 
 /// resolved -> open, by `actor`: the resolution and the acknowledgement are

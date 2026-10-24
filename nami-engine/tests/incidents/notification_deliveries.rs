@@ -18,7 +18,15 @@ use wiremock::{
     matchers::{header_exists, method, path},
 };
 
+/// Queues one delivery and disarms the incident's escalation, so `kick`
+/// sends only what this file queues (the default policy would also page the
+/// member's email and personal channels).
 async fn queue(pool: &sqlx::PgPool, incident: Uuid, round: &str, target: Target) -> u64 {
+    sqlx::query("update incidents set next_escalation_at = null where id = $1")
+        .bind(incident)
+        .execute(pool)
+        .await
+        .unwrap();
     let mut conn = pool.acquire().await.unwrap();
     deliveries::enqueue(
         &mut conn,
@@ -28,9 +36,8 @@ async fn queue(pool: &sqlx::PgPool, incident: Uuid, round: &str, target: Target)
     .unwrap()
 }
 
-// From Task 9 on, `kick` also runs the incident's default policy, which queues
-// emails of its own (round "g0p0r0s0"). These helpers look only at the rows and
-// events this file queues itself (round "p0r0s0", channel messages).
+// These helpers look only at the rows and events this file queues itself
+// (round "p0r0s0", channel messages).
 async fn delivery(pool: &sqlx::PgPool, incident: Uuid) -> (String, i32, Option<String>) {
     sqlx::query_as(
         "select status, attempts, last_error from notification_deliveries where incident_id = $1 and round = 'p0r0s0'",

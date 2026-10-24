@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod escalation_engine;
 mod escalation_policies_api;
 mod incident_actions;
 mod incident_lifecycle;

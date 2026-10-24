@@ -1,5 +1,5 @@
-//! The incidents worker: a delivery drain every [`TICK`] ([`run_forever`]),
-//! or at once ([`kick`]).
+//! The incidents worker: an escalation tick and a delivery drain every
+//! [`TICK`] ([`run_forever`]), or at once ([`kick`]).
 
 use std::time::Duration;
 
@@ -7,10 +7,10 @@ use tokio::{sync::Semaphore, time::MissedTickBehavior};
 
 use crate::{
     core::state::AppState,
-    incidents::{deliveries, send::Senders},
+    incidents::{deliveries, escalation, send::Senders},
 };
 
-/// How often the worker loop drains the queue.
+/// How often the worker loop escalates and drains the queue.
 pub const TICK: Duration = Duration::from_secs(2);
 /// Most kicks running at once in this process; the rest wait (R17).
 pub const MAX_CONCURRENT_KICKS: usize = 2;
@@ -32,10 +32,11 @@ pub async fn run_forever(state: AppState) {
     }
 }
 
-/// One drain now (Task 9 adds one escalation tick before it). Used by
-/// notify_transition (Task 10) and tests. Returns at once when
+/// One escalation tick, then one drain, now. Used by notify_transition
+/// (Task 10) and tests. Returns at once when
 /// `!state.config.incidents_worker_enabled`. Otherwise waits for one of the
-/// [`MAX_CONCURRENT_KICKS`] permits, then runs one bounded drain.
+/// [`MAX_CONCURRENT_KICKS`] permits, then runs both, each bounded; a failed
+/// tick is logged and never skips the drain.
 pub async fn kick(state: &AppState) {
     if !state.config.incidents_worker_enabled {
         return;
@@ -44,6 +45,9 @@ pub async fn kick(state: &AppState) {
     let Ok(_permit) = KICKS.acquire().await else {
         return;
     };
+    if let Err(e) = escalation::run::tick(state).await {
+        tracing::error!(error = ?e, "escalation tick failed");
+    }
     let senders = Senders::from_config(&state.config);
     if let Err(e) = deliveries::drain(state, &senders).await {
         tracing::error!(error = ?e, "notification drain failed");
