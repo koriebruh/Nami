@@ -1,5 +1,6 @@
 //! Incidents opened by monitors and heartbeats (`model`) and their routes.
 pub mod channel;
+pub mod format;
 pub mod lifecycle;
 pub mod model;
 pub mod routes;

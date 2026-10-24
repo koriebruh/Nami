@@ -171,8 +171,16 @@ availability function (SLA reports), and RBAC.
   formatting cannot be injected, and the only link an `Action.OpenUrl` to
   the incident; webhook — JSON body
   `{event, incident:{id,title,cause,status,source,severity,started_at,url}, project:{id,name}}`
-  plus `X-Nami-Signature: sha256=<HMAC of body>` with a per-channel secret
-  shown once at creation.
+  with `X-Nami-Timestamp: <unix seconds>` (decimal, taken once per attempt
+  just before sending), `X-Nami-Signature: sha256=<lowercase hex
+  HMAC-SHA256(secret, "{timestamp}." + raw body)>` and `X-Nami-Delivery:
+  <delivery id>`, under a per-channel signing secret shown once at creation
+  (used as its ASCII bytes). Receivers recompute the HMAC over
+  `{X-Nami-Timestamp}.{raw body}` and compare in constant time, reject a
+  timestamp more than 5 minutes old or in the future, and keep
+  `X-Nami-Delivery` ids for at least 5 minutes to drop a repeat. (Controller
+  ruling 2026-10-19, plan R29: a signed timestamp replaces the HMAC of the
+  body alone.)
 - Delivery queue `notification_deliveries` (durable): pending → sent |
   failed, up to 5 attempts with exponential backoff (30 s … 1 h), 10 s
   timeout, per-attempt result recorded in the incident timeline. A delivery
