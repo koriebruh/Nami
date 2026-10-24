@@ -165,10 +165,12 @@ async fn create_incident(
 ) -> Result<(StatusCode, Json<IncidentDetail>), AppError> {
     require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let title = validate_line("title", &req.title, MAX_TITLE_CHARS).map_err(AppError::Validation)?;
-    let description = req.description.filter(|d| !d.trim().is_empty());
-    if let Some(description) = &description {
-        validate_text("description", description, MAX_TEXT_BYTES).map_err(AppError::Validation)?;
-    }
+    let description = req
+        .description
+        .filter(|d| !d.trim().is_empty())
+        .map(|d| validate_text("description", &d, MAX_TEXT_BYTES))
+        .transpose()
+        .map_err(AppError::Validation)?;
     let mut tx = state.db.begin().await?;
     if let Some(severity_id) = req.severity_id
         && !severity::belongs_to(&mut *tx, project_id, severity_id).await?
@@ -266,9 +268,9 @@ async fn add_comment(
     if req.body.trim().is_empty() {
         return Err(AppError::Validation("comment is required".into()));
     }
-    validate_text("comment", &req.body, MAX_TEXT_BYTES).map_err(AppError::Validation)?;
+    let body = validate_text("comment", &req.body, MAX_TEXT_BYTES).map_err(AppError::Validation)?;
     let mut tx = begin_locked(&state, project_id, incident_id).await?;
-    let event_id = lifecycle::comment(&mut tx, incident_id, user.id, &req.body).await?;
+    let event_id = lifecycle::comment(&mut tx, incident_id, user.id, &body).await?;
     tx.commit().await?;
     let event = incident::event(&state.db, event_id)
         .await?
@@ -283,11 +285,12 @@ async fn set_postmortem(
     Json(req): Json<PostmortemRequest>,
 ) -> Result<Json<IncidentDetail>, AppError> {
     require_project_role(&state.db, &user, project_id, Role::Member).await?;
-    let postmortem = req.postmortem.filter(|p| !p.trim().is_empty());
-    if let Some(postmortem) = &postmortem {
-        validate_text("postmortem", postmortem, MAX_POSTMORTEM_BYTES)
-            .map_err(AppError::Validation)?;
-    }
+    let postmortem = req
+        .postmortem
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| validate_text("postmortem", &p, MAX_POSTMORTEM_BYTES))
+        .transpose()
+        .map_err(AppError::Validation)?;
     let mut tx = begin_locked(&state, project_id, incident_id).await?;
     incident::set_postmortem(&mut tx, incident_id, user.id, postmortem.as_deref()).await?;
     tx.commit().await?;

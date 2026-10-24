@@ -33,12 +33,12 @@ async fn members_open_manual_incidents_and_viewers_read_them(pool: sqlx::PgPool)
         "POST",
         &url(project, ""),
         Some(&member),
-        Some(json!({"title": "  Checkout slow  ", "description": "p95 > 2s\nsince 10:00"})),
+        Some(json!({"title": "  Checkout slow  ", "description": "p95 > 2s\r\nsince 10:00"})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["title"], "Checkout slow");
-    assert_eq!(created["cause"], "p95 > 2s\nsince 10:00");
+    assert_eq!(created["cause"], "p95 > 2s\nsince 10:00", "CRLF from a textarea is stored as LF");
     assert_eq!(created["source"], "manual");
     assert_eq!(created["status"], "open");
     assert_eq!(created["severity"], "high");
@@ -179,13 +179,14 @@ async fn comments_postmortems_and_severity_changes_are_capped_and_logged(pool: s
         "POST",
         &url(project, &format!("/{id}/comments")),
         Some(&member),
-        Some(json!({"body": "rolled back\nwatching"})),
+        Some(json!({"body": "rolled back\r\nwatching"})),
     )
     .await;
     assert_eq!(
         (status, event["kind"].as_str()),
         (StatusCode::CREATED, Some("comment"))
     );
+    assert_eq!(event["message"], "rolled back\nwatching");
     for bad in [
         json!({"body": ""}),
         json!({"body": "x".repeat(10_241)}),
@@ -207,7 +208,7 @@ async fn comments_postmortems_and_severity_changes_are_capped_and_logged(pool: s
         "PUT",
         &url(project, &format!("/{id}/postmortem")),
         Some(&member),
-        Some(json!({"postmortem": "# Cause\n<script>alert(1)</script>"})),
+        Some(json!({"postmortem": "# Cause\r\n<script>alert(1)</script>"})),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -451,4 +452,70 @@ async fn text_caps_and_the_page_size_accept_their_bound(pool: sqlx::PgPool) {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+#[sqlx::test]
+async fn every_write_needs_a_member_and_an_incident_of_the_path_project(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let other = seed_project(&pool).await;
+    let (member_id, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (_, _, outsider) = user_with_role(&app, &pool, project, None).await;
+    let id = open_test_incident(&pool, project, member_id).await;
+    let foreign = open_test_incident(&pool, other, member_id).await;
+    let severity: Uuid = sqlx::query_scalar(
+        "select id from incident_severities where project_id = $1 and name = 'critical'",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // Valid bodies, so the role check (not the body extractor) decides.
+    let writes = |incident: Uuid| {
+        [
+            ("POST", format!("/{incident}/resolve"), json!({})),
+            ("POST", format!("/{incident}/reopen"), json!({})),
+            ("POST", format!("/{incident}/comments"), json!({"body": "x"})),
+            ("PUT", format!("/{incident}/postmortem"), json!({"postmortem": "x"})),
+            ("PATCH", format!("/{incident}"), json!({"severity_id": severity})),
+        ]
+    };
+    for (method, rest, body) in writes(id) {
+        let (status, _) = call(&app, method, &url(project, &rest), Some(&viewer), Some(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "viewer {method} {rest}");
+    }
+    for (method, rest, body) in writes(foreign) {
+        let (status, _) = call(&app, method, &url(project, &rest), Some(&member), Some(body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "member {method} {rest}");
+    }
+
+    let (status, _) = call(&app, "GET", &url(project, &format!("/{id}")), Some(&outsider), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(
+        &app,
+        "GET",
+        &format!("/projects/{project}/severities"),
+        Some(&outsider),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let foreign_severity: Uuid =
+        sqlx::query_scalar("select id from incident_severities where project_id = $1 limit 1")
+            .bind(other)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let (status, _) = call(
+        &app,
+        "PATCH",
+        &url(project, &format!("/{id}")),
+        Some(&member),
+        Some(json!({"severity_id": foreign_severity})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

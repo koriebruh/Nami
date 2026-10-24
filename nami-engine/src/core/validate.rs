@@ -52,18 +52,21 @@ pub fn validate_line(field: &str, raw: &str, max_chars: usize) -> Result<String,
 }
 
 /// Rule for multi-line user text (incident descriptions, comments,
-/// postmortems): at most `max_bytes` bytes, and no control character other
-/// than `\n` and `\t`. The text is kept as it is (not trimmed).
-pub fn validate_text(field: &str, raw: &str, max_bytes: usize) -> Result<(), String> {
-    if raw.len() > max_bytes {
+/// postmortems). Returns the text with each `\r\n` turned into `\n`
+/// (browsers submit textarea lines that way), otherwise as it is (not
+/// trimmed). The result is at most `max_bytes` bytes and holds no control
+/// character other than `\n` and `\t`, so a lone `\r` is refused.
+pub fn validate_text(field: &str, raw: &str, max_bytes: usize) -> Result<String, String> {
+    let text = raw.replace("\r\n", "\n");
+    if text.len() > max_bytes {
         return Err(format!("{field} must be at most {max_bytes} bytes"));
     }
-    if raw.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+    if text.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
         return Err(format!(
             "{field} must not contain control characters other than newlines and tabs"
         ));
     }
-    Ok(())
+    Ok(text)
 }
 
 thread_local! {
@@ -371,6 +374,31 @@ mod tests {
             "API (eu-west) #1",
         ] {
             assert_eq!(validate_name(raw).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn text_turns_crlf_into_lf_and_counts_the_bytes_after() {
+        use super::validate_text;
+        assert_eq!(validate_text("comment", "a\r\nb\r\n", 10).unwrap(), "a\nb\n");
+        // Five `x\r\n` lines are 15 bytes, and 10 once normalized.
+        assert_eq!(validate_text("comment", &"x\r\n".repeat(5), 10).unwrap(), "x\n".repeat(5));
+        assert_eq!(
+            validate_text("comment", &"x\n".repeat(6), 10).unwrap_err(),
+            "comment must be at most 10 bytes"
+        );
+        assert_eq!(validate_text("comment", "a\tb", 10).unwrap(), "a\tb");
+    }
+
+    #[test]
+    fn text_refuses_a_lone_carriage_return_and_other_controls() {
+        use super::validate_text;
+        for raw in ["a\rb", "a\r", "\r\r\n", "a\u{1b}[31m", "a\u{0}"] {
+            assert_eq!(
+                validate_text("comment", raw, 100).unwrap_err(),
+                "comment must not contain control characters other than newlines and tabs",
+                "{raw:?}"
+            );
         }
     }
 }
