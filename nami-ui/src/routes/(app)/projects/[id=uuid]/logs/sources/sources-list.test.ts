@@ -51,12 +51,17 @@ describe('sources create action', () => {
 		expect(calls()).toEqual([]);
 	});
 
-	it('relays the engine failure, shows a viewer the 403, and sends a lost session to login', async () => {
+	it('shows a viewer the member-only message, relays other failures, and sends a lost session to login', async () => {
 		const form = { name: 'api' };
-		const denied = await actions.create(
-			fakeEvent({ form, status: 403, body: '{"error":"insufficient project role"}' }).event
+		const denied = await actions.create(fakeEvent({ form, status: 403, body: '{"error":"forbidden"}' }).event);
+		expect(denied).toMatchObject({
+			status: 403,
+			data: { message: 'Only project members and admins can create a source.' }
+		});
+		const clash = await actions.create(
+			fakeEvent({ form, status: 409, body: '{"error":"a source with this name already exists"}' }).event
 		);
-		expect(denied).toMatchObject({ status: 403, data: { message: 'insufficient project role' } });
+		expect(clash).toMatchObject({ status: 409, data: { message: 'a source with this name already exists' } });
 		await expect(actions.create(fakeEvent({ form, status: 401 }).event)).rejects.toMatchObject({
 			status: 303,
 			location: '/login'

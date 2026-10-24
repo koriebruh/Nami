@@ -71,6 +71,12 @@ export const actions: Actions = {
 			method: 'PATCH',
 			body: JSON.stringify(parsed.payload)
 		});
+		if (response.status === 403) {
+			return fail(403, {
+				action: 'update' as const,
+				message: 'Only project members and admins can change a source.'
+			});
+		}
 		if (!response.ok) return failure('update', response, 'Could not save the source.');
 		return { saved: true as const };
 	},

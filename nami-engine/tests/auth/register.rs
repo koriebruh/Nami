@@ -1,7 +1,7 @@
 use axum::{body::{self, Body}, http::{Request, StatusCode}};
 use tower::ServiceExt;
 use nami_engine::core::state::AppState;
-use serde_json::{json, Value};
+use serde_json::json;
 
 fn test_app(pool: sqlx::PgPool) -> axum::Router {
     let state = AppState::for_test(pool);
@@ -38,16 +38,14 @@ async fn register_creates_unverified_user(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn registering_twice_does_not_duplicate_or_change_response(pool: sqlx::PgPool) {
-    // Requires `docker compose up -d mailpit` to be running first.
-    reqwest::Client::new()
-        .delete("http://localhost:8025/api/v1/messages")
-        .send()
-        .await
-        .unwrap();
+    // Requires `docker compose up -d mailpit` to be running first. A fresh
+    // address per run instead of emptying the inbox, which would race the
+    // other tests that read their mail.
+    let email = format!("dup-{}@example.com", uuid::Uuid::new_v4());
 
     let app1 = test_app(pool.clone());
     let app2 = test_app(pool.clone());
-    let body = json!({ "email": "dup@example.com", "password": "password123" }).to_string();
+    let body = json!({ "email": email, "password": "password123" }).to_string();
 
     let make_request = || {
         Request::builder()
@@ -71,28 +69,15 @@ async fn registering_twice_does_not_duplicate_or_change_response(pool: sqlx::PgP
     assert_eq!(r1_body, r2_body);
 
     let count: (i64,) = sqlx::query_as("select count(*) from users where email = $1")
-        .bind("dup@example.com")
+        .bind(&email)
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(count.0, 1);
 
     // Exactly one verification email sent: the second (duplicate) registration
-    // must not trigger a second send. Filter by recipient (rather than raw
-    // inbox count) so this stays correct even when other tests in this file
-    // run concurrently and send mail to other addresses.
-    let mailpit_body: Value = reqwest::get("http://localhost:8025/api/v1/messages")
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let messages = mailpit_body["messages"].as_array().unwrap();
-    let dup_messages: Vec<_> = messages
-        .iter()
-        .filter(|m| m["To"][0]["Address"] == "dup@example.com")
-        .collect();
-    assert_eq!(dup_messages.len(), 1);
+    // must not trigger a second send.
+    assert_eq!(crate::common::settled_mail(&email, 1).await.len(), 1);
 }
 
 /// Fix 3a (final-fix-wave): the first user ever registered on a fresh
@@ -174,4 +159,61 @@ async fn verify_email_rejects_invalid_token(pool: sqlx::PgPool) {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// The verification email carries an absolute nami-ui link (the UI's
+/// `/verify-email` page, not a bare engine path), and its token verifies the
+/// account.
+#[sqlx::test]
+async fn the_verification_email_links_to_the_ui_verify_page(pool: sqlx::PgPool) {
+    // Requires `docker compose up -d mailpit`. A fresh address per run, since
+    // Mailpit keeps earlier runs' mail.
+    let email = format!("verify-{}@example.com", uuid::Uuid::new_v4());
+    let state = AppState::for_test(pool.clone());
+    let prefix = format!("{}/verify-email?token=", state.config.ui_base_url.trim_end_matches('/'));
+    let app = nami_engine::core::router::with_fallback_connect_info(
+        nami_engine::core::router::build_router(state),
+    );
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/register")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "email": email, "password": "password123" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mail = crate::common::settled_mail(&email, 1).await;
+    assert_eq!(mail.len(), 1);
+    let (_, text) = &mail[0];
+    let start = text.find(&prefix).expect("the email holds the absolute UI link");
+    let token: String = text[start + prefix.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    assert!(!token.is_empty());
+
+    let verify = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/auth/verify-email?token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(verify.status(), StatusCode::OK);
+    let verified: (Option<chrono::DateTime<chrono::Utc>>,) =
+        sqlx::query_as("select email_verified_at from users where email = $1")
+            .bind(&email)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(verified.0.is_some());
 }

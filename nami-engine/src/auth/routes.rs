@@ -35,6 +35,14 @@ pub fn rate_limited_router() -> Router<AppState> {
         .route("/auth/password/reset", post(reset_password))
 }
 
+/// The absolute nami-ui link for an emailed token: `{ui_base_url}{page}?token=…`,
+/// with the token percent-encoded and no doubled `/` after the base.
+fn ui_link(ui_base_url: &str, page: &str, token: &str) -> String {
+    let base = ui_base_url.trim_end_matches('/');
+    let token: String = url::form_urlencoded::byte_serialize(token.as_bytes()).collect();
+    format!("{base}{page}?token={token}")
+}
+
 #[derive(Deserialize)]
 struct RegisterRequest {
     email: String,
@@ -68,7 +76,10 @@ async fn register(
         .send(
             &user.email,
             "Verify your Nami account",
-            format!("Verify your email: /auth/verify-email?token={raw_token}"),
+            format!(
+                "Verify your email: {}",
+                ui_link(&state.config.ui_base_url, "/verify-email", &raw_token)
+            ),
         )
         .await
     {
@@ -352,7 +363,14 @@ async fn forgot_password(
     // failure propagate into a distinguishable error status.
     if let Err(e) = state
         .mailer
-        .send(&user.email, "Reset your Nami password", format!("Reset: /auth/password/reset?token={raw_token}"))
+        .send(
+            &user.email,
+            "Reset your Nami password",
+            format!(
+                "Reset your password: {}",
+                ui_link(&state.config.ui_base_url, "/reset-password", &raw_token)
+            ),
+        )
         .await
     {
         tracing::error!(error = %e, "failed to send password reset email");
@@ -525,4 +543,29 @@ async fn oauth_callback(
         .map_err(|_| AppError::Validation("session error".into()))?;
 
     Ok(Json(json!({ "authenticated": true })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ui_link;
+
+    #[test]
+    fn emailed_links_are_absolute_ui_links_without_a_doubled_slash() {
+        assert_eq!(
+            ui_link("https://nami.example.com/", "/verify-email", "abc123"),
+            "https://nami.example.com/verify-email?token=abc123"
+        );
+        assert_eq!(
+            ui_link("http://localhost:5173", "/reset-password", "abc"),
+            "http://localhost:5173/reset-password?token=abc"
+        );
+    }
+
+    #[test]
+    fn the_token_is_percent_encoded() {
+        assert_eq!(
+            ui_link("http://ui", "/verify-email", "a b&c=d"),
+            "http://ui/verify-email?token=a+b%26c%3Dd"
+        );
+    }
 }

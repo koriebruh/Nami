@@ -457,3 +457,66 @@ async fn register_returns_generic_200_even_if_mail_send_fails(pool: sqlx::PgPool
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+/// The reset email carries an absolute nami-ui link to `/reset-password`
+/// (the page that reads `token` from the query string), and its token resets
+/// the password.
+#[sqlx::test]
+async fn the_reset_email_links_to_the_ui_reset_page(pool: sqlx::PgPool) {
+    // Requires `docker compose up -d mailpit`. A fresh address per run, since
+    // Mailpit keeps earlier runs' mail.
+    let email = format!("reset-link-{}@example.com", uuid::Uuid::new_v4());
+    let password_hash = nami_engine::auth::password::hash_password("password123").unwrap();
+    sqlx::query("insert into users (email, password_hash, email_verified_at) values ($1, $2, now())")
+        .bind(&email)
+        .bind(&password_hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let prefix = format!(
+        "{}/reset-password?token=",
+        AppState::for_test(pool.clone()).config.ui_base_url.trim_end_matches('/')
+    );
+    let app = test_app(pool);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/password/forgot")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "email": email }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mail = crate::common::settled_mail(&email, 1).await;
+    assert_eq!(mail.len(), 1);
+    let (_, text) = &mail[0];
+    let start = text.find(&prefix).expect("the email holds the absolute UI link");
+    let token: String = text[start + prefix.len()..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect();
+    assert!(!token.is_empty());
+
+    let reset = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/auth/password/reset")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "token": token, "new_password": "linkednewpass" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reset.status(), StatusCode::OK);
+    login(&app, &email, "linkednewpass").await;
+}

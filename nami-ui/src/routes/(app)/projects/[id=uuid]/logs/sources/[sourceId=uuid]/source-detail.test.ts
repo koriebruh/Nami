@@ -97,6 +97,22 @@ describe('source delete and update actions', () => {
 		expect(denied).toMatchObject({ status: 403, data: { message: 'Only project admins can delete a source.' } });
 	});
 
+	it('update shows a viewer the member-only message and relays other failures', async () => {
+		const form = { name: 'api', platform: 'http', retention_days: '7' };
+		const denied = await actions.update(fakeEvent({ params, form, status: 403, body: '{"error":"forbidden"}' }).event);
+		expect(denied).toMatchObject({
+			status: 403,
+			data: { action: 'update', message: 'Only project members and admins can change a source.' }
+		});
+		const clash = await actions.update(
+			fakeEvent({ params, form, status: 409, body: '{"error":"a source with this name already exists"}' }).event
+		);
+		expect(clash).toMatchObject({
+			status: 409,
+			data: { action: 'update', message: 'a source with this name already exists' }
+		});
+	});
+
 	it('update sends the quota as null when cleared', async () => {
 		const { event, calls } = fakeEvent({
 			params,
