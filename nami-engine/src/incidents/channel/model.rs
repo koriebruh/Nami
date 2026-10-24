@@ -18,15 +18,21 @@ use crate::{
     incidents::outbound::{self, DISCORD, Reach, SLACK, UrlRule},
 };
 
+/// Every channel kind.
 pub const KINDS: [&str; 6] = ["email", "webhook", "slack", "teams", "telegram", "discord"];
+/// The kinds a personal channel may be (no email, R8).
 pub const PERSONAL_KINDS: [&str; 5] = ["webhook", "slack", "teams", "telegram", "discord"];
+/// Most channels one project may hold.
 pub const MAX_PROJECT_CHANNELS: i64 = 50;
+/// Most personal channels one user may hold.
 pub const MAX_PERSONAL_CHANNELS: i64 = 10;
 /// A channel name's length in chars (the column's check).
 pub const MAX_NAME_CHARS: usize = 100;
 /// The longest email address a channel may hold, in bytes.
 pub const MAX_ADDRESS_BYTES: usize = 254;
+/// AAD prefix of `config_enc` (see [`config_context`]).
 pub const CONFIG_CONTEXT: &str = "notification_channels.config";
+/// AAD prefix of `signing_secret_enc` (see [`signing_secret_context`]).
 pub const SIGNING_SECRET_CONTEXT: &str = "notification_channels.signing_secret";
 
 /// The AAD `config_enc` of channel `id` is sealed under.
@@ -69,6 +75,7 @@ impl fmt::Debug for ChannelConfig {
     }
 }
 
+/// Who a channel belongs to: a project (admin-managed) or one user.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Owner {
     Project(Uuid),
@@ -86,6 +93,7 @@ impl Owner {
 }
 
 impl ChannelConfig {
+    /// The kind, as stored in `notification_channels.kind`.
     pub fn kind(&self) -> &'static str {
         match self {
             ChannelConfig::Email { .. } => "email",
@@ -191,6 +199,7 @@ pub struct CreatedChannel {
     pub signing_secret: Option<String>,
 }
 
+/// The outcome of [`insert`].
 pub enum Inserted {
     Created(CreatedChannel),
     /// The owner already holds its maximum of channels.
@@ -293,7 +302,7 @@ fn seal_config(cipher: &Cipher, id: Uuid, config: &ChannelConfig) -> Vec<u8> {
     cipher.encrypt(&config_context(id), &json)
 }
 
-/// The owner's channels by name.
+/// The owner's channels, by name.
 pub async fn list(pool: &PgPool, owner: &Owner) -> Result<Vec<Channel>, sqlx::Error> {
     let (project_id, user_id) = owner.ids();
     sqlx::query_as(concat!(
@@ -379,6 +388,7 @@ pub async fn update(
     .await?)
 }
 
+/// The outcome of [`delete`].
 pub enum Deleted {
     Deleted,
     NotFound,
@@ -387,6 +397,7 @@ pub enum Deleted {
     InUse { policy: String },
 }
 
+/// Deletes the owner's channel `id`; another owner's is `NotFound`.
 pub async fn delete(pool: &PgPool, owner: &Owner, id: Uuid) -> Result<Deleted, sqlx::Error> {
     let (project_id, user_id) = owner.ids();
     let result = sqlx::query(

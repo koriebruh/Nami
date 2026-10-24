@@ -218,3 +218,49 @@ async fn a_channel_opens_for_sending_only_under_its_own_key(pool: sqlx::PgPool) 
     assert!(channel::open_for_send(&pool, &other_key, id).await.unwrap().unwrap().is_err(), "the key changed");
     assert!(channel::open_for_send(&pool, &test_cipher(), Uuid::new_v4()).await.unwrap().is_none());
 }
+
+#[sqlx::test]
+async fn channel_writes_check_role_and_owner(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let other = seed_project(&pool).await;
+    let (admin_id, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let slack = ChannelConfig::Slack { webhook_url: SLACK_URL.into() };
+    let insert = |owner| {
+        let (pool, slack) = (pool.clone(), slack.clone());
+        async move {
+            match channel::insert(&pool, &test_cipher(), owner, "room", &slack, true, admin_id).await.unwrap() {
+                Inserted::Created(created) => created.channel.id,
+                _ => panic!("not created"),
+            }
+        }
+    };
+    let room = insert(Owner::Project(project)).await;
+    let foreign = insert(Owner::Project(other)).await;
+    let path = format!("/projects/{project}/notification-channels");
+    let rename = json!({"name": "renamed"});
+
+    let (status, _) = call(&app, "PATCH", &format!("{path}/{room}"), Some(&member), Some(rename.clone())).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = call(&app, "DELETE", &format!("{path}/{room}"), Some(&member), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for method in ["PATCH", "DELETE"] {
+        let body = (method == "PATCH").then(|| rename.clone());
+        let (status, _) = call(&app, method, &format!("{path}/{foreign}"), Some(&admin), body.clone()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}: another project's channel");
+        let (status, _) = call(&app, method, &format!("/account/notification-channels/{room}"), Some(&member), body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}: a project channel through the personal route");
+    }
+    let name: String = sqlx::query_scalar("select name from notification_channels where id = $1")
+        .bind(room).fetch_one(&pool).await.unwrap();
+    assert_eq!(name, "room");
+
+    let (status, _) = call(&app, "DELETE", &format!("{path}/{room}"), Some(&admin), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let left: i64 = sqlx::query_scalar("select count(*) from notification_channels where id = $1")
+        .bind(room).fetch_one(&pool).await.unwrap();
+    assert_eq!(left, 0);
+    let (status, _) = call(&app, "DELETE", &format!("{path}/{room}"), Some(&admin), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

@@ -55,10 +55,12 @@ pub enum UrlRule {
     },
 }
 
+/// Slack incoming webhooks.
 pub const SLACK: UrlRule = UrlRule::HttpsHostPrefix {
     host: &["hooks.slack.com"],
     path_prefix: "/",
 };
+/// Discord webhooks, on any of Discord's hosts.
 pub const DISCORD: UrlRule = UrlRule::HttpsHostPrefix {
     host: &["discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com"],
     path_prefix: "/api/webhooks/",
