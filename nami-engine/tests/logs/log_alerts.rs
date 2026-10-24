@@ -147,8 +147,8 @@ async fn an_alert_opens_and_resolves_its_incident_and_emails_once_each(pool: sql
 
     let mail = settled_mail(&email, 2).await;
     let subjects: Vec<&str> = mail.iter().map(|(s, _)| s.as_str()).collect();
-    assert_eq!(subjects, ["[Nami] Log alert Checkout errors triggered", "[Nami] Log alert Checkout errors resolved"]);
-    assert!(mail[0].1.contains("Condition: 3 matching events in the last 5 min (threshold: > 2)"), "{}", mail[0].1);
+    assert_eq!(subjects, ["[Nami] [high] Log alert: Checkout errors", "[Nami] Resolved: Log alert: Checkout errors"]);
+    assert!(mail[0].1.contains("Cause: 3 matching events in the last 5 min (threshold: > 2)"), "{}", mail[0].1);
 
     let (_, listed) = call(&app, "GET", &format!("/projects/{project}/incidents"), Some(&member), None).await;
     assert_eq!(listed["incidents"][0]["source_name"], "Checkout errors");
@@ -239,8 +239,10 @@ async fn an_evaluation_of_an_edited_alert_is_dropped(pool: sqlx::PgPool) {
     ch.drop_database().await.unwrap();
 }
 
+/// Disabling an alerting alert resolves its incident and tells whoever was
+/// paged why (R17, superseding Logs Part 2's silent disable).
 #[sqlx::test]
-async fn disabled_alerts_are_skipped_and_disabling_resolves_quietly(pool: sqlx::PgPool) {
+async fn disabled_alerts_are_skipped_and_disabling_resolves_with_a_reason(pool: sqlx::PgPool) {
     let (state, ch) = state_with_clickhouse(&pool).await;
     let public = public_app(state.clone());
     let app = app(state.clone());
@@ -256,7 +258,11 @@ async fn disabled_alerts_are_skipped_and_disabling_resolves_quietly(pool: sqlx::
     assert_eq!(incidents(&pool, &id).await[0].0, "resolved");
     make_due(&pool, &id).await;
     assert_eq!(alert::evaluate_due_alerts(&state).await.unwrap(), 0, "a disabled alert is never claimed");
-    assert_eq!(settled_mail(&email, 1).await.len(), 1, "only the trigger email: disabling sends nothing");
+    common::run_incident_ticks(&state).await;
+    let mail = settled_mail(&email, 2).await;
+    assert_eq!(mail.len(), 2, "{mail:?}");
+    assert_eq!(mail[1].0, "[Nami] Resolved: Log alert: Quiet");
+    assert!(mail[1].1.contains("Reason: alert disabled"), "{}", mail[1].1);
     ch.drop_database().await.unwrap();
 }
 

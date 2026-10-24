@@ -11,8 +11,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use common::{
-    LogCapture, add_member, at, mail_for, make_due, seed_http_monitor, seed_project, seed_user,
-    settled_mail, silent_server, state_with_clickhouse, stored_mail_for, unique_email,
+    LogCapture, add_member, at, mail_for, make_due, make_escalation_due, run_incident_ticks,
+    seed_http_monitor, seed_project, seed_user, settled_mail, silent_server,
+    state_with_clickhouse, stored_mail_for, unique_email,
 };
 use nami_engine::{
     core::clickhouse::ClickHouse,
@@ -20,8 +21,7 @@ use nami_engine::{
     core::state::AppState,
     uptime::monitor::model::Monitor,
     uptime::{
-        alert_throttle::ALERT_FLAP_WINDOW,
-        alerts::{Transition, TransitionKind, notify_transition, send_deferred},
+        alerts::{Transition, TransitionKind, notify_transition},
         checker::{CheckOutcome, CheckStatus},
         store::{UptimeCheckRow, insert_checks},
         worker::{
@@ -72,6 +72,19 @@ async fn incidents_of(
 ) -> Vec<(String, String, Option<String>, bool)> {
     sqlx::query_as(
         "select status, title, cause, resolved_at is not null from incidents where monitor_id = $1 order by started_at",
+    )
+    .bind(monitor)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// (status, attempts, last_error) of every delivery of the monitor's incidents.
+async fn deliveries_of(pool: &sqlx::PgPool, monitor: Uuid) -> Vec<(String, i32, Option<String>)> {
+    sqlx::query_as(
+        "select d.status, d.attempts, d.last_error from notification_deliveries d
+         join incidents i on i.id = d.incident_id
+         where i.monitor_id = $1 order by d.created_at, d.id",
     )
     .bind(monitor)
     .fetch_all(pool)
@@ -202,14 +215,20 @@ async fn reaching_the_threshold_opens_one_incident_and_alerts_once(pool: sqlx::P
     );
     let mail = settled_mail(&recipient, 1).await;
     assert_eq!(mail.len(), 1, "{mail:?}");
-    assert_eq!(mail[0].0, "[Nami] Checkout API is DOWN");
+    assert_eq!(mail[0].0, "[Nami] [high] Checkout API is down");
     assert!(
         mail[0].1.contains("expected status 200-399, got 503"),
         "{}",
         mail[0].1
     );
+    // The email links to the incident, which links to the monitor.
+    let incident: Uuid = sqlx::query_scalar("select id from incidents where monitor_id = $1")
+        .bind(monitor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let link = format!(
-        "{}/projects/{project}/monitors/{monitor}",
+        "{}/projects/{project}/incidents/{incident}",
         state.config.ui_base_url
     );
     assert!(
@@ -277,8 +296,8 @@ async fn recovery_resolves_the_incident_and_sends_one_email(pool: sqlx::PgPool) 
             .map(|(subject, _)| subject.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "[Nami] Checkout API is DOWN",
-            "[Nami] Checkout API is back UP"
+            "[Nami] [high] Checkout API is down",
+            "[Nami] Resolved: Checkout API is down"
         ]
     );
     ch.drop_database().await.unwrap();
@@ -889,7 +908,7 @@ async fn a_result_that_fails_to_apply_is_rolled_back_and_does_not_stop_the_pass(
         mail.iter()
             .map(|(subject, _)| subject.as_str())
             .collect::<Vec<_>>(),
-        vec!["[Nami] Healthy is DOWN"]
+        vec!["[Nami] [high] Healthy is down"]
     );
     ch.drop_database().await.unwrap();
 }
@@ -935,7 +954,7 @@ async fn every_project_member_is_mailed_once_and_nobody_else(pool: sqlx::PgPool)
     for member in [&admin, &viewer] {
         let mail = settled_mail(member, 1).await;
         assert_eq!(mail.len(), 1, "{member}: {mail:?}");
-        assert_eq!(mail[0].0, "[Nami] Checkout API is DOWN");
+        assert_eq!(mail[0].0, "[Nami] [high] Checkout API is down");
     }
     assert!(mail_for(&outsider).await.is_empty());
     ch.drop_database().await.unwrap();
@@ -978,7 +997,7 @@ async fn a_name_written_around_the_api_cannot_inject_headers_or_recipients(pool:
     let message = &stored[0];
     assert_eq!(
         message.subject,
-        format!("[Nami] APIBcc: {victim}Cc: {victim} is DOWN")
+        format!("[Nami] [high] API  Bcc: {victim}  Cc: {victim} is down")
     );
     assert_eq!(message.to, vec![recipient.clone()]);
     assert!(message.cc.is_empty(), "{:?}", message.cc);
@@ -1045,7 +1064,7 @@ async fn a_hostile_error_text_is_sanitized_stored_and_mailed_as_plain_text(pool:
     let stored = stored_mail_for(&recipient).await;
     assert_eq!(stored.len(), 1);
     let message = &stored[0];
-    assert_eq!(message.subject, "[Nami] Checkout API is DOWN");
+    assert_eq!(message.subject, "[Nami] [high] Checkout API is down");
     assert!(
         message.text.contains("<script>alert(1)</script>"),
         "{}",
@@ -1210,7 +1229,7 @@ async fn an_up_monitor_that_fails_up_to_the_threshold_goes_down_with_one_inciden
         mail.iter()
             .map(|(subject, _)| subject.as_str())
             .collect::<Vec<_>>(),
-        vec!["[Nami] Checkout API is DOWN"]
+        vec!["[Nami] [high] Checkout API is down"]
     );
     ch.drop_database().await.unwrap();
 }
@@ -1394,8 +1413,8 @@ async fn a_hung_clickhouse_does_not_delay_state_changes_or_alerts(pool: sqlx::Pg
 
 /// An SMTP server that is up but hung must not hold up the checks: alerts are
 /// sent by background tasks, so a monitor can go down and recover in the time
-/// the two passes need while both alerts are still waiting on the silent
-/// server. (Before, a pass sent its alerts itself and so waited for them.)
+/// the two passes need while the silent server never answers. (Before, a pass
+/// sent its alerts itself and so waited for them.)
 #[sqlx::test]
 async fn a_hung_smtp_server_does_not_hold_up_the_checks(pool: sqlx::PgPool) {
     let (smtp_port, _silent) = silent_server().await;
@@ -1426,17 +1445,12 @@ async fn a_hung_smtp_server_does_not_hold_up_the_checks(pool: sqlx::PgPool) {
         elapsed < Duration::from_secs(5),
         "two passes took {elapsed:?} while the SMTP server never answered"
     );
-    assert_eq!(
-        notifications.reap(),
-        2,
-        "both alerts are still waiting on the silent server, off the checks' path"
-    );
     ch.drop_database().await.unwrap();
 }
 
-/// Such alerts are given up on after the limit for one email, one recipient
-/// after the other, so a pass that waits for its alerts (`run_due_checks`)
-/// ends too.
+/// Such alerts are given up on after the limit for one email (the recipients'
+/// emails are sent at once, and retried later), so a pass that waits for its
+/// alerts (`run_due_checks`) ends too.
 #[sqlx::test]
 async fn alerts_to_a_hung_smtp_server_are_given_up_on_after_the_timeout(pool: sqlx::PgPool) {
     let (smtp_port, _silent) = silent_server().await;
@@ -1459,12 +1473,17 @@ async fn alerts_to_a_hung_smtp_server_are_given_up_on_after_the_timeout(pool: sq
 
     assert_eq!(ran.unwrap(), 1);
     assert!(
-        elapsed >= Duration::from_millis(1_300),
-        "two recipients, 700 ms each: {elapsed:?}"
+        elapsed >= Duration::from_millis(700),
+        "two recipients, sent at once, 700 ms each: {elapsed:?}"
     );
     assert!(elapsed < Duration::from_secs(10), "{elapsed:?}");
     assert_eq!(monitor_state(&pool, monitor).await.0, "down");
     assert_eq!(incidents_of(&pool, monitor).await.len(), 1);
+    assert_eq!(
+        deliveries_of(&pool, monitor).await,
+        vec![("pending".to_string(), 1, Some("email not delivered".to_string())); 2],
+        "both given up on for now, to be retried"
+    );
     ch.drop_database().await.unwrap();
 }
 
@@ -1491,7 +1510,7 @@ async fn a_non_ascii_name_and_cause_are_mailed_intact(pool: sqlx::PgPool) {
     let stored = stored_mail_for(&recipient).await;
     assert_eq!(stored.len(), 1);
     let message = &stored[0];
-    assert_eq!(message.subject, "[Nami] Café ☕ API is DOWN");
+    assert_eq!(message.subject, "[Nami] [high] Café ☕ API is down");
     assert!(
         message
             .text
@@ -1508,9 +1527,9 @@ async fn a_non_ascii_name_and_cause_are_mailed_intact(pool: sqlx::PgPool) {
     );
 }
 
-/// One line per failed transition, naming the monitor and the kind of
-/// transition; the cause is logged once, by the mailer, and neither line
-/// carries the recipient's address.
+/// A failed alert is logged once, by the mailer, without the recipient's
+/// address; the incident's timeline records it, naming the recipient's own
+/// address there only.
 #[sqlx::test]
 async fn a_failed_alert_is_logged_once_and_without_the_recipients_address(pool: sqlx::PgPool) {
     let log = LogCapture::default();
@@ -1532,17 +1551,22 @@ async fn a_failed_alert_is_logged_once_and_without_the_recipients_address(pool: 
         !all.contains(&recipient),
         "the address is in the log:\n{all}"
     );
-    let summaries: Vec<_> = lines
-        .iter()
-        .filter(|line| line.contains("alert email not delivered to every recipient"))
-        .collect();
-    assert_eq!(summaries.len(), 1, "{all}");
-    assert!(
-        summaries[0].contains(&monitor.to_string()),
-        "{}",
-        summaries[0]
+    assert_eq!(
+        deliveries_of(&pool, monitor).await,
+        vec![("pending".to_string(), 1, Some("email not delivered".to_string()))]
     );
-    assert!(summaries[0].contains("Down"), "{}", summaries[0]);
+    let failed: Vec<Option<String>> = sqlx::query_scalar(
+        "select e.message from incident_events e join incidents i on i.id = e.incident_id
+         where i.monitor_id = $1 and e.kind = 'notification_failed'",
+    )
+    .bind(monitor)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        failed,
+        [Some(format!("Email: {recipient}: email not delivered"))]
+    );
     assert!(
         !all.contains("validation error"),
         "the mailer's generic error is not logged a second time:\n{all}"
@@ -1651,14 +1675,15 @@ async fn an_alert_does_not_wait_for_the_rest_of_its_pass(pool: sqlx::PgPool) {
         mail.iter()
             .map(|(subject, _)| subject.as_str())
             .collect::<Vec<_>>(),
-        vec!["[Nami] Refused API is DOWN"]
+        vec!["[Nami] [high] Refused API is down"]
     );
     pass.abort();
 }
 
-/// Flap control covers monitors too: a monitor that goes down and up four
-/// times in a row costs each member one DOWN + recovery pair; a monitor that
-/// then stays down is reported once the window is over.
+/// Flap control covers monitors too (R31): a monitor that goes down and up
+/// four times in a row costs each member one DOWN + recovery pair, because an
+/// incident pages no sooner than `SOURCE_PAGE_GAP_SECS` after its monitor's
+/// last page; a monitor that then stays down is paged once the gap is over.
 #[sqlx::test]
 async fn a_flapping_monitor_sends_one_pair_per_window_and_reports_staying_down_later(
     pool: sqlx::PgPool,
@@ -1682,110 +1707,27 @@ async fn a_flapping_monitor_sends_one_pair_per_window_and_reports_staying_down_l
     let subjects: Vec<&str> = mail.iter().map(|(subject, _)| subject.as_str()).collect();
     assert_eq!(
         subjects,
-        vec!["[Nami] Flaky API is DOWN", "[Nami] Flaky API is back UP"]
+        vec!["[Nami] [high] Flaky API is down", "[Nami] Resolved: Flaky API is down"]
     );
 
-    // Down once more, and it stays down: held back now, sent after the window.
+    // Down once more, and it stays down: held now, paged after the gap.
     let transition = apply_outcome(&pool, &snapshot, &at(failed_check(), second + 60))
         .await
         .unwrap()
         .expect("down again");
     notify_transition(&state, &transition).await;
-    let now = std::time::Instant::now();
-    assert_eq!(
-        send_deferred(&state, now).await,
-        0,
-        "the window is not over"
-    );
-    assert_eq!(send_deferred(&state, now + ALERT_FLAP_WINDOW).await, 1);
-    assert_eq!(
-        send_deferred(&state, now + ALERT_FLAP_WINDOW * 2).await,
-        0,
-        "sent once"
-    );
-    let mail = settled_mail(&recipient, 3).await;
-    assert_eq!(mail.len(), 3);
-    assert_eq!(mail[2].0, "[Nami] Flaky API is DOWN");
-}
-
-/// A monitor whose DOWN email the flap control is holding back: down, up,
-/// down again within the window.
-async fn monitor_with_held_down(state: &AppState, pool: &sqlx::PgPool, project: Uuid) -> Uuid {
-    let monitor = seed_http_monitor(pool, project, "Held API", "http://127.0.0.1:9/", 1).await;
-    let snapshot = claimed_snapshot(pool, monitor).await;
-    for (second, check) in [
-        (60, failed_check()),
-        (120, passed_check()),
-        (180, failed_check()),
-    ] {
-        let transition = apply_outcome(pool, &snapshot, &at(check, second))
-            .await
-            .unwrap()
-            .expect("a transition");
-        notify_transition(state, &transition).await;
-    }
-    monitor
-}
-
-/// A held-back DOWN is sent after the window only for a subject still down:
-/// not once it is paused, deleted, or inside a maintenance window (scoped to
-/// it or project-wide).
-#[sqlx::test]
-async fn a_held_down_is_dropped_for_paused_deleted_or_maintained_monitors(pool: sqlx::PgPool) {
-    let after_window = || std::time::Instant::now() + ALERT_FLAP_WINDOW;
-    let window = |project: Uuid, monitor: Option<Uuid>| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query(
-                "insert into maintenance_windows (project_id, monitor_id, title, kind, starts_at, ends_at)
-                 values ($1, $2, 'maintenance', 'once', now() - interval '5 minutes', now() + interval '1 hour')",
-            )
-            .bind(project)
+    run_incident_ticks(&state).await;
+    assert_eq!(settled_mail(&recipient, 2).await.len(), 2, "the gap is not over");
+    let held: Uuid =
+        sqlx::query_scalar("select id from incidents where monitor_id = $1 and status = 'open'")
             .bind(monitor)
-            .execute(&pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
-        }
-    };
-
-    // Still down: sent.
-    let state = AppState::for_test(pool.clone());
-    let project = seed_project(&pool).await;
-    monitor_with_held_down(&state, &pool, project).await;
-    assert_eq!(send_deferred(&state, after_window()).await, 1);
-
-    let cases: [&str; 4] = [
-        "paused",
-        "deleted",
-        "scoped maintenance",
-        "project maintenance",
-    ];
-    for case in cases {
-        let state = AppState::for_test(pool.clone());
-        let project = seed_project(&pool).await;
-        let monitor = monitor_with_held_down(&state, &pool, project).await;
-        match case {
-            "paused" => {
-                sqlx::query("update monitors set paused = true where id = $1")
-                    .bind(monitor)
-                    .execute(&pool)
-                    .await
-                    .unwrap();
-            }
-            "deleted" => {
-                sqlx::query("delete from monitors where id = $1")
-                    .bind(monitor)
-                    .execute(&pool)
-                    .await
-                    .unwrap();
-            }
-            "scoped maintenance" => window(project, Some(monitor)).await,
-            _ => window(project, None).await,
-        }
-        assert_eq!(send_deferred(&state, after_window()).await, 0, "{case}");
-        assert!(
-            state.alert_throttle.due(after_window()).is_empty(),
-            "{case}: dropped"
-        );
-    }
+    make_escalation_due(&pool, held).await;
+    run_incident_ticks(&state).await;
+    run_incident_ticks(&state).await;
+    let mail = settled_mail(&recipient, 3).await;
+    assert_eq!(mail.len(), 3, "sent once");
+    assert_eq!(mail[2].0, "[Nami] [high] Flaky API is down");
 }

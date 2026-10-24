@@ -1,15 +1,13 @@
-//! Incident notifications. `notify_transition` is the single entry point:
-//! the Incident Management sub-project replaces its body (escalation
-//! policies, webhook/Slack/Telegram/Discord channels) without touching the
-//! worker.
-
-use std::time::{Duration, Instant};
+//! Incident notifications. `notify_transition` is the single entry point the
+//! uptime worker, the heartbeat endpoint and the log alert worker call; the
+//! incident and its notifications are written by `incidents::lifecycle` in
+//! the transaction that changed the source's state.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use super::{alert_throttle::Decision, checker::is_unsafe_in_text, heartbeat::sanitize_output};
-use crate::{core::state::AppState, uptime::maintenance::model as maintenance};
+use super::checker::is_unsafe_in_text;
+use crate::core::state::AppState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionKind {
@@ -40,159 +38,12 @@ pub struct Transition {
     pub at: DateTime<Utc>,
 }
 
-/// Emails every member of the transition's project, unless the subject's
-/// flap control holds it back (see [`super::alert_throttle`]: at most one
-/// DOWN and one recovery email per subject per
-/// [`super::alert_throttle::ALERT_FLAP_WINDOW`]). Failures are logged and
-/// swallowed: alert delivery must never abort the worker or undo the state
-/// change that triggered it.
-///
-/// A failed send is logged once per transition, with the monitor and the kind
-/// of transition but without the recipient's address: `Mailer::send` has
-/// already logged the cause itself, and an address is personal data that has
-/// no business in a log.
-pub async fn notify_transition(state: &AppState, transition: &Transition) {
-    if state.alert_throttle.decide(transition, Instant::now()) == Decision::Suppress {
-        // Ids only: names and causes are user or target text.
-        tracing::info!(
-            kind = ?transition.kind,
-            subject = ?transition.subject,
-            project_id = %transition.project_id,
-            "alert email held back by flap control"
-        );
-        return;
-    }
-    deliver(state, transition).await;
-}
-
-/// How often every instance sends the DOWN emails its flap control held back
-/// ([`run_deferred_alerts`]).
-pub const DEFERRED_ALERT_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Sends the DOWN emails the flap control held back whose window has passed
-/// by `now`, for subjects that are still down (they exist, are not paused,
-/// are down, and no maintenance window covers them). Returns how many went
-/// out.
-pub async fn send_deferred(state: &AppState, now: Instant) -> usize {
-    let mut sent = 0;
-    for transition in state.alert_throttle.due(now) {
-        let still_down = match still_down(&state.db, &transition).await {
-            Ok(down) => down,
-            Err(e) => {
-                tracing::error!(error = %e, subject = ?transition.subject, "could not check a deferred alert; retried shortly");
-                continue;
-            }
-        };
-        if state
-            .alert_throttle
-            .confirm_deferred(&transition, still_down, now)
-        {
-            deliver(state, &transition).await;
-            sent += 1;
-        }
-    }
-    sent
-}
-
-/// Runs [`send_deferred`] every `interval`, forever, judging the window at
-/// `Instant::now() + skew` (`Duration::ZERO` in production; tests pass the
-/// window to stand for its passing). Every engine instance runs this, worker
-/// or not: the flap control lives in the process that received the ping or
-/// ran the check, so that process must also send what it held back. Cheap
-/// when nothing is pending: one lock and a scan of the subjects.
-pub async fn run_deferred_alerts(state: AppState, interval: Duration, skew: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        ticker.tick().await;
-        let now = Instant::now() + skew;
-        if !state.alert_throttle.due(now).is_empty() {
-            send_deferred(&state, now).await;
-        }
-    }
-}
-
-/// Whether the transition's subject still exists, is not paused, is down,
-/// and is not covered by a maintenance window (project-wide, or scoped to
-/// the monitor) right now.
-async fn still_down(pool: &sqlx::PgPool, transition: &Transition) -> Result<bool, sqlx::Error> {
-    let (sql, id) = match transition.subject {
-        Subject::Monitor(id) => (
-            "select exists (select 1 from monitors where id = $1 and not paused and current_status = 'down')",
-            id,
-        ),
-        Subject::Heartbeat(id) => (
-            "select exists (select 1 from heartbeats where id = $1 and not paused and current_status = 'down')",
-            id,
-        ),
-        Subject::LogAlert(id) => (
-            "select exists (select 1 from log_alerts where id = $1 and enabled and state = 'alerting')",
-            id,
-        ),
-    };
-    let down: bool = sqlx::query_scalar(sql).bind(id).fetch_one(pool).await?;
-    if !down {
-        return Ok(false);
-    }
-    let now = Utc::now();
-    let in_maintenance = match transition.subject {
-        Subject::Monitor(id) => {
-            maintenance::monitor_in_maintenance(pool, transition.project_id, id, now).await?
-        }
-        // Log alerts, like heartbeats, are held only by project-wide windows.
-        Subject::Heartbeat(_) | Subject::LogAlert(_) => {
-            maintenance::heartbeat_in_maintenance(pool, transition.project_id, now).await?
-        }
-    };
-    Ok(!in_maintenance)
-}
-
-/// Emails every member of the transition's project (see
-/// [`notify_transition`]).
-async fn deliver(state: &AppState, transition: &Transition) {
-    let recipients: Vec<String> = match sqlx::query_scalar(
-        "select u.email from project_members pm
-         join users u on u.id = pm.user_id
-         where pm.project_id = $1
-         order by u.email",
-    )
-    .bind(transition.project_id)
-    .fetch_all(&state.db)
-    .await
-    {
-        Ok(recipients) => recipients,
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                kind = ?transition.kind,
-                subject = ?transition.subject,
-                project_id = %transition.project_id,
-                "failed to load alert recipients"
-            );
-            return;
-        }
-    };
-    let (subject, body) = render(&state.config.ui_base_url, transition);
-    let mut failed = 0;
-    for recipient in &recipients {
-        if state
-            .mailer
-            .send(recipient, &subject, body.clone())
-            .await
-            .is_err()
-        {
-            failed += 1;
-        }
-    }
-    if failed > 0 {
-        tracing::error!(
-            kind = ?transition.kind,
-            subject = ?transition.subject,
-            failed,
-            recipients = recipients.len(),
-            "alert email not delivered to every recipient"
-        );
-    }
+/// Incidents are opened and resolved, and their notifications queued, inside
+/// the transaction that changed the source's state (`incidents::lifecycle`).
+/// This only wakes the incidents worker so they go out now instead of at its
+/// next tick (`incidents::worker::kick`, bounded and never failing).
+pub async fn notify_transition(state: &AppState, _transition: &Transition) {
+    crate::incidents::worker::kick(state).await;
 }
 
 /// Text a monitored server can influence (a check's error message) as one
@@ -210,259 +61,9 @@ pub fn sanitize_cause(cause: &str) -> String {
         .collect()
 }
 
-/// Subject and plain-text body for a transition's email.
-pub fn render(ui_base_url: &str, transition: &Transition) -> (String, String) {
-    // Names are validated to contain no control, separator or direction
-    // characters; stripping them again here keeps a header-injection attempt
-    // out of the subject even for rows written some other way.
-    let name: String = transition
-        .name
-        .chars()
-        .filter(|c| !is_unsafe_in_text(*c))
-        .collect();
-    let base = ui_base_url.trim_end_matches('/');
-    let link = match transition.subject {
-        Subject::Monitor(id) => format!("{base}/projects/{}/monitors/{id}", transition.project_id),
-        Subject::Heartbeat(id) => {
-            format!("{base}/projects/{}/heartbeats/{id}", transition.project_id)
-        }
-        Subject::LogAlert(id) => {
-            format!("{base}/projects/{}/logs/alerts/{id}", transition.project_id)
-        }
-    };
-    let at = transition.at.format("%Y-%m-%d %H:%M:%S UTC");
-    let cause = || {
-        transition
-            .cause
-            .as_deref()
-            .map(sanitize_cause)
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-    if let Subject::LogAlert(_) = transition.subject {
-        return match transition.kind {
-            TransitionKind::Down => (
-                format!("[Nami] Log alert {name} triggered"),
-                format!(
-                    "Log alert {name} triggered.\n\nCondition: {}\nSince: {at}\n\nDetails: {link}\n",
-                    cause()
-                ),
-            ),
-            TransitionKind::Recovered => (
-                format!("[Nami] Log alert {name} resolved"),
-                format!("Log alert {name} resolved.\n\nResolved at: {at}\n\nDetails: {link}\n"),
-            ),
-        };
-    }
-    // Quoted line by line, so no line of a job's output can start a
-    // header-looking line of its own. Sanitized again for a Transition built
-    // any other way.
-    let output = match transition.details.as_deref() {
-        Some(details) if !details.is_empty() => {
-            let mut quoted = String::from("\nOutput:\n");
-            for line in sanitize_output(details.as_bytes()).lines() {
-                quoted.push_str("> ");
-                quoted.push_str(line);
-                quoted.push('\n');
-            }
-            quoted
-        }
-        _ => String::new(),
-    };
-    match transition.kind {
-        TransitionKind::Down => (
-            format!("[Nami] {name} is DOWN"),
-            // The cause is already one line when it comes from
-            // `apply_outcome`; the same filter covers a Transition built any
-            // other way.
-            format!(
-                "{name} is DOWN.\n\nCause: {}\nSince: {at}\n{output}\nDetails: {link}\n",
-                cause()
-            ),
-        ),
-        TransitionKind::Recovered => (
-            format!("[Nami] {name} is back UP"),
-            format!("{name} is back UP.\n\nRecovered at: {at}\n\nDetails: {link}\n"),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn transition(kind: TransitionKind, name: &str) -> Transition {
-        Transition {
-            kind,
-            subject: Subject::Monitor(Uuid::nil()),
-            project_id: Uuid::nil(),
-            name: name.to_string(),
-            cause: Some("expected status 200-399, got 503".to_string()),
-            details: None,
-            at: DateTime::from_timestamp(1_792_000_000, 0).unwrap(),
-        }
-    }
-
-    #[test]
-    fn down_email_names_the_cause_time_and_link() {
-        let (subject, body) = render(
-            "http://ui.test/",
-            &transition(TransitionKind::Down, "Checkout API"),
-        );
-        assert_eq!(subject, "[Nami] Checkout API is DOWN");
-        assert!(
-            body.contains("Cause: expected status 200-399, got 503"),
-            "{body}"
-        );
-        assert!(body.contains("Since: 2026-10-14 17:46:40 UTC"), "{body}");
-        let nil = Uuid::nil();
-        assert!(
-            body.contains(&format!("http://ui.test/projects/{nil}/monitors/{nil}")),
-            "{body}"
-        );
-    }
-
-    #[test]
-    fn recovery_email_has_its_own_subject() {
-        let (subject, body) = render(
-            "http://ui.test",
-            &transition(TransitionKind::Recovered, "Checkout API"),
-        );
-        assert_eq!(subject, "[Nami] Checkout API is back UP");
-        assert!(
-            body.contains("Recovered at: 2026-10-14 17:46:40 UTC"),
-            "{body}"
-        );
-    }
-
-    #[test]
-    fn heartbeat_emails_link_to_the_heartbeat_page() {
-        let heartbeat = Transition {
-            subject: Subject::Heartbeat(Uuid::nil()),
-            ..transition(TransitionKind::Down, "Nightly backup")
-        };
-        let (subject, body) = render("http://ui.test", &heartbeat);
-        assert_eq!(subject, "[Nami] Nightly backup is DOWN");
-        let nil = Uuid::nil();
-        assert!(
-            body.contains(&format!("http://ui.test/projects/{nil}/heartbeats/{nil}")),
-            "{body}"
-        );
-    }
-
-    #[test]
-    fn heartbeat_output_is_quoted_line_by_line_between_since_and_details() {
-        let down = Transition {
-            subject: Subject::Heartbeat(Uuid::nil()),
-            cause: Some("Heartbeat reported failure (exit code 2)".into()),
-            details: Some("<script>alert(1)</script>\nBcc: x@evil.test\n\tdisk full".into()),
-            ..transition(TransitionKind::Down, "Nightly backup")
-        };
-        let (subject, body) = render("http://ui.test", &down);
-        assert_eq!(subject, "[Nami] Nightly backup is DOWN");
-        assert!(body.contains(
-            "Since: 2026-10-14 17:46:40 UTC\n\nOutput:\n> <script>alert(1)</script>\n> Bcc: x@evil.test\n> \tdisk full\n\nDetails: "
-        ), "{body:?}");
-        assert!(!body.lines().any(|l| l.starts_with("Bcc:")), "{body:?}");
-    }
-
-    #[test]
-    fn log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert() {
-        let triggered = Transition {
-            subject: Subject::LogAlert(Uuid::nil()),
-            cause: Some("12 matching events in the last 5 min (threshold: > 10)".to_string()),
-            ..transition(TransitionKind::Down, "Checkout errors")
-        };
-        let (subject, body) = render("http://ui.test", &triggered);
-        assert_eq!(subject, "[Nami] Log alert Checkout errors triggered");
-        assert!(
-            body.contains("Condition: 12 matching events in the last 5 min (threshold: > 10)"),
-            "{body}"
-        );
-        let nil = Uuid::nil();
-        assert!(
-            body.contains(&format!("http://ui.test/projects/{nil}/logs/alerts/{nil}")),
-            "{body}"
-        );
-        let resolved = Transition {
-            kind: TransitionKind::Recovered,
-            ..triggered
-        };
-        let (subject, body) = render("http://ui.test", &resolved);
-        assert_eq!(subject, "[Nami] Log alert Checkout errors resolved");
-        assert!(body.contains("Resolved at: 2026-10-14 17:46:40 UTC"), "{body}");
-        let evil = Transition {
-            name: "x\r\nBcc: a@evil.test".into(),
-            ..resolved
-        };
-        assert!(!render("http://ui.test", &evil).0.contains('\n'));
-    }
-
-    #[test]
-    fn details_are_sanitized_again_when_rendered() {
-        let down = Transition {
-            details: Some("a\rb\u{1b}c".into()),
-            ..transition(TransitionKind::Down, "X")
-        };
-        let (_, body) = render("http://ui.test", &down);
-        assert!(body.contains("Output:\n> abc\n"), "{body:?}");
-    }
-
-    #[test]
-    fn control_characters_never_reach_the_subject() {
-        let (subject, _) = render(
-            "http://ui.test",
-            &transition(TransitionKind::Down, "API\r\nBcc: x@evil.test"),
-        );
-        assert_eq!(subject, "[Nami] APIBcc: x@evil.test is DOWN");
-    }
-
-    #[test]
-    fn control_characters_never_reach_the_first_line_of_the_body() {
-        let (_, body) = render(
-            "http://ui.test",
-            &transition(TransitionKind::Down, "API\r\nBcc: x@evil.test"),
-        );
-        assert!(
-            body.starts_with("APIBcc: x@evil.test is DOWN.\n\nCause:"),
-            "{body:?}"
-        );
-    }
-
-    #[test]
-    fn a_missing_cause_reads_unknown() {
-        let mut down = transition(TransitionKind::Down, "Checkout API");
-        down.cause = None;
-        let (_, body) = render("http://ui.test", &down);
-        assert!(body.contains("Cause: unknown\n"), "{body}");
-    }
-
-    /// The cause is partly chosen by the monitored server. It reaches the
-    /// email as one line of plain text: nothing in it can start a line of its
-    /// own, rewrite the subject or the link, or turn into markup.
-    #[test]
-    fn a_hostile_cause_becomes_one_line_of_plain_text() {
-        let hostile = "x\r\nSubject: pwned\r\nBcc: evil@evil.test\r\n\r\n<script>alert(1)</script>";
-        let mut down = transition(TransitionKind::Down, "Checkout API");
-        down.cause = Some(hostile.to_string());
-
-        let (subject, body) = render("http://ui.test", &down);
-
-        assert_eq!(subject, "[Nami] Checkout API is DOWN");
-        assert!(
-            body.contains(
-                "Cause: x  Subject: pwned  Bcc: evil@evil.test    <script>alert(1)</script>\nSince:"
-            ),
-            "{body:?}"
-        );
-        let nil = Uuid::nil();
-        assert!(
-            body.ends_with(&format!(
-                "\nDetails: http://ui.test/projects/{nil}/monitors/{nil}\n"
-            )),
-            "the link is the last thing in the body and is built from ids only: {body:?}"
-        );
-        assert_eq!(body.lines().count(), 6, "{body:?}");
-    }
 
     #[test]
     fn every_control_character_in_a_cause_becomes_a_space() {
@@ -480,15 +81,6 @@ mod tests {
             sanitize_cause("a\u{2028}b\u{2029}c\u{202E}d\u{2066}e\u{200E}f"),
             "a b c d e f"
         );
-        let (subject, body) = render(
-            "http://ui.test",
-            &Transition {
-                cause: Some("evil\u{2028}Bcc: x@evil.test".to_string()),
-                ..transition(TransitionKind::Down, "API\u{202E}gnp.exe\u{2029}")
-            },
-        );
-        assert_eq!(subject, "[Nami] APIgnp.exe is DOWN");
-        assert!(body.contains("Cause: evil Bcc: x@evil.test\n"), "{body:?}");
     }
 
     #[test]
@@ -502,20 +94,5 @@ mod tests {
         ] {
             assert_eq!(sanitize_cause(text), text);
         }
-    }
-
-    #[test]
-    fn trailing_slashes_on_the_ui_base_url_never_double_up() {
-        let (_, body) = render(
-            "http://ui.test///",
-            &transition(TransitionKind::Recovered, "Checkout API"),
-        );
-        let nil = Uuid::nil();
-        assert!(
-            body.contains(&format!(
-                "Details: http://ui.test/projects/{nil}/monitors/{nil}\n"
-            )),
-            "{body}"
-        );
     }
 }

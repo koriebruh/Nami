@@ -16,6 +16,8 @@ use crate::{
     core::error::AppError,
     core::middleware::rbac::{CurrentUser, Role, require_project_role},
     core::state::AppState,
+    core::validate::nullable,
+    incidents::model as incident,
     logs::alert::{
         count_matches,
         model::{
@@ -46,6 +48,11 @@ pub struct CreateLogAlertRequest {
     pub interval_seconds: i32,
     #[serde(default = "yes")]
     pub enabled: bool,
+    /// `None`: the project's default policy and severity.
+    #[serde(default)]
+    pub escalation_policy_id: Option<Uuid>,
+    #[serde(default)]
+    pub severity_id: Option<Uuid>,
 }
 
 /// Every field optional: merged with the stored alert, then validated whole.
@@ -59,6 +66,11 @@ pub struct PatchLogAlertRequest {
     pub window_seconds: Option<i32>,
     pub interval_seconds: Option<i32>,
     pub enabled: Option<bool>,
+    /// Omitted keeps it, `null` returns to the project's default.
+    #[serde(default, deserialize_with = "nullable")]
+    pub escalation_policy_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub severity_id: Option<Option<Uuid>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,7 +94,8 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-/// The validated config, its sources checked against the project.
+/// The validated config, its sources, policy and severity checked against
+/// the project.
 async fn checked(
     state: &AppState,
     project_id: Uuid,
@@ -90,7 +103,30 @@ async fn checked(
 ) -> Result<LogAlertConfig, AppError> {
     let config = log_alert::validate(config).map_err(AppError::Validation)?;
     saved_query::check_sources(&state.db, project_id, &config.query.source_ids).await?;
+    check_routing(state, project_id, config.escalation_policy_id, config.severity_id).await?;
     Ok(config)
+}
+
+/// A policy or severity of another project is a 404, like any foreign id.
+async fn check_routing(
+    state: &AppState,
+    project_id: Uuid,
+    policy: Option<Uuid>,
+    severity: Option<Uuid>,
+) -> Result<(), AppError> {
+    if incident::routing_belongs_to(&state.db, project_id, policy, severity).await? {
+        Ok(())
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
+/// A policy or severity deleted between the check and the write is a 404.
+fn deleted_meanwhile(e: sqlx::Error) -> AppError {
+    match &e {
+        sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => AppError::NotFound,
+        _ => AppError::Database(e),
+    }
 }
 
 async fn list_alerts(
@@ -122,10 +158,15 @@ async fn create_alert(
             window_seconds: payload.window_seconds,
             interval_seconds: payload.interval_seconds,
             enabled: payload.enabled,
+            escalation_policy_id: payload.escalation_policy_id,
+            severity_id: payload.severity_id,
         },
     )
     .await?;
-    match log_alert::create(&state.db, project_id, &config, user.id).await? {
+    let created = log_alert::create(&state.db, project_id, &config, user.id)
+        .await
+        .map_err(deleted_meanwhile)?;
+    match created {
         CreatedAlert::Created(alert) => Ok((StatusCode::CREATED, Json(alert))),
         CreatedAlert::ProjectFull => Err(AppError::Conflict(format!(
             "a project may have at most {MAX_LOG_ALERTS_PER_PROJECT} log alerts"
@@ -168,6 +209,11 @@ async fn patch_alert(
         query.to_filters().map_err(AppError::Validation)?;
         saved_query::check_sources(&state.db, project_id, &query.source_ids).await?;
     }
+    let (policy, severity) = (
+        payload.escalation_policy_id.flatten(),
+        payload.severity_id.flatten(),
+    );
+    check_routing(&state, project_id, policy, severity).await?;
     let patch = LogAlertPatch {
         name: payload.name,
         query: payload.query,
@@ -176,9 +222,19 @@ async fn patch_alert(
         window_seconds: payload.window_seconds,
         interval_seconds: payload.interval_seconds,
         enabled: payload.enabled,
+        escalation_policy_id: payload.escalation_policy_id,
+        severity_id: payload.severity_id,
     };
-    match log_alert::update(&state.db, project_id, alert_id, patch).await? {
-        UpdatedAlert::Updated(alert) => Ok(Json(alert)),
+    let updated = log_alert::update(&state.db, project_id, alert_id, patch)
+        .await
+        .map_err(deleted_meanwhile)?;
+    match updated {
+        UpdatedAlert::Updated(alert) => {
+            // Disabling an alerting alert resolved its incident (R17): send
+            // the resolved notices now, not at the worker's next tick.
+            crate::incidents::worker::kick(&state).await;
+            Ok(Json(alert))
+        }
         UpdatedAlert::NotFound => Err(AppError::NotFound),
         UpdatedAlert::Invalid(message) => Err(AppError::Validation(message)),
     }

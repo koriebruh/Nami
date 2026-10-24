@@ -321,8 +321,49 @@ pub async fn set_severity(
     Ok(true)
 }
 
+// The escalation policy and severity a source names for its incidents.
+const MONITOR_ROUTING: &str = "select escalation_policy_id, severity_id from monitors where id = $1";
+const HEARTBEAT_ROUTING: &str = "select escalation_policy_id, severity_id from heartbeats where id = $1";
+const LOG_ALERT_ROUTING: &str = "select escalation_policy_id, severity_id from log_alerts where id = $1";
+
+/// `(escalation_policy_id, severity_id)` of the source row `sql` reads, on
+/// the caller's connection; `None` (also for a row gone) is the project's
+/// default.
+async fn routing(
+    conn: &mut PgConnection,
+    sql: &'static str,
+    id: Uuid,
+) -> Result<(Option<Uuid>, Option<Uuid>), sqlx::Error> {
+    let row: Option<(Option<Uuid>, Option<Uuid>)> =
+        sqlx::query_as(sql).bind(id).fetch_optional(&mut *conn).await?;
+    Ok(row.unwrap_or_default())
+}
+
+/// Whether the policy and the severity a source names (each optional) are
+/// the project's. A policy or severity never moves between projects, so a
+/// check made before the write cannot go stale; one deleted meanwhile is
+/// the write's foreign key violation.
+pub async fn routing_belongs_to(
+    pool: &PgPool,
+    project_id: Uuid,
+    escalation_policy_id: Option<Uuid>,
+    severity_id: Option<Uuid>,
+) -> Result<bool, sqlx::Error> {
+    if let Some(id) = escalation_policy_id
+        && !crate::incidents::escalation::model::belongs_to(pool, project_id, id).await?
+    {
+        return Ok(false);
+    }
+    match severity_id {
+        Some(id) => crate::incidents::severity::model::belongs_to(pool, project_id, id).await,
+        None => Ok(true),
+    }
+}
+
 /// Opens an incident for the monitor unless it already has an unresolved
-/// one (`lifecycle::open`). Returns the new incident's id, or `None`.
+/// one (`lifecycle::open`), on the monitor's escalation policy and severity
+/// (the project's defaults when it names none). Returns the new incident's
+/// id, or `None`.
 pub async fn open_for_monitor(
     conn: &mut PgConnection,
     project_id: Uuid,
@@ -331,6 +372,7 @@ pub async fn open_for_monitor(
     cause: Option<&str>,
     started_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
+    let (escalation_policy_id, severity_id) = routing(conn, MONITOR_ROUTING, monitor_id).await?;
     lifecycle::open(
         conn,
         &OpenIncident {
@@ -338,9 +380,9 @@ pub async fn open_for_monitor(
             source: IncidentSource::Monitor(monitor_id),
             title,
             cause,
-            severity_id: None,
+            severity_id,
             metadata: None,
-            escalation_policy_id: None,
+            escalation_policy_id,
             started_at,
         },
     )
@@ -367,6 +409,8 @@ pub async fn open_for_log_alert(
     cause: Option<&str>,
     started_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
+    let (escalation_policy_id, severity_id) =
+        routing(conn, LOG_ALERT_ROUTING, log_alert_id).await?;
     lifecycle::open(
         conn,
         &OpenIncident {
@@ -374,9 +418,9 @@ pub async fn open_for_log_alert(
             source: IncidentSource::LogAlert(log_alert_id),
             title,
             cause,
-            severity_id: None,
+            severity_id,
             metadata: None,
-            escalation_policy_id: None,
+            escalation_policy_id,
             started_at,
         },
     )
@@ -395,8 +439,8 @@ pub async fn resolve_for_log_alert(
 
 /// A heartbeat incident resolved less than this long ago is reopened, not
 /// followed by a new one, when the heartbeat goes down again (see
-/// [`open_for_heartbeat`]). Same length as the alert flap window
-/// (`uptime::alert_throttle::ALERT_FLAP_WINDOW`).
+/// [`open_for_heartbeat`]). Same length as the paging gap of a source
+/// (`lifecycle::SOURCE_PAGE_GAP_SECS`, R31), which the reopen keeps.
 pub const HEARTBEAT_REOPEN_WINDOW_SECS: i32 = 5 * 60;
 
 /// Heartbeat counterpart of [`open_for_monitor`], with flap control: when the
@@ -418,12 +462,15 @@ pub async fn open_for_heartbeat(
     started_at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let source = IncidentSource::Heartbeat(heartbeat_id);
+    let (escalation_policy_id, severity_id) =
+        routing(conn, HEARTBEAT_ROUTING, heartbeat_id).await?;
     let reopened = lifecycle::reopen_source_within(
         conn,
         &source,
         HEARTBEAT_REOPEN_WINDOW_SECS,
         title,
         cause,
+        escalation_policy_id,
         started_at,
     )
     .await?;
@@ -437,9 +484,9 @@ pub async fn open_for_heartbeat(
             source,
             title,
             cause,
-            severity_id: None,
+            severity_id,
             metadata: None,
-            escalation_policy_id: None,
+            escalation_policy_id,
             started_at,
         },
     )

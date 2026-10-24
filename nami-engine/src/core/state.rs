@@ -4,7 +4,7 @@ use sqlx::PgPool;
 
 use crate::{
     core::clickhouse::ClickHouse, core::config::Config, core::crypto::Cipher, core::email,
-    logs::LogsState, uptime::alert_throttle::AlertThrottle,
+    logs::LogsState,
 };
 
 /// A ClickHouse database name that is never created. `AppState::for_test`
@@ -22,8 +22,6 @@ pub struct AppState {
     pub cipher: Cipher,
     /// Log ingest rate limits and usage counters (in memory, per instance).
     pub logs: Arc<LogsState>,
-    /// Flap control for alert emails (in memory, per instance).
-    pub alert_throttle: Arc<AlertThrottle>,
     pub config: Config,
 }
 
@@ -33,8 +31,7 @@ impl AppState {
     /// defaults tests expect — `Config::from_env_for_test()`, the Mailpit
     /// mailer, a ClickHouse client bound to a database that does not
     /// exist, a cipher over the fixed `core::crypto::TEST_KEY`, and fresh log
-    /// ingest state (default rate limits, no usage) and fresh alert flap
-    /// control. Tests override
+    /// ingest state (default rate limits, no usage). Tests override
     /// single fields with struct-update syntax, e.g.
     /// `AppState { mailer: Mailer::new("localhost", 1), ..AppState::for_test(pool) }`,
     /// so adding a field to `AppState` never touches test files again.
@@ -51,7 +48,6 @@ impl AppState {
             ),
             cipher: Cipher::new(&config.encryption_key),
             logs: Arc::new(LogsState::default()),
-            alert_throttle: Arc::new(AlertThrottle::new()),
             config,
         }
     }

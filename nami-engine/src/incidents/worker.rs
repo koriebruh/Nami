@@ -22,9 +22,8 @@ static KICKS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_KICKS);
 
 /// Kicks every [`TICK`] (missed ticks delayed), one at a time, each in a task
 /// of its own so a panic is logged and never stops the loop, and prunes spent
-/// action link tokens every [`PRUNE_EVERY`] (a failure is logged). Not
-/// spawned yet: NAMI-INC-10 spawns it from `main` unless
-/// `INCIDENTS_WORKER_ENABLED=false`.
+/// action link tokens every [`PRUNE_EVERY`] (a failure is logged). `main`
+/// spawns it unless `INCIDENTS_WORKER_ENABLED=false`.
 pub async fn run_forever(state: AppState) {
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -44,8 +43,9 @@ pub async fn run_forever(state: AppState) {
     }
 }
 
-/// One escalation tick, then one drain, now. Used by notify_transition
-/// (Task 10) and tests. Returns at once when
+/// One escalation tick, then one drain, now. Used by
+/// `uptime::alerts::notify_transition`, the log alert PATCH and tests.
+/// Returns at once when
 /// `!state.config.incidents_worker_enabled`. Otherwise waits for one of the
 /// [`MAX_CONCURRENT_KICKS`] permits, then runs both, each bounded; a failed
 /// tick is logged and never skips the drain.

@@ -276,11 +276,13 @@ async fn log_alerts_constraints_are_all_named(pool: sqlx::PgPool) {
         [
             "log_alerts_comparison_known",
             "log_alerts_created_by_fkey",
+            "log_alerts_escalation_policy_id_fkey",
             "log_alerts_interval_range",
             "log_alerts_lt_needs_a_threshold",
             "log_alerts_pkey",
             "log_alerts_project_id_fkey",
             "log_alerts_query_is_object",
+            "log_alerts_severity_id_fkey",
             "log_alerts_state_known",
             "log_alerts_threshold_range",
             "log_alerts_window_range",
@@ -776,6 +778,18 @@ async fn cross_referenced_project(pool: &sqlx::PgPool) -> uuid::Uuid {
     .execute(pool)
     .await
     .unwrap();
+    // The monitor names the second policy and `critical` too (NAMI-INC-10).
+    sqlx::query(
+        "update monitors set
+             escalation_policy_id = (select id from escalation_policies where project_id = $1 and not is_default),
+             severity_id = (select id from incident_severities where project_id = $1 and name = 'critical')
+         where id = $2",
+    )
+    .bind(project)
+    .bind(monitor)
+    .execute(pool)
+    .await
+    .unwrap();
     project
 }
 
@@ -803,4 +817,75 @@ async fn removing_a_cross_referenced_project_works_whatever_table_its_cascade_em
     .await
     .unwrap();
     assert_eq!(left, 0);
+}
+
+/// Monitors, heartbeats and log alerts may name an escalation policy and a
+/// severity (NAMI-INC-10). Deleting either sets it back to null (the project
+/// default), and the keys carry their migration's names.
+#[sqlx::test]
+async fn deleting_a_policy_clears_it_on_monitors(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let monitor = common::seed_http_monitor(&pool, project, "api", "https://example.com", 1).await;
+    let policy: uuid::Uuid = sqlx::query_scalar(
+        "insert into escalation_policies (project_id, name) values ($1, 'second') returning id",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let severity: uuid::Uuid = sqlx::query_scalar(
+        "insert into incident_severities (project_id, name, rank) values ($1, 'minor', 4) returning id",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for insert in [
+        "update monitors set escalation_policy_id = $2, severity_id = $3 where id = $1",
+        "insert into heartbeats (project_id, name, token, period_seconds, escalation_policy_id, severity_id)
+         select project_id, 'job', md5(random()::text), 60, $2, $3 from monitors where id = $1",
+        "insert into log_alerts (project_id, name, threshold, comparison, window_seconds, interval_seconds,
+                                 escalation_policy_id, severity_id)
+         select project_id, 'errors', 1, 'gt', 300, 60, $2, $3 from monitors where id = $1",
+    ] {
+        sqlx::query(insert).bind(monitor).bind(policy).bind(severity).execute(&pool).await.unwrap();
+    }
+    let set = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "select (select count(*) from monitors where escalation_policy_id is not null)
+                  + (select count(*) from heartbeats where escalation_policy_id is not null)
+                  + (select count(*) from log_alerts where escalation_policy_id is not null)
+                  + (select count(*) from monitors where severity_id is not null)
+                  + (select count(*) from heartbeats where severity_id is not null)
+                  + (select count(*) from log_alerts where severity_id is not null)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(set(pool.clone()).await, 6);
+    sqlx::query("delete from escalation_policies where id = $1").bind(policy).execute(&pool).await.unwrap();
+    sqlx::query("delete from incident_severities where id = $1").bind(severity).execute(&pool).await.unwrap();
+    assert_eq!(set(pool.clone()).await, 0);
+
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid in ('public.monitors'::regclass, 'public.heartbeats'::regclass, 'public.log_alerts'::regclass)
+           and (conname like '%escalation_policy_id%' or conname like '%severity_id%')
+         order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "heartbeats_escalation_policy_id_fkey",
+            "heartbeats_severity_id_fkey",
+            "log_alerts_escalation_policy_id_fkey",
+            "log_alerts_severity_id_fkey",
+            "monitors_escalation_policy_id_fkey",
+            "monitors_severity_id_fkey",
+        ]
+    );
 }

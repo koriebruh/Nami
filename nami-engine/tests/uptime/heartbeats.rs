@@ -338,9 +338,15 @@ async fn the_sweep_marks_an_overdue_heartbeat_down_and_alerts_once(pool: sqlx::P
     );
     let mail = settled_mail(&recipient, 1).await;
     assert_eq!(mail.len(), 1, "{mail:?}");
-    assert_eq!(mail[0].0, "[Nami] Nightly backup is DOWN");
+    assert_eq!(mail[0].0, "[Nami] [high] Nightly backup missed its heartbeat");
+    // The email links to the incident, which links to the heartbeat.
+    let incident: Uuid = sqlx::query_scalar("select id from incidents where heartbeat_id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     let link = format!(
-        "{}/projects/{project}/heartbeats/{id}",
+        "{}/projects/{project}/incidents/{incident}",
         state.config.ui_base_url
     );
     assert!(mail[0].1.contains(&link), "{}", mail[0].1);
@@ -381,8 +387,8 @@ async fn a_ping_on_a_down_heartbeat_resolves_it_and_sends_a_recovery(pool: sqlx:
             .map(|(subject, _)| subject.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "[Nami] Nightly backup is DOWN",
-            "[Nami] Nightly backup is back UP"
+            "[Nami] [high] Nightly backup missed its heartbeat",
+            "[Nami] Resolved: Nightly backup missed its heartbeat"
         ]
     );
 }
@@ -722,8 +728,8 @@ async fn no_token_ever_reaches_a_log_line(pool: sqlx::PgPool) {
         .0,
         StatusCode::NOT_FOUND
     );
-    // The second DOWN/UP pair falls inside the alert flap window: held back
-    // (and logged by ids only).
+    // The second DOWN/UP pair falls inside the paging gap of the heartbeat
+    // (R31): its reopened incident pages nobody.
     assert_eq!(settled_mail(&recipient, 2).await.len(), 2);
 
     let lines = log.lines();
@@ -1044,7 +1050,7 @@ async fn run_forever_sweeps_overdue_heartbeats_by_itself(pool: sqlx::PgPool) {
         mail.iter()
             .map(|(subject, _)| subject.as_str())
             .collect::<Vec<_>>(),
-        vec!["[Nami] Nightly backup is DOWN"]
+        vec!["[Nami] [high] Nightly backup missed its heartbeat"]
     );
 }
 
@@ -2599,13 +2605,16 @@ async fn a_fail_ping_takes_the_heartbeat_down_at_once_and_a_success_ping_recover
         incidents[0].2.as_deref(),
         Some("Heartbeat reported failure")
     );
+    // The page goes out from the incident's state: let it leave before the
+    // recovery resolves the incident.
+    settled_mail(&recipient, 1).await;
 
     let (status, _, _) = ping_with(&public, &format!("/api/v1/heartbeat/{token}/0"), vec![]).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(heartbeat_state(&pool, id).await.0, "up");
     assert_eq!(incidents_of(&pool, id).await[0].0, "resolved");
     let mail = settled_mail(&recipient, 2).await;
-    assert_eq!(mail[0].0, "[Nami] Nightly backup is DOWN");
+    assert_eq!(mail[0].0, "[Nami] [high] Nightly backup reported a failure");
     assert!(
         // Mailpit hands the text part back with CRLF line endings.
         mail[0]
@@ -2615,7 +2624,7 @@ async fn a_fail_ping_takes_the_heartbeat_down_at_once_and_a_success_ping_recover
         "{}",
         mail[0].1
     );
-    assert_eq!(mail[1].0, "[Nami] Nightly backup is back UP");
+    assert_eq!(mail[1].0, "[Nami] Resolved: Nightly backup reported a failure");
 }
 
 #[sqlx::test]
@@ -3274,6 +3283,12 @@ async fn a_flapping_heartbeat_keeps_one_incident_and_sends_one_pair_of_emails(po
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        if n == 0 {
+            // The page goes out from the incident's state: let the first one
+            // leave before the recovery resolves the incident. The later
+            // failures fall inside the paging gap (R31).
+            settled_mail(&recipient, 1).await;
+        }
         let (status, _, _) =
             ping_with(&public, &format!("/api/v1/heartbeat/{token}/0"), vec![]).await;
         assert_eq!(status, StatusCode::OK);
@@ -3290,7 +3305,10 @@ async fn a_flapping_heartbeat_keeps_one_incident_and_sends_one_pair_of_emails(po
     let subjects: Vec<&str> = mail.iter().map(|(subject, _)| subject.as_str()).collect();
     assert_eq!(
         subjects,
-        vec!["[Nami] Flaky job is DOWN", "[Nami] Flaky job is back UP"]
+        vec![
+            "[Nami] [high] Flaky job reported a failure",
+            "[Nami] Resolved: Flaky job reported a failure"
+        ]
     );
 }
 
@@ -3317,6 +3335,9 @@ async fn a_failure_reopens_a_recent_incident_and_opens_a_new_one_later(pool: sql
         ping_with(&public, &fail(2), b"first".to_vec()).await.0,
         StatusCode::OK
     );
+    // The page goes out from the incident's state: let it leave before the
+    // recovery resolves the incident.
+    settled_mail(&recipient, 1).await;
     assert_eq!(ping_with(&public, &fail(0), vec![]).await.0, StatusCode::OK);
     let first = ids(pool.clone()).await;
     assert_eq!(
@@ -3346,13 +3367,21 @@ async fn a_failure_reopens_a_recent_incident_and_opens_a_new_one_later(pool: sql
             .unwrap();
     assert_eq!(resolved_at, None);
 
-    // Recover, then let six minutes pass (moved back in the database; a fresh
-    // engine state stands for the alert window having passed too).
+    // Recover, then let six minutes pass (moved back in the database, the
+    // heartbeat's pages too: the paging gap has passed as well).
     assert_eq!(ping_with(&public, &fail(0), vec![]).await.0, StatusCode::OK);
     sqlx::query(
         "update incidents set resolved_at = resolved_at - interval '6 minutes',
                               started_at = started_at - interval '7 minutes'
          where heartbeat_id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "update notification_deliveries set created_at = created_at - interval '7 minutes'
+         where incident_id in (select id from incidents where heartbeat_id = $1)",
     )
     .bind(id)
     .execute(&pool)
@@ -3373,7 +3402,10 @@ async fn a_failure_reopens_a_recent_incident_and_opens_a_new_one_later(pool: sql
     );
     let mail = settled_mail(&recipient, before + 1).await;
     assert_eq!(mail.len(), before + 1);
-    assert_eq!(mail.last().unwrap().0, "[Nami] Nightly backup is DOWN");
+    assert_eq!(
+        mail.last().unwrap().0,
+        "[Nami] [high] Nightly backup reported a failure"
+    );
 }
 
 /// The sweep reopens a recent incident too: a job that recovered and then
@@ -3437,86 +3469,4 @@ async fn a_heartbeat_with_a_stored_stray_tag_character_can_be_paused(pool: sqlx:
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-}
-
-/// An instance without the uptime worker (API only) still sends the DOWN its
-/// flap control held back for a ping it received, once the window is over;
-/// a project-wide maintenance window stops it.
-#[sqlx::test]
-async fn a_held_down_is_sent_without_the_worker(pool: sqlx::PgPool) {
-    use nami_engine::uptime::{alert_throttle::ALERT_FLAP_WINDOW, alerts::run_deferred_alerts};
-    let mut state = AppState::for_test(pool.clone());
-    state.config.uptime_worker_enabled = false;
-    let public = unthrottled_public(state.clone());
-    let (project, recipient) = project_with_recipient(&pool).await;
-    let (_, token) = seed_heartbeat(&pool, project, "Flaky job", 3600, 60, 0).await;
-    for path in ["fail", "0", "fail"] {
-        let (status, _, _) = ping_with(
-            &public,
-            &format!("/api/v1/heartbeat/{token}/{path}"),
-            vec![],
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-    }
-    assert_eq!(
-        settled_mail(&recipient, 2).await.len(),
-        2,
-        "the second DOWN is held"
-    );
-
-    // The loop every instance runs; the skew stands for the window passing.
-    let deferred = tokio::spawn(run_deferred_alerts(
-        state.clone(),
-        Duration::from_millis(50),
-        ALERT_FLAP_WINDOW,
-    ));
-    let mail = settled_mail(&recipient, 3).await;
-    deferred.abort();
-    let subjects: Vec<&str> = mail.iter().map(|(subject, _)| subject.as_str()).collect();
-    assert_eq!(
-        subjects,
-        vec![
-            "[Nami] Flaky job is DOWN",
-            "[Nami] Flaky job is back UP",
-            "[Nami] Flaky job is DOWN"
-        ]
-    );
-}
-
-/// A heartbeat's held-back DOWN is dropped while a project-wide maintenance
-/// window covers it.
-#[sqlx::test]
-async fn a_held_heartbeat_down_is_dropped_during_maintenance(pool: sqlx::PgPool) {
-    use nami_engine::uptime::{alert_throttle::ALERT_FLAP_WINDOW, alerts::send_deferred};
-    let state = AppState::for_test(pool.clone());
-    let public = unthrottled_public(state.clone());
-    let project = seed_project(&pool).await;
-    let (_, token) = seed_heartbeat(&pool, project, "Flaky job", 3600, 60, 0).await;
-    for path in ["fail", "0", "fail"] {
-        let (status, _, _) = ping_with(
-            &public,
-            &format!("/api/v1/heartbeat/{token}/{path}"),
-            vec![],
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-    }
-    sqlx::query(
-        "insert into maintenance_windows (project_id, title, kind, starts_at, ends_at)
-         values ($1, 'maintenance', 'once', now() - interval '5 minutes', now() + interval '1 hour')",
-    )
-    .bind(project)
-    .execute(&pool)
-    .await
-    .unwrap();
-    // The alert tasks of the pings may still be running: wait for the held DOWN.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let later = || std::time::Instant::now() + ALERT_FLAP_WINDOW;
-    while state.alert_throttle.due(later()).is_empty() {
-        assert!(Instant::now() < deadline, "the DOWN was never held");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(send_deferred(&state, later()).await, 0);
-    assert!(state.alert_throttle.due(later()).is_empty());
 }

@@ -420,6 +420,7 @@ async fn an_automatic_reopen_leaves_the_latest_incident_alone_while_an_older_one
         300,
         "flapping",
         None,
+        None,
         at(60),
     )
     .await
@@ -463,6 +464,7 @@ async fn an_automatic_reopen_racing_a_manual_reopen_of_another_incident_returns_
                 &IncidentSource::Monitor(monitor),
                 300,
                 "flapping",
+                None,
                 None,
                 at(60),
             )

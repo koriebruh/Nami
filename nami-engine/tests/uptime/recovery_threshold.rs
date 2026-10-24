@@ -673,7 +673,7 @@ async fn the_recovery_alert_goes_out_only_when_the_threshold_is_reached(pool: sq
     assert_eq!(incident_statuses(&pool, monitor).await, vec!["open"]);
     assert_eq!(
         subjects(&settled_mail(&recipient, 1).await),
-        vec!["[Nami] Checkout API is DOWN"],
+        vec!["[Nami] [high] Checkout API is down"],
         "one healthy check is not a recovery"
     );
 
@@ -684,8 +684,8 @@ async fn the_recovery_alert_goes_out_only_when_the_threshold_is_reached(pool: sq
     assert_eq!(
         subjects(&settled_mail(&recipient, 2).await),
         vec![
-            "[Nami] Checkout API is DOWN",
-            "[Nami] Checkout API is back UP"
+            "[Nami] [high] Checkout API is down",
+            "[Nami] Resolved: Checkout API is down"
         ]
     );
     ch.drop_database().await.unwrap();

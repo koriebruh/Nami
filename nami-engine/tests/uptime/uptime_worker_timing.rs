@@ -290,7 +290,7 @@ async fn overlapping_passes_apply_each_outcome_once_and_drop_stale_ones(pool: sq
         mail.iter()
             .map(|(subject, _)| subject.as_str())
             .collect::<Vec<_>>(),
-        vec!["[Nami] Checkout API is DOWN"]
+        vec!["[Nami] [high] Checkout API is down"]
     );
     ch.drop_database().await.unwrap();
 }

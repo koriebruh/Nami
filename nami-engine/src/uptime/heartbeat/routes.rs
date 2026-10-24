@@ -26,6 +26,7 @@ use crate::{
     },
     core::state::AppState,
     logs::ingest::rate_limit::{InFlight, TokenBuckets},
+    incidents::model as incident,
     uptime::group::model as monitor_group,
     uptime::heartbeat::model::{
         self as heartbeat, CreateHeartbeatRequest, Heartbeat, HeartbeatView, PatchHeartbeatRequest,
@@ -273,6 +274,17 @@ async fn create_heartbeat(
     {
         return Err(AppError::NotFound);
     }
+    // So is a policy or severity of another project.
+    if !incident::routing_belongs_to(
+        &state.db,
+        project_id,
+        config.escalation_policy_id,
+        config.severity_id,
+    )
+    .await?
+    {
+        return Err(AppError::NotFound);
+    }
     let created = heartbeat::insert_heartbeat(&state.db, project_id, &config)
         .await
         .map_err(|e| match &e {
@@ -308,6 +320,14 @@ async fn patch_heartbeat(
     Json(payload): Json<PatchHeartbeatRequest>,
 ) -> Result<Json<HeartbeatView>, AppError> {
     require_project_role(&state.db, &user, project_id, Role::Member).await?;
+    // A policy or severity of another project is a 404, like any foreign id.
+    let (policy, severity) = (
+        payload.escalation_policy_id.flatten(),
+        payload.severity_id.flatten(),
+    );
+    if !incident::routing_belongs_to(&state.db, project_id, policy, severity).await? {
+        return Err(AppError::NotFound);
+    }
     let updated = heartbeat::update_in_project(&state.db, project_id, heartbeat_id, payload)
         .await?
         .ok_or(AppError::NotFound)?;

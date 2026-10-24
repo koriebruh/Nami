@@ -151,13 +151,28 @@ const OPEN_MANUAL: &str = "insert into incidents
         coalesce($6, '{}'::jsonb), $7)
     returning id";
 
+/// R31: an incident a monitor, heartbeat or log alert opens (or a heartbeat
+/// reopens) runs its first step no sooner than this after the same source's
+/// latest page, so a flapping source pages at most once per gap.
+pub const SOURCE_PAGE_GAP_SECS: i32 = 5 * 60;
+
 // Restarts escalation at the first step of a policy, due that step's delay
 // after $3: the requested policy $2 (none requested: the incident's own) if
-// it is still one of the project's, else the project's default.
+// it is still one of the project's, else the project's default. When $4
+// (R31), not before $5 seconds after the latest step notification queued
+// for any incident of the same source (`greatest` skips a null: a source that
+// never paged, or a manual incident, which has no source).
 const ARM: &str = "update incidents i set
         escalation_policy_id = p.id, escalation_step = 0, escalation_repeat = 0,
         escalation_on_fallback = false, escalation_notified = 0, escalation_legacy = false,
-        next_escalation_at = $3 + make_interval(mins => s.delay_minutes)
+        next_escalation_at = greatest(
+            $3 + make_interval(mins => s.delay_minutes),
+            (select max(d.created_at) from notification_deliveries d
+             join incidents o on o.id = d.incident_id
+             where $4 and d.event = 'triggered'
+               and (o.monitor_id = i.monitor_id or o.heartbeat_id = i.heartbeat_id
+                    or o.log_alert_id = i.log_alert_id))
+                + make_interval(secs => $5))
     from escalation_policies p
     join escalation_steps s on s.policy_id = p.id and s.position = 0
     where i.id = $1
@@ -166,17 +181,21 @@ const ARM: &str = "update incidents i set
            where id = coalesce($2, i.escalation_policy_id) and project_id = i.project_id),
           (select id from escalation_policies where project_id = i.project_id and is_default))";
 
-/// Arms escalation (see `ARM`) from `base`.
+/// Arms escalation (see `ARM`) from `base`; `hold` applies R31's
+/// [`SOURCE_PAGE_GAP_SECS`] (automatic opens and reopens, never a person's).
 async fn arm(
     conn: &mut PgConnection,
     incident_id: Uuid,
     requested_policy: Option<Uuid>,
     base: DateTime<Utc>,
+    hold: bool,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(ARM)
         .bind(incident_id)
         .bind(requested_policy)
         .bind(base)
+        .bind(hold)
+        .bind(SOURCE_PAGE_GAP_SECS)
         .execute(conn)
         .await?;
     Ok(())
@@ -185,7 +204,8 @@ async fn arm(
 /// Opens an incident unless the source already has an unresolved one (then
 /// `None`). Records an `opened` event (a manual incident's names its
 /// creator) and arms escalation on the requested policy (else the project's
-/// default) from `started_at`, in the same transaction.
+/// default) from `started_at`, held off by the source's latest page (R31),
+/// in the same transaction.
 pub async fn open(
     conn: &mut PgConnection,
     req: &OpenIncident<'_>,
@@ -208,7 +228,7 @@ pub async fn open(
         .await?;
     if let Some(id) = id {
         record_event(conn, id, EventKind::Opened, actor, None, json!({})).await?;
-        arm(conn, id, req.escalation_policy_id, req.started_at).await?;
+        arm(conn, id, req.escalation_policy_id, req.started_at, true).await?;
     }
     Ok(id)
 }
@@ -420,7 +440,7 @@ pub async fn reopen(
     }
     savepoint.commit().await?;
     record_event(conn, incident_id, EventKind::Reopened, Some(actor), None, json!({})).await?;
-    arm(conn, incident_id, None, at).await?;
+    arm(conn, incident_id, None, at, false).await?;
     Ok(Reopen::Reopened)
 }
 
@@ -428,14 +448,17 @@ pub async fn reopen(
 /// than `window_secs` before `at`, goes back to `open` with the new title and
 /// cause (details, resolver and acknowledgement cleared; id and `started_at`
 /// kept) and gets a `reopened` event with no actor; escalation restarts from
-/// `at` as for [`reopen`]. Returns its id, or `None` when there is no such
-/// incident or the source already has an unresolved one.
+/// `at` as for [`reopen`], on `escalation_policy_id` when given (else the
+/// incident's own), held off by the source's latest page like [`open`] (R31).
+/// Returns its id, or `None` when there is no such incident or the source
+/// already has an unresolved one.
 pub async fn reopen_source_within(
     conn: &mut PgConnection,
     source: &IncidentSource,
     window_secs: i32,
     title: &str,
     cause: Option<&str>,
+    escalation_policy_id: Option<Uuid>,
     at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let (monitor, heartbeat, log_alert) = source.keys();
@@ -482,7 +505,7 @@ pub async fn reopen_source_within(
     savepoint.commit().await?;
     if let Some(id) = reopened {
         record_event(conn, id, EventKind::Reopened, None, None, json!({})).await?;
-        arm(conn, id, None, at).await?;
+        arm(conn, id, escalation_policy_id, at, true).await?;
     }
     Ok(reopened)
 }

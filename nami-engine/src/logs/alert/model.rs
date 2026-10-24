@@ -122,6 +122,10 @@ pub struct LogAlert {
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// The escalation policy of its incidents; `None` is the project default.
+    pub escalation_policy_id: Option<Uuid>,
+    /// The severity of its incidents; `None` is the project default.
+    pub severity_id: Option<Uuid>,
 }
 
 /// Everything a user sets on an alert.
@@ -134,6 +138,8 @@ pub struct LogAlertConfig {
     pub window_seconds: i32,
     pub interval_seconds: i32,
     pub enabled: bool,
+    pub escalation_policy_id: Option<Uuid>,
+    pub severity_id: Option<Uuid>,
 }
 
 /// The config with its name trimmed, or the first problem as a message for
@@ -185,7 +191,7 @@ macro_rules! columns {
     () => {
         "id, project_id, name, query, threshold, comparison, window_seconds, interval_seconds,
          enabled, state, last_evaluated_at, last_count, last_error, last_error_at,
-         next_evaluation_at, created_by, created_at, updated_at"
+         next_evaluation_at, created_by, created_at, updated_at, escalation_policy_id, severity_id"
     };
 }
 
@@ -248,8 +254,8 @@ pub async fn create(
     }
     let alert = sqlx::query_as(concat!(
         "insert into log_alerts (project_id, name, query, threshold, comparison, window_seconds,
-                                 interval_seconds, enabled, created_by)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9) returning ",
+                                 interval_seconds, enabled, created_by, escalation_policy_id, severity_id)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning ",
         columns!(),
         ""
     ))
@@ -262,6 +268,8 @@ pub async fn create(
     .bind(config.interval_seconds)
     .bind(config.enabled)
     .bind(created_by)
+    .bind(config.escalation_policy_id)
+    .bind(config.severity_id)
     .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -278,6 +286,9 @@ pub struct LogAlertPatch {
     pub window_seconds: Option<i32>,
     pub interval_seconds: Option<i32>,
     pub enabled: Option<bool>,
+    /// `Some(None)` returns to the project's default.
+    pub escalation_policy_id: Option<Option<Uuid>>,
+    pub severity_id: Option<Option<Uuid>>,
 }
 
 impl LogAlertPatch {
@@ -291,6 +302,8 @@ impl LogAlertPatch {
             window_seconds: self.window_seconds.unwrap_or(stored.window_seconds),
             interval_seconds: self.interval_seconds.unwrap_or(stored.interval_seconds),
             enabled: self.enabled.unwrap_or(stored.enabled),
+            escalation_policy_id: self.escalation_policy_id.unwrap_or(stored.escalation_policy_id),
+            severity_id: self.severity_id.unwrap_or(stored.severity_id),
         }
     }
 }
@@ -312,8 +325,9 @@ pub enum UpdatedAlert {
 /// different fields never undo each other. Bumps `updated_at` (an
 /// evaluation already running is then dropped) and makes the alert due at
 /// once. Disabling an `alerting` alert sets it `ok` and resolves its
-/// incident without a notification. Whether the patch's sources belong to
-/// the project is checked by the caller.
+/// incident with the reason `alert disabled` (R17; the caller wakes the
+/// incidents worker). Whether the patch's sources, policy and severity
+/// belong to the project is checked by the caller.
 pub async fn update(
     pool: &PgPool,
     project_id: Uuid,
@@ -343,6 +357,7 @@ pub async fn update(
          set name = $3, query = $4, threshold = $5, comparison = $6, window_seconds = $7,
              interval_seconds = $8, enabled = $9,
              state = case when $9 then state else 'ok' end,
+             escalation_policy_id = $10, severity_id = $11,
              updated_at = now(), next_evaluation_at = now()
          where id = $1 and project_id = $2 returning ",
         columns!(),
@@ -357,6 +372,8 @@ pub async fn update(
     .bind(config.window_seconds)
     .bind(config.interval_seconds)
     .bind(config.enabled)
+    .bind(config.escalation_policy_id)
+    .bind(config.severity_id)
     .fetch_one(&mut *tx)
     .await?;
     if !config.enabled && was == AlertState::Alerting {
@@ -391,6 +408,8 @@ mod tests {
             window_seconds: *WINDOW_RANGE.start(),
             interval_seconds: *INTERVAL_RANGE.start(),
             enabled: true,
+            escalation_policy_id: None,
+            severity_id: None,
         }
     }
 
