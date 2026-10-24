@@ -573,3 +573,21 @@ async fn one_tick_runs_at_most_the_step_limit_of_one_incident(pool: sqlx::PgPool
     assert_eq!(run::tick(&state).await.unwrap(), 1);
     assert!(kinds(&pool, &id).await.contains(&"escalated".to_string()));
 }
+
+#[sqlx::test]
+async fn one_tick_escalates_at_most_its_batch_of_incidents(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (member, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    for _ in 0..=run::ESCALATION_BATCH {
+        common::open_test_incident(&pool, project, member).await;
+    }
+    assert_eq!(run::tick(&state).await.unwrap(), run::ESCALATION_BATCH, "one step each");
+    let due: i64 = sqlx::query_scalar("select count(*) from incidents where next_escalation_at <= now()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(due, 1, "the last one waits for the next tick");
+    assert_eq!(run::tick(&state).await.unwrap(), 1);
+}

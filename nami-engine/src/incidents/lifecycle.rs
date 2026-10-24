@@ -331,12 +331,16 @@ pub async fn resolve_source_with_reason(
     at: DateTime<Utc>,
     reason: &str,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    let reason: String = reason
+    resolve_source_inner(conn, source, at, Some(&clean_reason(reason))).await
+}
+
+/// At most [`MAX_REASON_CHARS`], one line, every unsafe char a space.
+fn clean_reason(reason: &str) -> String {
+    reason
         .chars()
         .take(MAX_REASON_CHARS)
         .map(|c| if is_unsafe_in_text(c) || is_invisible_or_bidi_char(c) { ' ' } else { c })
-        .collect();
-    resolve_source_inner(conn, source, at, Some(&reason)).await
+        .collect()
 }
 
 async fn resolve_source_inner(
@@ -508,4 +512,17 @@ pub async fn record_event(
     .bind(metadata)
     .fetch_one(&mut *conn)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reason_is_one_line_and_cut_at_its_char_limit() {
+        let at = "é".repeat(MAX_REASON_CHARS);
+        assert_eq!(clean_reason(&at), at);
+        assert_eq!(clean_reason(&format!("{at}x")), at);
+        assert_eq!(clean_reason("alert\ndisabled\u{202E}!"), "alert disabled !");
+    }
 }
