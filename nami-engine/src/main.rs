@@ -78,6 +78,9 @@ async fn main() {
         clickhouse,
         cipher: Cipher::new(&config.encryption_key),
         logs: Arc::new(LogsState::default()),
+        notification_sends: Arc::new(tokio::sync::Semaphore::new(
+            nami_engine::incidents::deliveries::MAX_SENDS_IN_FLIGHT,
+        )),
         config,
     };
 

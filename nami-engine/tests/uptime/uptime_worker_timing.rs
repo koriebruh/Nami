@@ -21,7 +21,7 @@ async fn project_with_recipient(pool: &sqlx::PgPool) -> (Uuid, String) {
     let project = seed_project(pool).await;
     let email = unique_email("oncall");
     let user = seed_user(pool, &email, "member").await;
-    add_member(pool, project, user, "viewer").await;
+    add_member(pool, project, user, "member").await;
     (project, email)
 }
 

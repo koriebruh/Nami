@@ -185,7 +185,7 @@ async fn the_output_of_the_ping_that_opens_the_incident_is_attached_to_it(pool: 
     let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
     let recipient = unique_email("oncall");
     let oncall = seed_user(&pool, &recipient, "member").await;
-    add_member(&pool, project, oncall, "viewer").await;
+    add_member(&pool, project, oncall, "member").await;
     let (_, token) = create_heartbeat(&app, project, &member).await;
     let base = format!("/api/v1/heartbeat/{token}");
     let list = format!("/projects/{project}/incidents");

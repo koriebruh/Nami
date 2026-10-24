@@ -262,6 +262,23 @@ impl ActiveWindows {
     pub fn covers_project(&self) -> bool {
         self.covers_heartbeats()
     }
+
+    /// The latest end, no later than `cap`, of the current spans of the
+    /// windows that `applies` selects (`cap` for one whose span runs on past
+    /// it); `None` when none applies. `at` is the instant these windows were
+    /// found in effect at.
+    pub fn in_effect_until(
+        &self,
+        applies: impl Fn(&MaintenanceWindow) -> bool,
+        at: DateTime<Utc>,
+        cap: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        self.0
+            .iter()
+            .filter(|w| applies(w))
+            .map(|w| w.spans(at, cap).first().filter(|s| s.start == at).map_or(cap, |s| s.end))
+            .max()
+    }
 }
 
 /// A window as API responses show it: `active` = in effect right now.
@@ -997,6 +1014,39 @@ mod tests {
         };
         let inactive = ActiveWindows::in_effect(vec![broken, over], now);
         assert!(!inactive.covers_heartbeats() && !inactive.covers_monitor(monitor));
+    }
+
+    #[test]
+    fn a_window_is_in_effect_until_its_spans_end_or_the_cap() {
+        let now = utc(2026, 10, 13, 10, 0, 0);
+        let cap = now + TimeDelta::seconds(60);
+        let once = |minutes: i64, seconds: i64| MaintenanceWindow {
+            kind: "once".to_string(),
+            days_of_week: None,
+            start_time: None,
+            end_time: None,
+            timezone: None,
+            starts_at: Some(now - TimeDelta::minutes(minutes)),
+            ends_at: Some(now + TimeDelta::seconds(seconds)),
+            ..row()
+        };
+        let until = |windows: Vec<MaintenanceWindow>| {
+            ActiveWindows::in_effect(windows, now).in_effect_until(MaintenanceWindow::applies_to_heartbeats, now, cap)
+        };
+        assert_eq!(until(vec![once(5, 59)]), Some(now + TimeDelta::seconds(59)), "it ends first");
+        assert_eq!(until(vec![once(5, 60)]), Some(cap));
+        assert_eq!(until(vec![once(5, 3600)]), Some(cap), "the cap comes first");
+        assert_eq!(until(vec![once(5, 20), once(1, 40)]), Some(now + TimeDelta::seconds(40)), "the latest end");
+        // 09:00-10:00:30 UTC daily: its span covering now ends at 10:00:30.
+        let weekly = MaintenanceWindow {
+            timezone: Some("UTC".to_string()),
+            start_time: NaiveTime::from_hms_opt(9, 0, 0),
+            end_time: NaiveTime::from_hms_opt(10, 0, 30),
+            ..row()
+        };
+        assert_eq!(until(vec![weekly]), Some(now + TimeDelta::seconds(30)));
+        let scoped = MaintenanceWindow { monitor_id: Some(Uuid::new_v4()), ..once(5, 3600) };
+        assert_eq!(until(vec![scoped]), None, "a window that does not apply holds nothing");
     }
 
     fn config(kind: &str) -> WindowConfig {

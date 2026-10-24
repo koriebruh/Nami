@@ -3,7 +3,10 @@ use crate::common;
 
 use axum::http::StatusCode;
 use chrono::Utc;
-use common::{call, open_test_incident, run_incident_ticks, seed_project, settled_mail, test_app, user_with_role};
+use common::{
+    call, insert_channel, open_test_incident, run_incident_ticks, seed_project, set_policy, settled_mail, test_app,
+    user_with_role,
+};
 use nami_engine::{
     core::state::AppState,
     incidents::action::{
@@ -11,8 +14,11 @@ use nami_engine::{
         routes::BURST,
         token::{self as action_token, Action, Claims},
     },
+    incidents::channel::model::ChannelConfig,
+    incidents::deliveries::{self, DeliveryEvent, NewDelivery, Target},
 };
 use serde_json::json;
+use std::time::Instant;
 use uuid::Uuid;
 
 fn token(state: &AppState, incident: Uuid, user: Uuid, action: Action) -> String {
@@ -53,8 +59,12 @@ async fn viewers_get_no_links_and_their_tokens_do_nothing(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
     let (member, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
     let (viewer, viewer_email, _) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    // Named, as "all members" leaves viewers out.
+    set_policy(&app, project, &admin, json!({"name": "Default", "steps": [
+        {"delay_minutes": 0, "targets": [{"type": "user", "id": viewer}]}]})).await;
     let id = open_test_incident(&pool, project, member).await;
     run_incident_ticks(&state).await;
     assert!(!settled_mail(&viewer_email, 1).await[0].1.contains("Acknowledge:"));
@@ -277,4 +287,34 @@ async fn spent_tokens_are_pruned_long_after_they_expire(pool: sqlx::PgPool) {
     assert_eq!(incident_action::prune_spent(&pool).await.unwrap(), 1);
     let left: Vec<Vec<u8>> = sqlx::query_scalar("select token_hash from incident_action_token_uses").fetch_all(&pool).await.unwrap();
     assert_eq!(left, [vec![2u8; 32]]);
+}
+
+/// A confirm answers without waiting for the notices it queues: a receiver
+/// that hangs never holds up the responder's page.
+#[sqlx::test]
+async fn a_confirm_answers_while_a_receiver_hangs(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (alice, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let id = open_test_incident(&pool, project, alice).await;
+    let (port, _silent) = common::silent_server().await;
+    let config = ChannelConfig::Slack { webhook_url: format!("http://127.0.0.1:{port}/services/x") };
+    let channel = insert_channel(&pool, Some(project), None, "hung", config).await;
+    // Due now, and resolved notices always go out: the confirm's kick sends it.
+    let mut conn = pool.acquire().await.unwrap();
+    let notice = NewDelivery {
+        incident_id: id,
+        event: DeliveryEvent::Resolved,
+        round: "hung".into(),
+        target: Target::Channel { channel_id: channel, user_id: None },
+    };
+    deliveries::enqueue(&mut conn, &[notice]).await.unwrap();
+
+    let started = Instant::now();
+    let (status, body) = call(&app, "POST", "/incident-actions/confirm", None,
+        Some(json!({"token": token(&state, id, alice, Action::Acknowledge)}))).await;
+    let took = started.elapsed();
+    assert_eq!((status, body["status"].as_str()), (StatusCode::OK, Some("acknowledged")), "{body}");
+    assert!(took < deliveries::DRAIN_DEADLINE / 2, "the confirm waited {took:?} for the receiver");
 }

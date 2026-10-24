@@ -9,7 +9,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use sqlx::{PgConnection, PgPool};
-use tokio::task::JoinSet;
+use tokio::{task::JoinSet, time::Instant};
 use uuid::Uuid;
 
 use crate::{
@@ -35,8 +35,16 @@ pub const EMAIL_PER_USER_PER_MINUTE: i64 = 20;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 /// Most deliveries one drain claims.
 pub const DRAIN_BATCH: i64 = 50;
-/// Most sends one drain runs at once.
-pub const MAX_SENDS_IN_FLIGHT: usize = 10;
+/// Most sends running at once in this process, across every drain
+/// (`AppState::notification_sends`). Above [`CHANNEL_PER_MINUTE`], which
+/// also caps one channel's live leases, so a channel whose receiver hangs
+/// never holds every slot: the rest stay free for the other targets.
+pub const MAX_SENDS_IN_FLIGHT: usize = 40;
+const _: () = assert!(MAX_SENDS_IN_FLIGHT > CHANNEL_PER_MINUTE as usize);
+/// How long one drain claims and waits for its sends. A send still running
+/// then (a receiver that hangs until its 10 s timeout) finishes and records
+/// itself in the background, so it never holds up the next drain.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
 /// Most chars of `last_error` and of a delivery's timeline event.
 pub const MAX_RECORDED_CHARS: usize = 200;
 /// What an email delivery to a user without a verified address records.
@@ -120,27 +128,66 @@ pub async fn enqueue(conn: &mut PgConnection, deliveries: &[NewDelivery]) -> Res
     Ok(inserted)
 }
 
-/// Claims due deliveries and sends them, at most [`MAX_SENDS_IN_FLIGHT`] at
-/// once, and returns when every send is recorded. Returns how many were
-/// attempted.
+/// Claims up to [`DRAIN_BATCH`] due deliveries and sends them within the
+/// process's [`MAX_SENDS_IN_FLIGHT`] slots, then waits for the sends, all
+/// within [`DRAIN_DEADLINE`]: a send still running then goes on in the
+/// background and records itself. Returns how many were attempted.
 pub async fn drain(state: &AppState, senders: &Senders) -> Result<usize, AppError> {
-    let claimed = claim(&state.db).await?;
-    let attempted = claimed.len();
+    let deadline = Instant::now() + DRAIN_DEADLINE;
     let mut sends = JoinSet::new();
-    for row in claimed {
-        if sends.len() >= MAX_SENDS_IN_FLIGHT {
-            log_panic(sends.join_next().await);
+    let attempted = claim_and_spawn(state, senders, deadline, &mut sends).await;
+    // A dropped JoinSet aborts its tasks, which would cut sends off mid-way.
+    let _ = tokio::time::timeout_at(deadline, async {
+        while let Some(ended) = sends.join_next().await {
+            log_panic(Some(ended));
         }
-        let (state, senders) = (state.clone(), senders.clone());
-        sends.spawn(async move {
-            let id = row.id;
-            if let Err(e) = deliver(&state, &senders, row).await {
-                tracing::error!(delivery_id = %id, error = %e, "notification delivery could not be recorded");
-            }
-        });
-    }
-    while let Some(ended) = sends.join_next().await {
-        log_panic(Some(ended));
+    })
+    .await;
+    sends.detach_all();
+    attempted
+}
+
+/// Claims rows only for the send slots it holds, so a claimed row starts at
+/// once and its lease and attempt are never spent waiting for a slot. Waits
+/// for a slot until `deadline` at most.
+async fn claim_and_spawn(
+    state: &AppState,
+    senders: &Senders,
+    deadline: Instant,
+    sends: &mut JoinSet<()>,
+) -> Result<usize, AppError> {
+    let batch = usize::try_from(DRAIN_BATCH).unwrap_or(0);
+    let mut attempted = 0;
+    while attempted < batch {
+        let first = tokio::select! {
+            slot = state.notification_sends.clone().acquire_owned() => match slot {
+                Ok(slot) => slot,
+                Err(_) => break,
+            },
+            () = tokio::time::sleep_until(deadline) => break,
+        };
+        let mut slots = vec![first];
+        while slots.len() < batch - attempted {
+            let Ok(slot) = state.notification_sends.clone().try_acquire_owned() else {
+                break;
+            };
+            slots.push(slot);
+        }
+        let claimed = claim(&state.db, slots.len()).await?;
+        if claimed.is_empty() {
+            break;
+        }
+        attempted += claimed.len();
+        for (row, slot) in claimed.into_iter().zip(slots) {
+            let (state, senders) = (state.clone(), senders.clone());
+            sends.spawn(async move {
+                let _slot = slot;
+                let id = row.id;
+                if let Err(e) = deliver(&state, &senders, row).await {
+                    tracing::error!(delivery_id = %id, error = %e, "notification delivery could not be recorded");
+                }
+            });
+        }
     }
     Ok(attempted)
 }
@@ -173,7 +220,7 @@ const FAIL_INTERRUPTED: &str = "update notification_deliveries
 // or a user's implicit email) after what the bucket sent in the last window
 // plus what is leased now. Over-cap rows are deferred in the same statement,
 // without spending an attempt, so a busy channel never starves the others.
-// $1 = DRAIN_BATCH, $2 = CHANNEL_PER_MINUTE, $3 = EMAIL_PER_USER_PER_MINUTE,
+// $1 = the claim's limit, $2 = CHANNEL_PER_MINUTE, $3 = EMAIL_PER_USER_PER_MINUTE,
 // $4 = LEASE, $5 = RATE_WINDOW (seconds), $6 = MAX_ATTEMPTS.
 const CLAIM: &str = "with candidates as (
     select id, channel_id, user_id, next_attempt_at,
@@ -211,16 +258,17 @@ from ranked r
 where d.id = r.id and r.nth <= r.cap
 returning d.id, d.incident_id, d.event, d.user_id, d.channel_id, d.attempts";
 
-/// One claim at a time across every engine instance (a transaction-level
-/// advisory lock, held for milliseconds), so the caps count every lease.
-async fn claim(pool: &PgPool) -> Result<Vec<Claimed>, sqlx::Error> {
+/// Claims at most `limit` due rows. One claim at a time across every engine
+/// instance (a transaction-level advisory lock, held for milliseconds), so
+/// the caps count every lease.
+async fn claim(pool: &PgPool, limit: usize) -> Result<Vec<Claimed>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("select pg_advisory_xact_lock(hashtext('nami.notification_deliveries.claim'))")
         .execute(&mut *tx)
         .await?;
     sqlx::query(FAIL_INTERRUPTED).bind(MAX_ATTEMPTS).execute(&mut *tx).await?;
     let claimed = sqlx::query_as(CLAIM)
-        .bind(DRAIN_BATCH)
+        .bind(i64::try_from(limit).unwrap_or(DRAIN_BATCH))
         .bind(CHANNEL_PER_MINUTE)
         .bind(EMAIL_PER_USER_PER_MINUTE)
         .bind(LEASE.as_secs_f64())
@@ -423,9 +471,21 @@ const RECORD: &str = "update notification_deliveries
         next_attempt_at = coalesce(now() + make_interval(secs => $5), next_attempt_at)
     where id = $1 and status = 'sending' and attempts = $2";
 
+// A page sent after its incident was resolved (it was in flight then, so the
+// resolve did not see it sent) gets the resolved notice the resolve gave the
+// others: same generation ($2) only, once per target.
+const QUEUE_LATE_RESOLVED: &str = "insert into notification_deliveries
+        (incident_id, event, round, target_key, user_id, channel_id)
+    select incident_id, 'resolved', 'resolved:g' || $2, target_key, user_id, channel_id
+    from notification_deliveries
+    where id = $1 and round like 'g' || $2 || 'p%'
+    on conflict on constraint notification_deliveries_target_unique do nothing";
+
 /// Writes the outcome and its timeline event in one transaction: `sent`, a
 /// retry (`pending` after the backoff or a longer `Retry-After`), `failed`
-/// (never retryable, or the last attempt) or `cancelled` (no event).
+/// (never retryable, or the last attempt) or `cancelled` (no event). A step
+/// notification sent for an incident already resolved queues its resolved
+/// notice (`QUEUE_LATE_RESOLVED`).
 async fn record(pool: &PgPool, row: &Claimed, outcome: Outcome) -> Result<(), sqlx::Error> {
     let (status, error, retry_in, event) = match outcome {
         Outcome::Lost => return Ok(()),
@@ -444,6 +504,17 @@ async fn record(pool: &PgPool, row: &Claimed, outcome: Outcome) -> Result<(), sq
         }
     };
     let mut tx = pool.begin().await?;
+    // The incident before the delivery, the order resolve and the tick lock
+    // them in. Locked whatever its status: a resolve committing meanwhile is
+    // then either seen here, or waits and sees this row sent.
+    let incident: Option<(String, i32)> = if status == "sent" && row.event == "triggered" {
+        sqlx::query_as("select status, escalation_generation from incidents where id = $1 for share")
+            .bind(row.incident_id)
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        None
+    };
     let updated = sqlx::query(RECORD)
         .bind(row.id)
         .bind(row.attempts)
@@ -456,6 +527,12 @@ async fn record(pool: &PgPool, row: &Claimed, outcome: Outcome) -> Result<(), sq
     if let (1, Some((kind, message))) = (updated, event) {
         lifecycle::record_event(&mut tx, row.incident_id, kind, None, Some(&recorded(&message)), json!({}))
             .await?;
+    }
+    if updated == 1
+        && let Some((incident_status, generation)) = incident
+        && incident_status == "resolved"
+    {
+        sqlx::query(QUEUE_LATE_RESOLVED).bind(row.id).bind(generation).execute(&mut *tx).await?;
     }
     tx.commit().await?;
     if updated == 1 && status == "sent" && row.event == "triggered" {

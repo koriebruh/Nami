@@ -308,6 +308,13 @@ const QUEUE_RESOLVED_LEGACY: &str = "insert into notification_deliveries
 const CANCEL_QUEUED_PAGES: &str = "update notification_deliveries set status = 'cancelled'
     where incident_id = $1 and event = 'triggered' and status = 'pending'";
 
+// A reopen makes the resolved notices still waiting (unsent, or in retry
+// backoff) stale: the incident is open again, and one sent now would end the
+// recipient's thread on "Resolved". A notice already in flight cannot be
+// called back.
+const CANCEL_QUEUED_RESOLVED: &str = "update notification_deliveries set status = 'cancelled'
+    where incident_id = $1 and event = 'resolved' and status = 'pending'";
+
 /// [`resolve`], with the `resolved` event carrying `reason` as its message
 /// and `metadata.reason` (R30).
 async fn resolve_with_reason(
@@ -398,10 +405,11 @@ async fn resolve_source_inner(
 }
 
 /// resolved -> open, by `actor`: the resolution and the acknowledgement are
-/// cleared, and escalation restarts from `at` at the first step of the
-/// incident's own policy (the project's default if it was deleted), in a new
-/// generation. Refused while another incident of the same source is
-/// unresolved.
+/// cleared, the resolved notices still queued are cancelled
+/// (`CANCEL_QUEUED_RESOLVED`), and escalation restarts from `at` at the
+/// first step of the incident's own policy (the project's default if it was
+/// deleted), in a new generation. Refused while another incident of the
+/// same source is unresolved.
 pub async fn reopen(
     conn: &mut PgConnection,
     incident_id: Uuid,
@@ -442,6 +450,7 @@ pub async fn reopen(
     }
     savepoint.commit().await?;
     record_event(conn, incident_id, EventKind::Reopened, Some(actor), None, json!({})).await?;
+    sqlx::query(CANCEL_QUEUED_RESOLVED).bind(incident_id).execute(&mut *conn).await?;
     arm(conn, incident_id, None, at, false).await?;
     Ok(Reopen::Reopened)
 }
@@ -457,7 +466,8 @@ pub struct Routing {
 /// Automatic reopen: the source's latest incident, if it was resolved less
 /// than `window_secs` before `at`, goes back to `open` with the new title and
 /// cause (details, resolver and acknowledgement cleared; id and `started_at`
-/// kept) and gets a `reopened` event with no actor; escalation restarts from
+/// kept) and gets a `reopened` event with no actor; its queued resolved
+/// notices are cancelled as for [`reopen`]; escalation restarts from
 /// `at` as for [`reopen`], held off by the source's latest page like
 /// [`open`] (R31). It takes the source's current `routing`, each part
 /// falling back to the project's default, never to the incident's previous
@@ -525,6 +535,7 @@ pub async fn reopen_source_within(
     savepoint.commit().await?;
     if let Some(id) = reopened {
         record_event(conn, id, EventKind::Reopened, None, None, json!({})).await?;
+        sqlx::query(CANCEL_QUEUED_RESOLVED).bind(id).execute(&mut *conn).await?;
         arm(conn, id, None, at, true).await?;
     }
     Ok(reopened)
@@ -538,9 +549,17 @@ pub const PAUSED_STOP: &str = "paused";
 // The source's open incident whose escalation the tick stopped because the
 // source was paused: its latest `escalation_exhausted` event is that stop
 // (one recorded after it, a natural end, leaves the incident alone). The step
-// that was due runs at $4, in the same generation, so everyone it already
-// paged still gets the resolved notice.
-const RESUME: &str = "update incidents i set next_escalation_at = $4
+// that was due runs $6 seconds after the resume ($4) and after the source's
+// latest page, in the same generation, so everyone it already paged still
+// gets the resolved notice. The wait gives a source that recovered while
+// paused its first check after the resume, which resolves the incident
+// before anyone is paged for it.
+const RESUME: &str = "update incidents i set next_escalation_at = greatest(
+        $4 + make_interval(secs => $6),
+        coalesce((select last_paged_at from monitors where id = i.monitor_id),
+                 (select last_paged_at from heartbeats where id = i.heartbeat_id),
+                 (select last_paged_at from log_alerts where id = i.log_alert_id))
+            + make_interval(secs => $6))
     where (i.monitor_id = $1 or i.heartbeat_id = $2 or i.log_alert_id = $3)
       and i.status = 'open' and i.next_escalation_at is null
       and (select e.metadata->>'stop' from incident_events e
@@ -548,11 +567,12 @@ const RESUME: &str = "update incidents i set next_escalation_at = $4
            order by e.id desc limit 1) = $5";
 
 /// Restarts the escalation the tick stopped while the source was paused
-/// (ruling on NAMI-INC-10): the step that was due runs at `at`, its cursor
-/// and generation kept. A person resumed the source, so R31's hold does not
-/// apply, as for a manual [`reopen`]. Returns whether an incident was
-/// re-armed; an acknowledged incident, or one whose escalation ended for
-/// another reason, is left alone.
+/// (ruling on NAMI-INC-10), its cursor and generation kept. The step that was
+/// due runs no sooner than [`SOURCE_PAGE_GAP_SECS`] after `at` and after the
+/// source's latest page (R31), so a source that recovered while paused is
+/// resolved by its next check instead of paging at once. Returns whether an
+/// incident was re-armed; an acknowledged incident, or one whose escalation
+/// ended for another reason, is left alone.
 pub async fn resume_source(
     conn: &mut PgConnection,
     source: &IncidentSource,
@@ -565,6 +585,7 @@ pub async fn resume_source(
         .bind(log_alert)
         .bind(at)
         .bind(PAUSED_STOP)
+        .bind(SOURCE_PAGE_GAP_SECS)
         .execute(conn)
         .await?
         .rows_affected();

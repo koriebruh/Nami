@@ -54,7 +54,7 @@ async fn project_with_recipient(pool: &sqlx::PgPool) -> (Uuid, String) {
     let project = seed_project(pool).await;
     let email = unique_email("oncall");
     let user = seed_user(pool, &email, "member").await;
-    add_member(pool, project, user, "viewer").await;
+    add_member(pool, project, user, "member").await;
     (project, email)
 }
 
@@ -913,15 +913,17 @@ async fn a_result_that_fails_to_apply_is_rolled_back_and_does_not_stop_the_pass(
     ch.drop_database().await.unwrap();
 }
 
-/// Every member of the project, whatever the role, is mailed once; members of
-/// other projects are not.
+/// Every member of the project who may act on the incident (project role
+/// member or admin) is mailed once; viewers and members of other projects
+/// are not.
 #[sqlx::test]
 async fn every_project_member_is_mailed_once_and_nobody_else(pool: sqlx::PgPool) {
     let (state, ch) = state_with_clickhouse(&pool).await;
     let project = seed_project(&pool).await;
     let other_project = seed_project(&pool).await;
-    let (admin, viewer, outsider) = (
+    let (admin, member, viewer, outsider) = (
         unique_email("admin"),
+        unique_email("member"),
         unique_email("viewer"),
         unique_email("outsider"),
     );
@@ -930,6 +932,13 @@ async fn every_project_member_is_mailed_once_and_nobody_else(pool: sqlx::PgPool)
         project,
         seed_user(&pool, &admin, "member").await,
         "admin",
+    )
+    .await;
+    add_member(
+        &pool,
+        project,
+        seed_user(&pool, &member, "member").await,
+        "member",
     )
     .await;
     add_member(
@@ -951,11 +960,12 @@ async fn every_project_member_is_mailed_once_and_nobody_else(pool: sqlx::PgPool)
 
     run_due_checks(&state).await.unwrap();
 
-    for member in [&admin, &viewer] {
+    for member in [&admin, &member] {
         let mail = settled_mail(member, 1).await;
         assert_eq!(mail.len(), 1, "{member}: {mail:?}");
         assert_eq!(mail[0].0, "[Nami] [high] Checkout API is down");
     }
+    assert!(mail_for(&viewer).await.is_empty(), "a viewer cannot act on it");
     assert!(mail_for(&outsider).await.is_empty());
     ch.drop_database().await.unwrap();
 }
@@ -1461,7 +1471,7 @@ async fn alerts_to_a_hung_smtp_server_are_given_up_on_after_the_timeout(pool: sq
     };
     let (project, _first) = project_with_recipient(&pool).await;
     let second = seed_user(&pool, &unique_email("second"), "member").await;
-    add_member(&pool, project, second, "viewer").await;
+    add_member(&pool, project, second, "member").await;
     let server = server_with_status(503).await;
     let monitor = seed_http_monitor(&pool, project, "Checkout API", &server.uri(), 1).await;
 

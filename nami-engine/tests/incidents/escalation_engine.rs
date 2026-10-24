@@ -12,6 +12,7 @@ use nami_engine::{
     incidents::channel::model::ChannelConfig,
     incidents::escalation::run,
     incidents::lifecycle::{self, IncidentSource},
+    incidents::model as incident,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -47,21 +48,35 @@ fn one_step(delay: i64, targets: Value) -> Value {
     json!({"delay_minutes": delay, "targets": targets})
 }
 
+/// The default policy (all members) emails once every member who may act on
+/// the incident: project members and admins, and global admins whatever
+/// their project role. Viewers, who cannot act, are left out, personal
+/// channels included.
 #[sqlx::test]
-async fn the_default_policy_emails_every_member_once(pool: sqlx::PgPool) {
+async fn the_default_policy_emails_every_member_who_may_act_once(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, alice, member) = user_with_role(&app, &pool, project, Some("member")).await;
-    let (_, viewer_email, _) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let (_, admin_email, _) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (viewer, viewer_email, _) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let global_admin_email = common::unique_email("global-admin");
+    let global_admin = common::seed_user(&pool, &global_admin_email, "admin").await;
+    common::add_member(&pool, project, global_admin, "viewer").await;
+    let slack = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&slack).await;
+    let config = ChannelConfig::Slack { webhook_url: format!("{}/services/x", slack.uri()) };
+    insert_channel(&pool, None, Some(viewer), "mine", config).await;
     let id = open(&app, project, &member).await;
     run_incident_ticks(&state).await;
     run_incident_ticks(&state).await;
-    for email in [&alice, &viewer_email] {
+    for email in [&alice, &admin_email, &global_admin_email] {
         let mail = settled_mail(email, 1).await;
         assert_eq!(mail.len(), 1, "{email}");
         assert_eq!(mail[0].0, "[Nami] [high] db down");
     }
+    assert!(settled_mail(&viewer_email, 0).await.is_empty(), "a viewer is not paged");
+    assert!(slack.received_requests().await.unwrap().is_empty(), "nor through their personal channel");
     assert!(kinds(&pool, &id).await.contains(&"escalated".to_string()));
 }
 
@@ -445,13 +460,106 @@ async fn the_per_incident_delivery_cap_stops_a_storm(pool: sqlx::PgPool) {
     assert_eq!(capped, 1);
 }
 
+/// The cap bounds step notifications only: resolved notices (an earlier
+/// generation's here) neither count against it nor are stopped by it.
+#[sqlx::test]
+async fn the_per_incident_cap_counts_step_notifications_only(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (member_id, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let all = json!([{"type": "all_members"}]);
+    set_policy(&app, project, &admin, json!({"name": "Default", "steps": [one_step(0, all.clone()), one_step(0, all)]}))
+        .await;
+    let id = open(&app, project, &member).await;
+    // Out of the per-minute window, so the step's email is not deferred.
+    sqlx::query(
+        "insert into notification_deliveries (incident_id, event, round, target_key, user_id, status, sent_at)
+         select $1::uuid, case when g < $3 then 'triggered' else 'resolved' end, 'old', 'email:' || g, $2,
+                'sent', now() - interval '1 hour'
+         from generate_series(1, $3 + 9) g",
+    )
+    .bind(&id)
+    .bind(member_id)
+    .bind(run::MAX_DELIVERIES_PER_INCIDENT as i32)
+    .execute(&pool)
+    .await
+    .unwrap();
+    run_incident_ticks(&state).await;
+    let count = |event: &'static str| {
+        let pool = pool.clone();
+        let id = id.clone();
+        async move {
+            let n: i64 = sqlx::query_scalar(
+                "select count(*) from notification_deliveries where incident_id = $1::uuid and event = $2",
+            )
+            .bind(&id)
+            .bind(event)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            n
+        }
+    };
+    assert_eq!(count("triggered").await, run::MAX_DELIVERIES_PER_INCIDENT, "one more fit, the rest did not");
+    assert!(kinds(&pool, &id).await.contains(&"notification_failed".to_string()), "the cap is on the timeline");
+
+    let mut conn = pool.acquire().await.unwrap();
+    lifecycle::resolve(&mut conn, uid(&id), None, Utc::now()).await.unwrap();
+    assert_eq!(count("resolved").await, 10 + 1, "the page sent past the earlier notices is told");
+}
+
+async fn resolved_notices(pool: &sqlx::PgPool, incident: Uuid) -> Vec<String> {
+    sqlx::query_scalar("select status from notification_deliveries where incident_id = $1 and event = 'resolved'")
+        .bind(incident)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// A reopen, by a person or by a heartbeat failing again, cancels the
+/// resolved notices still queued, so an open incident's last message to
+/// anyone is never "Resolved".
+#[sqlx::test]
+async fn a_reopen_cancels_the_resolved_notices_still_queued(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (_, email, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let id = open(&app, project, &member).await;
+    run_incident_ticks(&state).await;
+    act(&app, project, &member, &id, "resolve").await;
+    act(&app, project, &member, &id, "reopen").await;
+    assert_eq!(resolved_notices(&pool, uid(&id)).await, ["cancelled", "cancelled"], "the member and the admin");
+    run_incident_ticks(&state).await;
+    let mail = settled_mail(&email, 2).await;
+    let subjects: Vec<&str> = mail.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(subjects, ["[Nami] [high] db down", "[Nami] [high] db down"]);
+
+    let (status, body) = call(&app, "POST", &format!("/projects/{project}/heartbeats"), Some(&admin),
+        Some(json!({"name": "nightly", "period_seconds": 60}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let heartbeat: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let opened = incident::open_for_heartbeat(&mut conn, project, heartbeat, "nightly failed", None, Utc::now())
+        .await.unwrap().expect("opened");
+    run_incident_ticks(&state).await;
+    incident::resolve_for_heartbeat(&mut conn, heartbeat, Utc::now()).await.unwrap();
+    let reopened = incident::open_for_heartbeat(&mut conn, project, heartbeat, "nightly failed", None, Utc::now())
+        .await.unwrap();
+    assert_eq!(reopened, Some(opened), "reopened inside the heartbeat's window");
+    assert_eq!(resolved_notices(&pool, opened).await, ["cancelled", "cancelled"]);
+}
+
 #[sqlx::test]
 async fn racing_ticks_notify_each_target_once(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
-    user_with_role(&app, &pool, project, Some("viewer")).await;
+    user_with_role(&app, &pool, project, Some("member")).await;
     let id = open(&app, project, &member).await;
     let (a, b) = tokio::join!(run::tick(&state), run::tick(&state));
     a.unwrap();

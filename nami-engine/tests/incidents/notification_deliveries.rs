@@ -6,12 +6,15 @@ use common::{
     call, insert_channel, open_test_incident, run_incident_ticks, seed_project, settled_mail, test_app,
     user_with_role,
 };
+use chrono::Utc;
 use nami_engine::{
     core::state::AppState,
     incidents::channel::model::ChannelConfig,
     incidents::deliveries::{self, DeliveryEvent, NewDelivery, Target},
+    incidents::{lifecycle, outbound::OUTBOUND_TIMEOUT},
 };
 use serde_json::{Value, json};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
@@ -628,4 +631,116 @@ async fn a_personal_channel_of_someone_who_left_the_project_is_not_sent(pool: sq
     queue(&pool, incident, "p0r0s0", Target::Channel { channel_id: personal, user_id: None }).await;
     run_incident_ticks(&state).await;
     assert_eq!(delivery(&pool, incident).await.0, "cancelled");
+}
+
+/// Polls `ready` every 50 ms until it holds or `limit` passes; whether it held.
+async fn wait_until<F, Fut>(limit: Duration, mut ready: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let started = Instant::now();
+    while started.elapsed() < limit {
+        if ready().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+async fn sending_to(pool: &sqlx::PgPool, channel: Uuid) -> i64 {
+    sqlx::query_scalar("select count(*) from notification_deliveries where channel_id = $1 and status = 'sending'")
+        .bind(channel)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A receiver that hangs holds its own send slots until its timeout, never
+/// the queue: with as many of its sends in flight as its cap allows, the
+/// worker's next drain still sends to another channel.
+#[sqlx::test]
+async fn a_hanging_receiver_does_not_hold_up_another_channel(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (user, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (port, _silent) = common::silent_server().await;
+    let config = ChannelConfig::Slack { webhook_url: format!("http://127.0.0.1:{port}/services/x") };
+    let hung = insert_channel(&pool, Some(project), None, "hung", config).await;
+    let fast = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&fast).await;
+    let config = ChannelConfig::Slack { webhook_url: format!("{}/services/y", fast.uri()) };
+    let other = insert_channel(&pool, Some(project), None, "other", config).await;
+    let incident = open_test_incident(&pool, project, user).await;
+    for n in 0..deliveries::CHANNEL_PER_MINUTE {
+        queue(&pool, incident, &format!("hung{n}"), Target::Channel { channel_id: hung, user_id: None }).await;
+    }
+    // The worker loop: one kick after another, never two at once.
+    let worker = tokio::spawn({
+        let state = state.clone();
+        async move {
+            loop {
+                run_incident_ticks(&state).await;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    });
+    let all_in_flight =
+        wait_until(Duration::from_secs(5), || async { sending_to(&pool, hung).await == deliveries::CHANNEL_PER_MINUTE })
+            .await;
+    assert!(all_in_flight, "the hanging channel's deliveries were claimed");
+
+    queue(&pool, incident, "p0r0s0", Target::Channel { channel_id: other, user_id: None }).await;
+    let queued = Instant::now();
+    let sent = wait_until(OUTBOUND_TIMEOUT * 2, || async { !fast.received_requests().await.unwrap().is_empty() }).await;
+    let waited = queued.elapsed();
+    worker.abort();
+    assert!(sent && waited < OUTBOUND_TIMEOUT, "the other channel waited {waited:?} (sent: {sent})");
+    assert_eq!(sending_to(&pool, hung).await, deliveries::CHANNEL_PER_MINUTE, "still hanging meanwhile");
+}
+
+/// A page still in flight when its incident is resolved is followed by its
+/// resolved notice once it lands, like the pages the resolve saw sent.
+#[sqlx::test]
+async fn a_page_in_flight_at_resolve_time_gets_its_resolved_notice(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (user, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let slow = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(2)))
+        .mount(&slow)
+        .await;
+    let config = ChannelConfig::Slack { webhook_url: format!("{}/services/x", slow.uri()) };
+    let channel = insert_channel(&pool, Some(project), None, "room", config).await;
+    let incident = open_test_incident(&pool, project, user).await;
+    // A step notification of the incident's current generation (0).
+    queue(&pool, incident, "g0p0r0s0", Target::Channel { channel_id: channel, user_id: None }).await;
+    let kick = tokio::spawn({
+        let state = state.clone();
+        async move { run_incident_ticks(&state).await }
+    });
+    let requested = wait_until(Duration::from_secs(5), || async { !slow.received_requests().await.unwrap().is_empty() }).await;
+    assert!(requested, "the page is on its way");
+    let mut conn = pool.acquire().await.unwrap();
+    assert!(lifecycle::resolve(&mut conn, incident, None, Utc::now()).await.unwrap());
+    kick.await.unwrap();
+
+    let notices = || async {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "select round, status from notification_deliveries where incident_id = $1 and event = 'resolved'",
+        )
+        .bind(incident)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        rows
+    };
+    assert_eq!(notices().await, [("resolved:g0".to_string(), "pending".to_string())]);
+    run_incident_ticks(&state).await;
+    assert_eq!(notices().await, [("resolved:g0".to_string(), "sent".to_string())]);
+    assert_eq!(slow.received_requests().await.unwrap().len(), 2);
 }

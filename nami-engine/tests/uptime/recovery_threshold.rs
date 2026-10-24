@@ -650,7 +650,7 @@ async fn the_recovery_alert_goes_out_only_when_the_threshold_is_reached(pool: sq
     let project = seed_project(&pool).await;
     let recipient = unique_email("oncall");
     let user = seed_user(&pool, &recipient, "member").await;
-    add_member(&pool, project, user, "viewer").await;
+    add_member(&pool, project, user, "member").await;
     let server = MockServer::start().await;
     respond_with_status(&server, 503).await;
     let monitor = seed_http_monitor(&pool, project, "Checkout API", &server.uri(), 1).await;

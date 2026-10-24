@@ -1,10 +1,11 @@
 use std::sync::Arc;
 
 use sqlx::PgPool;
+use tokio::sync::Semaphore;
 
 use crate::{
     core::clickhouse::ClickHouse, core::config::Config, core::crypto::Cipher, core::email,
-    logs::LogsState,
+    incidents::deliveries::MAX_SENDS_IN_FLIGHT, logs::LogsState,
 };
 
 /// A ClickHouse database name that is never created. `AppState::for_test`
@@ -22,6 +23,9 @@ pub struct AppState {
     pub cipher: Cipher,
     /// Log ingest rate limits and usage counters (in memory, per instance).
     pub logs: Arc<LogsState>,
+    /// The notification send slots of this instance
+    /// (`incidents::deliveries::MAX_SENDS_IN_FLIGHT`), shared by every drain.
+    pub notification_sends: Arc<Semaphore>,
     pub config: Config,
 }
 
@@ -31,7 +35,8 @@ impl AppState {
     /// defaults tests expect — `Config::from_env_for_test()`, the Mailpit
     /// mailer, a ClickHouse client bound to a database that does not
     /// exist, a cipher over the fixed `core::crypto::TEST_KEY`, and fresh log
-    /// ingest state (default rate limits, no usage). Tests override
+    /// ingest state (default rate limits, no usage) and send slots of its
+    /// own (so parallel tests never share them). Tests override
     /// single fields with struct-update syntax, e.g.
     /// `AppState { mailer: Mailer::new("localhost", 1), ..AppState::for_test(pool) }`,
     /// so adding a field to `AppState` never touches test files again.
@@ -48,6 +53,7 @@ impl AppState {
             ),
             cipher: Cipher::new(&config.encryption_key),
             logs: Arc::new(LogsState::default()),
+            notification_sends: Arc::new(Semaphore::new(MAX_SENDS_IN_FLIGHT)),
             config,
         }
     }

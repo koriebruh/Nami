@@ -18,10 +18,14 @@ pub fn validate_name(raw: &str) -> Result<String, String> {
     validate_label("name", raw)
 }
 
-/// Rule for any short label (monitor and heartbeat names, maintenance window
-/// titles): [`validate_line`] with at most 200 characters.
+/// Most chars of a short label ([`validate_label`]).
+pub const MAX_LABEL_CHARS: usize = 200;
+
+/// Rule for any short label (monitor, heartbeat and project names,
+/// maintenance window titles): [`validate_line`] with at most
+/// [`MAX_LABEL_CHARS`] characters.
 pub fn validate_label(field: &str, raw: &str) -> Result<String, String> {
-    validate_line(field, raw, 200)
+    validate_line(field, raw, MAX_LABEL_CHARS)
 }
 
 /// Rule for one line of user text: trimmed, 1 to `max_chars` characters, no

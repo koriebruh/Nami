@@ -19,7 +19,6 @@ use crate::{
         },
         lifecycle::{self, EventKind, PAUSED_STOP},
         oncall::{model::load_rotation, rotation::on_call_at},
-        worker::TICK,
     },
     uptime::maintenance::model as maintenance,
 };
@@ -31,11 +30,17 @@ pub const ESCALATION_BATCH: usize = 50;
 pub const MAX_STEPS_PER_TICK: usize = 20;
 /// Most recipients one step notifies.
 pub const MAX_RECIPIENTS_PER_STEP: usize = 100;
-/// Most deliveries one incident ever queues through its steps.
+/// Most step notifications one incident ever queues, over every generation.
+/// Resolved notices are outside the cap, neither counted nor stopped by it:
+/// a resolve tells each target its generation paged, so they add at most
+/// one per step notification sent.
 pub const MAX_DELIVERIES_PER_INCIDENT: i64 = 500;
 /// A step overdue by more than this runs now, and the policy's clock restarts
 /// from now (R14): an outage never replays missed steps as a burst.
 const MAX_LAG: Duration = Duration::seconds(60);
+/// Longest a maintenance hold waits before looking again: a window deleted
+/// or cut short early lets the step run this much later at most.
+pub const MAINTENANCE_RECHECK: Duration = Duration::seconds(60);
 
 /// An incident whose next step is due, locked by its transaction.
 #[derive(sqlx::FromRow)]
@@ -151,8 +156,9 @@ enum SourceHold {
     /// The monitor or heartbeat is paused, or the log alert disabled; the
     /// message names it.
     Paused(&'static str),
-    /// A maintenance window that applies to the source is in effect.
-    Maintenance,
+    /// A maintenance window that applies to the source is in effect, until
+    /// `until` (its current span's end, at most [`MAINTENANCE_RECHECK`] away).
+    Maintenance { until: DateTime<Utc> },
 }
 
 /// Whether the incident's source holds its due step (ruling on NAMI-INC-10),
@@ -172,19 +178,21 @@ async fn source_hold(conn: &mut PgConnection, due: &Due) -> Result<Option<Source
         return Ok(Some(SourceHold::Paused(paused)));
     }
     let windows = maintenance::active_windows(&mut *conn, due.project_id, due.now).await?;
-    let covered = match (due.monitor_id, due.heartbeat_id) {
-        (Some(monitor), _) => windows.covers_monitor(monitor),
-        (_, Some(_)) => windows.covers_heartbeats(),
-        _ => windows.covers_project(),
+    let cap = due.now + MAINTENANCE_RECHECK;
+    let until = match due.monitor_id {
+        Some(monitor) => windows.in_effect_until(|w| w.applies_to_monitor(monitor), due.now, cap),
+        // Heartbeats and log alerts: project-wide windows only.
+        None => windows.in_effect_until(maintenance::MaintenanceWindow::applies_to_heartbeats, due.now, cap),
     };
-    Ok(covered.then_some(SourceHold::Maintenance))
+    Ok(until.map(|until| SourceHold::Maintenance { until }))
 }
 
 /// A held step does not page. A paused source stops escalation for this
 /// generation (the cursor is kept; `lifecycle::resume_source` or a reopen
 /// re-arms it) and says so on the timeline. A source in maintenance defers
-/// the step to the next tick, which looks again: it runs once the window is
-/// over, and the policy's clock restarts then (R14's lag rule).
+/// the step to the window's end, or [`MAINTENANCE_RECHECK`] if sooner, when
+/// the tick looks again: it runs once the window is over, and the policy's
+/// clock restarts then (R14's lag rule).
 async fn hold(conn: &mut PgConnection, due: &Due, hold: SourceHold) -> Result<(), sqlx::Error> {
     match hold {
         SourceHold::Paused(why) => {
@@ -197,11 +205,10 @@ async fn hold(conn: &mut PgConnection, due: &Due, hold: SourceHold) -> Result<()
             let metadata = json!({ "stop": PAUSED_STOP });
             lifecycle::record_event(conn, due.id, kind, None, Some(&message), metadata).await?;
         }
-        SourceHold::Maintenance => {
-            let recheck = Duration::from_std(TICK).expect("TICK is a few seconds");
+        SourceHold::Maintenance { until } => {
             sqlx::query("update incidents set next_escalation_at = $2 where id = $1")
                 .bind(due.id)
-                .bind(due.now + recheck)
+                .bind(until)
                 .execute(&mut *conn)
                 .await?;
         }
@@ -301,11 +308,12 @@ async fn run_step(
         return Ok(0);
     }
     let mut targets = recipients(conn, due.project_id, step_id, due.now).await?;
-    let existing: i64 =
-        sqlx::query_scalar("select count(*) from notification_deliveries where incident_id = $1")
-            .bind(due.id)
-            .fetch_one(&mut *conn)
-            .await?;
+    let existing: i64 = sqlx::query_scalar(
+        "select count(*) from notification_deliveries where incident_id = $1 and event = 'triggered'",
+    )
+    .bind(due.id)
+    .fetch_one(&mut *conn)
+    .await?;
     let room = usize::try_from(MAX_DELIVERIES_PER_INCIDENT - existing).unwrap_or(0);
     if targets.len() > room {
         targets.truncate(room);
@@ -418,25 +426,31 @@ struct TargetRow {
 }
 
 // $1 = project, $2 = the users the step names (directly or on call), $3 =
-// every member, $4 = the project channels it names. Only project members
-// are paged (R7), with their verified email and enabled personal channels.
+// all members, $4 = the project channels it names. Only project members are
+// paged (R7), with their verified email and enabled personal channels. "All
+// members" leaves out viewers, who cannot acknowledge or resolve, unless they
+// are global admins; a user the step names is paged whatever their role.
 const RECIPIENTS: &str = "select m.user_id, null::uuid as channel_id
     from project_members m join users u on u.id = m.user_id
-    where m.project_id = $1 and ($3 or m.user_id = any($2)) and u.email_verified_at is not null
+    where m.project_id = $1 and u.email_verified_at is not null
+      and (m.user_id = any($2) or ($3 and (m.project_role in ('member', 'admin') or u.global_role = 'admin')))
     union all
     select c.user_id, c.id
     from notification_channels c
     join project_members m on m.user_id = c.user_id and m.project_id = $1
-    where c.enabled and ($3 or c.user_id = any($2))
+    join users u on u.id = c.user_id
+    where c.enabled
+      and (c.user_id = any($2) or ($3 and (m.project_role in ('member', 'admin') or u.global_role = 'admin')))
     union all
     select null, c.id from notification_channels c
     where c.project_id = $1 and c.enabled and c.id = any($4)";
 
 /// R7: the targets of one step at `at`, deduplicated, members only, capped.
-/// A `user` target (also whoever a `schedule` puts on call at `at`, and each
-/// member for `all_members`) yields their email when it is verified and
-/// each enabled personal channel; a `project_channel` yields itself when
-/// enabled. Ordered by `Target::key`, at most [`MAX_RECIPIENTS_PER_STEP`].
+/// A `user` target (also whoever a `schedule` puts on call at `at`, and for
+/// `all_members` each member who may act: project role member or admin, or
+/// a global admin) yields their email when it is verified and each enabled
+/// personal channel; a `project_channel` yields itself when enabled. Ordered
+/// by `Target::key`, at most [`MAX_RECIPIENTS_PER_STEP`].
 pub async fn recipients(
     conn: &mut PgConnection,
     project_id: Uuid,

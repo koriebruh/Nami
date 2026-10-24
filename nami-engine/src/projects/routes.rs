@@ -1,6 +1,6 @@
 use axum::{routing::post, Router, Json, extract::{State, Path}};
 use serde::Deserialize;
-use crate::{core::state::AppState, core::error::AppError, projects::model as project, core::middleware::rbac::{CurrentUser, Role, require_global_role, require_project_role}};
+use crate::{core::state::AppState, core::error::AppError, core::validate::validate_label, projects::model as project, core::middleware::rbac::{CurrentUser, Role, require_global_role, require_project_role}};
 
 // axum 0.8 requires `{param}` path syntax, not the brief's pre-0.8 `:param`
 // syntax (panics at router-build time otherwise) — same issue as Task 10's
@@ -14,6 +14,7 @@ pub fn router() -> Router<AppState> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateProjectRequest {
     name: String,
     slug: String,
@@ -25,7 +26,9 @@ async fn create_project(
     Json(payload): Json<CreateProjectRequest>,
 ) -> Result<Json<project::Project>, AppError> {
     require_global_role(&user, Role::Admin)?;
-    let project = project::insert_project(&state.db, &payload.name, &payload.slug, user.id).await?;
+    // The name reaches email subjects and chat messages.
+    let name = validate_label("name", &payload.name).map_err(AppError::Validation)?;
+    let project = project::insert_project(&state.db, &name, &payload.slug, user.id).await?;
     Ok(Json(project))
 }
 

@@ -63,9 +63,11 @@ async fn inspect(State(state): State<AppState>, Json(req): Json<TokenRequest>) -
 }
 
 /// `POST /incident-actions/confirm {token}`: does it, once, then kicks the
-/// worker (a resolve queues notices).
+/// worker (a resolve queues notices) in the background: a slow receiver
+/// must not hold the answer up, and the queue is durable (the worker loop
+/// is the backstop).
 async fn confirm(State(state): State<AppState>, Json(req): Json<TokenRequest>) -> Result<Json<Value>, Refused> {
     let status = action::confirm(&state.db, &state.cipher, &req.token, Utc::now()).await?;
-    worker::kick(&state).await;
+    tokio::spawn(async move { worker::kick(&state).await });
     Ok(Json(json!({ "status": status })))
 }

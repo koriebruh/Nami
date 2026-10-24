@@ -245,9 +245,10 @@ async fn a_manual_reopen_inside_the_paging_gap_pages_at_once(pool: sqlx::PgPool)
     let (status, body) = call(&app, "POST", &format!("/projects/{project}/incidents/{id}/reopen"), Some(&member), Some(json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     common::run_incident_ticks(&state).await;
-    let mail = settled_mail(&email, 3).await;
+    // The resolved notice was still queued: the reopen cancelled it.
+    let mail = settled_mail(&email, 2).await;
     let subjects: Vec<&str> = mail.iter().map(|(s, _)| s.as_str()).collect();
-    assert_eq!(subjects, ["[Nami] [high] api is down", "[Nami] Resolved: api is down", "[Nami] [high] api is down"]);
+    assert_eq!(subjects, ["[Nami] [high] api is down", "[Nami] [high] api is down"]);
 }
 
 /// The messages of the incident's `escalation_exhausted` events, oldest first.
@@ -264,8 +265,9 @@ async fn next_escalation_at(pool: &sqlx::PgPool, incident: Uuid) -> Option<DateT
 
 /// A step that comes due while its monitor or heartbeat is paused does not
 /// page (ruling on NAMI-INC-10): escalation stops and the timeline says why.
-/// Resuming the source runs that step, in the same generation, so the
-/// resolved notice reaches everyone paged before the pause as well.
+/// Resuming the source runs that step no sooner than the paging gap after
+/// the resume, in the same generation, so the resolved notice reaches
+/// everyone paged before the pause as well.
 #[sqlx::test]
 async fn a_paused_source_stops_its_escalation_and_resuming_runs_the_due_step(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
@@ -305,8 +307,15 @@ async fn a_paused_source_stops_its_escalation_and_resuming_runs_the_due_step(poo
         assert_eq!(next_escalation_at(&pool, id).await, None, "{kind}");
         assert_eq!(exhausted(&pool, id).await, [format!("Escalation stopped: the {kind} is paused")]);
 
+        let resumed_at = Utc::now();
         let (status, body) = call(&app, "PATCH", &path, Some(&admin), Some(json!({"paused": false}))).await;
         assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+        let due = next_escalation_at(&pool, id).await.expect("re-armed");
+        let gap = chrono::Duration::seconds(SOURCE_PAGE_GAP_SECS.into());
+        assert!(due >= resumed_at + gap, "{kind}: step 2 is due {due}, before the resume + the gap");
+        common::run_incident_ticks(&state).await;
+        assert!(settled_mail(&bob_email, 0).await.is_empty(), "{kind}: paged inside the gap");
+        common::make_escalation_due(&pool, id).await;
         common::run_incident_ticks(&state).await;
         let mail = settled_mail(&bob_email, 1).await;
         let subjects: Vec<&str> = mail.iter().map(|(s, _)| s.as_str()).collect();
@@ -321,6 +330,43 @@ async fn a_paused_source_stops_its_escalation_and_resuming_runs_the_due_step(poo
             assert_eq!(mail[1].0, "[Nami] Resolved: api is down", "{kind}");
         }
     }
+}
+
+/// A source that recovered while it was paused is resolved by its first
+/// check after the resume, before the step that was due may page: nobody
+/// new is paged, and only those paged before the pause hear it resolved.
+#[sqlx::test]
+async fn a_source_that_recovered_while_paused_resolves_without_paging_on_resume(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (alice, alice_email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (bob, bob_email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    set_policy(&app, project, &admin, json!({"name": "Default", "steps": [
+        {"delay_minutes": 0, "targets": [{"type": "user", "id": alice}]},
+        {"delay_minutes": 10, "targets": [{"type": "user", "id": bob}]}]})).await;
+    let monitor = seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    let path = format!("/projects/{project}/monitors/{monitor}");
+    let mut conn = pool.acquire().await.unwrap();
+    let id = incident::open_for_monitor(&mut conn, project, monitor, "api is down", None, Utc::now())
+        .await.unwrap().expect("opened");
+    common::run_incident_ticks(&state).await;
+    assert_eq!(settled_mail(&alice_email, 1).await.len(), 1);
+    let (status, body) = call(&app, "PATCH", &path, Some(&admin), Some(json!({"paused": true}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    common::make_escalation_due(&pool, id).await;
+    common::run_incident_ticks(&state).await;
+
+    let (status, body) = call(&app, "PATCH", &path, Some(&admin), Some(json!({"paused": false}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    common::run_incident_ticks(&state).await;
+    incident::resolve_for_monitor(&mut conn, monitor, Utc::now()).await.unwrap();
+    common::run_incident_ticks(&state).await;
+    let mail = settled_mail(&alice_email, 2).await;
+    let subjects: Vec<&str> = mail.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(subjects, ["[Nami] [high] api is down", "[Nami] Resolved: api is down"]);
+    assert!(settled_mail(&bob_email, 0).await.is_empty(), "nobody is paged for a recovered source");
 }
 
 /// A maintenance window defers a due step until it is over, looking again
@@ -373,6 +419,43 @@ async fn maintenance_defers_a_log_alert_page_until_the_window_ends(pool: sqlx::P
     let mail = settled_mail(&email, 2).await;
     assert_eq!(mail.len(), 2, "{mail:?}");
     assert_eq!(mail[1].0, "[Nami] [high] Log alert: Checkout errors");
+}
+
+/// A maintenance hold looks again when its window ends, or after
+/// `MAINTENANCE_RECHECK` if that comes first, never at every tick.
+#[sqlx::test]
+async fn a_maintenance_hold_waits_for_the_window_end_or_the_recheck(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let monitor = seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    let window: Uuid = sqlx::query_scalar(
+        "insert into maintenance_windows (project_id, monitor_id, title, kind, starts_at, ends_at)
+         values ($1, $2, 'maintenance', 'once', now() - interval '5 minutes', now() + interval '1 hour')
+         returning id")
+        .bind(project).bind(monitor).fetch_one(&pool).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let id = incident::open_for_monitor(&mut conn, project, monitor, "api is down", None, Utc::now())
+        .await.unwrap().expect("opened");
+
+    // Postgres keeps microseconds.
+    let before = Utc::now() - chrono::Duration::milliseconds(1);
+    run::tick(&state).await.unwrap();
+    let after = Utc::now();
+    let held = next_escalation_at(&pool, id).await.expect("deferred");
+    assert!(held >= before + run::MAINTENANCE_RECHECK && held <= after + run::MAINTENANCE_RECHECK, "{held}");
+    run::tick(&state).await.unwrap();
+    assert_eq!(next_escalation_at(&pool, id).await, Some(held), "not taken again before then");
+
+    let ends_at: DateTime<Utc> = sqlx::query_scalar(
+        "update maintenance_windows set ends_at = now() + interval '20 seconds' where id = $1 returning ends_at")
+        .bind(window).fetch_one(&pool).await.unwrap();
+    common::make_escalation_due(&pool, id).await;
+    run::tick(&state).await.unwrap();
+    assert_eq!(next_escalation_at(&pool, id).await, Some(ends_at), "looked at again when the window ends");
+    common::run_incident_ticks(&state).await;
+    assert!(settled_mail(&email, 0).await.is_empty());
 }
 
 /// A heartbeat incident reopened by a new failure takes the heartbeat's
