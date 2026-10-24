@@ -44,7 +44,7 @@ use crate::logs::{
 };
 use crate::{
     core::error::AppError,
-    core::middleware::rbac::{require_project_role, user_from_session},
+    core::middleware::rbac::{Role, require_project_role, user_from_session},
     core::state::AppState,
 };
 
@@ -302,7 +302,7 @@ async fn check_session(state: &AppState, session: &Session, project_id: Uuid) ->
         Err(AppError::Unauthorized) => return SessionCheck::Gone,
         Err(_) => return SessionCheck::Unknown,
     };
-    match require_project_role(&state.db, &user, project_id, "viewer").await {
+    match require_project_role(&state.db, &user, project_id, Role::Viewer).await {
         Ok(_) => SessionCheck::Valid,
         Err(AppError::Forbidden) => SessionCheck::Gone,
         Err(_) => SessionCheck::Unknown,

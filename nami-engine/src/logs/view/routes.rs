@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     core::error::AppError,
-    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::middleware::rbac::{CurrentUser, Role, require_project_role},
     core::state::AppState,
     core::validate::validate_label,
     logs::view::model::{self as log_view, CreatedView, LogView, MAX_VIEWS_PER_PROJECT},
@@ -58,7 +58,7 @@ async fn list_views(
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<Vec<LogView>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     Ok(Json(
         log_view::list_for_project(&state.db, project_id).await?,
     ))
@@ -70,7 +70,7 @@ async fn create_view(
     Path(project_id): Path<Uuid>,
     Json(payload): Json<CreateViewRequest>,
 ) -> Result<(StatusCode, Json<LogView>), AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let name = validate_label("name", &payload.name).map_err(AppError::Validation)?;
     checked_query(&state, project_id, &payload.query).await?;
     match log_view::create(&state.db, project_id, &name, &payload.query, user.id).await? {
@@ -91,7 +91,7 @@ async fn get_view(
     user: CurrentUser,
     Path((project_id, view_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<LogView>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     log_view::get(&state.db, project_id, view_id)
         .await?
         .map(Json)
@@ -104,7 +104,7 @@ async fn patch_view(
     Path((project_id, view_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PatchViewRequest>,
 ) -> Result<Json<LogView>, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let name = payload
         .name
         .as_deref()
@@ -131,7 +131,7 @@ async fn delete_view(
     user: CurrentUser,
     Path((project_id, view_id)): Path<(Uuid, Uuid)>,
 ) -> Result<StatusCode, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     if log_view::delete(&state.db, project_id, view_id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {

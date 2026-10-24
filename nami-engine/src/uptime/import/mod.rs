@@ -452,7 +452,7 @@ async fn import_one(
             row.monitor_id = Some(created.id);
             Ok(row)
         }
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23503") => {
+        Err(sqlx::Error::Database(e)) if e.is_foreign_key_violation() => {
             // The group (or, for a global admin, the project) was deleted
             // while the import ran.
             Ok(ImportResultRow::error(line, "group not found"))

@@ -359,7 +359,7 @@ pub async fn update_in_project(
     .await
     .map_err(|e| match &e {
         // The group was deleted between the check and the write.
-        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
+        sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
             AppError::NotFound
         }
         _ => AppError::Database(e),

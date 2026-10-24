@@ -2,10 +2,40 @@ use crate::{auth::user, core::error::AppError, core::state::AppState};
 use axum::{extract::FromRequestParts, http::request::Parts};
 use tower_sessions::Session;
 
+/// The three roles, used both as `users.global_role` and
+/// `project_members.project_role`. Ordered by rank: `Viewer < Member < Admin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    Viewer,
+    Member,
+    Admin,
+}
+
+impl Role {
+    /// The role stored as `text` in Postgres, or `None` for any other string,
+    /// so a caller fails closed.
+    pub fn parse(value: &str) -> Option<Role> {
+        match value {
+            "admin" => Some(Role::Admin),
+            "member" => Some(Role::Member),
+            "viewer" => Some(Role::Viewer),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Member => "member",
+            Role::Viewer => "viewer",
+        }
+    }
+}
+
 pub struct CurrentUser {
     pub id: uuid::Uuid,
     pub email: String,
-    pub global_role: String,
+    pub global_role: Role,
 }
 
 impl FromRequestParts<AppState> for CurrentUser {
@@ -62,47 +92,35 @@ pub async fn user_from_session(
         return Err(AppError::Unauthorized);
     }
 
+    // The column's check constraint allows only the three roles; anything
+    // else fails closed.
+    let global_role = Role::parse(&user.global_role).ok_or(AppError::Unauthorized)?;
     Ok(CurrentUser {
         id: user.id,
         email: user.email,
-        global_role: user.global_role,
+        global_role,
     })
 }
 
-/// Shared by `require_global_role` and `require_project_role` (previously
-/// duplicated verbatim in both). `None` on an unrecognized role string so
-/// both callers fail closed rather than ranking an unknown role above `-1`.
-fn role_rank(role: &str) -> Option<i32> {
-    match role {
-        "admin" => Some(2),
-        "member" => Some(1),
-        "viewer" => Some(0),
-        _ => None,
+pub fn require_global_role(user: &CurrentUser, min: Role) -> Result<(), AppError> {
+    if user.global_role >= min {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden)
     }
 }
 
-pub fn require_global_role(user: &CurrentUser, min: &str) -> Result<(), AppError> {
-    match (role_rank(&user.global_role), role_rank(min)) {
-        (Some(user_rank), Some(min_rank)) if user_rank >= min_rank => Ok(()),
-        _ => Err(AppError::Forbidden),
-    }
-}
-
-// Project-scoped counterpart to `require_global_role`. A global admin
-// bypasses the membership check entirely (consistent with
-// `list_projects_for_user`'s global-admin bypass). Otherwise the caller must
-// hold a `project_members` row for this project, and its role must rank at
-// or above `min`. Mirrors `require_global_role`'s fail-closed rank
-// comparison (`Option<i32>`, `None` on an unrecognized role string) rather
-// than the brief's original `-1`-sentinel version, which fails open when
-// `min` itself is unrecognized (any known role ranks >= -1).
+/// Project-scoped counterpart to `require_global_role`. A global admin
+/// bypasses the membership check (as `list_projects_for_user` does).
+/// Otherwise the caller needs a `project_members` row for this project whose
+/// role ranks at or above `min`; an unrecognized stored role fails closed.
 pub async fn require_project_role(
     pool: &sqlx::PgPool,
     user: &CurrentUser,
     project_id: uuid::Uuid,
-    min: &str,
-) -> Result<(), crate::core::error::AppError> {
-    if user.global_role == "admin" {
+    min: Role,
+) -> Result<(), AppError> {
+    if user.global_role == Role::Admin {
         return Ok(());
     }
 
@@ -114,12 +132,9 @@ pub async fn require_project_role(
     .fetch_optional(pool)
     .await?;
 
-    match row {
-        Some((role,)) => match (role_rank(&role), role_rank(min)) {
-            (Some(user_rank), Some(min_rank)) if user_rank >= min_rank => Ok(()),
-            _ => Err(crate::core::error::AppError::Forbidden),
-        },
-        None => Err(crate::core::error::AppError::Forbidden),
+    match row.and_then(|(role,)| Role::parse(&role)) {
+        Some(role) if role >= min => Ok(()),
+        _ => Err(AppError::Forbidden),
     }
 }
 
@@ -141,10 +156,10 @@ pub async fn require_project_reader(
     user: &CurrentUser,
     project_id: uuid::Uuid,
 ) -> Result<ProjectReader, AppError> {
-    match require_project_role(pool, user, project_id, "member").await {
+    match require_project_role(pool, user, project_id, Role::Member).await {
         Ok(()) => Ok(ProjectReader::Member),
         Err(AppError::Forbidden) => {
-            require_project_role(pool, user, project_id, "viewer").await?;
+            require_project_role(pool, user, project_id, Role::Viewer).await?;
             Ok(ProjectReader::Viewer)
         }
         Err(e) => Err(e),
@@ -155,39 +170,38 @@ pub async fn require_project_reader(
 mod tests {
     use super::*;
 
-    fn user_with_role(role: &str) -> CurrentUser {
+    fn user_with_role(role: Role) -> CurrentUser {
         CurrentUser {
             id: uuid::Uuid::nil(),
             email: "test@example.com".to_string(),
-            global_role: role.to_string(),
+            global_role: role,
         }
     }
 
     #[test]
-    fn unrecognized_global_role_fails_closed_even_against_low_bar() {
-        let user = user_with_role("superadmin");
-        let result = require_global_role(&user, "viewer");
-        assert!(matches!(result, Err(AppError::Forbidden)));
+    fn an_unrecognized_stored_role_does_not_parse() {
+        assert_eq!(Role::parse("superadmin"), None);
+        assert_eq!(Role::parse("Admin"), None);
     }
 
     #[test]
-    fn unrecognized_min_argument_fails_closed() {
-        let user = user_with_role("admin");
-        let result = require_global_role(&user, "Admin");
-        assert!(matches!(result, Err(AppError::Forbidden)));
+    fn roles_round_trip_through_their_stored_text() {
+        for role in [Role::Viewer, Role::Member, Role::Admin] {
+            assert_eq!(Role::parse(role.as_str()), Some(role));
+        }
     }
 
     #[test]
-    fn known_roles_still_rank_correctly() {
-        let admin = user_with_role("admin");
-        let member = user_with_role("member");
-        let viewer = user_with_role("viewer");
+    fn known_roles_rank_correctly() {
+        let admin = user_with_role(Role::Admin);
+        let member = user_with_role(Role::Member);
+        let viewer = user_with_role(Role::Viewer);
 
-        assert!(require_global_role(&admin, "admin").is_ok());
-        assert!(require_global_role(&admin, "viewer").is_ok());
-        assert!(require_global_role(&member, "admin").is_err());
-        assert!(require_global_role(&member, "member").is_ok());
-        assert!(require_global_role(&viewer, "member").is_err());
-        assert!(require_global_role(&viewer, "viewer").is_ok());
+        assert!(require_global_role(&admin, Role::Admin).is_ok());
+        assert!(require_global_role(&admin, Role::Viewer).is_ok());
+        assert!(require_global_role(&member, Role::Admin).is_err());
+        assert!(require_global_role(&member, Role::Member).is_ok());
+        assert!(require_global_role(&viewer, Role::Member).is_err());
+        assert!(require_global_role(&viewer, Role::Viewer).is_ok());
     }
 }

@@ -57,7 +57,7 @@ use crate::{
     core::clickhouse::ClickHouseError,
     core::download::{AbortableBody, ProjectSlots, instance_busy, project_busy, user_busy},
     core::error::AppError,
-    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::middleware::rbac::{CurrentUser, Role, require_project_role},
     core::state::AppState,
     logs::query::slots::UserSlots,
     uptime::monitor::model as monitor,
@@ -156,7 +156,7 @@ async fn export_checks(
     Path((project_id, monitor_id)): Path<(Uuid, Uuid)>,
     Query(range): Query<RangeQuery>,
 ) -> Result<Response, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     check_range(range.from, range.to).map_err(AppError::Validation)?;
     monitor::find_in_project(&state.db, project_id, monitor_id)
         .await?

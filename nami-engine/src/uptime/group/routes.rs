@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     core::error::AppError,
-    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::middleware::rbac::{CurrentUser, Role, require_project_role},
     core::state::AppState,
     uptime::group::model::{
         self as monitor_group, CreateGroupRequest, MonitorGroup, PatchGroupRequest,
@@ -35,7 +35,7 @@ async fn list_groups(
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<Vec<MonitorGroup>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     Ok(Json(
         monitor_group::list_for_project(&state.db, project_id).await?,
     ))
@@ -47,7 +47,7 @@ async fn create_group(
     Path(project_id): Path<Uuid>,
     Json(payload): Json<CreateGroupRequest>,
 ) -> Result<(StatusCode, Json<MonitorGroup>), AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let (name, position) =
         monitor_group::validate(&payload.name, payload.position).map_err(AppError::Validation)?;
     // Global admins skip membership: a project that does not exist is a 404.
@@ -60,7 +60,7 @@ async fn get_group(
     user: CurrentUser,
     Path((project_id, group_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<MonitorGroup>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let group = monitor_group::find_in_project(&state.db, project_id, group_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -73,7 +73,7 @@ async fn patch_group(
     Path((project_id, group_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PatchGroupRequest>,
 ) -> Result<Json<MonitorGroup>, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let group = monitor_group::update_in_project(&state.db, project_id, group_id, payload)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -85,7 +85,7 @@ async fn delete_group(
     user: CurrentUser,
     Path((project_id, group_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, AppError> {
-    require_project_role(&state.db, &user, project_id, "admin").await?;
+    require_project_role(&state.db, &user, project_id, Role::Admin).await?;
     if !monitor_group::delete_in_project(&state.db, project_id, group_id).await? {
         return Err(AppError::NotFound);
     }

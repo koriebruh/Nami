@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::{
     core::download::{AbortableBody, instance_busy, user_busy},
     core::error::AppError,
-    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::middleware::rbac::{CurrentUser, Role, require_project_role},
     core::state::AppState,
     logs::query::{
         self,
@@ -54,7 +54,7 @@ async fn search_logs(
     Path(project_id): Path<Uuid>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<SearchPage>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let params = query::parse_search(&query::query_pairs(raw.as_deref()), Utc::now())
         .map_err(AppError::Validation)?;
     // Held until the response is built, or dropped with the handler when the
@@ -72,7 +72,7 @@ async fn log_histogram(
     Path(project_id): Path<Uuid>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Histogram>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let pairs = query::query_pairs(raw.as_deref());
     let window = query::parse_window(&pairs, Utc::now()).map_err(AppError::Validation)?;
     let filters = query::parse_filters(&pairs).map_err(AppError::Validation)?;
@@ -90,7 +90,7 @@ async fn log_patterns(
     Path(project_id): Path<Uuid>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let pairs = query::query_pairs(raw.as_deref());
     let window = query::parse_window(&pairs, Utc::now()).map_err(AppError::Validation)?;
     let filters = query::parse_filters(&pairs).map_err(AppError::Validation)?;
@@ -109,7 +109,7 @@ async fn log_entry(
     Path((project_id, log_id)): Path<(Uuid, Uuid)>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<LogEntry>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let pairs = query::query_pairs(raw.as_deref());
     let dt = pairs
         .iter()
@@ -137,7 +137,7 @@ async fn tail_logs(
     Path(project_id): Path<Uuid>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let filters =
         query::parse_filters(&query::query_pairs(raw.as_deref())).map_err(AppError::Validation)?;
     let permit = tail::TailPermit::acquire(&state.logs, user.id)?;
@@ -174,7 +174,7 @@ async fn export_logs(
     Path(project_id): Path<Uuid>,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let params = export::parse_export(&query::query_pairs(raw.as_deref()), Utc::now())
         .map_err(AppError::Validation)?;
     // Names for the CSV `source` column. A `source_id` filter naming a

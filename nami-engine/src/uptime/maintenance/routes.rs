@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{
     core::error::AppError,
-    core::middleware::rbac::{CurrentUser, require_project_role},
+    core::middleware::rbac::{CurrentUser, Role, require_project_role},
     core::state::AppState,
     uptime::maintenance::model::{
         self as maintenance, CreateWindowRequest, PatchWindowRequest, WindowConfig, WindowView,
@@ -38,7 +38,7 @@ async fn list_windows(
     user: CurrentUser,
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<Vec<WindowView>>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let now = Utc::now();
     let windows = maintenance::list_for_project(&state.db, project_id).await?;
     Ok(Json(
@@ -55,7 +55,7 @@ async fn create_window(
     Path(project_id): Path<Uuid>,
     Json(payload): Json<CreateWindowRequest>,
 ) -> Result<(StatusCode, Json<WindowView>), AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let window =
         maintenance::validate(WindowConfig::from(payload)).map_err(AppError::Validation)?;
     let created = maintenance::insert_window(&state.db, project_id, &window).await?;
@@ -70,7 +70,7 @@ async fn get_window(
     user: CurrentUser,
     Path((project_id, window_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<WindowView>, AppError> {
-    require_project_role(&state.db, &user, project_id, "viewer").await?;
+    require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let window = maintenance::find_in_project(&state.db, project_id, window_id)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -83,7 +83,7 @@ async fn patch_window(
     Path((project_id, window_id)): Path<(Uuid, Uuid)>,
     Json(payload): Json<PatchWindowRequest>,
 ) -> Result<Json<WindowView>, AppError> {
-    require_project_role(&state.db, &user, project_id, "member").await?;
+    require_project_role(&state.db, &user, project_id, Role::Member).await?;
     let window = maintenance::update_in_project(&state.db, project_id, window_id, payload)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -95,7 +95,7 @@ async fn delete_window(
     user: CurrentUser,
     Path((project_id, window_id)): Path<(Uuid, Uuid)>,
 ) -> Result<Json<Value>, AppError> {
-    require_project_role(&state.db, &user, project_id, "admin").await?;
+    require_project_role(&state.db, &user, project_id, Role::Admin).await?;
     if !maintenance::delete_in_project(&state.db, project_id, window_id).await? {
         return Err(AppError::NotFound);
     }

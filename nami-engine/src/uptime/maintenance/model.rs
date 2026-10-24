@@ -470,7 +470,7 @@ pub fn validate(c: WindowConfig) -> Result<ValidWindow, String> {
 /// key refuses another project's monitor. Either way, a 404.
 fn not_found_on_foreign_key(e: sqlx::Error) -> AppError {
     match &e {
-        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
+        sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
             AppError::NotFound
         }
         _ => AppError::Database(e),

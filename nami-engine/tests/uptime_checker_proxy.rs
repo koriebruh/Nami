@@ -1,3 +1,5 @@
+#![allow(unsafe_code)] // `std::env::set_var` is `unsafe` in edition 2024; this binary owns its process.
+
 //! Proxy environment variables must never reroute uptime checks.
 //!
 //! This test has its own binary because it changes process-wide environment

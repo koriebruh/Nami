@@ -1,3 +1,5 @@
+#![allow(unsafe_code)] // The counting global allocator must implement `GlobalAlloc`.
+
 // What decoding a hostile body takes in memory. The request limits bound the
 // bytes of a body, not what it decodes to: 50 MiB of MessagePack zeros inside
 // one array decoded to 1.8 GB. A counting allocator measures the heap that is

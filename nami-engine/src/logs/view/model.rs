@@ -39,10 +39,7 @@ macro_rules! columns {
 }
 
 fn is_unique_violation(error: &sqlx::Error) -> bool {
-    error
-        .as_database_error()
-        .and_then(|e| e.code())
-        .is_some_and(|code| code == "23505")
+    error.as_database_error().is_some_and(|e| e.is_unique_violation())
 }
 
 pub async fn list_for_project(

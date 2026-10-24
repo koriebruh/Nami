@@ -1,6 +1,6 @@
 use axum::{routing::post, Router, Json, extract::{State, Path}};
 use serde::Deserialize;
-use crate::{core::state::AppState, core::error::AppError, projects::model as project, core::middleware::rbac::{CurrentUser, require_global_role, require_project_role}};
+use crate::{core::state::AppState, core::error::AppError, projects::model as project, core::middleware::rbac::{CurrentUser, Role, require_global_role, require_project_role}};
 
 // axum 0.8 requires `{param}` path syntax, not the brief's pre-0.8 `:param`
 // syntax (panics at router-build time otherwise) — same issue as Task 10's
@@ -24,7 +24,7 @@ async fn create_project(
     user: CurrentUser,
     Json(payload): Json<CreateProjectRequest>,
 ) -> Result<Json<project::Project>, AppError> {
-    require_global_role(&user, "admin")?;
+    require_global_role(&user, Role::Admin)?;
     let project = project::insert_project(&state.db, &payload.name, &payload.slug, user.id).await?;
     Ok(Json(project))
 }
@@ -33,7 +33,7 @@ async fn list_projects(
     State(state): State<AppState>,
     user: CurrentUser,
 ) -> Result<Json<Vec<project::Project>>, AppError> {
-    let projects = project::list_projects_for_user(&state.db, user.id, user.global_role == "admin").await?;
+    let projects = project::list_projects_for_user(&state.db, user.id, user.global_role == Role::Admin).await?;
     Ok(Json(projects))
 }
 
@@ -42,7 +42,7 @@ async fn get_project(
     user: CurrentUser,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<project::Project>, AppError> {
-    require_project_role(&state.db, &user, id, "viewer").await?;
+    require_project_role(&state.db, &user, id, Role::Viewer).await?;
     let project = project::find_by_id(&state.db, id).await?.ok_or(AppError::NotFound)?;
     Ok(Json(project))
 }
@@ -59,7 +59,7 @@ async fn add_member(
     Path(id): Path<uuid::Uuid>,
     Json(payload): Json<AddMemberRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_project_role(&state.db, &user, id, "admin").await?;
+    require_project_role(&state.db, &user, id, Role::Admin).await?;
 
     if !matches!(payload.project_role.as_str(), "admin" | "member" | "viewer") {
         return Err(AppError::Validation("invalid project_role".into()));
@@ -71,7 +71,7 @@ async fn add_member(
             // Postgres SQLSTATE 23503 = foreign_key_violation: project_id or
             // user_id doesn't exist. The DB correctly refuses the write; map
             // it to 404 instead of letting it surface as a raw 500.
-            sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503") => {
+            sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
                 AppError::NotFound
             }
             _ => AppError::Database(e),
@@ -84,7 +84,7 @@ async fn delete_member(
     user: CurrentUser,
     Path((id, member_id)): Path<(uuid::Uuid, uuid::Uuid)>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    require_project_role(&state.db, &user, id, "admin").await?;
+    require_project_role(&state.db, &user, id, Role::Admin).await?;
     project::remove_member(&state.db, id, member_id).await?;
     Ok(Json(serde_json::json!({ "removed": true })))
 }

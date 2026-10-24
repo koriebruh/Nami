@@ -233,8 +233,11 @@ Correct and bounded first. Fast second, and only with a measurement.
   `[lints]` table in `Cargo.toml` sets the shared levels. Both tools need
   the `rustfmt` and `clippy` components (on Fedora:
   `sudo dnf install -y rustfmt clippy`).
-- `unsafe` is denied crate-wide. The only exception is the counting
-  allocator in `tests/logs_decode_memory.rs`, which allows it locally.
+- `unsafe` is denied crate-wide (`[lints.rust]`). The only exceptions are
+  the standalone process-state test binaries, which allow it at the top of
+  the file: the counting allocator in `tests/logs_decode_memory.rs` and
+  `std::env::set_var` in `tests/clickhouse_proxy.rs` and
+  `tests/uptime_checker_proxy.rs`.
 
 ### 14. Review checklist
 
