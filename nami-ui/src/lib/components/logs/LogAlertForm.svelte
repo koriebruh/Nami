@@ -90,6 +90,9 @@
 
 	// Live count, 500 ms after the last change; a newer one aborts the last.
 	let count = $state<number | null>(null);
+	// The window `count` was taken over: the label must not follow the select
+	// before the new answer arrives.
+	let countedWindow = $state(start.window_seconds);
 	let previewError = $state<string | null>(null);
 	let previewing = $state(false);
 	let retry = $state(0);
@@ -98,6 +101,7 @@
 
 	$effect(() => {
 		const body = payload;
+		const window = windowSeconds;
 		void retry;
 		if (body === null) return;
 		const controller = new AbortController();
@@ -129,6 +133,7 @@
 				}
 				previewError = null;
 				count = answer.count;
+				countedWindow = window;
 			} catch (cause) {
 				if ((cause as Error)?.name === 'AbortError') return;
 				previewError = 'The preview could not reach the server.';
@@ -323,7 +328,7 @@
 		{:else}
 			<span class="text-ink">
 				<span class="font-medium tabular-nums">{count.toLocaleString('en-US')}</span>
-				matching {count === 1 ? 'event' : 'events'} in the last {formatSeconds(windowSeconds)}{previewing ? ' (updating…)' : ''}.
+				matching {count === 1 ? 'event' : 'events'} in the last {formatSeconds(countedWindow)}{previewing ? ' (updating…)' : ''}.
 			</span>
 			{#if wouldTrigger}
 				<span class="badge badge-danger ml-2">would trigger now</span>

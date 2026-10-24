@@ -56,6 +56,13 @@ describe('incidents page', () => {
 		);
 	});
 
+	it('links only a log alert id that is a UUID', () => {
+		const { body } = renderPage([incident({ monitor_id: null, log_alert_id: '../../auth/me', title: 'Odd alert' })]);
+		expect(body).toContain('Odd alert');
+		expect(body).not.toContain('Odd alert</a>');
+		expect(body).not.toContain('/logs/alerts/');
+	});
+
 	it('shows an incident without a source as plain text', () => {
 		const { body } = renderPage([incident({ monitor_id: null, heartbeat_id: null, title: 'Orphan incident' })]);
 		expect(body).toContain('Orphan incident');
