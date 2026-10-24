@@ -14,6 +14,7 @@ use crate::{
     core::middleware::rbac::{CurrentUser, Role, require_project_role},
     core::state::AppState,
     core::validate::{validate_line, validate_text},
+    incidents::escalation::model as escalation,
     incidents::lifecycle::{self, IncidentSource, OpenIncident, Reopen},
     incidents::model::{
         self as incident, DEFAULT_LIST_LIMIT, IncidentDetail, IncidentEvent, IncidentListItem,
@@ -62,6 +63,7 @@ struct CreateIncidentRequest {
     title: String,
     description: Option<String>,
     severity_id: Option<Uuid>,
+    escalation_policy_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,6 +179,11 @@ async fn create_incident(
     {
         return Err(AppError::NotFound);
     }
+    if let Some(policy_id) = req.escalation_policy_id
+        && !escalation::belongs_to(&mut *tx, project_id, policy_id).await?
+    {
+        return Err(AppError::NotFound);
+    }
     let id = lifecycle::open(
         &mut tx,
         &OpenIncident {
@@ -188,6 +195,7 @@ async fn create_incident(
             cause: description.as_deref(),
             severity_id: req.severity_id,
             metadata: None,
+            escalation_policy_id: req.escalation_policy_id,
             started_at: Utc::now(),
         },
     )

@@ -34,6 +34,9 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "on_call_participants",
         "on_call_overrides",
         "notification_deliveries",
+        "escalation_policies",
+        "escalation_steps",
+        "escalation_step_targets",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -391,6 +394,7 @@ async fn incident_lifecycle_constraints_are_all_named(pool: sqlx::PgPool) {
             "incidents_acknowledged_by_fkey",
             "incidents_acknowledged_has_time",
             "incidents_created_by_fkey",
+            "incidents_escalation_policy_id_fkey",
             "incidents_metadata_is_object",
             "incidents_postmortem_size",
             "incidents_resolved_by_fkey",
@@ -560,6 +564,150 @@ async fn notification_deliveries_constraints_are_all_named(pool: sqlx::PgPool) {
             "notification_deliveries_status_known",
             "notification_deliveries_target_unique",
             "notification_deliveries_user_id_fkey",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn every_project_gets_a_default_policy_that_pages_all_members(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let rows: Vec<(String, bool, i32, i32, String, i32)> = sqlx::query_as(
+        "select p.name, p.is_default, s.position, s.delay_minutes, t.kind, t.position
+         from escalation_policies p
+         join escalation_steps s on s.policy_id = p.id
+         join escalation_step_targets t on t.step_id = s.id
+         where p.project_id = $1",
+    )
+    .bind(project)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, [("Default".into(), true, 0, 0, "all_members".into(), 0)]);
+}
+
+#[sqlx::test]
+async fn a_policy_cannot_fall_back_to_itself(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let error = sqlx::query(
+        "update escalation_policies set fallback_policy_id = id where project_id = $1",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23514"));
+}
+
+/// A schedule and a project channel of `project`, both targeted by a step
+/// of its default policy (inserted in SQL).
+async fn targeted_schedule_and_channel(pool: &sqlx::PgPool, project: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
+    let schedule: uuid::Uuid = sqlx::query_scalar(
+        "insert into on_call_schedules (project_id, name, timezone, rotation, handoff_time, start_date)
+         values ($1, 'primary', 'UTC', 'weekly', '09:00', '2026-10-19') returning id",
+    )
+    .bind(project)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let channel: uuid::Uuid = sqlx::query_scalar(
+        "insert into notification_channels (id, project_id, name, kind, config_enc, summary)
+         values (gen_random_uuid(), $1, 'ops', 'slack', '\\x00', 'hooks.slack.com') returning id",
+    )
+    .bind(project)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into escalation_step_targets (step_id, position, kind, schedule_id, channel_id)
+         select s.id, v.position, v.kind, v.schedule_id, v.channel_id
+         from escalation_steps s join escalation_policies p on p.id = s.policy_id
+         cross join (values (1, 'schedule', $2::uuid, null::uuid), (2, 'project_channel', null, $3)) as
+             v(position, kind, schedule_id, channel_id)
+         where p.project_id = $1",
+    )
+    .bind(project)
+    .bind(schedule)
+    .bind(channel)
+    .execute(pool)
+    .await
+    .unwrap();
+    (schedule, channel)
+}
+
+#[sqlx::test]
+async fn a_targeted_schedule_cannot_be_deleted_from_sql(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let (schedule, _) = targeted_schedule_and_channel(&pool, project).await;
+    let error = sqlx::query("delete from on_call_schedules where id = $1")
+        .bind(schedule)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23503"));
+}
+
+#[sqlx::test]
+async fn removing_a_project_removes_its_policies_schedules_and_channels(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    targeted_schedule_and_channel(&pool, project).await;
+    sqlx::query("delete from projects where id = $1")
+        .bind(project)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let left: i64 = sqlx::query_scalar(
+        "select (select count(*) from escalation_policies where project_id = $1)
+              + (select count(*) from escalation_steps s
+                 where not exists (select 1 from escalation_policies p where p.id = s.policy_id))
+              + (select count(*) from escalation_step_targets t
+                 where not exists (select 1 from escalation_steps s where s.id = t.step_id))
+              + (select count(*) from on_call_schedules where project_id = $1)
+              + (select count(*) from notification_channels where project_id = $1)",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// Every constraint of the escalation tables carries the name its migration
+/// gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn escalation_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid in ('public.escalation_policies'::regclass, 'public.escalation_steps'::regclass,
+                            'public.escalation_step_targets'::regclass)
+         order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "escalation_policies_fallback_policy_id_fkey",
+            "escalation_policies_name_unique",
+            "escalation_policies_not_own_fallback",
+            "escalation_policies_pkey",
+            "escalation_policies_project_id_fkey",
+            "escalation_policies_repeat_count_range",
+            "escalation_step_targets_channel_id_fkey",
+            "escalation_step_targets_kind_known",
+            "escalation_step_targets_one_reference",
+            "escalation_step_targets_pkey",
+            "escalation_step_targets_position_range",
+            "escalation_step_targets_position_unique",
+            "escalation_step_targets_schedule_id_fkey",
+            "escalation_step_targets_step_id_fkey",
+            "escalation_step_targets_user_id_fkey",
+            "escalation_steps_condition_is_object",
+            "escalation_steps_delay_range",
+            "escalation_steps_pkey",
+            "escalation_steps_policy_id_fkey",
+            "escalation_steps_position_range",
+            "escalation_steps_position_unique",
         ]
     );
 }

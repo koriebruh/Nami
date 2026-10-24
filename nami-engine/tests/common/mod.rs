@@ -219,6 +219,7 @@ pub async fn open_test_incident(pool: &sqlx::PgPool, project: Uuid, created_by: 
             cause: None,
             severity_id: None,
             metadata: None,
+            escalation_policy_id: None,
             started_at: Utc::now(),
         },
     )

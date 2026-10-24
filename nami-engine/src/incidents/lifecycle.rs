@@ -99,6 +99,8 @@ pub struct OpenIncident<'a> {
     /// `None` or an id of another project: the project's default severity.
     pub severity_id: Option<Uuid>,
     pub metadata: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    /// `None` or an id of another project: the project's default policy.
+    pub escalation_policy_id: Option<Uuid>,
     pub started_at: DateTime<Utc>,
 }
 
@@ -147,9 +149,41 @@ const OPEN_MANUAL: &str = "insert into incidents
         coalesce($6, '{}'::jsonb), $7)
     returning id";
 
+// Restarts escalation at the first step of a policy, due that step's delay
+// after $3: the requested policy $2 (none requested: the incident's own) if
+// it is still one of the project's, else the project's default.
+const ARM: &str = "update incidents i set
+        escalation_policy_id = p.id, escalation_step = 0, escalation_repeat = 0,
+        escalation_on_fallback = false, escalation_notified = 0, escalation_legacy = false,
+        next_escalation_at = $3 + make_interval(mins => s.delay_minutes)
+    from escalation_policies p
+    join escalation_steps s on s.policy_id = p.id and s.position = 0
+    where i.id = $1
+      and p.id = coalesce(
+          (select id from escalation_policies
+           where id = coalesce($2, i.escalation_policy_id) and project_id = i.project_id),
+          (select id from escalation_policies where project_id = i.project_id and is_default))";
+
+/// Arms escalation (see `ARM`) from `base`.
+async fn arm(
+    conn: &mut PgConnection,
+    incident_id: Uuid,
+    requested_policy: Option<Uuid>,
+    base: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(ARM)
+        .bind(incident_id)
+        .bind(requested_policy)
+        .bind(base)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Opens an incident unless the source already has an unresolved one (then
 /// `None`). Records an `opened` event (a manual incident's names its
-/// creator) in the same transaction.
+/// creator) and arms escalation on the requested policy (else the project's
+/// default) from `started_at`, in the same transaction.
 pub async fn open(
     conn: &mut PgConnection,
     req: &OpenIncident<'_>,
@@ -172,11 +206,13 @@ pub async fn open(
         .await?;
     if let Some(id) = id {
         record_event(conn, id, EventKind::Opened, actor, None, json!({})).await?;
+        arm(conn, id, req.escalation_policy_id, req.started_at).await?;
     }
     Ok(id)
 }
 
-/// open -> acknowledged, by `actor` at `at`. `false` when it was not open.
+/// open -> acknowledged, by `actor` at `at`, which stops escalation. `false`
+/// when it was not open.
 pub async fn acknowledge(
     conn: &mut PgConnection,
     incident_id: Uuid,
@@ -184,7 +220,8 @@ pub async fn acknowledge(
     at: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
     let done = sqlx::query(
-        "update incidents set status = 'acknowledged', acknowledged_at = $3, acknowledged_by = $2
+        "update incidents set status = 'acknowledged', acknowledged_at = $3, acknowledged_by = $2,
+                next_escalation_at = null
          where id = $1 and status = 'open'",
     )
     .bind(incident_id)
@@ -201,8 +238,9 @@ pub async fn acknowledge(
     Ok(done)
 }
 
-/// open|acknowledged -> resolved at `at`. `actor: None` = automatic.
-/// `false` when it was already resolved (or does not exist).
+/// open|acknowledged -> resolved at `at`, which stops escalation. `actor:
+/// None` = automatic. `false` when it was already resolved (or does not
+/// exist).
 pub async fn resolve(
     conn: &mut PgConnection,
     incident_id: Uuid,
@@ -210,7 +248,8 @@ pub async fn resolve(
     at: DateTime<Utc>,
 ) -> Result<bool, sqlx::Error> {
     let done = sqlx::query(
-        "update incidents set status = 'resolved', resolved_at = $3, resolved_by = $2
+        "update incidents set status = 'resolved', resolved_at = $3, resolved_by = $2,
+                next_escalation_at = null
          where id = $1 and status <> 'resolved'",
     )
     .bind(incident_id)
@@ -252,13 +291,15 @@ pub async fn resolve_source(
 }
 
 /// resolved -> open, by `actor`: the resolution and the acknowledgement are
-/// cleared. Refused while another incident of the same source is unresolved.
-/// `_at` is the reopen time (escalation will restart from it).
+/// cleared, and escalation restarts from `at` at the first step of the
+/// incident's own policy (the project's default if it was deleted), in a new
+/// generation. Refused while another incident of the same source is
+/// unresolved.
 pub async fn reopen(
     conn: &mut PgConnection,
     incident_id: Uuid,
     actor: Uuid,
-    _at: DateTime<Utc>,
+    at: DateTime<Utc>,
 ) -> Result<Reopen, sqlx::Error> {
     let status: Option<String> =
         sqlx::query_scalar("select status from incidents where id = $1 for update")
@@ -276,7 +317,8 @@ pub async fn reopen(
     let mut savepoint = conn.begin().await?;
     let updated = sqlx::query(
         "update incidents set status = 'open', resolved_at = null, resolved_by = null,
-                acknowledged_at = null, acknowledged_by = null
+                acknowledged_at = null, acknowledged_by = null,
+                escalation_generation = escalation_generation + 1
          where id = $1",
     )
     .bind(incident_id)
@@ -293,14 +335,16 @@ pub async fn reopen(
     }
     savepoint.commit().await?;
     record_event(conn, incident_id, EventKind::Reopened, Some(actor), None, json!({})).await?;
+    arm(conn, incident_id, None, at).await?;
     Ok(Reopen::Reopened)
 }
 
 /// Automatic reopen: the source's latest incident, if it was resolved less
 /// than `window_secs` before `at`, goes back to `open` with the new title and
 /// cause (details, resolver and acknowledgement cleared; id and `started_at`
-/// kept) and gets a `reopened` event with no actor. Returns its id, or `None`
-/// when there is no such incident or the source already has an unresolved one.
+/// kept) and gets a `reopened` event with no actor; escalation restarts from
+/// `at` as for [`reopen`]. Returns its id, or `None` when there is no such
+/// incident or the source already has an unresolved one.
 pub async fn reopen_source_within(
     conn: &mut PgConnection,
     source: &IncidentSource,
@@ -320,7 +364,8 @@ pub async fn reopen_source_within(
         "update incidents i
          set status = 'open', resolved_at = null, resolved_by = null,
              acknowledged_at = null, acknowledged_by = null,
-             title = $4, cause = $5, details = null
+             title = $4, cause = $5, details = null,
+             escalation_generation = i.escalation_generation + 1
          from (select id, status, resolved_at from incidents
                where monitor_id = $1 or heartbeat_id = $2 or log_alert_id = $3
                order by started_at desc
@@ -352,6 +397,7 @@ pub async fn reopen_source_within(
     savepoint.commit().await?;
     if let Some(id) = reopened {
         record_event(conn, id, EventKind::Reopened, None, None, json!({})).await?;
+        arm(conn, id, None, at).await?;
     }
     Ok(reopened)
 }

@@ -23,6 +23,7 @@ async fn open(pool: &PgPool, project: Uuid, source: IncidentSource) -> Option<Uu
             cause: Some("connection refused"),
             severity_id: None,
             metadata: None,
+            escalation_policy_id: None,
             started_at: at(0),
         },
     )
@@ -91,6 +92,7 @@ async fn a_severity_of_another_project_falls_back_to_the_default(pool: PgPool) {
             cause: None,
             severity_id: Some(foreign),
             metadata: None,
+            escalation_policy_id: None,
             started_at: at(0),
         },
     )
@@ -376,6 +378,7 @@ async fn resolved_monitor_incident(pool: &PgPool, project: Uuid, monitor: Uuid, 
             cause: None,
             severity_id: None,
             metadata: None,
+            escalation_policy_id: None,
             started_at: at(started),
         },
     )

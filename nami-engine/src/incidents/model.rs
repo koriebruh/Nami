@@ -340,6 +340,7 @@ pub async fn open_for_monitor(
             cause,
             severity_id: None,
             metadata: None,
+            escalation_policy_id: None,
             started_at,
         },
     )
@@ -375,6 +376,7 @@ pub async fn open_for_log_alert(
             cause,
             severity_id: None,
             metadata: None,
+            escalation_policy_id: None,
             started_at,
         },
     )
@@ -437,6 +439,7 @@ pub async fn open_for_heartbeat(
             cause,
             severity_id: None,
             metadata: None,
+            escalation_policy_id: None,
             started_at,
         },
     )

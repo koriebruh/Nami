@@ -248,3 +248,115 @@ create index notification_deliveries_channel_sent_idx on notification_deliveries
     where channel_id is not null and status = 'sent';
 create index notification_deliveries_email_sent_idx on notification_deliveries (user_id, sent_at)
     where channel_id is null and status = 'sent';
+
+-- Escalation policies (NAMI-INC-8) and the incident escalation cursor (R14
+-- in the plan). The engine (incidents::escalation) walks the cursor.
+create table escalation_policies (
+    id uuid default gen_random_uuid() constraint escalation_policies_pkey primary key,
+    project_id uuid not null
+        constraint escalation_policies_project_id_fkey references projects(id) on delete cascade,
+    name text not null,
+    repeat_count int not null default 0
+        constraint escalation_policies_repeat_count_range check (repeat_count between 0 and 10),
+    -- Same project, checked when saving; followed one hop only.
+    fallback_policy_id uuid
+        constraint escalation_policies_fallback_policy_id_fkey references escalation_policies(id) on delete set null,
+    is_default boolean not null default false,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint escalation_policies_name_unique unique (project_id, name),
+    constraint escalation_policies_not_own_fallback check (fallback_policy_id is null or fallback_policy_id <> id)
+);
+create unique index escalation_policies_one_default on escalation_policies (project_id) where is_default;
+
+create table escalation_steps (
+    id uuid default gen_random_uuid() constraint escalation_steps_pkey primary key,
+    policy_id uuid not null
+        constraint escalation_steps_policy_id_fkey references escalation_policies(id) on delete cascade,
+    position int not null
+        constraint escalation_steps_position_range check (position between 0 and 19),
+    -- Minutes after the previous step (the first step: after the incident opened).
+    delay_minutes int not null
+        constraint escalation_steps_delay_range check (delay_minutes between 0 and 1440),
+    condition jsonb
+        constraint escalation_steps_condition_is_object check (condition is null or jsonb_typeof(condition) = 'object'),
+    constraint escalation_steps_position_unique unique (policy_id, position)
+);
+
+create table escalation_step_targets (
+    id uuid default gen_random_uuid() constraint escalation_step_targets_pkey primary key,
+    step_id uuid not null
+        constraint escalation_step_targets_step_id_fkey references escalation_steps(id) on delete cascade,
+    -- The order the policy lists its targets in.
+    position int not null
+        constraint escalation_step_targets_position_range check (position between 0 and 19),
+    kind text not null
+        constraint escalation_step_targets_kind_known
+        check (kind in ('user', 'schedule', 'all_members', 'project_channel')),
+    user_id uuid
+        constraint escalation_step_targets_user_id_fkey references users(id) on delete cascade,
+    -- Removing a targeted schedule or channel is refused (23503), checked
+    -- at commit: removing the whole project cascades to the schedules and
+    -- channels and, separately, to the policies' targets, and the schedule
+    -- or channel cascade may run first. Checked any earlier (RESTRICT, or
+    -- NO ACTION at the end of that cascade), the project removal would fail.
+    schedule_id uuid
+        constraint escalation_step_targets_schedule_id_fkey references on_call_schedules(id)
+        on delete no action deferrable initially deferred,
+    channel_id uuid
+        constraint escalation_step_targets_channel_id_fkey references notification_channels(id)
+        on delete no action deferrable initially deferred,
+    constraint escalation_step_targets_position_unique unique (step_id, position),
+    constraint escalation_step_targets_one_reference check (
+        (kind = 'user' and user_id is not null and schedule_id is null and channel_id is null) or
+        (kind = 'schedule' and schedule_id is not null and user_id is null and channel_id is null) or
+        (kind = 'project_channel' and channel_id is not null and user_id is null and schedule_id is null) or
+        (kind = 'all_members' and user_id is null and schedule_id is null and channel_id is null))
+);
+create index escalation_step_targets_schedule_idx on escalation_step_targets (schedule_id) where schedule_id is not null;
+create index escalation_step_targets_channel_idx on escalation_step_targets (channel_id) where channel_id is not null;
+
+alter table incidents
+    add column escalation_policy_id uuid
+        constraint incidents_escalation_policy_id_fkey references escalation_policies(id) on delete set null,
+    -- Bumped by every reopen, so a new run's deliveries never collide with
+    -- the previous run's (escalation::plan::round).
+    add column escalation_generation int not null default 0,
+    -- The next step to run (0-based), the pass, whether the cursor walks the
+    -- fallback policy, and how many recipients the current pass notified.
+    add column escalation_step int not null default 0,
+    add column escalation_repeat int not null default 0,
+    add column escalation_on_fallback boolean not null default false,
+    add column escalation_notified int not null default 0,
+    add column escalation_legacy boolean not null default false,
+    add column next_escalation_at timestamptz;
+create index incidents_escalation_due_idx on incidents (next_escalation_at)
+    where status = 'open' and next_escalation_at is not null;
+
+create function seed_default_escalation_policy(target_project uuid) returns void language plpgsql as $$
+declare
+    policy uuid;
+    step uuid;
+begin
+    insert into escalation_policies (project_id, name, is_default) values (target_project, 'Default', true)
+        returning id into policy;
+    insert into escalation_steps (policy_id, position, delay_minutes) values (policy, 0, 0) returning id into step;
+    insert into escalation_step_targets (step_id, position, kind) values (step, 0, 'all_members');
+end
+$$;
+create function projects_seed_default_escalation_policy() returns trigger language plpgsql as $$
+begin
+    perform seed_default_escalation_policy(new.id);
+    return new;
+end
+$$;
+create trigger projects_seed_default_escalation_policy after insert on projects
+    for each row execute function projects_seed_default_escalation_policy();
+select seed_default_escalation_policy(id) from projects;
+
+-- R6: incidents open at deploy time were already emailed by the old path.
+-- They get the default policy but no escalation (next_escalation_at stays
+-- null); "legacy" makes their resolution notify every member, as the old
+-- path would have.
+update incidents i set escalation_policy_id = p.id, escalation_legacy = (i.status <> 'resolved')
+from escalation_policies p where p.project_id = i.project_id and p.is_default;
