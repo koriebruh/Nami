@@ -51,7 +51,7 @@ export const actions: Actions = {
 		}
 		return { action: 'save' as const, saved: true, message: 'Policy saved.' };
 	},
-	default: async (event) => {
+	makeDefault: async (event) => {
 		const form = await event.request.formData();
 		return (await policyCommand(event, 'default', event.params.policyId, form)) ?? { action: 'default' as const, saved: true, message: 'This is now the default policy.' };
 	},

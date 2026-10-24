@@ -34,6 +34,8 @@
 			['monitors', 'Monitors', 'monitor'],
 			['heartbeats', 'Heartbeats', 'heartbeat'],
 			['incidents', 'Incidents', 'incident'],
+			['escalation', 'Escalation', 'escalation'],
+			['oncall', 'On-call', 'calendar'],
 			['logs', 'Logs', 'logs'],
 			['maintenance', 'Maintenance', 'maintenance'],
 			['settings', 'Settings', 'settings']

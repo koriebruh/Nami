@@ -73,7 +73,7 @@ describe('escalation list', () => {
 
 	it('makes a policy the default', async () => {
 		const { event, calls } = fakeEvent({ form: { policy_id: OTHER_ID }, body: JSON.stringify(policy({ id: OTHER_ID })) });
-		expect(await actions.default(event)).toMatchObject({ action: 'default' });
+		expect(await actions.makeDefault(event)).toMatchObject({ action: 'default' });
 		expect(calls()).toEqual([{ method: 'POST', path: `${base}/${OTHER_ID}/default`, search: '', body: '{}' }]);
 	});
 
@@ -116,12 +116,12 @@ describe('escalation list page', () => {
 		for (const role of ['viewer', 'member'] as const) {
 			const body = renderPage(role);
 			expect(body).not.toContain('action="?/create"');
-			expect(body).not.toContain('action="?/default"');
+			expect(body).not.toContain('action="?/makeDefault"');
 			expect(body).not.toContain('action="?/delete"');
 		}
 		const admin = renderPage('admin');
 		expect(admin).toContain('action="?/create"');
-		expect(admin).toContain('action="?/default"');
+		expect(admin).toContain('action="?/makeDefault"');
 		expect(admin).toContain('action="?/delete"');
 	});
 });

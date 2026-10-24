@@ -320,7 +320,7 @@
 					Sources without a policy of their own use the default. The default policy cannot be deleted.
 				</p>
 				{#if !policy.is_default}
-					<form method="POST" action="?/default" use:enhance={submit}>
+					<form method="POST" action="?/makeDefault" use:enhance={submit}>
 						<button type="submit" disabled={busy} class="btn btn-secondary btn-sm">Make default</button>
 					</form>
 				{/if}

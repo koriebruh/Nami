@@ -9,21 +9,26 @@ import {
 import { formText, formWholeNumber } from '#lib/server/uptime/monitor-form';
 import { isUuid } from '#lib/core/uuid';
 import type { MonitorGroup } from '#lib/uptime/uptime';
+import type { Member } from '#lib/incidents/oncall';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {
-	const response = await callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`);
+	const [response, membersResponse] = await Promise.all([
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`),
+		callEngine(event, enginePath`/projects/${event.params.id}/members`)
+	]);
 	redirectToLoginIfUnauthorized(response);
-	// The member forms below work without the group list, so a failure is
-	// shown in its section instead of replacing the page.
-	if (!response.ok) {
-		return {
-			groups: [] as MonitorGroup[],
-			groupsError: await engineErrorMessage(response, 'Could not load monitor groups.')
-		};
-	}
-	const groups: MonitorGroup[] = await response.json();
-	return { groups, groupsError: null };
+	// The member forms work without either list, so a failure is shown in its
+	// section instead of replacing the page.
+	const [groups, members] = await Promise.all([
+		response.ok
+			? { groups: (await response.json()) as MonitorGroup[], groupsError: null }
+			: { groups: [] as MonitorGroup[], groupsError: await engineErrorMessage(response, 'Could not load monitor groups.') },
+		membersResponse.ok
+			? { members: (await membersResponse.json()) as Member[], membersError: null }
+			: { members: [] as Member[], membersError: await engineErrorMessage(membersResponse, 'Could not load members.') }
+	]);
+	return { ...groups, ...members };
 };
 
 const GROUP_MAX_POSITION = 1_000_000;

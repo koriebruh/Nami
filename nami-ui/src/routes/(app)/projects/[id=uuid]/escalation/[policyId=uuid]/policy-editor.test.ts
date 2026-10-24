@@ -117,7 +117,7 @@ describe('policy editor actions', () => {
 
 	it('makes the policy the default with a POST of {}', async () => {
 		const { event, calls } = fakeEvent({ params, form: {}, body: JSON.stringify(policy({ is_default: true })) });
-		expect(await actions.default(event)).toMatchObject({ action: 'default' });
+		expect(await actions.makeDefault(event)).toMatchObject({ action: 'default' });
 		expect(calls()).toEqual([{ method: 'POST', path: `${path}/default`, search: '', body: '{}' }]);
 	});
 
@@ -161,7 +161,7 @@ describe('policy editor page', () => {
 	it('gives admins the editor with the stored values', async () => {
 		const body = await renderPage('admin');
 		expect(body).toContain('action="?/save"');
-		expect(body).toContain('action="?/default"');
+		expect(body).toContain('action="?/makeDefault"');
 		expect(body).toContain('action="?/delete"');
 		expect(body).toContain('name="step_count" value="2"');
 		expect(body).toContain(`name="step_0_target" value="user:${USER_ID}"`);

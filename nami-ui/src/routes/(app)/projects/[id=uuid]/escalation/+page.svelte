@@ -81,7 +81,7 @@
 									<td>
 										<div class="flex flex-wrap justify-end gap-2">
 											{#if !policy.is_default}
-												<form method="POST" action="?/default" use:enhance={submit}>
+												<form method="POST" action="?/makeDefault" use:enhance={submit}>
 													<input type="hidden" name="policy_id" value={policy.id} />
 													<button type="submit" disabled={busy} class="btn btn-secondary btn-sm">Make default</button>
 												</form>

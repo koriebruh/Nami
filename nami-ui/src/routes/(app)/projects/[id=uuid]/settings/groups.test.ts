@@ -6,13 +6,25 @@ const GROUP_ID = '5a4b3c2d-1e0f-4a9b-8c7d-6e5f4a3b2c1d';
 const base = `/projects/${PROJECT_ID}/monitor-groups`;
 
 describe('settings load', () => {
-	it('returns the groups', async () => {
-		const groups = [{ id: GROUP_ID, name: 'APIs', position: 1 }];
-		expect(await load(fakeEvent({ body: JSON.stringify(groups) }).event)).toEqual({ groups, groupsError: null });
+	const groups = [{ id: GROUP_ID, name: 'APIs', position: 1 }];
+	const members = [{ user_id: GROUP_ID, email: 'a@example.com', project_role: 'admin' }];
+	const answer = (failing: string) => (url: URL) =>
+		url.pathname.endsWith(failing)
+			? new Response('{"error":"forbidden"}', { status: 403 })
+			: new Response(JSON.stringify(url.pathname.endsWith('/members') ? members : groups));
+
+	it('returns the groups and the members', async () => {
+		const { event, calls } = fakeEvent({ respond: answer('/none') });
+		expect(await load(event)).toEqual({ groups, groupsError: null, members, membersError: null });
+		expect(calls().map((c) => c.path)).toEqual([base, `/projects/${PROJECT_ID}/members`]);
 	});
 
 	it('keeps the page (member forms) when the groups fail to load', async () => {
-		expect(await load(fakeEvent({ status: 403, body: '{"error":"forbidden"}' }).event)).toEqual({ groups: [], groupsError: 'forbidden' });
+		expect(await load(fakeEvent({ respond: answer('/monitor-groups') }).event)).toEqual({ groups: [], groupsError: 'forbidden', members, membersError: null });
+	});
+
+	it('keeps the page when the members fail to load', async () => {
+		expect(await load(fakeEvent({ respond: answer('/members') }).event)).toEqual({ groups, groupsError: null, members: [], membersError: 'forbidden' });
 	});
 });
 

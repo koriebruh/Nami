@@ -3,7 +3,7 @@ import type { Actions, PageServerLoad } from './$types';
 import { callEngine, engineErrorMessage } from '#lib/server/core/engine';
 
 /** Longest token passed on to the engine; real ones are under 250 chars. */
-export const MAX_TOKEN_CHARS = 1024;
+const MAX_TOKEN_CHARS = 1024;
 
 export type Inspected = {
 	action: 'acknowledge' | 'resolve';

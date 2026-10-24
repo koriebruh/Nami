@@ -145,9 +145,39 @@
 		</form>
 	</div>
 
-	<p class="text-sm text-muted">
-		This project has no visible member list yet — add or remove members by their user ID.
-	</p>
+	<div class="card p-5 sm:p-6">
+		<h2 class="text-lg font-light text-ink">Members</h2>
+		<p class="mt-1 text-sm text-muted">Add or remove members by their user ID.</p>
+
+		{#if data.membersError}
+			<div role="alert" class="alert alert-danger mt-4">
+				{data.membersError}
+			</div>
+		{:else if data.members.length === 0}
+			<p class="mt-4 text-sm text-muted">No members yet.</p>
+		{:else}
+			<div class="mt-4 overflow-x-auto">
+				<table class="table">
+					<thead>
+						<tr>
+							<th>Email</th>
+							<th>Role</th>
+							<th>User ID</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each data.members as member (member.user_id)}
+							<tr>
+								<td class="wrap-anywhere text-ink">{member.email}</td>
+								<td>{member.project_role}</td>
+								<td class="font-mono text-xs text-muted">{member.user_id}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+			</div>
+		{/if}
+	</div>
 
 	<div class="grid gap-6 lg:grid-cols-2">
 		<div class="card p-5 sm:p-6">

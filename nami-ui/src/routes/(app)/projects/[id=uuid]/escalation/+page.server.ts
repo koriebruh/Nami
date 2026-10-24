@@ -33,7 +33,7 @@ export const actions: Actions = {
 		if (!isUuid(created.id)) return fail(502, { action: 'create' as const, message: 'Could not create the policy.' });
 		throw redirect(303, enginePath`/projects/${event.params.id}/escalation/${created.id}`);
 	},
-	default: async (event) => {
+	makeDefault: async (event) => {
 		const form = await event.request.formData();
 		return (await policyCommand(event, 'default', form.get('policy_id'), form)) ?? { action: 'default' as const, done: true, message: 'Default policy changed.' };
 	},
