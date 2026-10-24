@@ -101,7 +101,10 @@ pub fn public_client() -> reqwest::Client {
 /// `is_forbidden_destination(ip)`, loopback, RFC 1918, CGNAT `100.64.0.0/10`,
 /// `198.18.0.0/15`, the reserved `240.0.0.0/4` and broadcast, multicast,
 /// documentation ranges, ULA `fc00::/7`, the deprecated site-local
-/// `fec0::/10` and the IPv4-compatible `::/96`.
+/// `fec0::/10`, the IPv4-compatible `::/96`, and the prefixes that tunnel or
+/// translate to an IPv4 address chosen by the network: the rest of
+/// `64:ff9b::/32` (local-use NAT64 `64:ff9b:1::/48`), 6to4 `2002::/16` and
+/// Teredo `2001::/32`.
 /// IPv4-mapped and NAT64 (`64:ff9b::/96`) forms are judged as the IPv4
 /// address they carry.
 pub fn is_non_public(ip: IpAddr) -> bool {
@@ -119,6 +122,9 @@ pub fn is_non_public(ip: IpAddr) -> bool {
                 return is_non_public_v4(v4_from(s[6], s[7]));
             }
             s[..6] == [0; 6]
+                || (s[0], s[1]) == (0x64, 0xff9b)
+                || s[0] == 0x2002
+                || (s[0], s[1]) == (0x2001, 0)
                 || v6.is_multicast()
                 || s[0] & 0xfe00 == 0xfc00
                 || s[0] & 0xffc0 == 0xfec0
@@ -381,6 +387,14 @@ mod tests {
             ("::10.0.0.1", true),
             ("2606:4700::1111", false),
             ("64:ff9b::808:808", false),
+            ("64:ff9b:1::808:808", true),
+            ("64:ff9a:ffff::1", false),
+            ("64:ff9c::1", false),
+            ("2002:808:808::1", true),
+            ("2003::1", false),
+            ("2001:0:1::1", true),
+            ("2001:1::1", false),
+            ("2001:4860::8888", false),
         ] {
             assert_eq!(is_non_public(ip.parse().unwrap()), internal, "{ip}");
         }

@@ -5,8 +5,8 @@ use crate::common;
 use axum::http::StatusCode;
 use common::{call, seed_project, test_app, test_cipher, user_with_role};
 use nami_engine::incidents::channel::model::{
-    self as channel, ChannelConfig, Inserted, MAX_PERSONAL_CHANNELS, MAX_PROJECT_CHANNELS, Owner,
-    config_context, signing_secret_context,
+    self as channel, ChannelConfig, Inserted, MAX_NAME_CHARS, MAX_PERSONAL_CHANNELS,
+    MAX_PROJECT_CHANNELS, Owner, config_context, signing_secret_context,
 };
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -263,4 +263,36 @@ async fn channel_writes_check_role_and_owner(pool: sqlx::PgPool) {
     assert_eq!(left, 0);
     let (status, _) = call(&app, "DELETE", &format!("{path}/{room}"), Some(&admin), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test]
+async fn a_name_is_refused_past_its_char_limit(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let path = format!("/projects/{project}/notification-channels");
+    for (chars, expected) in [(MAX_NAME_CHARS, StatusCode::CREATED), (MAX_NAME_CHARS + 1, StatusCode::BAD_REQUEST)] {
+        let body = json!({"name": "é".repeat(chars), "kind": "slack", "config": {"webhook_url": SLACK_URL}});
+        let (status, body) = call(&app, "POST", &path, Some(&admin), Some(body)).await;
+        assert_eq!(status, expected, "{chars} chars: {body}");
+    }
+}
+
+#[sqlx::test]
+async fn a_personal_webhook_cannot_be_patched_to_an_internal_address(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, alice) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (status, created) = call(&app, "POST", "/account/notification-channels", Some(&alice),
+        Some(json!({"name": "hook", "kind": "webhook", "config": {"url": "https://hooks.example.org/in"}}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let path = format!("/account/notification-channels/{}", created["id"].as_str().unwrap());
+    for url in ["http://10.0.0.5/in", "http://[::ffff:127.0.0.1]/in", "http://[64:ff9b:1::a00:5]/in"] {
+        let (status, body) = call(&app, "PATCH", &path, Some(&alice),
+            Some(json!({"kind": "webhook", "config": {"url": url}}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{url}: {body}");
+    }
+    let summary: String = sqlx::query_scalar("select summary from notification_channels where id = $1")
+        .bind(created["id"].as_str().unwrap().parse::<Uuid>().unwrap()).fetch_one(&pool).await.unwrap();
+    assert_eq!(summary, "https://hooks.example.org");
 }

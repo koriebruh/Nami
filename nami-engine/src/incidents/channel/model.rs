@@ -15,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::{
     core::crypto::{Cipher, DecryptError},
     core::error::AppError,
+    core::validate::has_invisible_or_bidi,
     incidents::outbound::{self, DISCORD, Reach, SLACK, UrlRule},
 };
 
@@ -129,7 +130,11 @@ impl ChannelConfig {
                     .into(),
             ),
             ChannelConfig::Email { address } => {
+                // lettre accepts a quoted local part with tabs and any
+                // non-ASCII char; the address reaches SMTP headers and the UI.
                 if address.len() > MAX_ADDRESS_BYTES
+                    || address.chars().any(char::is_control)
+                    || has_invisible_or_bidi(address)
                     || lettre::Address::from_str(address).is_err()
                 {
                     Err("address must be a valid email address".into())
@@ -545,13 +550,30 @@ mod tests {
     }
 
     #[test]
+    fn a_config_with_an_unknown_field_is_refused() {
+        let extra = serde_json::json!({
+            "kind": "slack",
+            "config": {"webhook_url": "https://hooks.slack.com/services/T/B/x", "extra": 1}
+        });
+        assert!(serde_json::from_value::<ChannelConfig>(extra).is_err());
+    }
+
+    #[test]
     fn email_addresses_are_bare_and_bounded() {
         let project = Owner::Project(Uuid::nil());
         let labels = ["b", "c", "d", "e"].map(|c| c.repeat(60)).join(".");
         let at_limit = format!("a@{labels}.fff.test");
         assert_eq!(at_limit.len(), MAX_ADDRESS_BYTES);
         assert!(ChannelConfig::Email { address: at_limit.clone() }.validate(&project).is_ok());
-        for bad in [format!("a{at_limit}"), "Ops <ops@b.test>".into(), "not an address".into()] {
+        for bad in [
+            format!("a{at_limit}"),
+            "Ops <ops@b.test>".into(),
+            "not an address".into(),
+            "\"a\tb\"@x.test".into(),
+            "a\u{202e}b@x.test".into(),
+            "a\u{200b}@x.test".into(),
+            "a@ex\u{200d}ample.test".into(),
+        ] {
             assert!(ChannelConfig::Email { address: bad.clone() }.validate(&project).is_err(), "{bad}");
         }
     }
