@@ -461,7 +461,22 @@
 		<div class="alert alert-warning" role="alert">{data.histogramError}</div>
 	{/if}
 
-	<SegmentedTabs label="Results or patterns" items={tabs} size="sm" />
+	<div class="flex flex-wrap items-center justify-between gap-2">
+		<SegmentedTabs label="Results or patterns" items={tabs} size="sm" />
+		<!-- The live tail keeps running on the Patterns tab: its status stays outside the results card. -->
+		<div class="flex items-center gap-2 text-sm text-ink-2" role="status" aria-live="polite">
+			{#if liveStatus === 'live'}
+				<span class="h-2 w-2 animate-pulse rounded-full bg-success"></span><span class="text-success-ink">Live</span>
+			{:else if liveStatus === 'connecting'}
+				<span class="text-muted">Connecting live tail…</span>
+			{:else if liveStatus === 'reconnecting'}
+				<span class="text-muted">Reconnecting…</span>
+			{/if}
+			{#if liveNotice}
+				<span class="text-warning-ink">{liveNotice}</span>
+			{/if}
+		</div>
+	</div>
 
 	{#if data.state.tab === 'patterns'}
 		<div class="card">
@@ -469,19 +484,7 @@
 		</div>
 	{:else}
 		<div class="card">
-			<div class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
-				<div class="flex items-center gap-2 text-sm text-ink-2" role="status" aria-live="polite">
-					{#if liveStatus === 'live'}
-						<span class="h-2 w-2 animate-pulse rounded-full bg-success"></span><span class="text-success-ink">Live</span>
-					{:else if liveStatus === 'connecting'}
-						<span class="text-muted">Connecting live tail…</span>
-					{:else if liveStatus === 'reconnecting'}
-						<span class="text-muted">Reconnecting…</span>
-					{/if}
-					{#if liveNotice}
-						<span class="text-warning-ink">{liveNotice}</span>
-					{/if}
-				</div>
+			<div class="flex flex-wrap items-center justify-end gap-2 border-b border-border px-4 py-3">
 				<form class="flex flex-wrap items-center gap-1" onsubmit={addColumn}>
 					<label class="sr-only" for="column-path">Add a column</label>
 					<input id="column-path" name="column" placeholder="Add column: field.path" maxlength="324" class="{input} w-52 py-1 text-xs" />
