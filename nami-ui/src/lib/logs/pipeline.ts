@@ -14,8 +14,12 @@ export const RULE_KINDS: { value: RuleKind; label: string }[] = [
 	{ value: 'sample', label: 'Sample' }
 ];
 
-/** `equals` is always sent as a string: the engine compares it with the field's JSON text (R-P2-4). */
-export type Match = { field?: string; equals?: string; message_regex?: string };
+/**
+ * `equals` is sent as a string (the engine compares it with the field's JSON
+ * text, R-P2-4), except a whole number for `level`: the engine maps a number
+ * there to a level (pino `50` = error), but the string `"50"` never matches.
+ */
+export type Match = { field?: string; equals?: string | number; message_regex?: string };
 export type Rule = {
 	type: RuleKind;
 	match?: Match;
@@ -129,7 +133,8 @@ function matchFromDraft(draft: RuleDraft): { ok: true; match?: Match } | { ok: f
 			if ([...draft.equals].length > MAX_EQUALS_CHARS) {
 				return { ok: false, message: `The match value must be at most ${MAX_EQUALS_CHARS} characters.` };
 			}
-			return { ok: true, match: { field, equals: draft.equals } };
+			const equals = field === 'level' && /^\d{1,3}$/.test(draft.equals) ? Number(draft.equals) : draft.equals;
+			return { ok: true, match: { field, equals } };
 		}
 		case 'regex': {
 			const error = regexError(draft.messageRegex, 'The message regex');

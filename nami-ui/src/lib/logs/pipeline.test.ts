@@ -15,6 +15,13 @@ describe('rule drafts', () => {
 		for (const rule of rules) expect(ruleFromDraft(draftFromRule(rule))).toEqual({ ok: true, rule });
 	});
 
+	it('keep a whole-number level as a number, so a pino level still matches after a re-save', () => {
+		const level: Rule = { type: 'drop', match: { field: 'level', equals: 50 } };
+		expect(ruleFromDraft(draftFromRule(level))).toEqual({ ok: true, rule: level });
+		const status = ruleFromDraft({ ...emptyDraft('drop'), field: 'http.status', equals: '200' });
+		expect(status).toEqual({ ok: true, rule: { type: 'drop', match: { field: 'http.status', equals: '200' } } });
+	});
+
 	it('reject what the engine would reject, with a readable message', () => {
 		const cases: [Partial<ReturnType<typeof emptyDraft>> & { type: Rule['type'] }, string][] = [
 			[{ type: 'drop', matchMode: 'none' }, 'match'],

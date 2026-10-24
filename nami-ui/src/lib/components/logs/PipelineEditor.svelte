@@ -4,7 +4,7 @@
 	// (the engine runs the unsaved rules; nothing is stored). Everything renders
 	// as text, never as HTML.
 	import { goto } from '$app/navigation';
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import {
 		describeRule,
 		draftFromRule,
@@ -65,16 +65,31 @@
 		valid = validRules !== null && listError === null;
 	});
 
+	// Adding, removing and moving re-render the list, so focus is put back
+	// where a keyboard user expects it instead of falling to the page.
+	async function focusLater(id: string) {
+		await tick();
+		document.getElementById(id)?.focus();
+	}
 	function add() {
-		if (drafts.length < MAX_RULES) drafts.push(keyed(emptyDraft('drop')));
+		if (drafts.length >= MAX_RULES) return;
+		const draft = keyed(emptyDraft('drop'));
+		drafts.push(draft);
+		focusLater(`rule-${draft.key}-type`);
 	}
 	function remove(i: number) {
 		drafts.splice(i, 1);
+		const next = drafts[i] ?? drafts[i - 1];
+		focusLater(next ? `rule-${next.key}-remove` : 'pipeline-add-rule');
 	}
 	function move(i: number, by: -1 | 1) {
 		const j = i + by;
 		if (j < 0 || j >= drafts.length) return;
 		[drafts[i], drafts[j]] = [drafts[j], drafts[i]];
+		// At the top or bottom the pressed button is disabled; use the other one.
+		const atEdge = by < 0 ? j === 0 : j === drafts.length - 1;
+		const up = by < 0 !== atEdge;
+		focusLater(`rule-${drafts[j].key}-${up ? 'up' : 'down'}`);
 	}
 	/** Keeps what was typed; only fixes what the new kind cannot take. */
 	function kindChanged(draft: KeyedDraft) {
@@ -177,18 +192,28 @@
 							{/if}
 						</div>
 						<div class="flex gap-1">
-							<button type="button" class={button} disabled={i === 0} onclick={() => move(i, -1)} aria-label="Move rule {i + 1} up"
-								>↑</button
+							<button
+								type="button"
+								id="{id}-up"
+								class={button}
+								disabled={i === 0}
+								onclick={() => move(i, -1)}
+								aria-label="Move rule {i + 1} up">↑</button
 							>
 							<button
 								type="button"
+								id="{id}-down"
 								class={button}
 								disabled={i === drafts.length - 1}
 								onclick={() => move(i, 1)}
 								aria-label="Move rule {i + 1} down">↓</button
 							>
-							<button type="button" class="btn btn-danger btn-sm" onclick={() => remove(i)} aria-label="Remove rule {i + 1}"
-								>Remove</button
+							<button
+								type="button"
+								id="{id}-remove"
+								class="btn btn-danger btn-sm"
+								onclick={() => remove(i)}
+								aria-label="Remove rule {i + 1}">Remove</button
 							>
 						</div>
 					</div>
@@ -270,7 +295,13 @@
 			{/each}
 		</ol>
 		<div class="flex flex-wrap items-center gap-3">
-			<button type="button" class="btn btn-secondary btn-sm" disabled={drafts.length >= MAX_RULES} onclick={add}>Add rule</button>
+			<button
+				type="button"
+				id="pipeline-add-rule"
+				class="btn btn-secondary btn-sm"
+				disabled={drafts.length >= MAX_RULES}
+				onclick={add}>Add rule</button
+			>
 			<span class="text-xs text-muted tabular-nums">{drafts.length}/{MAX_RULES} rules · {regexes}/{MAX_REGEXES} regexes</span>
 		</div>
 		{#if listError}
