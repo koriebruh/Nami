@@ -13,6 +13,9 @@ use crate::uptime::{checker::is_unsafe_in_text, heartbeat::sanitize_output};
 
 /// Chars of a cause a chat message carries; longer causes are cut and end in `…`.
 pub const MAX_CHAT_CAUSE_CHARS: usize = 1000;
+/// Chars of a project name a notification shows; projects have no name cap
+/// of their own, and an unbounded name would push chat messages past their caps.
+pub const MAX_PROJECT_NAME_CHARS: usize = 200;
 /// Slack's cap on a section block's `text`, counted after escaping.
 pub const MAX_SLACK_SECTION_CHARS: usize = 3000;
 /// Discord's cap on a message's `content`.
@@ -180,7 +183,7 @@ fn parts(m: &Message) -> Parts {
     Parts {
         headline,
         title,
-        project: one_line(&m.project_name),
+        project: cut_chars(&one_line(&m.project_name), MAX_PROJECT_NAME_CHARS),
         severity,
         status: one_line(&i.status),
         reason,
@@ -816,5 +819,22 @@ mod tests {
         let mut m = message("API", None);
         m.actions = Some(links);
         assert!(!format!("{m:?}").contains("secret"));
+    }
+
+    #[test]
+    fn a_project_name_is_cut_at_its_limit() {
+        let at = "p".repeat(MAX_PROJECT_NAME_CHARS);
+        let mut m = message("API", None);
+        m.project_name = at.clone();
+        assert!(email(&m).1.contains(&format!("Project: {at}\n")));
+        m.project_name = format!("{at}p");
+        let cut = format!("{}…", "p".repeat(MAX_PROJECT_NAME_CHARS - 1));
+        assert!(email(&m).1.contains(&format!("Project: {cut}\n")));
+        // A huge name leaves every chat message within its cap, link kept.
+        m.project_name = "&\"*".repeat(100_000);
+        assert!(slack_section(&slack(&m), 0).chars().count() <= MAX_SLACK_SECTION_CHARS);
+        assert!(discord(&m)["content"].as_str().unwrap().ends_with(&m.incident_url));
+        let text = telegram(&m, "1")["text"].as_str().unwrap().to_string();
+        assert!(text.chars().count() <= MAX_TELEGRAM_CHARS);
     }
 }
