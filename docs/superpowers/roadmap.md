@@ -25,6 +25,35 @@ Also out of scope (ruled 2026-10-13):
 - Google Analytics and custom JS on status pages — third-party scripts
   break the CSP and no-cookie posture.
 
+## Plans and execution order
+
+Every unticked item below is claimed by a task in one of these plans
+(`python3 scripts/check-plans.py` proves it; see
+`docs/superpowers/plan-conventions.md`). Phases run in this order, one
+phase PR each.
+
+| # | Phase | Plan | Branch | Status |
+|---|---|---|---|---|
+| 1 | Logs Part 2 | `plans/2026-10-13-log-management-part2.md` | `feat/logs-part2` | in progress |
+| 2 | Incidents Part 1 | `plans/2026-10-13-incident-management-part1.md` | `feat/incidents-part1` | ready |
+| 3 | Incidents Part 2 | `plans/2026-10-24-incident-management-part2.md` | `feat/incidents-part2` | outline |
+| 4 | Status Pages Part 1 | `plans/2026-10-13-status-pages-part1.md` | `feat/statuspages-part1` | ready |
+| 5 | Status Pages Part 2 | `plans/2026-10-24-status-pages-part2.md` | `feat/statuspages-part2` | outline |
+| 6 | Metrics Part 1 | `plans/2026-10-13-metrics-dashboards-part1.md` | `feat/metrics-part1` | ready |
+| 7 | Metrics Part 2 | `plans/2026-10-24-metrics-dashboards-part2.md` | `feat/metrics-part2` | outline |
+| 8 | Traces | `plans/2026-10-24-traces-part1.md` | `feat/traces-part1` | outline |
+| 9 | Error tracking Part 1 | `plans/2026-10-24-error-tracking-part1.md` | `feat/errors-part1` | outline |
+| 10 | Error tracking Part 2 | `plans/2026-10-24-error-tracking-part2.md` | `feat/errors-part2` | outline |
+| 11 | RUM Part 1 | `plans/2026-10-24-rum-part1.md` | `feat/rum-part1` | outline |
+| 12 | RUM Part 2 | `plans/2026-10-24-rum-part2.md` | `feat/rum-part2` | outline |
+| 13 | AI SRE | `plans/2026-10-24-ai-sre-part1.md` | `feat/ai-part1` | outline |
+| 14 | Platform Part 1 | `plans/2026-10-24-platform-hardening-part1.md` | `feat/platform-part1` | outline |
+| 15 | Platform Part 2 | `plans/2026-10-24-platform-hardening-part2.md` | `feat/platform-part2` | outline |
+
+`outline` plans fix tasks, data shapes, endpoints, tests and acceptance;
+their step-level code is written at phase start against the then-current
+`main`.
+
 ## 1. Foundation — done (PRs #1-#16)
 
 - [x] **R1.01** Email/password registration with verification, login, logout
