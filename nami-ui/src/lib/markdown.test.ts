@@ -47,4 +47,39 @@ describe('renderMarkdown', () => {
 		expect(renderMarkdown(`it's "x"`)).toBe('<p>it&#39;s &quot;x&quot;</p>');
 		expect(renderMarkdown('a'.repeat(200_000))).toBe(`<p>${'a'.repeat(102_400)}</p>`);
 	});
+
+	// Review (NAMI-INC-12): hostile inputs that stay literal or safe. Later
+	// plans reuse this renderer, so they are pinned here.
+	it.each([
+		['[x](&#106;avascript:alert(1))', '<p>[x](&amp;#106;avascript:alert(1))</p>'],
+		['[x](JAVASCRIPT:alert(1))', '<p>[x](JAVASCRIPT:alert(1))</p>'],
+		['[x](//evil.test)', '<p>[x](//evil.test)</p>'],
+		['[x]( https://a.test)', '<p>[x]( https://a.test)</p>'],
+		["[x](https://a.test/'onclick='x)", '<p><a href="https://a.test/&#39;onclick=&#39;x" rel="noopener noreferrer nofollow">x</a></p>'],
+		['\0[x](javascript:1)', '<p>[x](javascript:1)</p>'],
+		['[x](https://a.test/((b)))', '<p>[x](https://a.test/((b)))</p>']
+	])('keeps a hostile link literal or safe: %s', (input, expected) => {
+		expect(renderMarkdown(input)).toBe(expected);
+	});
+
+	it('links the innermost bracket pair and keeps code spans in a label', () => {
+		expect(renderMarkdown('[[x](https://a.test)](https://b.test)')).toBe(
+			'<p>[<a href="https://a.test" rel="noopener noreferrer nofollow">x</a>](https://b.test)</p>'
+		);
+		expect(renderMarkdown('[`a[0]`](https://x.test)')).toBe(
+			'<p><a href="https://x.test" rel="noopener noreferrer nofollow"><code>a[0]</code></a></p>'
+		);
+	});
+
+	// A label that could run over every later `[` made a line of brackets
+	// quadratic: about 4 s per render of a 100 KiB postmortem, during SSR.
+	it.each([
+		['brackets', '['.repeat(102_400)],
+		['brackets and a close', '['.repeat(102_399) + ']'],
+		['an open target of brackets', '[a](' + '['.repeat(102_396)]
+	])('renders a line of %s in linear time', (_name, input) => {
+		const start = performance.now();
+		renderMarkdown(input);
+		expect(performance.now() - start).toBeLessThan(500);
+	});
 });

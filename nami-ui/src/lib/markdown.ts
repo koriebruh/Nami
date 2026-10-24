@@ -21,8 +21,10 @@ const LIST_ITEM = /^\s*([-*]|\d+\.)\s+(.*)$/;
 // marker and newlines, so a run of unmatched markers fails fast (linear time
 // even for 100,000 stars) and an unbalanced marker stays literal.
 const CODE_SPAN = /`([^`\n]+)`/g;
-// The target allows one level of balanced parentheses: `https://x/a(1)`.
-const LINK = /\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g;
+// The label holds no `[` (the innermost pair links, and a line of brackets
+// stays linear); the target allows one level of balanced parentheses:
+// `https://x/a(1)`.
+const LINK = /\[([^[\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g;
 // No NUL: a held code span inside a target keeps the link literal.
 const SAFE_URL = /^https?:\/\/[^\s<>\0]+$/;
 const STRONG = /\*\*([^*\n]+)\*\*/g;

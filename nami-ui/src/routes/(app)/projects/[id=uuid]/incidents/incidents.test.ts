@@ -44,6 +44,7 @@ describe('incidents load', () => {
 
 	it.each([
 		['?tab=resolved', '?status=resolved'],
+		['?status=resolved', '?status=resolved'],
 		['?tab=acknowledged', '?status=acknowledged'],
 		['?tab=all', ''],
 		['?tab=all&source=heartbeat&cursor=MjAy_-', '?source=heartbeat&cursor=MjAy_-']
@@ -56,7 +57,7 @@ describe('incidents load', () => {
 	// The query is user input: only parsed values reach the engine.
 	it.each([
 		['?tab=bogus&source=x&cursor=%%'],
-		['?status=resolved'],
+		['?status=open'],
 		['?tab=resolved%26status%3Dopen'],
 		['?tab=unresolved&source=monitor%26monitor_id%3D1'],
 		['?cursor=..%2Fauth%2Fme%3F'],

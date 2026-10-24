@@ -26,6 +26,13 @@ describe('parseListQuery', () => {
 	])('drops an unknown tab, source and a malformed cursor: %s', (query) => {
 		expect(parseListQuery(url(query))).toEqual({ tab: 'unresolved', source: null, cursor: null });
 	});
+
+	it('lands an old ?status=resolved link on the resolved tab; a known tab wins', () => {
+		expect(parseListQuery(url('?status=resolved')).tab).toBe('resolved');
+		expect(parseListQuery(url('?tab=bogus&status=resolved')).tab).toBe('resolved');
+		expect(parseListQuery(url('?tab=all&status=resolved')).tab).toBe('all');
+		expect(parseListQuery(url('?status=open')).tab).toBe('unresolved');
+	});
 });
 
 describe('engineListQuery', () => {

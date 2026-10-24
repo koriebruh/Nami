@@ -72,7 +72,8 @@ export function parseListQuery(url: URL): ListQuery {
 	const source = url.searchParams.get('source');
 	const cursor = url.searchParams.get('cursor');
 	return {
-		tab: LIST_TABS.find((t) => t === tab) ?? 'unresolved',
+		// Links from before the tabs carried `?status=resolved`.
+		tab: LIST_TABS.find((t) => t === tab) ?? (url.searchParams.get('status') === 'resolved' ? 'resolved' : 'unresolved'),
 		source: SOURCES.find((s) => s === source) ?? null,
 		cursor: cursor !== null && CURSOR.test(cursor) ? cursor : null
 	};
