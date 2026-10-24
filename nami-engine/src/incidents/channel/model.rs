@@ -407,11 +407,20 @@ pub enum Deleted {
 /// Deletes the owner's channel `id`; another owner's is `NotFound`, and a
 /// project channel an escalation step targets is `InUse`.
 pub async fn delete(pool: &PgPool, owner: &Owner, id: Uuid) -> Result<Deleted, sqlx::Error> {
-    if let Owner::Project(project_id) = owner
-        && let Some(policy) =
-            escalation::model::policy_targeting_channel(pool, *project_id, id).await?
-    {
-        return Ok(Deleted::InUse { policy });
+    let mut tx = pool.begin().await?;
+    if let Owner::Project(project_id) = owner {
+        // The project lock policy saves take: without it a save committing
+        // a target between this check and the delete fails one of the two
+        // on the deferred foreign key (a 500).
+        sqlx::query("select id from projects where id = $1 for no key update")
+            .bind(project_id)
+            .execute(&mut *tx)
+            .await?;
+        if let Some(policy) =
+            escalation::model::policy_targeting_channel(&mut *tx, *project_id, id).await?
+        {
+            return Ok(Deleted::InUse { policy });
+        }
     }
     let (project_id, user_id) = owner.ids();
     let result = sqlx::query(
@@ -420,8 +429,9 @@ pub async fn delete(pool: &PgPool, owner: &Owner, id: Uuid) -> Result<Deleted, s
     .bind(id)
     .bind(project_id)
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(if result.rows_affected() > 0 {
         Deleted::Deleted
     } else {

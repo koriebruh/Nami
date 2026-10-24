@@ -711,3 +711,95 @@ async fn escalation_constraints_are_all_named(pool: sqlx::PgPool) {
         ]
     );
 }
+
+/// Each re-adds one project foreign key. Postgres runs a project removal's
+/// cascades in the order their constraints were created, so the table whose
+/// key was re-added last is emptied last.
+const PROJECT_CASCADES: [&str; 5] = [
+    "alter table incidents drop constraint incidents_project_id_fkey,
+        add constraint incidents_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+    "alter table incident_severities drop constraint incident_severities_project_id_fkey,
+        add constraint incident_severities_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+    "alter table notification_channels drop constraint notification_channels_project_id_fkey,
+        add constraint notification_channels_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+    "alter table on_call_schedules drop constraint on_call_schedules_project_id_fkey,
+        add constraint on_call_schedules_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+    "alter table escalation_policies drop constraint escalation_policies_project_id_fkey,
+        add constraint escalation_policies_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+];
+
+/// A project whose rows all point at each other: the default policy and a
+/// second one fall back to each other and both target a schedule and a
+/// channel; a manual and a monitor incident use the non-default `critical`
+/// severity and the second policy, and each has a delivery to the channel.
+async fn cross_referenced_project(pool: &sqlx::PgPool) -> uuid::Uuid {
+    let project = common::seed_project(pool).await;
+    let (schedule, channel) = targeted_schedule_and_channel(pool, project).await;
+    let monitor = common::seed_http_monitor(pool, project, "api", "https://example.com", 1).await;
+    sqlx::query(
+        "with second as (
+             insert into escalation_policies (project_id, name, fallback_policy_id)
+             select $1, 'second', id from escalation_policies where project_id = $1 and is_default
+             returning id),
+         step as (
+             insert into escalation_steps (policy_id, position, delay_minutes)
+             select id, 0, 5 from second returning id),
+         targets as (
+             insert into escalation_step_targets (step_id, position, kind, schedule_id, channel_id)
+             select step.id, v.position, v.kind, v.schedule_id, v.channel_id from step
+             cross join (values (0, 'schedule', $2::uuid, null::uuid),
+                                (1, 'project_channel', null::uuid, $3::uuid)) as
+                 v(position, kind, schedule_id, channel_id)),
+         fallback as (
+             update escalation_policies set fallback_policy_id = (select id from second)
+             where project_id = $1 and is_default),
+         opened as (
+             insert into incidents (project_id, monitor_id, title, severity_id, escalation_policy_id)
+             select $1, m, 'down',
+                    (select id from incident_severities where project_id = $1 and name = 'critical'),
+                    (select id from second)
+             from unnest(array[null, $4::uuid]) as m
+             returning id)
+         insert into notification_deliveries (incident_id, event, round, target_key, channel_id)
+         select id, 'triggered', 'g0p0r0s0', 'channel:' || $3::uuid::text, $3::uuid from opened",
+    )
+    .bind(project)
+    .bind(schedule)
+    .bind(channel)
+    .bind(monitor)
+    .execute(pool)
+    .await
+    .unwrap();
+    project
+}
+
+#[sqlx::test]
+async fn removing_a_cross_referenced_project_works_whatever_table_its_cascade_empties_last(
+    pool: sqlx::PgPool,
+) {
+    let remove = |project: uuid::Uuid| sqlx::query("delete from projects where id = $1").bind(project);
+    let project = cross_referenced_project(&pool).await;
+    remove(project).execute(&pool).await.expect("in migration order");
+    for statement in PROJECT_CASCADES {
+        let project = cross_referenced_project(&pool).await;
+        sqlx::query(statement).execute(&pool).await.unwrap();
+        if let Err(e) = remove(project).execute(&pool).await {
+            panic!("emptied last by: {statement}: {e}");
+        }
+    }
+    let left: i64 = sqlx::query_scalar(
+        "select (select count(*) from incidents) + (select count(*) from incident_severities)
+              + (select count(*) from escalation_policies) + (select count(*) from escalation_steps)
+              + (select count(*) from escalation_step_targets) + (select count(*) from on_call_schedules)
+              + (select count(*) from notification_channels) + (select count(*) from notification_deliveries)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+}

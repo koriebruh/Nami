@@ -45,9 +45,11 @@ alter table incidents
     add column source text not null default 'manual'
         constraint incidents_source_known check (source in
             ('monitor', 'heartbeat', 'log_alert', 'metric_alert', 'manual', 'integration', 'report_form')),
-    -- No action on delete: deleting a severity an incident uses is refused
-    -- (checked at the end of the statement, so a project's cascade still
-    -- removes both).
+    -- No action on delete: deleting a severity an incident uses is refused.
+    -- Removing a project still removes both: a cascade's own checks run
+    -- after every cascade already queued, and incidents are a direct
+    -- cascade of the project, like severities, so they are gone by the time
+    -- this is checked, whichever of the two goes first.
     add column severity_id uuid
         constraint incidents_severity_id_fkey references incident_severities(id) on delete no action,
     add column metadata jsonb not null default '{}'::jsonb
@@ -296,10 +298,11 @@ create table escalation_step_targets (
     user_id uuid
         constraint escalation_step_targets_user_id_fkey references users(id) on delete cascade,
     -- Removing a targeted schedule or channel is refused (23503), checked
-    -- at commit: removing the whole project cascades to the schedules and
-    -- channels and, separately, to the policies' targets, and the schedule
-    -- or channel cascade may run first. Checked any earlier (RESTRICT, or
-    -- NO ACTION at the end of that cascade), the project removal would fail.
+    -- at commit. Removing the whole project reaches the targets three
+    -- cascades deep (policy, step, target) but the schedules and channels
+    -- one deep, so a check queued by their removal (RESTRICT at once, NO
+    -- ACTION after the cascades already queued) would still see the
+    -- targets and fail the project removal.
     schedule_id uuid
         constraint escalation_step_targets_schedule_id_fkey references on_call_schedules(id)
         on delete no action deferrable initially deferred,
@@ -332,6 +335,9 @@ alter table incidents
     add column next_escalation_at timestamptz;
 create index incidents_escalation_due_idx on incidents (next_escalation_at)
     where status = 'open' and next_escalation_at is not null;
+-- Deleting a policy clears it on its incidents (set null) through this.
+create index incidents_escalation_policy_idx on incidents (escalation_policy_id)
+    where escalation_policy_id is not null;
 
 create function seed_default_escalation_policy(target_project uuid) returns void language plpgsql as $$
 declare

@@ -98,8 +98,16 @@ async fn policies_are_validated_and_scoped_to_their_project(pool: sqlx::PgPool) 
         Some(json!({"name": "self", "fallback_policy_id": id, "steps": step(json!([{"type": "all_members"}]))}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "no fallback to itself");
     let (_, _, other_admin) = user_with_role(&app, &pool, other, Some("admin")).await;
-    let (status, _) = call(&app, "GET", &format!("/projects/{other}/escalation-policies/{id}"), Some(&other_admin), None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let foreign = format!("/projects/{other}/escalation-policies/{id}");
+    for (method, uri, body) in [
+        ("GET", foreign.clone(), None),
+        ("PUT", foreign.clone(), Some(json!({"name": "x", "steps": step(json!([{"type": "all_members"}]))}))),
+        ("POST", format!("{foreign}/default"), Some(json!({}))),
+        ("DELETE", foreign.clone(), None),
+    ] {
+        let (status, _) = call(&app, method, &uri, Some(&other_admin), body).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+    }
 }
 
 #[sqlx::test]

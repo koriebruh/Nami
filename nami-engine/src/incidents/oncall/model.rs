@@ -801,16 +801,26 @@ pub enum Deleted {
 /// Deletes a schedule with its participants and overrides, unless an
 /// escalation step targets it (`InUse`).
 pub async fn delete(pool: &PgPool, project_id: Uuid, id: Uuid) -> Result<Deleted, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // The project lock policy saves take: without it a save committing a
+    // target between this check and the delete fails one of the two on the
+    // deferred foreign key (a 500).
+    sqlx::query("select id from projects where id = $1 for no key update")
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
     if let Some(policy) =
-        crate::incidents::escalation::model::policy_targeting_schedule(pool, project_id, id).await?
+        crate::incidents::escalation::model::policy_targeting_schedule(&mut *tx, project_id, id)
+            .await?
     {
         return Ok(Deleted::InUse { policy });
     }
     let result = sqlx::query("delete from on_call_schedules where id = $1 and project_id = $2")
         .bind(id)
         .bind(project_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(if result.rows_affected() > 0 { Deleted::Deleted } else { Deleted::NotFound })
 }
 
