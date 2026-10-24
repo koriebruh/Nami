@@ -29,6 +29,7 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "log_alerts",
         "incident_severities",
         "incident_events",
+        "notification_channels",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -393,6 +394,60 @@ async fn incident_lifecycle_constraints_are_all_named(pool: sqlx::PgPool) {
             "incidents_severity_id_fkey",
             "incidents_source_known",
             "incidents_status_check",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn a_channel_belongs_to_exactly_one_owner(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let user = common::seed_user(&pool, &common::unique_email("owner"), "member").await;
+    for (project_id, user_id, kind) in [
+        (None, None, "slack"),
+        (Some(project), Some(user), "slack"),
+        (None, Some(user), "email"),
+    ] {
+        let error = sqlx::query(
+            "insert into notification_channels (id, project_id, user_id, name, kind, config_enc, summary)
+             values (gen_random_uuid(), $1, $2, 'x', $3, '\\x00', 'x')",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .bind(kind)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("23514"),
+            "{project_id:?} {user_id:?} {kind}"
+        );
+    }
+}
+
+/// Every constraint of `notification_channels` carries the name its
+/// migration gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn notification_channels_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid = 'public.notification_channels'::regclass order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "notification_channels_created_by_fkey",
+            "notification_channels_kind_known",
+            "notification_channels_name_length",
+            "notification_channels_no_personal_email",
+            "notification_channels_one_owner",
+            "notification_channels_pkey",
+            "notification_channels_project_id_fkey",
+            "notification_channels_user_id_fkey",
+            "notification_channels_webhook_has_secret",
         ]
     );
 }

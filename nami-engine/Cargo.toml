@@ -17,6 +17,7 @@ form_urlencoded = "1.2.2"
 hex = "0.4.3"
 hickory-resolver = "0.26.3"
 hkdf = "0.13.0"
+hmac = "0.13.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "service"] }

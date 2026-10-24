@@ -82,6 +82,21 @@ pub struct Config {
     /// share of the ingest endpoint, so this bounds what one project's
     /// members can claim.
     pub max_sources_per_project: i64,
+    /// Which destinations notification sends may reach. `Strict` everywhere
+    /// but `from_env_for_test`: no environment variable reads it, so no
+    /// deployment can relax it.
+    pub outbound_policy: OutboundPolicy,
+}
+
+/// The send-time destination rules of notification channels (R9).
+/// `Relaxed` keeps the scheme, userinfo and host-present rules and the
+/// monitors' forbidden-address set, but skips the per-kind host allowlists,
+/// the `https`-only rule and the public-only rule, so integration tests can
+/// send to wiremock on `127.0.0.1`. Create/update validation is always strict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundPolicy {
+    Strict,
+    Relaxed,
 }
 
 impl Config {
@@ -161,11 +176,14 @@ impl Config {
 
     /// Test-only constructor: doesn't require `DATABASE_URL`/`GOOGLE_CLIENT_ID`/etc. to be
     /// set, so tests don't need a `.env` file. `sqlx::test` supplies its own pool directly,
-    /// so `database_url` is unused in tests. Identical to `from_env_defaults_only()` (which
-    /// already defaults `database_url`/`port`/`smtp_host`/`smtp_port`), kept as its own named
-    /// constructor for call-site clarity at test sites.
+    /// so `database_url` is unused in tests. `from_env_defaults_only()` (which already
+    /// defaults `database_url`/`port`/`smtp_host`/`smtp_port`) with one difference: the
+    /// outbound policy is `Relaxed`, the only place it ever is.
     pub fn from_env_for_test() -> Self {
-        Self::from_env_defaults_only()
+        Self {
+            outbound_policy: OutboundPolicy::Relaxed,
+            ..Self::from_env_defaults_only()
+        }
     }
 
     /// Shared OAuth-defaults block for `from_env()` and `from_env_for_test()`: each
@@ -225,6 +243,7 @@ impl Config {
             rdap_base_url: std::env::var("RDAP_BASE_URL")
                 .unwrap_or_else(|_| crate::uptime::checker::DEFAULT_RDAP_BASE_URL.to_string()),
             max_sources_per_project: DEFAULT_MAX_SOURCES_PER_PROJECT,
+            outbound_policy: OutboundPolicy::Strict,
         }
     }
 }

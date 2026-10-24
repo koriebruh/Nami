@@ -3,3 +3,4 @@ mod common;
 
 mod incident_lifecycle;
 mod incidents;
+mod notification_channels;

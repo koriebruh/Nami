@@ -78,6 +78,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(logs::source::routes::router())
         .merge(uptime::monitor::routes::router())
         .merge(incidents::routes::router())
+        .merge(incidents::channel::routes::router())
         .merge(uptime::heartbeat::routes::router())
         .merge(uptime::maintenance::routes::router())
         .merge(uptime::group::routes::router())

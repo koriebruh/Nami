@@ -124,3 +124,35 @@ insert into incident_events (incident_id, kind, created_at)
 select id, 'opened', started_at from incidents;
 insert into incident_events (incident_id, kind, created_at)
 select id, 'resolved', resolved_at from incidents where status = 'resolved';
+
+-- Notification channels (NAMI-INC-3). A channel belongs to a project (a team
+-- room, admin-managed) or to one user (personal). Secrets are sealed with
+-- core::crypto::Cipher under per-row contexts; `summary` is what the UI may show.
+create table notification_channels (
+    id uuid constraint notification_channels_pkey primary key,
+    project_id uuid
+        constraint notification_channels_project_id_fkey references projects(id) on delete cascade,
+    user_id uuid
+        constraint notification_channels_user_id_fkey references users(id) on delete cascade,
+    name text not null
+        constraint notification_channels_name_length check (char_length(name) between 1 and 100),
+    kind text not null
+        constraint notification_channels_kind_known
+        check (kind in ('email', 'webhook', 'slack', 'teams', 'telegram', 'discord')),
+    config_enc bytea not null,
+    signing_secret_enc bytea,
+    summary text not null,
+    enabled boolean not null default true,
+    last_tested_at timestamptz,
+    created_by uuid
+        constraint notification_channels_created_by_fkey references users(id) on delete set null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint notification_channels_one_owner check ((project_id is null) <> (user_id is null)),
+    constraint notification_channels_webhook_has_secret
+        check ((kind = 'webhook') = (signing_secret_enc is not null)),
+    -- A user's own verified address covers personal email (R8).
+    constraint notification_channels_no_personal_email check (user_id is null or kind <> 'email')
+);
+create index notification_channels_project_idx on notification_channels (project_id) where project_id is not null;
+create index notification_channels_user_idx on notification_channels (user_id) where user_id is not null;

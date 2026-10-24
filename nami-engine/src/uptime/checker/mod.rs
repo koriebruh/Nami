@@ -232,8 +232,8 @@ pub(crate) fn names_forbidden_address(url: &reqwest::Url) -> bool {
 /// `the_proxy_host_is_resolved_by_the_clients_resolver`). Addresses of the
 /// family `ip_version` excludes are dropped first (see [`keep_family`]), with
 /// no fallback.
-struct GuardedResolver {
-    ip_version: IpVersion,
+pub(crate) struct GuardedResolver {
+    pub(crate) ip_version: IpVersion,
 }
 
 impl reqwest::dns::Resolve for GuardedResolver {
@@ -1359,7 +1359,9 @@ fn io_error_kind(error: &(dyn std::error::Error + 'static)) -> Option<std::io::E
 
 /// Whether an `E` is anywhere in `error`'s `source()` chain (reqwest wraps a
 /// resolver's or a redirect policy's error several layers deep).
-fn caused_by<E: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn caused_by<E: std::error::Error + 'static>(
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
     let mut current = Some(error);
     while let Some(err) = current {
         if err.is::<E>() {
