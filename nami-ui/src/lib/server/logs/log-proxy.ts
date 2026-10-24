@@ -42,3 +42,10 @@ export function pickLogParams(params: URLSearchParams, keys: readonly string[]):
 	const text = picked.toString();
 	return text ? `?${text}` : '';
 }
+
+const LAST_EVENT_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** The Last-Event-ID to forward, or null when absent or not a plausible cursor. */
+export function lastEventIdHeader(value: string | null): string | null {
+	return value && LAST_EVENT_ID.test(value) ? value : null;
+}

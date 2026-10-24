@@ -113,6 +113,37 @@ describe('GET /projects/[id]/logs/tail', () => {
 		});
 	});
 
+	it('forwards a valid Last-Event-ID and nothing else from the browser', async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValue(new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } }));
+		const url = `http://ui.test/projects/${PROJECT}/logs/tail`;
+		const { event, controller } = fakeEvent(fetchMock, url);
+		event.request = new Request(url, {
+			headers: { cookie: 'id=session', 'last-event-id': 'abc_DEF-1', 'x-other': 'no' },
+			signal: controller.signal
+		});
+		await GET(event);
+		const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+		expect(headers.get('last-event-id')).toBe('abc_DEF-1');
+		expect(headers.get('x-other')).toBeNull();
+	});
+
+	it('drops a Last-Event-ID that is not a plausible cursor', async () => {
+		const fetchMock = vi
+			.fn()
+			.mockResolvedValue(new Response('', { status: 200, headers: { 'content-type': 'text/event-stream' } }));
+		const url = `http://ui.test/projects/${PROJECT}/logs/tail`;
+		const { event, controller } = fakeEvent(fetchMock, url);
+		event.request = new Request(url, {
+			headers: { cookie: 'id=session', 'last-event-id': 'a b' },
+			signal: controller.signal
+		});
+		await GET(event);
+		const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+		expect(headers.has('last-event-id')).toBe(false);
+	});
+
 	it('refuses a project id that is not a UUID before calling the engine', async () => {
 		const fetchMock = vi.fn();
 		const { event } = fakeEvent(fetchMock, 'http://ui.test/projects/x/logs/tail', '../monitors');

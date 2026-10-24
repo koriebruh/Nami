@@ -54,6 +54,8 @@ enum Sse {
 struct SseStream {
     body: Body,
     buffer: String,
+    /// The `id:` of the last block that carried one.
+    last_id: Option<String>,
 }
 
 impl SseStream {
@@ -62,9 +64,22 @@ impl SseStream {
         uri: &str,
         cookie: Option<&HeaderValue>,
     ) -> Result<SseStream, (StatusCode, Value)> {
+        Self::open_with(app, uri, cookie, None).await
+    }
+
+    /// `open`, sending `Last-Event-ID` when given.
+    async fn open_with(
+        app: &Router,
+        uri: &str,
+        cookie: Option<&HeaderValue>,
+        last_event_id: Option<&str>,
+    ) -> Result<SseStream, (StatusCode, Value)> {
         let mut request = Request::builder().uri(uri);
         if let Some(cookie) = cookie {
             request = request.header(header::COOKIE, cookie);
+        }
+        if let Some(id) = last_event_id {
+            request = request.header("last-event-id", id);
         }
         let response = app
             .clone()
@@ -89,6 +104,7 @@ impl SseStream {
         Ok(SseStream {
             body: response.into_body(),
             buffer: String::new(),
+            last_id: None,
         })
     }
 
@@ -99,7 +115,11 @@ impl SseStream {
         loop {
             if let Some(end) = self.buffer.find("\n\n") {
                 let block: String = self.buffer.drain(..end + 2).collect();
-                return Some(parse_block(block.trim_end()));
+                let (sse, id) = parse_block(block.trim_end());
+                if id.is_some() {
+                    self.last_id = id;
+                }
+                return Some(sse);
             }
             let frame = tokio::time::timeout_at(deadline, self.body.frame())
                 .await
@@ -131,23 +151,28 @@ impl SseStream {
     }
 }
 
-fn parse_block(block: &str) -> Sse {
+/// The block and its `id:`, if it has one.
+fn parse_block(block: &str) -> (Sse, Option<String>) {
     let mut event = None;
+    let mut id = None;
     let mut data = String::new();
     for line in block.lines() {
         if let Some(value) = line.strip_prefix("event:") {
             event = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("id:") {
+            id = Some(value.trim().to_string());
         } else if let Some(value) = line.strip_prefix("data:") {
             data.push_str(value.trim_start());
         }
     }
-    match event {
+    let sse = match event {
         None if data.is_empty() => Sse::Comment,
         event => Sse::Event {
             event: event.unwrap_or_default(),
             data: serde_json::from_str(&data).unwrap(),
         },
-    }
+    };
+    (sse, id)
 }
 
 /// Ingests through the public router; ingestion must be accepted (202).
@@ -598,5 +623,161 @@ async fn tailed_rows_are_cut_like_list_rows(pool: sqlx::PgPool) {
         None,
         "nothing twice"
     );
+    ch.drop_database().await.unwrap();
+}
+
+#[sqlx::test]
+async fn a_reconnect_with_last_event_id_gets_the_rows_it_missed(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let state = AppState {
+        logs: fast(|_| {}),
+        ..state
+    };
+    let public = public_app(state.clone());
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    let uri = format!("/projects/{project}/logs/tail");
+
+    let mut stream = SseStream::open(&app, &uri, Some(&viewer)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // A row dated before the cursor but inside the look-back: seen, and never
+    // sent again after the reconnect.
+    post_json(&public, &token, json!({ "message": "earlier", "dt": ago(2) })).await;
+    assert_eq!(
+        stream.next_log(Duration::from_secs(5)).await.unwrap()["message"],
+        "earlier"
+    );
+    post_json(&public, &token, json!({ "message": "seen" })).await;
+    assert_eq!(
+        stream.next_log(Duration::from_secs(5)).await.unwrap()["message"],
+        "seen"
+    );
+    let last = stream.last_id.clone().expect("log events carry an id");
+    drop(stream);
+
+    post_json(
+        &public,
+        &token,
+        json!([{ "message": "missed 1" }, { "message": "missed 2" }]),
+    )
+    .await;
+    let mut resumed = SseStream::open_with(&app, &uri, Some(&viewer), Some(&last))
+        .await
+        .unwrap();
+    let first = resumed.next_log(Duration::from_secs(5)).await.unwrap();
+    let second = resumed.next_log(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        (first["message"].clone(), second["message"].clone()),
+        (json!("missed 1"), json!("missed 2"))
+    );
+    post_json(&public, &token, json!({ "message": "live again" })).await;
+    assert_eq!(
+        resumed.next_log(Duration::from_secs(5)).await.unwrap()["message"],
+        "live again",
+        "\"seen\" and \"earlier\" are not sent twice and the stream goes on live"
+    );
+    ch.drop_database().await.unwrap();
+}
+
+#[sqlx::test]
+async fn an_unusable_last_event_id_starts_a_normal_tail(pool: sqlx::PgPool) {
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let state = AppState {
+        logs: fast(|_| {}),
+        ..state
+    };
+    let public = public_app(state.clone());
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let other = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let (_, foreign) = seed_source(&pool, other, "theirs").await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    post_json(&public, &token, json!({ "message": "old" })).await;
+    post_json(&public, &foreign, json!({ "message": "theirs" })).await;
+    let old = nami_engine::logs::query::Cursor {
+        dt_ms: (Utc::now() - chrono::Duration::minutes(10)).timestamp_millis(),
+        id: Uuid::nil(),
+    }
+    .encode();
+    let long = "A".repeat(4096);
+    for header in ["garbage", long.as_str(), old.as_str()] {
+        let mut stream = SseStream::open_with(
+            &app,
+            &format!("/projects/{project}/logs/tail"),
+            Some(&viewer),
+            Some(header),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        post_json(&public, &token, json!({ "message": "new" })).await;
+        assert_eq!(
+            stream.next_log(Duration::from_secs(5)).await.unwrap()["message"],
+            "new",
+            "nothing replayed for {header:?}, never another project's rows"
+        );
+    }
+    ch.drop_database().await.unwrap();
+}
+
+/// A poll reads list rows only for ids it has not sent (R-P2-25).
+#[sqlx::test]
+async fn polls_read_the_list_rows_of_new_ids_only(pool: sqlx::PgPool) {
+    use std::sync::atomic::Ordering;
+
+    let (state, ch) = state_with_clickhouse(&pool).await;
+    let logs = fast(|_| {});
+    let state = AppState {
+        logs: logs.clone(),
+        ..state
+    };
+    let public = public_app(state.clone());
+    let app = app(state);
+    let project = seed_project(&pool).await;
+    let (_, token) = seed_source(&pool, project, "api").await;
+    let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
+    // 100 rows already there, with large messages: re-reading them would show in the counter.
+    post_json(
+        &public,
+        &token,
+        json!(
+            (0..100)
+                .map(|n| json!({ "message": format!("{n} {}", "x".repeat(4000)) }))
+                .collect::<Vec<_>>()
+        ),
+    )
+    .await;
+
+    let mut stream = SseStream::open(
+        &app,
+        &format!("/projects/{project}/logs/tail"),
+        Some(&viewer),
+    )
+    .await
+    .unwrap();
+    let polls = |n: u64| logs.tail_stats.id_polls.load(Ordering::Relaxed) >= n;
+    common::logs::eventually("five polls", Duration::from_secs(5), || polls(5)).await;
+    assert_eq!(
+        logs.tail_stats.rows_fetched.load(Ordering::Relaxed),
+        0,
+        "rows stored before the tail are remembered by id, never read"
+    );
+    post_json(
+        &public,
+        &token,
+        json!([{ "message": "new 1" }, { "message": "new 2" }]),
+    )
+    .await;
+    stream.next_log(Duration::from_secs(5)).await.unwrap();
+    stream.next_log(Duration::from_secs(5)).await.unwrap();
+    let after = logs.tail_stats.id_polls.load(Ordering::Relaxed);
+    common::logs::eventually("five more polls", Duration::from_secs(5), || {
+        polls(after + 5)
+    })
+    .await;
+    assert_eq!(logs.tail_stats.rows_fetched.load(Ordering::Relaxed), 2);
     ch.drop_database().await.unwrap();
 }

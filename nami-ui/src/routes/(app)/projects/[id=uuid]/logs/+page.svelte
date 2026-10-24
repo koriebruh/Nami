@@ -17,11 +17,10 @@
 		isFieldPath,
 		LEVELS,
 		levelClasses,
-		LIVE_ROW_CAP,
 		MAX_COLUMNS,
 		MAX_FILTERS,
 		PAGE_SIZE,
-		tailParams,
+		tailKey,
 		TIME_PRESETS,
 		toggled,
 		toInputValue,
@@ -30,6 +29,7 @@
 		type FilterOp,
 		type LogEntry
 	} from '#lib/logs/logs';
+	import { startLiveTail, type LiveStatus } from '#lib/logs/live-tail';
 	import { formatUtc } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
@@ -56,20 +56,39 @@
 	let loadError = $state<string | null>(null);
 	const expanded = new SvelteSet<string>();
 
+	// "Load more" extends the page it was clicked on: a navigation aborts it,
+	// and an answer for an older page is dropped. Plain variables on purpose:
+	// the effect below must not depend on them.
+	let generation = 0;
+	let controller: AbortController | null = null;
+	$effect(() => {
+		void data.logs;
+		generation += 1;
+		controller?.abort();
+		controller = null;
+		loadingMore = false;
+		loadError = null;
+	});
+
 	async function loadMore() {
 		if (!nextCursor || loadingMore) return;
+		const mine = generation;
+		const own = new AbortController();
+		controller = own;
 		loadingMore = true;
 		loadError = null;
 		const params = engineParams(data.state, data.window);
 		params.set('cursor', nextCursor);
 		params.set('limit', String(PAGE_SIZE));
 		try {
-			const response = await fetch(`${path}/search?${params}`);
+			const response = await fetch(`${path}/search?${params}`, { signal: own.signal });
+			if (mine !== generation) return;
 			if (response.status === 401) {
 				await goto('/login');
 				return;
 			}
 			const body = await response.json().catch(() => null);
+			if (mine !== generation) return;
 			if (response.ok && body) {
 				rows = [...rows, ...body.logs];
 				nextCursor = body.next_cursor;
@@ -77,79 +96,40 @@
 				loadError = body?.error ?? 'Could not load more logs.';
 			}
 		} catch {
-			loadError = 'Could not load more logs.';
+			// An abort only comes from a navigation: nothing to report then.
+			if (mine === generation) loadError = 'Could not load more logs.';
 		} finally {
-			loadingMore = false;
+			if (mine === generation) {
+				loadingMore = false;
+				controller = null;
+			}
 		}
 	}
 
-	// Live tail: Server-Sent Events through the BFF while `live` is on. The
-	// stream closes when the toggle goes off, on navigation (effect cleanup)
-	// and when the page is hidden for good (pagehide); rows held are capped.
+	// Live tail: Server-Sent Events through the BFF while `live` is on (see
+	// `startLiveTail`). It restarts only when the filters it sends change
+	// (not for columns or the time range), and stops when the toggle goes
+	// off, which also clears its rows.
+	const liveKey = $derived(data.state.live ? tailKey(data.state) : null);
 	let liveRows = $state<LogEntry[]>([]);
-	let liveStatus = $state<'off' | 'connecting' | 'live' | 'reconnecting' | 'ended'>('off');
+	let liveStatus = $state<'off' | LiveStatus>('off');
 	let liveNotice = $state<string | null>(null);
 	$effect(() => {
-		if (!data.state.live) {
-			liveStatus = 'off';
-			liveNotice = null;
-			return;
-		}
-		const query = tailParams(data.state).toString();
-		const stream = new EventSource(`${path}/tail${query ? `?${query}` : ''}`);
 		liveRows = [];
 		liveNotice = null;
-		liveStatus = 'connecting';
-		stream.onopen = () => {
-			liveStatus = 'live';
-			liveNotice = null;
-		};
-		stream.addEventListener('log', (event) => {
-			let row: LogEntry;
-			try {
-				row = JSON.parse((event as MessageEvent).data);
-			} catch {
-				return;
-			}
-			liveRows = [row, ...liveRows].slice(0, LIVE_ROW_CAP);
-		});
-		// The engine ends a stream after 30 minutes ("timeout": EventSource
-		// reconnects by itself) or when the session is no longer valid
-		// ("session": no reconnect, it would only be refused again).
-		stream.addEventListener('end', (event) => {
-			let reason: unknown;
-			try {
-				reason = JSON.parse((event as MessageEvent).data).reason;
-			} catch {
-				reason = null;
-			}
-			if (reason === 'session') {
-				stream.close();
-				liveStatus = 'ended';
-				liveNotice = 'Live tail stopped: your session ended or access changed. Reload the page to resume.';
-			} else {
-				liveStatus = 'reconnecting';
-				liveNotice = 'The live stream reached its time limit and is reconnecting…';
+		if (liveKey === null) {
+			liveStatus = 'off';
+			return;
+		}
+		return startLiveTail(`${path}/tail${liveKey ? `?${liveKey}` : ''}`, {
+			onStatus: (status, notice) => {
+				liveStatus = status;
+				liveNotice = notice;
+			},
+			onRows: (next) => {
+				liveRows = next;
 			}
 		});
-		stream.onerror = () => {
-			if (stream.readyState === EventSource.CLOSED) {
-				liveStatus = 'ended';
-				liveNotice = 'Live tail could not be started (check the filters, or sign in again). Reload to retry.';
-			} else if (liveStatus === 'live') {
-				liveStatus = 'reconnecting';
-			}
-		};
-		const hide = () => {
-			stream.close();
-			liveStatus = 'ended';
-			liveNotice = 'Live tail paused while the page was hidden. Reload to resume.';
-		};
-		window.addEventListener('pagehide', hide);
-		return () => {
-			window.removeEventListener('pagehide', hide);
-			stream.close();
-		};
 	});
 
 	const shown = $derived.by(() => {
@@ -338,9 +318,13 @@
 								{source.name}
 							</label>
 						{:else}
-							<p class="px-2 py-1 text-sm text-muted">
-								No sources yet — <a href="{path}/sources" class="text-primary">create one</a>.
-							</p>
+							{#if data.sourcesError}
+								<p class="px-2 py-1 text-sm text-danger-ink" role="alert">{data.sourcesError}</p>
+							{:else}
+								<p class="px-2 py-1 text-sm text-muted">
+									No sources yet — <a href="{path}/sources" class="text-primary">create one</a>.
+								</p>
+							{/if}
 						{/each}
 					</div>
 				</details>
@@ -430,11 +414,13 @@
 			</div>
 			<LogVolumeChart histogram={data.histogram} onselect={(from, to) => go({ range: 'custom', from, to })} />
 		</div>
+	{:else if data.histogramError}
+		<div class="alert alert-warning" role="alert">{data.histogramError}</div>
 	{/if}
 
 	<div class="card">
 		<div class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
-			<div class="flex items-center gap-2 text-sm text-ink-2">
+			<div class="flex items-center gap-2 text-sm text-ink-2" role="status" aria-live="polite">
 				{#if liveStatus === 'live'}
 					<span class="h-2 w-2 animate-pulse rounded-full bg-success"></span><span class="text-success-ink">Live</span>
 				{:else if liveStatus === 'connecting'}
@@ -443,7 +429,7 @@
 					<span class="text-muted">Reconnecting…</span>
 				{/if}
 				{#if liveNotice}
-					<span class="text-warning-ink" role="status">{liveNotice}</span>
+					<span class="text-warning-ink">{liveNotice}</span>
 				{/if}
 			</div>
 			<form class="flex flex-wrap items-center gap-1" onsubmit={addColumn}>
@@ -455,7 +441,7 @@
 		</div>
 		{#if shown.length === 0}
 			<p class="px-4 py-12 text-center text-sm text-muted">
-				{#if data.sources.length === 0}
+				{#if data.sources.length === 0 && !data.sourcesError}
 					No sources yet — <a href="{path}/sources" class="text-primary">create one</a> to start sending logs.
 				{:else}
 					No logs match in this time range.
@@ -493,7 +479,7 @@
 								<td class="px-2 py-1.5">
 									<span class="rounded-full px-2 py-0.5 text-xs font-medium {levelClasses(row.level)}">{row.level}</span>
 								</td>
-								<td class="truncate px-2 py-1.5 text-xs text-ink-2">{sourceNames.get(row.source_id) ?? 'deleted source'}</td>
+								<td class="truncate px-2 py-1.5 text-xs text-ink-2">{sourceNames.get(row.source_id) ?? (data.sourcesError ? 'unknown source' : 'deleted source')}</td>
 								<td class="px-2 py-1.5">
 									<button
 										type="button"
@@ -527,7 +513,7 @@
 										{/if}
 										<pre class="max-h-96 overflow-auto font-mono text-xs wrap-anywhere whitespace-pre-wrap text-ink">{full.message}</pre>
 										<pre
-											class="max-h-96 overflow-auto rounded-control border border-border bg-surface-2 p-3 font-mono text-xs text-ink-2">{JSON.stringify(full.fields, null, 2)}</pre>
+											class="max-h-96 overflow-auto rounded-control border border-border bg-surface-2 p-3 font-mono text-xs wrap-anywhere whitespace-pre-wrap text-ink-2">{JSON.stringify(full.fields, null, 2)}</pre>
 										<dl class="grid gap-x-6 gap-y-1 text-xs text-muted sm:grid-cols-2">
 											<div>id <code class="text-ink-2">{row.id}</code></div>
 											<div>pattern <code class="text-ink-2">{row.pattern_hash}</code></div>

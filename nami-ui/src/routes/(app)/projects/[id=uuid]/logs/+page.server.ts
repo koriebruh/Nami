@@ -56,6 +56,12 @@ export const load: PageServerLoad = async (event) => {
 		searchError = await engineErrorMessage(searchResponse, 'Could not search the logs.');
 	}
 	const histogram: Histogram | null = histogramResponse.ok ? await histogramResponse.json() : null;
+	const histogramError = histogramResponse.ok
+		? null
+		: await engineErrorMessage(histogramResponse, 'Could not load the log volume chart.');
 	const sources: Source[] = sourcesResponse.ok ? await sourcesResponse.json() : [];
-	return { state, window, logs, nextCursor, searchError, histogram, sources };
+	const sourcesError = sourcesResponse.ok
+		? null
+		: await engineErrorMessage(sourcesResponse, 'Could not load the sources.');
+	return { state, window, logs, nextCursor, searchError, histogram, histogramError, sources, sourcesError };
 };

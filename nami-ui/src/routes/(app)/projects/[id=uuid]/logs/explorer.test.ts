@@ -78,4 +78,19 @@ describe('explorer load', () => {
 		expect(data.histogram).toBeNull();
 		expect(data.sources).toEqual([]);
 	});
+
+	it('says why the histogram or the source list is missing', async () => {
+		const { event } = fakeEvent({
+			respond: engine({ histogram: json({ error: 'the log store is unavailable' }, 500), sources: json({}, 500) })
+		});
+		const data: any = await load(event);
+		expect(data.histogramError).toBe('the log store is unavailable');
+		expect(data.sourcesError).toBe('Could not load the sources.');
+		expect(data.logs).toEqual([]);
+		expect(data.nextCursor).toBe('c1');
+
+		const fine = fakeEvent({ respond: engine() });
+		const ok: any = await load(fine.event);
+		expect([ok.histogramError, ok.sourcesError]).toEqual([null, null]);
+	});
 });

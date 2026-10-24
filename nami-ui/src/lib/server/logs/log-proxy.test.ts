@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
 	EXPORT_PARAMS,
 	FILTER_PARAMS,
+	lastEventIdHeader,
 	pickLogParams,
 	SEARCH_PARAMS,
 	TAIL_PARAMS
@@ -37,5 +38,16 @@ describe('pickLogParams', () => {
 		expect(Object.isFrozen(EXPORT_PARAMS)).toBe(true);
 		expect(EXPORT_PARAMS).not.toContain('cursor');
 		expect(EXPORT_PARAMS).not.toContain('limit');
+	});
+});
+
+describe('lastEventIdHeader', () => {
+	it('forwards only a plausible cursor', () => {
+		expect(lastEventIdHeader('MTc5MjAwMDAwMDAwMDpjMTNiYzEwYS1kMTdm')).toBe('MTc5MjAwMDAwMDAwMDpjMTNiYzEwYS1kMTdm');
+		expect(lastEventIdHeader(null)).toBeNull();
+		expect(lastEventIdHeader('')).toBeNull();
+		expect(lastEventIdHeader('a b')).toBeNull();
+		expect(lastEventIdHeader('x'.repeat(128))).toBe('x'.repeat(128));
+		expect(lastEventIdHeader('x'.repeat(129))).toBeNull();
 	});
 });

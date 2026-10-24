@@ -1,6 +1,6 @@
 import { error } from '@sveltejs/kit';
 import { callEngine, enginePath } from '#lib/server/core/engine';
-import { pickLogParams, TAIL_PARAMS } from '#lib/server/logs/log-proxy';
+import { lastEventIdHeader, pickLogParams, TAIL_PARAMS } from '#lib/server/logs/log-proxy';
 import { isUuid } from '#lib/core/uuid';
 import type { RequestHandler } from './$types';
 
@@ -14,14 +14,18 @@ import type { RequestHandler } from './$types';
  * does not reconnect on a non-200 answer, so the page sees the failure once
  * and decides (a 401 means "log in again"), instead of a redirect page being
  * mistaken for a stream.
+ *
+ * The only browser header passed on is a plausible `Last-Event-ID`, so the
+ * engine can replay what a reconnecting EventSource missed.
  */
 export const GET: RequestHandler = async (event) => {
 	if (!isUuid(event.params.id)) throw error(404, 'Not found');
 	const query = pickLogParams(event.url.searchParams, TAIL_PARAMS);
+	const lastEventId = lastEventIdHeader(event.request.headers.get('last-event-id'));
 	let response: Response;
 	try {
 		response = await callEngine(event, enginePath`/projects/${event.params.id}/logs/tail` + query, {
-			headers: { accept: 'text/event-stream' },
+			headers: { accept: 'text/event-stream', ...(lastEventId ? { 'last-event-id': lastEventId } : {}) },
 			signal: event.request.signal
 		});
 	} catch (cause) {

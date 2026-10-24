@@ -16,17 +16,21 @@ import {
 	fromInputValue,
 	ingestUrl,
 	isFieldPath,
+	isLogEntry,
 	levelClasses,
+	mergeLiveRows,
 	MIB,
 	parseExplorerState,
 	quotaInMib,
 	resolveWindow,
 	rsyslogSnippet,
+	tailKey,
 	tailParams,
 	toggled,
 	toInputValue,
 	vectorSnippet,
-	type ExplorerState
+	type ExplorerState,
+	type LogEntry
 } from './logs';
 
 describe('formatBytes', () => {
@@ -235,5 +239,42 @@ describe('entryHref', () => {
 				dt: '2026-10-13T12:00:00.123Z'
 			})
 		).toBe('/projects/p/logs/entry/1c7f4f4e-7e3b-4d2f-8c8b-3a2e4d5c6b70?dt=2026-10-13T12%3A00%3A00.123Z');
+	});
+});
+
+const row = (id: string, message = id): LogEntry =>
+	({
+		id,
+		source_id: 'c13bc10a-d17f-443b-8976-c6d9b54e2798',
+		dt: '2026-10-19T08:00:00.000Z',
+		level: 'info',
+		message,
+		fields: {},
+		trace_id: '',
+		span_id: '',
+		pattern_hash: '1',
+		truncated: false
+	}) as LogEntry;
+
+describe('live rows', () => {
+	it('validates incoming rows', () => {
+		expect(isLogEntry(row('a'))).toBe(true);
+		const { truncated: _, ...untruncated } = row('a');
+		expect(isLogEntry(untruncated)).toBe(true);
+		expect(isLogEntry({ id: 'a' })).toBe(false);
+		expect(isLogEntry({ ...row('a'), message: 5 })).toBe(false);
+		expect(isLogEntry({ ...row('a'), truncated: 'yes' })).toBe(false);
+		expect(isLogEntry({ ...row('a'), fields: null })).toBe(false);
+		expect(isLogEntry(null)).toBe(false);
+	});
+	it('prepends newest first, drops duplicates and caps', () => {
+		const merged = mergeLiveRows([row('b'), row('a')], [row('b'), row('c'), row('d')], 3);
+		expect(merged.map((r) => r.id)).toEqual(['d', 'c', 'b']);
+	});
+	it('restarts the tail only for filter changes', () => {
+		const base = parseExplorerState(new URLSearchParams('level=error&live=1'));
+		expect(tailKey({ ...base, columns: ['a.b'] })).toBe(tailKey(base));
+		expect(tailKey({ ...base, range: '7d' })).toBe(tailKey(base));
+		expect(tailKey({ ...base, q: 'disk' })).not.toBe(tailKey(base));
 	});
 });

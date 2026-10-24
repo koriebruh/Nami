@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, RawQuery, State},
-    http::{HeaderValue, header, header::HeaderName},
+    http::{HeaderMap, HeaderValue, header, header::HeaderName},
     response::{
         IntoResponse, Response,
         sse::{KeepAlive, Sse},
@@ -129,24 +129,32 @@ async fn log_entry(
 
 /// Server-Sent Events of new rows matching the search filters (no window,
 /// cursor or limit); see `logs::query::tail`. At most `MAX_TAILS_PER_USER` streams
-/// per user and `MAX_TAILS_GLOBAL` in all, else 429.
+/// per user and `MAX_TAILS_GLOBAL` in all, else 429. A recent `Last-Event-ID`
+/// replays the rows after it (`tail::resume_cursor`); any other is ignored.
 async fn tail_logs(
     State(state): State<AppState>,
     user: CurrentUser,
     session: Session,
     Path(project_id): Path<Uuid>,
+    headers: HeaderMap,
     RawQuery(raw): RawQuery,
 ) -> Result<Response, AppError> {
     require_project_role(&state.db, &user, project_id, Role::Viewer).await?;
     let filters =
         query::parse_filters(&query::query_pairs(raw.as_deref())).map_err(AppError::Validation)?;
+    let resume = tail::resume_cursor(
+        headers
+            .get("last-event-id")
+            .and_then(|value| value.to_str().ok()),
+        Utc::now(),
+    );
     let permit = tail::TailPermit::acquire(&state.logs, user.id)?;
     let keep_alive = state.logs.tail.keep_alive;
     let (tx, rx) = mpsc::channel(64);
     tokio::spawn(async move {
         // The slot is held exactly as long as the stream is.
         let _permit = permit;
-        tail::run(state, session, project_id, filters, tx).await;
+        tail::run(state, session, project_id, filters, resume, tx).await;
     });
     let mut response = Sse::new(ReceiverStream::new(rx))
         .keep_alive(KeepAlive::new().interval(keep_alive))

@@ -173,6 +173,33 @@ export type LogEntry = {
 	truncated?: boolean;
 };
 
+const ENTRY_STRINGS = ['id', 'source_id', 'dt', 'level', 'message', 'trace_id', 'span_id', 'pattern_hash'] as const;
+
+/** A row as the live tail sends it (the stream is not trusted to keep its shape). */
+export function isLogEntry(value: unknown): value is LogEntry {
+	if (!value || typeof value !== 'object') return false;
+	const entry = value as Record<string, unknown>;
+	return (
+		ENTRY_STRINGS.every((key) => typeof entry[key] === 'string') &&
+		typeof entry.fields === 'object' &&
+		entry.fields !== null &&
+		(entry.truncated === undefined || typeof entry.truncated === 'boolean')
+	);
+}
+
+/** `incoming` (oldest first) prepended newest-first to `existing`, without duplicate ids, at most `cap` rows. */
+export function mergeLiveRows(existing: LogEntry[], incoming: LogEntry[], cap: number): LogEntry[] {
+	const seen = new Set<string>();
+	const merged: LogEntry[] = [];
+	for (const row of [...[...incoming].reverse(), ...existing]) {
+		if (merged.length >= cap) break;
+		if (seen.has(row.id)) continue;
+		seen.add(row.id);
+		merged.push(row);
+	}
+	return merged;
+}
+
 /** The BFF URL of one whole row, from the explorer at `explorerPath`. */
 export function entryHref(explorerPath: string, row: Pick<LogEntry, 'id' | 'dt'>): string {
 	return `${explorerPath}/entry/${encodeURIComponent(row.id)}?${new URLSearchParams({ dt: row.dt })}`;
@@ -348,6 +375,11 @@ export function tailParams(state: ExplorerState): URLSearchParams {
 	if (state.q && state.inFields) params.set('in_fields', 'true');
 	for (const filter of state.filters) params.append('filter', JSON.stringify(filter));
 	return params;
+}
+
+/** What restarts the live tail: only the filters it sends. */
+export function tailKey(state: ExplorerState): string {
+	return tailParams(state).toString();
 }
 
 /** Search and histogram parameters: the filters plus the window. */
