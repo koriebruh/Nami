@@ -198,7 +198,7 @@ async fn the_output_of_the_ping_that_opens_the_incident_is_attached_to_it(pool: 
         StatusCode::OK
     );
     let (_, incidents) = call(&app, "GET", &list, Some(&member), None).await;
-    let incidents = incidents.as_array().unwrap();
+    let incidents = incidents["incidents"].as_array().unwrap();
     assert_eq!(incidents.len(), 1, "{incidents:?}");
     assert_eq!(incidents[0]["details"], output);
     assert_eq!(
@@ -214,7 +214,7 @@ async fn the_output_of_the_ping_that_opens_the_incident_is_attached_to_it(pool: 
         StatusCode::OK
     );
     let (_, incidents) = call(&app, "GET", &list, Some(&member), None).await;
-    assert_eq!(incidents[0]["details"], output);
+    assert_eq!(incidents["incidents"][0]["details"], output);
 
     // The DOWN email quotes the output.
     let mut mail = vec![];
@@ -245,7 +245,7 @@ async fn the_output_of_the_ping_that_opens_the_incident_is_attached_to_it(pool: 
         StatusCode::OK
     );
     let (_, incidents) = call(&app, "GET", &list, Some(&member), None).await;
-    let incidents = incidents.as_array().unwrap();
+    let incidents = incidents["incidents"].as_array().unwrap();
     assert_eq!(incidents.len(), 1);
     assert_eq!(incidents[0]["status"], "open");
     assert_eq!(incidents[0]["details"], Value::Null);
@@ -381,7 +381,7 @@ async fn a_first_failure_with_the_maximum_output_opens_an_incident_with_all_of_i
         None,
     )
     .await;
-    let details = incidents[0]["details"].as_str().unwrap();
+    let details = incidents["incidents"][0]["details"].as_str().unwrap();
     assert_eq!(details.len(), MAX_OUTPUT_BYTES + TRUNCATED_MARKER.len());
     assert_eq!(
         details,

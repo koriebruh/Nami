@@ -5,4 +5,5 @@ pub mod model;
 pub mod routes;
 pub mod oncall;
 pub mod outbound;
+pub mod severity;
 pub mod timewindow;

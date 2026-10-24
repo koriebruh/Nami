@@ -19,11 +19,17 @@ pub fn validate_name(raw: &str) -> Result<String, String> {
 }
 
 /// Rule for any short label (monitor and heartbeat names, maintenance window
-/// titles): trimmed, 1-200 characters, no control characters (labels end up
-/// in alert email subjects) and none of the invisible or text-direction
-/// characters that let a label render as something it is not (see
-/// `is_invisible_or_bidi_char`). `field` names the label in the message.
+/// titles): [`validate_line`] with at most 200 characters.
 pub fn validate_label(field: &str, raw: &str) -> Result<String, String> {
+    validate_line(field, raw, 200)
+}
+
+/// Rule for one line of user text: trimmed, 1 to `max_chars` characters, no
+/// control characters (lines end up in alert email subjects) and none of the
+/// invisible or text-direction characters that let a line render as
+/// something it is not (see `is_invisible_or_bidi_char`). Returns the trimmed
+/// text. `field` names the line in the message.
+pub fn validate_line(field: &str, raw: &str, max_chars: usize) -> Result<String, String> {
     // Checked on the raw input, before trimming: U+2028 and U+2029 are
     // whitespace, so `trim` would otherwise drop them at the edges instead
     // of rejecting them.
@@ -36,13 +42,28 @@ pub fn validate_label(field: &str, raw: &str) -> Result<String, String> {
     if label.is_empty() {
         return Err(format!("{field} is required"));
     }
-    if label.chars().count() > 200 {
-        return Err(format!("{field} must be at most 200 characters"));
+    if label.chars().count() > max_chars {
+        return Err(format!("{field} must be at most {max_chars} characters"));
     }
     if label.chars().any(char::is_control) {
         return Err(format!("{field} must not contain control characters"));
     }
     Ok(label.to_string())
+}
+
+/// Rule for multi-line user text (incident descriptions, comments,
+/// postmortems): at most `max_bytes` bytes, and no control character other
+/// than `\n` and `\t`. The text is kept as it is (not trimmed).
+pub fn validate_text(field: &str, raw: &str, max_bytes: usize) -> Result<(), String> {
+    if raw.len() > max_bytes {
+        return Err(format!("{field} must be at most {max_bytes} bytes"));
+    }
+    if raw.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return Err(format!(
+            "{field} must not contain control characters other than newlines and tabs"
+        ));
+    }
+    Ok(())
 }
 
 thread_local! {

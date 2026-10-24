@@ -151,8 +151,8 @@ async fn an_alert_opens_and_resolves_its_incident_and_emails_once_each(pool: sql
     assert!(mail[0].1.contains("Condition: 3 matching events in the last 5 min (threshold: > 2)"), "{}", mail[0].1);
 
     let (_, listed) = call(&app, "GET", &format!("/projects/{project}/incidents"), Some(&member), None).await;
-    assert_eq!(listed[0]["source_name"], "Checkout errors");
-    assert_eq!(listed[0]["log_alert_id"], json!(id));
+    assert_eq!(listed["incidents"][0]["source_name"], "Checkout errors");
+    assert_eq!(listed["incidents"][0]["log_alert_id"], json!(id));
     ch.drop_database().await.unwrap();
 }
 

@@ -805,7 +805,8 @@ async fn incidents_are_newest_first_and_filterable(pool: sqlx::PgPool) {
     seed_incident(&pool, other_project, elsewhere, "open", 10).await;
     let (_, _, viewer) = user_with_role(&app, &pool, project, Some("viewer")).await;
     let ids = |list: &Value| -> Vec<String> {
-        list.as_array()
+        list["incidents"]
+            .as_array()
             .unwrap()
             .iter()
             .map(|i| i["id"].as_str().unwrap().to_string())
@@ -823,17 +824,17 @@ async fn incidents_are_newest_first_and_filterable(pool: sqlx::PgPool) {
             old_resolved.to_string()
         ]
     );
-    assert_eq!(all[0]["source_name"], "Web");
-    assert_eq!(all[0]["monitor_id"], web.to_string());
+    assert_eq!(all["incidents"][0]["source_name"], "Web");
+    assert_eq!(all["incidents"][0]["monitor_id"], web.to_string());
     assert!(
-        all[0].get("heartbeat_id").is_some_and(Value::is_null),
+        all["incidents"][0].get("heartbeat_id").is_some_and(Value::is_null),
         "monitor incidents carry the heartbeat_id key, null: {}",
-        all[0]
+        all["incidents"][0]
     );
     assert!(
-        all[0].get("resolved_at").is_some_and(Value::is_null),
+        all["incidents"][0].get("resolved_at").is_some_and(Value::is_null),
         "an open incident carries the resolved_at key, null: {}",
-        all[0]
+        all["incidents"][0]
     );
 
     let (_, open) = call(
@@ -855,9 +856,9 @@ async fn incidents_are_newest_first_and_filterable(pool: sqlx::PgPool) {
     .await;
     assert_eq!(ids(&resolved), vec![old_resolved.to_string()]);
     assert!(
-        resolved[0].get("resolved_at").is_some_and(Value::is_string),
+        resolved["incidents"][0].get("resolved_at").is_some_and(Value::is_string),
         "a resolved incident carries its resolved_at: {}",
-        resolved[0]
+        resolved["incidents"][0]
     );
     let (_, for_api) = call(
         &app,

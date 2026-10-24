@@ -467,9 +467,9 @@ async fn heartbeat_incidents_appear_in_the_incident_list(pool: sqlx::PgPool) {
     .await;
 
     assert_eq!(status, StatusCode::OK, "{list}");
-    assert_eq!(list[0]["heartbeat_id"], id.to_string());
-    assert_eq!(list[0]["monitor_id"], Value::Null);
-    assert_eq!(list[0]["source_name"], "Nightly backup");
+    assert_eq!(list["incidents"][0]["heartbeat_id"], id.to_string());
+    assert_eq!(list["incidents"][0]["monitor_id"], Value::Null);
+    assert_eq!(list["incidents"][0]["source_name"], "Nightly backup");
 }
 
 // ---------------------------------------------------------------------------

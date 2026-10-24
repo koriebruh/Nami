@@ -162,6 +162,7 @@ async fn every_state_changing_route_refuses_bodies_that_are_not_json(pool: sqlx:
         source["id"].as_str().unwrap()
     );
 
+    let incident = Uuid::new_v4();
     for (method, uri) in [
         ("POST", "/auth/logout".to_string()),
         ("POST", "/auth/totp/setup".to_string()),
@@ -182,6 +183,13 @@ async fn every_state_changing_route_refuses_bodies_that_are_not_json(pool: sqlx:
         ("PATCH", format!("/projects/{project}/notification-channels/{}", Uuid::new_v4())),
         ("POST", "/account/notification-channels".to_string()),
         ("PATCH", format!("/account/notification-channels/{}", Uuid::new_v4())),
+        ("POST", format!("/projects/{project}/incidents")),
+        ("PATCH", format!("/projects/{project}/incidents/{incident}")),
+        ("POST", format!("/projects/{project}/incidents/{incident}/acknowledge")),
+        ("POST", format!("/projects/{project}/incidents/{incident}/resolve")),
+        ("POST", format!("/projects/{project}/incidents/{incident}/reopen")),
+        ("POST", format!("/projects/{project}/incidents/{incident}/comments")),
+        ("PUT", format!("/projects/{project}/incidents/{incident}/postmortem")),
     ] {
         for cookie in [Some(&admin), None] {
             for (content_type, body) in NOT_JSON {
