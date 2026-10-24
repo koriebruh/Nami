@@ -170,3 +170,54 @@ async fn resolving_stops_escalation_and_reopening_restarts_it_in_a_new_generatio
     assert_eq!((policy, generation), (Some(default), 2), "a deleted policy falls back to the default");
     assert!((before..=after).contains(&next.unwrap()), "the default's first step has no delay");
 }
+
+#[sqlx::test]
+async fn a_project_holds_at_most_the_policy_limit(pool: sqlx::PgPool) {
+    use nami_engine::incidents::escalation::model::MAX_POLICIES_PER_PROJECT;
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    // With Default, one short of the limit.
+    sqlx::query("insert into escalation_policies (project_id, name) select $1, 'p' || n from generate_series(1, $2) as n")
+        .bind(project).bind(MAX_POLICIES_PER_PROJECT - 2).execute(&pool).await.unwrap();
+    let path = format!("/projects/{project}/escalation-policies");
+    let body = |name: &str| json!({"name": name, "steps": [{"delay_minutes": 0, "targets": [{"type": "all_members"}]}]});
+    let (status, _) = call(&app, "POST", &path, Some(&admin), Some(body("last"))).await;
+    assert_eq!(status, StatusCode::CREATED, "the limit itself is allowed");
+    let (status, _) = call(&app, "POST", &path, Some(&admin), Some(body("one too many"))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _) = call(&app, "POST", &path, Some(&admin), Some(body("Default"))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
+#[sqlx::test]
+async fn only_admins_change_policies(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let path = format!("/projects/{project}/escalation-policies");
+    let (_, list) = call(&app, "GET", &path, Some(&member), None).await;
+    let id = list[0]["id"].as_str().unwrap();
+    let body = json!({"name": "Default", "steps": [{"delay_minutes": 0, "targets": [{"type": "all_members"}]}]});
+    for (method, uri, body) in [
+        ("PUT", format!("{path}/{id}"), Some(body)),
+        ("POST", format!("{path}/{id}/default"), Some(json!({}))),
+        ("DELETE", format!("{path}/{id}"), None),
+    ] {
+        let (status, _) = call(&app, method, &uri, Some(&member), body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+    }
+}
+
+#[sqlx::test]
+async fn a_manual_incident_cannot_use_another_projects_policy(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let other = seed_project(&pool).await;
+    let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let foreign: Uuid = sqlx::query_scalar("select id from escalation_policies where project_id = $1")
+        .bind(other).fetch_one(&pool).await.unwrap();
+    let (status, _) = call(&app, "POST", &format!("/projects/{project}/incidents"), Some(&member),
+        Some(json!({"title": "x", "escalation_policy_id": foreign}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
