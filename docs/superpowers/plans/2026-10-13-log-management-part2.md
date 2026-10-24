@@ -1,6 +1,6 @@
 # Log Management — Part 2 Implementation Plan
 
-> **Status:** in progress. NAMI-LOG-9 to NAMI-LOG-13 are merged (PRs #56, #63, #67, #75, #76, under the old one-PR-per-task flow). Next is NAMI-LOG-14; NAMI-LOG-15 to NAMI-LOG-18 and the Part 2 security review (NAMI-LOG-19) follow.
+> **Status:** done. NAMI-LOG-9..13 merged as PRs #56, #63, #67, #75, #76; NAMI-LOG-14..19 shipped as one phase PR. Decisions: `docs/superpowers/decisions/2026-10-25-log-management-part2.md`.
 > **Branch:** `feat/logs-part2` in `.worktrees/logs-part2/`.
 > **Depends on:** Logs Part 1 and Uptime Phases 1-3 (merged).
 

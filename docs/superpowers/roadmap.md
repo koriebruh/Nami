@@ -34,7 +34,7 @@ phase PR each.
 
 | # | Phase | Plan | Branch | Status |
 |---|---|---|---|---|
-| 1 | Logs Part 2 | `plans/2026-10-13-log-management-part2.md` | `feat/logs-part2` | in progress |
+| 1 | Logs Part 2 | `plans/2026-10-13-log-management-part2.md` | `feat/logs-part2` | done |
 | 2 | Incidents Part 1 | `plans/2026-10-13-incident-management-part1.md` | `feat/incidents-part1` | ready |
 | 3 | Incidents Part 2 | `plans/2026-10-24-incident-management-part2.md` | `feat/incidents-part2` | outline |
 | 4 | Status Pages Part 1 | `plans/2026-10-13-status-pages-part1.md` | `feat/statuspages-part1` | ready |
@@ -121,28 +121,19 @@ their step-level code is written at phase start against the then-current
 - [x] **R3.11** Live tail (SSE through the BFF)
 - [x] **R3.12** UI: sources, explorer, live tail
 
-### Part 2 — in progress (plan: `docs/superpowers/plans/2026-10-13-log-management-part2.md`, branch `feat/logs-part2`)
+### Part 2 — done (PRs #56, #63, #67, #75, #76 and the phase PR for NAMI-LOG-14..19; decisions: `docs/superpowers/decisions/2026-10-25-log-management-part2.md`)
 
-Items stay unticked until the phase PR merges. The status note after each
-item says what is already on `main`.
-
-- [ ] **R3.13** Per-source ingest pipeline: drop, remove fields, redact, rename,
-      sample (1 in N). *Engine on `main` (NAMI-LOG-10 #63, NAMI-LOG-11 #67);
-      UI pending (NAMI-LOG-16).*
-- [ ] **R3.14** Message pattern grouping + explorer Patterns tab. *Engine on `main`
-      (NAMI-LOG-9 #56); UI pending (NAMI-LOG-17).*
-- [ ] **R3.15** Streamed CSV/NDJSON export (capped at 100k rows). *Engine and UI on
-      `main` (NAMI-LOG-12 #75); explorer warning pending (NAMI-LOG-17).*
-- [ ] **R3.16** Saved views. *Engine on `main` (NAMI-LOG-13 #76); UI pending
-      (NAMI-LOG-17).*
-- [ ] **R3.17** Log alerts (threshold over a window → incident). *Pending
-      (NAMI-LOG-14, NAMI-LOG-18).*
-- [ ] **R3.18** Live-tail resume across reconnects and the explorer fixes Part 1
-      deferred. *Pending (NAMI-LOG-15).*
-- [ ] **R3.19** 30-day usage chart per source. *Pending (NAMI-LOG-16).*
-- [ ] **R3.20** UI: pipeline editor, Patterns tab, saved views, alerts. *Pending
-      (NAMI-LOG-16..18).*
-- [ ] **R3.21** Part 2 security review + fix wave.
+- [x] **R3.13** Per-source ingest pipeline: drop, remove fields, redact, rename,
+      sample (1 in N).
+- [x] **R3.14** Message pattern grouping + explorer Patterns tab.
+- [x] **R3.15** Streamed CSV/NDJSON export (capped at 100k rows).
+- [x] **R3.16** Saved views.
+- [x] **R3.17** Log alerts (threshold over a window → incident).
+- [x] **R3.18** Live-tail resume across reconnects and the explorer fixes Part 1
+      deferred.
+- [x] **R3.19** 30-day usage chart per source.
+- [x] **R3.20** UI: pipeline editor, Patterns tab, saved views, alerts.
+- [x] **R3.21** Part 2 security review + fix wave.
 
 ## 4. Incident management + on-call
 
