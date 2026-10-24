@@ -34,6 +34,7 @@ describe('renderMarkdown', () => {
 		expect(renderMarkdown('`a_b_c` and [w](https://x.test/a_b_c*d*)')).toBe(
 			'<p><code>a_b_c</code> and <a href="https://x.test/a_b_c*d*" rel="noopener noreferrer nofollow">w</a></p>'
 		);
+		expect(renderMarkdown('[x](https://a.test/`y`)')).toBe('<p>[x](https://a.test/<code>y</code>)</p>');
 		expect(renderMarkdown('snake_case_name stays _as is_')).toBe('<p>snake_case_name stays <em>as is</em></p>');
 	});
 

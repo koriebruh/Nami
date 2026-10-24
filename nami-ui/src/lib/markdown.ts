@@ -23,7 +23,8 @@ const LIST_ITEM = /^\s*([-*]|\d+\.)\s+(.*)$/;
 const CODE_SPAN = /`([^`\n]+)`/g;
 // The target allows one level of balanced parentheses: `https://x/a(1)`.
 const LINK = /\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+)\)/g;
-const SAFE_URL = /^https?:\/\/[^\s<>]+$/;
+// No NUL: a held code span inside a target keeps the link literal.
+const SAFE_URL = /^https?:\/\/[^\s<>\0]+$/;
 const STRONG = /\*\*([^*\n]+)\*\*/g;
 const EM_STAR = /\*([^*\n]+)\*/g;
 // `_` only at word edges, so snake_case_names stay as they are.
