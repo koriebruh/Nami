@@ -72,7 +72,11 @@
 
 	async function loadMore() {
 		if (!nextCursor || loadingMore) return;
+		// The generation alone could miss a navigation whose effect has not
+		// run yet; the page's own rows cannot.
 		const mine = generation;
+		const base = data.logs;
+		const stale = () => mine !== generation || data.logs !== base;
 		const own = new AbortController();
 		controller = own;
 		loadingMore = true;
@@ -82,13 +86,13 @@
 		params.set('limit', String(PAGE_SIZE));
 		try {
 			const response = await fetch(`${path}/search?${params}`, { signal: own.signal });
-			if (mine !== generation) return;
+			if (stale()) return;
 			if (response.status === 401) {
 				await goto('/login');
 				return;
 			}
 			const body = await response.json().catch(() => null);
-			if (mine !== generation) return;
+			if (stale()) return;
 			if (response.ok && body) {
 				rows = [...rows, ...body.logs];
 				nextCursor = body.next_cursor;
@@ -97,9 +101,9 @@
 			}
 		} catch {
 			// An abort only comes from a navigation: nothing to report then.
-			if (mine === generation) loadError = 'Could not load more logs.';
+			if (!stale()) loadError = 'Could not load more logs.';
 		} finally {
-			if (mine === generation) {
+			if (!stale()) {
 				loadingMore = false;
 				controller = null;
 			}
@@ -414,7 +418,7 @@
 			</div>
 			<LogVolumeChart histogram={data.histogram} onselect={(from, to) => go({ range: 'custom', from, to })} />
 		</div>
-	{:else if data.histogramError}
+	{:else if data.histogramError && !data.searchError}
 		<div class="alert alert-warning" role="alert">{data.histogramError}</div>
 	{/if}
 

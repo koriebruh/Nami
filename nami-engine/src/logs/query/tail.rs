@@ -17,9 +17,14 @@
 //! oldest first, at most [`TailTimings::batch`] of them (with more, the
 //! newest are replayed and the older part of the gap is lost). Late rows
 //! dated at or before the cursor that arrived during the gap are not
-//! replayed. The cursor only moves the first poll's lower `dt` bound (never
-//! more than [`RESUME_WINDOW`] back) and sets a bound flag column: the
-//! project and filters are the request's, as for any poll.
+//! replayed. The id is the row's own, so after a late row (sent after newer
+//! ones) the resume sends those newer rows again; the explorer drops them by
+//! id. A quiet tail whose last row is older than [`RESUME_WINDOW`] when it
+//! reconnects (the 30-minute timeout included) starts normally, and rows
+//! stored during the reconnect delay are not sent. The cursor only moves the
+//! first poll's lower `dt` bound (never more than [`RESUME_WINDOW`] back)
+//! and sets a bound flag column: the project and filters are the request's,
+//! as for any poll.
 //!
 //! The session is re-checked every [`TailTimings::recheck`] (logged out,
 //! password changed, or removed from the project ends the stream with
@@ -595,6 +600,14 @@ mod tests {
             "over 128 bytes: not even decoded"
         );
         assert!(resume_cursor(None, now).is_none());
+
+        let ms = chrono::Duration::milliseconds;
+        let window = chrono::Duration::from_std(RESUME_WINDOW).unwrap();
+        let ahead = chrono::Duration::from_std(FUTURE_ALLOWANCE).unwrap();
+        assert!(resume_cursor(Some(&at(-window)), now).is_some(), "at the window");
+        assert!(resume_cursor(Some(&at(-window - ms(1))), now).is_none());
+        assert!(resume_cursor(Some(&at(ahead)), now).is_some(), "at the allowance");
+        assert!(resume_cursor(Some(&at(ahead + ms(1))), now).is_none());
     }
 
     #[test]
