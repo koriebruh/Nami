@@ -468,3 +468,30 @@ export function bucketParts(bucket: HistogramBucket): {
 export function bucketEnd(bucket: HistogramBucket, stepSeconds: number): string {
 	return new Date(Date.parse(bucket.start) + stepSeconds * 1000).toISOString();
 }
+
+/** One day of the source usage chart: each series scaled to its own maximum. */
+export type UsageBar = {
+	day: string;
+	events: number;
+	bytes: number;
+	eventsShare: number;
+	bytesShare: number;
+	dropped: number;
+	sampledOut: number;
+	rejected: number;
+};
+
+export function usageBars(days: DailyUsage[]): UsageBar[] {
+	const maxEvents = Math.max(0, ...days.map((d) => d.events));
+	const maxBytes = Math.max(0, ...days.map((d) => d.bytes));
+	return days.map((d) => ({
+		day: d.day,
+		events: d.events,
+		bytes: d.bytes,
+		eventsShare: maxEvents > 0 ? d.events / maxEvents : 0,
+		bytesShare: maxBytes > 0 ? d.bytes / maxBytes : 0,
+		dropped: d.events_dropped,
+		sampledOut: d.events_sampled_out,
+		rejected: d.requests_rate_limited + d.requests_over_quota
+	}));
+}

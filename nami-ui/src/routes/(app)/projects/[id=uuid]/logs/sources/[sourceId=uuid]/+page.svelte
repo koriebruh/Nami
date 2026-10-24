@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import CopyButton from '#lib/components/CopyButton.svelte';
+	import UsageChart from '#lib/components/UsageChart.svelte';
 	import {
 		curlSnippet,
 		dockerSnippet,
@@ -127,9 +128,12 @@
 				</p>
 				<p class="text-xs text-muted">Created {formatUtc(data.source.created_at)}</p>
 			</div>
-			<form method="POST" action="?/delete" use:enhance={confirmed(deleteQuestion)}>
-				{@render submitButton('Delete', dangerButton)}
-			</form>
+			<div class="flex flex-wrap items-center gap-2">
+				<a href="{base}/pipeline" class={button}>Pipeline</a>
+				<form method="POST" action="?/delete" use:enhance={confirmed(deleteQuestion)}>
+					{@render submitButton('Delete', dangerButton)}
+				</form>
+			</div>
 		</div>
 		{#if form?.message && form.action === 'delete'}
 			<div role="alert" class="mt-4 {alertBox}">{form.message}</div>
@@ -243,6 +247,13 @@
 			<p class="mt-2 text-sm text-muted">No usage data.</p>
 		{/if}
 	</div>
+
+	{#if data.usage.length > 0}
+		<div class="card space-y-3 p-5 sm:p-6">
+			<h3 class="card-title">Last 30 days (UTC)</h3>
+			<UsageChart days={data.usage} />
+		</div>
+	{/if}
 
 	<div class="card p-5 sm:p-6">
 		<h3 class="card-title">Settings</h3>

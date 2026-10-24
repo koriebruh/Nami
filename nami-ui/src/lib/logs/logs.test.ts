@@ -278,3 +278,18 @@ describe('live rows', () => {
 		expect(tailKey({ ...base, q: 'disk' })).not.toBe(tailKey(base));
 	});
 });
+
+// Separate import so the block above stays as it is (NAMI-LOG-16).
+import { usageBars } from './logs';
+
+describe('usageBars', () => {
+	it('scales each series to its own maximum and sums the rejections', () => {
+		const day = (d: string, events: number, bytes: number) => ({
+			day: d, events, bytes, events_dropped: 1, events_sampled_out: 2, requests_rate_limited: 3, requests_over_quota: 4
+		});
+		const bars = usageBars([day('2026-10-18', 50, 4000), day('2026-10-19', 100, 1000)]);
+		expect(bars.map((b) => [b.eventsShare, b.bytesShare])).toEqual([[0.5, 1], [1, 0.25]]);
+		expect(bars[0]).toMatchObject({ dropped: 1, sampledOut: 2, rejected: 7 });
+		expect(usageBars([day('2026-10-19', 0, 0)])[0].eventsShare).toBe(0);
+	});
+});
