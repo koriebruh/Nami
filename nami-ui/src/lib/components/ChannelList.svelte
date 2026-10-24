@@ -53,8 +53,8 @@
 			}
 		};
 	};
-	// A created channel empties the form (its secrets with it).
-	const submitCreate: SubmitFunction = () => {
+	// A saved create or edit empties its form, so no typed secret stays in it.
+	const submitReset: SubmitFunction = () => {
 		busy = true;
 		return async ({ update, result }) => {
 			try {
@@ -157,7 +157,7 @@
 						{#if canEdit}
 							<details>
 								<summary class="cursor-pointer text-sm text-ink-2 hover:text-ink">Edit</summary>
-								<form method="POST" action="?/update" use:enhance={submit} class="mt-3 grid gap-3 sm:grid-cols-2">
+								<form method="POST" action="?/update" use:enhance={submitReset} class="mt-3 grid gap-3 sm:grid-cols-2">
 									<input type="hidden" name="channel_id" value={channel.id} />
 									<input type="hidden" name="kind" value={channel.kind} />
 									<div>
@@ -207,7 +207,7 @@
 			{#if form?.action === 'create' && form.message}
 				<div class="alert alert-danger mt-4" role="alert">{form.message}</div>
 			{/if}
-			<form method="POST" action="?/create" use:enhance={submitCreate} class="mt-4 grid gap-4 sm:grid-cols-2">
+			<form method="POST" action="?/create" use:enhance={submitReset} class="mt-4 grid gap-4 sm:grid-cols-2">
 				<div>
 					<label for="channel-name" class="label">Name</label>
 					<input id="channel-name" name="name" type="text" required maxlength="100" placeholder="On-call Slack" class="input" />
