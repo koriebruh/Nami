@@ -24,6 +24,20 @@ describe('localInputToUtc', () => {
 	});
 });
 
+// ICU abbreviates September as "Sept" in en-GB: no month may depend on its names.
+describe('every month', () => {
+	it('converts and formats September like any other month', () => {
+		expect(localInputToUtc('2026-09-15T09:00', 'Europe/Berlin')).toBe('2026-09-15T07:00:00.000Z');
+		expect(formatInZone('2026-09-15T07:00:00Z', 'Europe/Berlin')).toBe('Tue 15 Sep 09:00');
+	});
+	it('round-trips a time on the first of every month', () => {
+		for (let m = 1; m <= 12; m++) {
+			const local = `2026-${String(m).padStart(2, '0')}-01T12:00`;
+			expect(localInputToUtc(local, 'UTC'), local).toBe(`${local}:00.000Z`);
+		}
+	});
+});
+
 describe('shiftRows', () => {
 	it('formats times in the schedule zone and marks overrides', () => {
 		const rows = shiftRows([{ user_id: 'u', email: 'a@b.test', starts_at: '2026-10-19T07:00:00Z', ends_at: '2026-10-20T07:00:00Z', override_id: 'o' }], 'Europe/Berlin');

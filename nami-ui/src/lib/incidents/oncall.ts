@@ -40,29 +40,26 @@ export type BoardEntry = { schedule_id: string; name: string; on_call_now: OnCal
 
 export type Member = { user_id: string; email: string; project_role: string };
 
-/** Wall-clock fields of `instant` in `timeZone`; throws a RangeError for an unknown zone. */
-function wallParts(instant: Date, timeZone: string) {
+// Month and weekday names are our own: ICU's en-GB names vary by version
+// (September is "Sept" in recent ones).
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const WEEKDAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/** The wall clock of `instant` in `timeZone`, read as if it were UTC (ms);
+ *  throws a RangeError for an unknown zone. */
+function wallAsUtc(instant: number, timeZone: string): number {
 	const parts = new Intl.DateTimeFormat('en-GB', {
 		timeZone,
-		weekday: 'short',
 		year: 'numeric',
-		month: 'short',
+		month: 'numeric',
 		day: 'numeric',
-		hour: '2-digit',
-		minute: '2-digit',
-		second: '2-digit',
+		hour: 'numeric',
+		minute: 'numeric',
+		second: 'numeric',
 		hourCycle: 'h23'
-	}).formatToParts(instant);
-	const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)?.value ?? '';
-	return { weekday: get('weekday'), year: get('year'), month: get('month'), day: get('day'), hour: get('hour'), minute: get('minute'), second: get('second') };
-}
-
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-
-/** The wall clock of `instant` in `timeZone`, read as if it were UTC (ms). */
-function wallAsUtc(instant: number, timeZone: string): number {
-	const p = wallParts(new Date(instant), timeZone);
-	return Date.UTC(Number(p.year), MONTHS.indexOf(p.month), Number(p.day), Number(p.hour), Number(p.minute), Number(p.second));
+	}).formatToParts(new Date(instant));
+	const get = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find((p) => p.type === type)?.value);
+	return Date.UTC(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'), get('second'));
 }
 
 const LOCAL_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/;
@@ -95,13 +92,15 @@ export function localInputToUtc(local: string, timezone: string): string | null 
 
 /** "Mon 19 Oct 09:00" in `timezone`, or in UTC when the runtime does not know the zone. */
 export function formatInZone(iso: string, timezone: string): string {
-	let p;
+	const instant = new Date(iso).getTime();
+	let wall: Date;
 	try {
-		p = wallParts(new Date(iso), timezone);
+		wall = new Date(wallAsUtc(instant, timezone));
 	} catch {
-		p = wallParts(new Date(iso), 'UTC');
+		wall = new Date(instant);
 	}
-	return `${p.weekday} ${p.day} ${p.month} ${p.hour}:${p.minute}`;
+	const two = (n: number) => String(n).padStart(2, '0');
+	return `${WEEKDAY_NAMES[wall.getUTCDay()]} ${wall.getUTCDate()} ${MONTHS[wall.getUTCMonth()]} ${two(wall.getUTCHours())}:${two(wall.getUTCMinutes())}`;
 }
 
 /** The shift list's rows, in the schedule's zone. */
