@@ -1,9 +1,11 @@
 import { error } from '@sveltejs/kit';
+import { render } from 'svelte/server';
 import { describe, expect, it } from 'vitest';
 import { fakeEvent, MONITOR_ID, PROJECT_ID } from '#lib/server/core/fake-event';
 import { load as loadLayout } from './+layout.server';
 import { load as loadRoot } from './+page.server';
 import { load as loadMonitors } from './monitors/+page.server';
+import MonitorsPage from './monitors/+page.svelte';
 import { actions as newActions, load as loadNew } from './monitors/new/+page.server';
 import { actions as settingsActions } from './settings/+page.server';
 
@@ -107,11 +109,12 @@ describe('monitor list load', () => {
 	it('returns the monitors', async () => {
 		const monitors = [{ id: MONITOR_ID, name: 'API', uptime_24h: null }];
 		const { event, calls } = fakeEvent({ body: JSON.stringify(monitors) });
-		// Both calls answer with the monitors here: the groups only need to be a list.
-		expect(await loadMonitors(event)).toEqual({ monitors, groups: monitors });
+		// Every call answers with the monitors here: the groups and the on-call rows only need to be a list.
+		expect(await loadMonitors(event)).toEqual({ monitors, groups: monitors, onCall: monitors });
 		expect(calls().map((call) => call.path)).toEqual([
 			`/projects/${PROJECT_ID}/monitors`,
-			`/projects/${PROJECT_ID}/monitor-groups`
+			`/projects/${PROJECT_ID}/monitor-groups`,
+			`/projects/${PROJECT_ID}/on-call`
 		]);
 	});
 
@@ -123,7 +126,7 @@ describe('monitor list load', () => {
 					? new Response('{"error":"internal error"}', { status: 500 })
 					: new Response(JSON.stringify(monitors))
 		});
-		expect(await loadMonitors(event)).toEqual({ monitors, groups: [] });
+		expect(await loadMonitors(event)).toEqual({ monitors, groups: [], onCall: monitors });
 	});
 
 	it('keeps a 403 a 403', async () => {
@@ -146,7 +149,8 @@ describe('monitor list load', () => {
 		await loadMonitors(event);
 		expect(calls().map((call) => call.path + call.search)).toEqual([
 			'/projects/..%2Fauth%2Fme%3F/monitors',
-			'/projects/..%2Fauth%2Fme%3F/monitor-groups'
+			'/projects/..%2Fauth%2Fme%3F/monitor-groups',
+			'/projects/..%2Fauth%2Fme%3F/on-call'
 		]);
 	});
 
@@ -162,6 +166,53 @@ describe('monitor list load', () => {
 		else await loadMonitors(event);
 		expect(setHeaders).toHaveBeenCalledTimes(1);
 		expect(setHeaders).toHaveBeenCalledWith({ 'cache-control': 'private, no-store' });
+	});
+});
+
+describe('on call now card (NAMI-INC-15)', () => {
+	const SCHEDULE_ID = '5d2c7e1a-3b4f-4a6d-8e9c-1f2a3b4c5d6e';
+	const onCall = [
+		{ schedule_id: SCHEDULE_ID, name: 'Primary', on_call_now: { user_id: 'u', email: 'ann@b.test', until: '2026-10-26T08:00:00Z' } },
+		{ schedule_id: MONITOR_ID, name: 'Backup', on_call_now: null }
+	];
+	const answer = (onCallResponse: () => Response) => (url: URL) =>
+		url.pathname.endsWith('/on-call') ? onCallResponse() : new Response('[]');
+
+	it('takes its rows from /on-call', async () => {
+		const { event } = fakeEvent({ respond: answer(() => new Response(JSON.stringify(onCall))) });
+		expect(await loadMonitors(event)).toEqual({ monitors: [], groups: [], onCall });
+	});
+
+	it.each([
+		['a 500', () => new Response('{"error":"internal error"}', { status: 500 })],
+		['a 403', () => new Response('{"error":"forbidden"}', { status: 403 })],
+		['an answer that is not JSON', () => new Response('<html>')],
+		['an unreachable engine', () => { throw new TypeError('fetch failed'); }]
+	] as const)('is hidden, and the page still loads, after %s', async (_case, onCallResponse) => {
+		const { event } = fakeEvent({ respond: answer(onCallResponse) });
+		expect(await loadMonitors(event)).toEqual({ monitors: [], groups: [], onCall: [] });
+	});
+
+	function renderMonitors(rows: typeof onCall) {
+		const data = {
+			user: { id: 'u', email: 'a@b.test', global_role: 'member' },
+			project: { id: PROJECT_ID, name: 'Demo', slug: 'demo' },
+			role: 'viewer',
+			monitors: [],
+			groups: [],
+			onCall: rows
+		};
+		return render(MonitorsPage, { props: { params: { id: PROJECT_ID }, data } as never }).body;
+	}
+
+	it('shows who is on call per schedule, until in UTC, and hides when empty', () => {
+		const body = renderMonitors(onCall);
+		expect(body).toContain('On call now');
+		expect(body).toContain(`href="/projects/${PROJECT_ID}/oncall/${SCHEDULE_ID}"`);
+		expect(body).toContain('ann@b.test');
+		expect(body).toContain('until 2026-10-26 08:00:00 UTC');
+		expect(body).toContain('Nobody on call');
+		expect(renderMonitors([])).not.toContain('On call now');
 	});
 });
 

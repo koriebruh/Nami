@@ -7,7 +7,7 @@
 	import Icon from '#lib/components/ui/Icon.svelte';
 	import StatCard from '#lib/components/ui/StatCard.svelte';
 	import StatStrip from '#lib/components/ui/StatStrip.svelte';
-	import { CHECK_TYPE_LABELS, formatUptime, groupMonitors, monitorTarget, timeAgo } from '#lib/uptime/uptime';
+	import { CHECK_TYPE_LABELS, formatUptime, formatUtc, groupMonitors, monitorTarget, timeAgo } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -141,6 +141,24 @@
 			/>
 			<StatCard label="Avg uptime, 24 h" value={formatUptime(kpi.avgUptime)} hint="across monitors with checks" />
 		</StatStrip>
+	{/if}
+
+	{#if data.onCall.length > 0}
+		<Card title="On call now" subtitle="Until, in UTC.">
+			<ul class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+				{#each data.onCall as entry (entry.schedule_id)}
+					<li class="min-w-0 text-sm">
+						<a href="/projects/{data.project.id}/oncall/{entry.schedule_id}" class="link wrap-anywhere">{entry.name}</a>
+						{#if entry.on_call_now}
+							<p class="wrap-anywhere text-ink">{entry.on_call_now.email}</p>
+							<p class="text-xs text-muted">until {formatUtc(entry.on_call_now.until)}</p>
+						{:else}
+							<p class="text-muted">Nobody on call</p>
+						{/if}
+					</li>
+				{/each}
+			</ul>
+		</Card>
 	{/if}
 
 	<Card title="Monitors" subtitle="Refreshes every 30 seconds." padded={false}>
