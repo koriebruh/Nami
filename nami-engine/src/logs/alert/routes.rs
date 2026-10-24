@@ -214,6 +214,7 @@ async fn patch_alert(
         payload.severity_id.flatten(),
     );
     check_routing(&state, project_id, policy, severity).await?;
+    let disabling = payload.enabled == Some(false);
     let patch = LogAlertPatch {
         name: payload.name,
         query: payload.query,
@@ -232,7 +233,9 @@ async fn patch_alert(
         UpdatedAlert::Updated(alert) => {
             // Disabling an alerting alert resolved its incident (R17): send
             // the resolved notices now, not at the worker's next tick.
-            crate::incidents::worker::kick(&state).await;
+            if disabling {
+                crate::incidents::worker::kick(&state).await;
+            }
             Ok(Json(alert))
         }
         UpdatedAlert::NotFound => Err(AppError::NotFound),

@@ -160,8 +160,9 @@ pub const SOURCE_PAGE_GAP_SECS: i32 = 5 * 60;
 // after $3: the requested policy $2 (none requested: the incident's own) if
 // it is still one of the project's, else the project's default. When $4
 // (R31), not before $5 seconds after the latest step notification queued
-// for any incident of the same source (`greatest` skips a null: a source that
-// never paged, or a manual incident, which has no source).
+// for any incident of the same source and not cancelled (one cancelled paged
+// nobody; `greatest` skips a null: a source that never paged, or a manual
+// incident, which has no source).
 const ARM: &str = "update incidents i set
         escalation_policy_id = p.id, escalation_step = 0, escalation_repeat = 0,
         escalation_on_fallback = false, escalation_notified = 0, escalation_legacy = false,
@@ -169,7 +170,7 @@ const ARM: &str = "update incidents i set
             $3 + make_interval(mins => s.delay_minutes),
             (select max(d.created_at) from notification_deliveries d
              join incidents o on o.id = d.incident_id
-             where $4 and d.event = 'triggered'
+             where $4 and d.event = 'triggered' and d.status <> 'cancelled'
                and (o.monitor_id = i.monitor_id or o.heartbeat_id = i.heartbeat_id
                     or o.log_alert_id = i.log_alert_id))
                 + make_interval(secs => $5))
