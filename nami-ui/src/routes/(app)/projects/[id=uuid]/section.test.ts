@@ -10,10 +10,21 @@ import { actions as settingsActions } from './settings/+page.server';
 describe('project layout load', () => {
 	const project = { id: PROJECT_ID, name: 'UP7 Demo', slug: 'up7-demo' };
 
-	it('returns the project the engine found', async () => {
-		const { event, calls } = fakeEvent({ body: JSON.stringify(project) });
-		expect(await loadLayout(event)).toEqual({ project });
+	it('returns the project the engine found and the caller role', async () => {
+		const { event, calls } = fakeEvent({ body: JSON.stringify({ ...project, role: 'admin' }) });
+		expect(await loadLayout(event)).toEqual({ project, role: 'admin' });
 		expect(calls()).toEqual([{ method: 'GET', path: `/projects/${PROJECT_ID}`, search: '', body: undefined }]);
+	});
+
+	it.each(['member', 'viewer'])('passes the %s role through', async (role) => {
+		const { event } = fakeEvent({ body: JSON.stringify({ ...project, role }) });
+		expect(await loadLayout(event)).toEqual({ project, role });
+	});
+
+	// Fail closed: the UI then hides what only members and admins may do.
+	it.each([undefined, 'owner', 7, null])('treats a missing or unknown role (%s) as a viewer', async (role) => {
+		const { event } = fakeEvent({ body: JSON.stringify({ ...project, role }) });
+		expect(await loadLayout(event)).toEqual({ project, role: 'viewer' });
 	});
 
 	// The engine answers 403 for a project the caller may not see, whether or

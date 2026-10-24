@@ -156,3 +156,55 @@ create table notification_channels (
 );
 create index notification_channels_project_idx on notification_channels (project_id) where project_id is not null;
 create index notification_channels_user_idx on notification_channels (user_id) where user_id is not null;
+
+-- On-call schedules (NAMI-INC-7). The rotation is evaluated by
+-- oncall::rotation (pure); restrictions are TimeWindow objects in the
+-- schedule's zone.
+create table on_call_schedules (
+    id uuid default gen_random_uuid() constraint on_call_schedules_pkey primary key,
+    project_id uuid not null
+        constraint on_call_schedules_project_id_fkey references projects(id) on delete cascade,
+    name text not null,
+    timezone text not null,
+    rotation text not null
+        constraint on_call_schedules_rotation_known check (rotation in ('daily', 'weekly', 'custom')),
+    rotation_hours int
+        constraint on_call_schedules_rotation_hours_range check (rotation_hours between 1 and 8760),
+    handoff_time time not null,
+    start_date date not null,
+    restrictions jsonb not null default '[]'::jsonb
+        constraint on_call_schedules_restrictions_is_array check (jsonb_typeof(restrictions) = 'array'),
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    constraint on_call_schedules_name_unique unique (project_id, name),
+    constraint on_call_schedules_custom_has_hours check ((rotation = 'custom') = (rotation_hours is not null))
+);
+
+-- A deleted user's row goes by cascade and leaves a gap in the positions:
+-- the cycle skips that slot until the next save rewrites them as 0..n-1.
+create table on_call_participants (
+    schedule_id uuid not null
+        constraint on_call_participants_schedule_id_fkey references on_call_schedules(id) on delete cascade,
+    position int not null
+        constraint on_call_participants_position_range check (position >= 0),
+    user_id uuid not null
+        constraint on_call_participants_user_id_fkey references users(id) on delete cascade,
+    constraint on_call_participants_pkey primary key (schedule_id, position),
+    constraint on_call_participants_user_unique unique (schedule_id, user_id)
+);
+
+create table on_call_overrides (
+    id uuid default gen_random_uuid() constraint on_call_overrides_pkey primary key,
+    schedule_id uuid not null
+        constraint on_call_overrides_schedule_id_fkey references on_call_schedules(id) on delete cascade,
+    user_id uuid not null
+        constraint on_call_overrides_user_id_fkey references users(id) on delete cascade,
+    starts_at timestamptz not null,
+    ends_at timestamptz not null,
+    created_by uuid
+        constraint on_call_overrides_created_by_fkey references users(id) on delete set null,
+    created_at timestamptz not null default now(),
+    constraint on_call_overrides_ends_after_start check (ends_at > starts_at)
+);
+-- The current and upcoming overrides of one schedule.
+create index on_call_overrides_schedule_idx on on_call_overrides (schedule_id, ends_at);

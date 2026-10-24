@@ -1,4 +1,5 @@
 use sqlx::PgPool;
+use crate::core::middleware::rbac::{CurrentUser, Role};
 use uuid::Uuid;
 
 #[derive(Debug, sqlx::FromRow, serde::Serialize)]
@@ -87,4 +88,53 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<Project>, sqlx
         .bind(id)
         .fetch_optional(pool)
         .await
+}
+
+/// A project with the caller's effective role on it (R28).
+#[derive(Debug, serde::Serialize)]
+pub struct ProjectView {
+    #[serde(flatten)]
+    pub project: Project,
+    pub role: &'static str,
+}
+
+/// The caller's effective role on `project_id`: `Admin` for a global admin
+/// (member or not), otherwise their `project_members` role; `None` without
+/// a membership with a known role.
+pub async fn effective_role(
+    pool: &PgPool,
+    user: &CurrentUser,
+    project_id: Uuid,
+) -> Result<Option<Role>, sqlx::Error> {
+    if user.global_role == Role::Admin {
+        return Ok(Some(Role::Admin));
+    }
+    let role: Option<String> = sqlx::query_scalar(
+        "select project_role from project_members where project_id = $1 and user_id = $2",
+    )
+    .bind(project_id)
+    .bind(user.id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(role.as_deref().and_then(Role::parse))
+}
+
+/// A member of a project (R28).
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct MemberView {
+    pub user_id: Uuid,
+    pub email: String,
+    pub project_role: String,
+}
+
+/// The members of a project, by email.
+pub async fn list_members(pool: &PgPool, project_id: Uuid) -> Result<Vec<MemberView>, sqlx::Error> {
+    sqlx::query_as(
+        "select m.user_id, u.email, m.project_role from project_members m
+         join users u on u.id = m.user_id
+         where m.project_id = $1 order by u.email",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
 }

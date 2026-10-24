@@ -30,6 +30,9 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "incident_severities",
         "incident_events",
         "notification_channels",
+        "on_call_schedules",
+        "on_call_participants",
+        "on_call_overrides",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -448,6 +451,65 @@ async fn notification_channels_constraints_are_all_named(pool: sqlx::PgPool) {
             "notification_channels_project_id_fkey",
             "notification_channels_user_id_fkey",
             "notification_channels_webhook_has_secret",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn a_custom_rotation_needs_hours_and_others_must_not_have_them(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    for (rotation, hours) in [("custom", None), ("weekly", Some(24))] {
+        let error = sqlx::query(
+            "insert into on_call_schedules (project_id, name, timezone, rotation, rotation_hours, handoff_time, start_date)
+             values ($1, $2, 'UTC', $2, $3, '09:00', '2026-10-19')",
+        )
+        .bind(project)
+        .bind(rotation)
+        .bind(hours)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("23514"),
+            "{rotation} {hours:?}"
+        );
+    }
+}
+
+/// Every constraint of the on-call tables carries the name its migration
+/// gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn on_call_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid in ('public.on_call_schedules'::regclass, 'public.on_call_participants'::regclass,
+                            'public.on_call_overrides'::regclass)
+         order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "on_call_overrides_created_by_fkey",
+            "on_call_overrides_ends_after_start",
+            "on_call_overrides_pkey",
+            "on_call_overrides_schedule_id_fkey",
+            "on_call_overrides_user_id_fkey",
+            "on_call_participants_pkey",
+            "on_call_participants_position_range",
+            "on_call_participants_schedule_id_fkey",
+            "on_call_participants_user_id_fkey",
+            "on_call_participants_user_unique",
+            "on_call_schedules_custom_has_hours",
+            "on_call_schedules_name_unique",
+            "on_call_schedules_pkey",
+            "on_call_schedules_project_id_fkey",
+            "on_call_schedules_restrictions_is_array",
+            "on_call_schedules_rotation_hours_range",
+            "on_call_schedules_rotation_known",
         ]
     );
 }

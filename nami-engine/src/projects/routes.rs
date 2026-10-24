@@ -9,7 +9,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/projects", post(create_project).get(list_projects))
         .route("/projects/{id}", axum::routing::get(get_project))
-        .route("/projects/{id}/members", post(add_member))
+        .route("/projects/{id}/members", post(add_member).get(list_members))
         .route("/projects/{id}/members/{user_id}", axum::routing::delete(delete_member))
 }
 
@@ -41,10 +41,23 @@ async fn get_project(
     State(state): State<AppState>,
     user: CurrentUser,
     Path(id): Path<uuid::Uuid>,
-) -> Result<Json<project::Project>, AppError> {
+) -> Result<Json<project::ProjectView>, AppError> {
     require_project_role(&state.db, &user, id, Role::Viewer).await?;
     let project = project::find_by_id(&state.db, id).await?.ok_or(AppError::NotFound)?;
-    Ok(Json(project))
+    // A membership removed since the check above reads as no access.
+    let role = project::effective_role(&state.db, &user, id).await?.ok_or(AppError::Forbidden)?;
+    Ok(Json(project::ProjectView { project, role: role.as_str() }))
+}
+
+/// The project's members by email, for choosing schedule participants and
+/// escalation targets (R28).
+async fn list_members(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(id): Path<uuid::Uuid>,
+) -> Result<Json<Vec<project::MemberView>>, AppError> {
+    require_project_role(&state.db, &user, id, Role::Viewer).await?;
+    Ok(Json(project::list_members(&state.db, id).await?))
 }
 
 #[derive(Deserialize)]

@@ -23,11 +23,20 @@ export const load: LayoutServerLoad = async (event) => {
 	// must not read as "no access".
 	if (!response.ok) throw error(502, ENGINE_UNAVAILABLE);
 
-	let project: { id: string; name: string; slug: string };
+	let body: { id: string; name: string; slug: string; role?: unknown };
 	try {
-		project = await response.json();
+		body = await response.json();
 	} catch {
 		throw error(502, ENGINE_UNAVAILABLE);
 	}
-	return { project };
+	const { role, ...project } = body;
+	return { project, role: projectRole(role) };
 };
+
+export type ProjectRole = 'admin' | 'member' | 'viewer';
+
+/** The caller's effective role, failing closed: anything else is a viewer. The
+ * engine still answers 403 to every action the role does not allow. */
+function projectRole(role: unknown): ProjectRole {
+	return role === 'admin' || role === 'member' ? role : 'viewer';
+}

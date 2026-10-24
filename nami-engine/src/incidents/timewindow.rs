@@ -58,7 +58,7 @@ pub fn parse_timezone(name: &str) -> Result<Tz, String> {
 }
 
 /// Exactly "HH:MM": chrono alone would also take "9:00" or " 9:00".
-fn parse_hhmm(field: &str, s: &str) -> Result<NaiveTime, String> {
+pub(crate) fn parse_hhmm(field: &str, s: &str) -> Result<NaiveTime, String> {
     let b = s.as_bytes();
     let shaped =
         b.len() == 5 && b[2] == b':' && [0, 1, 3, 4].iter().all(|&i| b[i].is_ascii_digit());
