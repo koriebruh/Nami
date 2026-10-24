@@ -24,6 +24,9 @@ export const SEARCH_PARAMS: readonly string[] = Object.freeze([
 	'cursor'
 ]);
 
+/** Patterns: the filters plus the window (the engine returns the top 100, no paging). */
+export const PATTERN_PARAMS: readonly string[] = Object.freeze([...FILTER_PARAMS, 'from', 'to']);
+
 /** Export: the filters, the window, the format and the CSV columns. */
 export const EXPORT_PARAMS: readonly string[] = Object.freeze([
 	...FILTER_PARAMS,

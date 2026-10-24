@@ -6,6 +6,9 @@ import {
 	dockerSnippet,
 	engineParams,
 	entryHref,
+	EXPORT_ROW_LIMIT,
+	exportHref,
+	exportWarning,
 	explorerHref,
 	explorerParams,
 	fieldAt,
@@ -24,11 +27,13 @@ import {
 	quotaInMib,
 	resolveWindow,
 	rsyslogSnippet,
+	stateFromViewQuery,
 	tailKey,
 	tailParams,
 	toggled,
 	toInputValue,
 	vectorSnippet,
+	viewQueryFromState,
 	type ExplorerState,
 	type LogEntry
 } from './logs';
@@ -99,7 +104,9 @@ describe('explorer URL state', () => {
 			sources: [],
 			filters: [],
 			columns: [],
-			live: false
+			live: false,
+			tab: 'results',
+			patterns: []
 		});
 		expect(explorerParams(state).toString()).toBe('');
 		expect(explorerHref('/p/logs', state)).toBe('/p/logs');
@@ -119,7 +126,9 @@ describe('explorer URL state', () => {
 				{ path: 'trace', op: 'exists' }
 			],
 			columns: ['user.id', 'status'],
-			live: true
+			live: true,
+			tab: 'patterns',
+			patterns: ['7']
 		};
 		const url = explorerParams(state);
 		expect(parseExplorerState(url)).toEqual(state);
@@ -180,6 +189,53 @@ describe('explorer URL state', () => {
 		const tail = tailParams(state);
 		expect(tail.has('from') || tail.has('to')).toBe(false);
 		expect(tailParams(parseExplorerState(new URLSearchParams('in_fields=1'))).has('in_fields')).toBe(false);
+	});
+});
+
+describe('explorer state, part 2', () => {
+	it('reads the tab and pattern filters from the URL', () => {
+		// 18446744073709551615 is u64::MAX; one more is not a pattern hash (the engine would answer 400).
+		const state = parseExplorerState(new URLSearchParams(
+			'tab=patterns&pattern=123&pattern=123&pattern=x&pattern=18446744073709551615&pattern=18446744073709551616'
+		));
+		expect(state.tab).toBe('patterns');
+		expect(state.patterns).toEqual(['123', '18446744073709551615']);
+		expect(parseExplorerState(new URLSearchParams('tab=weird')).tab).toBe('results');
+		expect(explorerParams(state).toString()).toBe('tab=patterns&pattern=123&pattern=18446744073709551615');
+		expect(tailParams(state).getAll('pattern_hash')).toEqual(['123', '18446744073709551615']);
+	});
+
+	it('builds export links with the absolute window and the picked columns', () => {
+		const state = parseExplorerState(new URLSearchParams('level=error&col=user.id&live=1&tab=patterns'));
+		const window = { from: '2026-10-19T07:00:00.000Z', to: '2026-10-19T08:00:00.000Z' };
+		const csv = new URL(exportHref('/projects/p/logs', state, window, 'csv'), 'http://ui.test');
+		expect(csv.pathname).toBe('/projects/p/logs/export');
+		expect(Object.fromEntries(csv.searchParams)).toMatchObject({ level: 'error', from: window.from, to: window.to, format: 'csv', columns: 'user.id' });
+		expect(csv.searchParams.has('live') || csv.searchParams.has('tab')).toBe(false);
+		const ndjson = new URL(exportHref('/projects/p/logs', state, window, 'ndjson'), 'http://ui.test');
+		expect(ndjson.searchParams.has('columns')).toBe(false);
+	});
+
+	it('warns before a truncated export', () => {
+		expect(EXPORT_ROW_LIMIT).toBe(100_000);
+		expect(exportWarning(100_000)).toBeNull();
+		expect(exportWarning(250_000)).toBe('Only the newest 100,000 of 250,000 matching rows will be exported.');
+	});
+
+	it('view state round-trips and stays relative', () => {
+		const state = parseExplorerState(new URLSearchParams(
+			'range=6h&q=disk&in_fields=1&level=error&source=c13bc10a-d17f-443b-8976-c6d9b54e2798&col=a.b&pattern=7&live=1&tab=patterns&filter=' +
+				encodeURIComponent('{"path":"a","op":"gt","value":"5"}')
+		));
+		const query = viewQueryFromState(state);
+		expect(query).toEqual({
+			range: '6h', q: 'disk', in_fields: true, levels: ['error'], source_ids: ['c13bc10a-d17f-443b-8976-c6d9b54e2798'],
+			filters: [{ path: 'a', op: 'gt', value: '5' }], pattern_hashes: ['7'], columns: ['a.b']
+		});
+		expect(stateFromViewQuery(query)).toEqual({ ...state, live: false, tab: 'results' });
+		const custom = viewQueryFromState(parseExplorerState(new URLSearchParams('range=custom&from=2026-10-01T00:00:00.000Z&to=2026-10-02T00:00:00.000Z')));
+		expect(custom).toEqual({ range: 'custom', from: '2026-10-01T00:00:00.000Z', to: '2026-10-02T00:00:00.000Z' });
+		expect(stateFromViewQuery({ range: '1h', levels: ['loud' as any] }).levels).toEqual([]);
 	});
 });
 

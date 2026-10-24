@@ -3,6 +3,7 @@ import {
 	EXPORT_PARAMS,
 	FILTER_PARAMS,
 	lastEventIdHeader,
+	PATTERN_PARAMS,
 	pickLogParams,
 	SEARCH_PARAMS,
 	TAIL_PARAMS
@@ -38,6 +39,15 @@ describe('pickLogParams', () => {
 		expect(Object.isFrozen(EXPORT_PARAMS)).toBe(true);
 		expect(EXPORT_PARAMS).not.toContain('cursor');
 		expect(EXPORT_PARAMS).not.toContain('limit');
+	});
+});
+
+describe('PATTERN_PARAMS', () => {
+	it('lets patterns carry the filters and the window only', () => {
+		expect(PATTERN_PARAMS).toEqual([...FILTER_PARAMS, 'from', 'to']);
+		expect(Object.isFrozen(PATTERN_PARAMS)).toBe(true);
+		expect(PATTERN_PARAMS).not.toContain('limit');
+		expect(PATTERN_PARAMS).not.toContain('cursor');
 	});
 });
 

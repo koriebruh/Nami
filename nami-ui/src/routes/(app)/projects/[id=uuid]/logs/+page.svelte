@@ -4,10 +4,17 @@
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import LogVolumeChart from '#lib/components/LogVolumeChart.svelte';
+	import ExportMenu from '#lib/components/logs/ExportMenu.svelte';
+	import PatternsTable from '#lib/components/logs/PatternsTable.svelte';
+	import SavedViews from '#lib/components/logs/SavedViews.svelte';
+	import SegmentedTabs from '#lib/components/ui/SegmentedTabs.svelte';
 	import {
 		engineParams,
 		entryHref,
 		explorerHref,
+		explorerParams,
+		exportHref,
+		exportWarning,
 		fieldAt,
 		FILTER_OPS,
 		filterNeedsValue,
@@ -33,7 +40,7 @@
 	import { formatUtc } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
 
-	let { data }: PageProps = $props();
+	let { data, form }: PageProps = $props();
 
 	// Log text is attacker-controlled (anyone with a source token can send
 	// it): everything below renders as text, never as HTML, and nothing is
@@ -48,6 +55,21 @@
 	function go(change: Partial<ExplorerState>) {
 		void goto(explorerHref(path, { ...data.state, ...change }), { reset: false });
 	}
+
+	const tabs = $derived(
+		(['results', 'patterns'] as const).map((tab) => ({
+			href: explorerHref(path, { ...data.state, tab }),
+			label: tab === 'results' ? 'Results' : 'Patterns',
+			active: data.state.tab === tab
+		}))
+	);
+	/** The results limited to one more pattern. */
+	const patternHref = (hash: string) =>
+		explorerHref(path, {
+			...data.state,
+			tab: 'results',
+			patterns: data.state.patterns.includes(hash) ? data.state.patterns : [...data.state.patterns, hash]
+		});
 
 	// Results: the loaded page, extended by "Load more"; both reset on navigation.
 	let rows = $derived(data.logs);
@@ -266,6 +288,7 @@
 
 <div class="space-y-4">
 	<div class="card space-y-3 p-4">
+		<SavedViews views={data.views} {path} query={explorerParams(data.state).toString()} {form} />
 		{#key `${data.state.q}|${data.state.inFields}`}
 			<form class="flex flex-wrap items-center gap-2" onsubmit={search}>
 				<label class="sr-only" for="log-q">Search</label>
@@ -332,6 +355,11 @@
 						{/each}
 					</div>
 				</details>
+				<ExportMenu
+					csvHref={exportHref(path, data.state, data.window, 'csv')}
+					ndjsonHref={exportHref(path, data.state, data.window, 'ndjson')}
+					warning={data.histogram ? exportWarning(data.histogram.total) : null}
+				/>
 				<button
 					type="button"
 					aria-pressed={data.state.live}
@@ -370,6 +398,17 @@
 		</div>
 
 		<div class="flex flex-wrap items-center gap-2">
+			{#each data.state.patterns as hash (hash)}
+				<span class="badge badge-primary">
+					pattern <code>{hash}</code>
+					<button
+						type="button"
+						aria-label="Remove pattern filter {hash}"
+						onclick={() => go({ patterns: data.state.patterns.filter((other) => other !== hash) })}
+						class="hover:text-danger-ink">×</button
+					>
+				</span>
+			{/each}
 			{#each data.state.filters as filter, index (index)}
 				<span class="flex items-center gap-1 rounded-control border border-border bg-surface-2 px-2 py-0.5 text-xs text-ink-2">
 					<code>{filter.path}</code>
@@ -402,9 +441,9 @@
 		</div>
 	</div>
 
-	{#if data.searchError}
+	{#if data.searchError || data.patternsError}
 		<div class="alert alert-danger" role="alert">
-			{data.searchError}
+			{data.searchError ?? data.patternsError}
 		</div>
 	{/if}
 
@@ -418,130 +457,138 @@
 			</div>
 			<LogVolumeChart histogram={data.histogram} onselect={(from, to) => go({ range: 'custom', from, to })} />
 		</div>
-	{:else if data.histogramError && !data.searchError}
+	{:else if data.histogramError && !data.searchError && !data.patternsError}
 		<div class="alert alert-warning" role="alert">{data.histogramError}</div>
 	{/if}
 
-	<div class="card">
-		<div class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
-			<div class="flex items-center gap-2 text-sm text-ink-2" role="status" aria-live="polite">
-				{#if liveStatus === 'live'}
-					<span class="h-2 w-2 animate-pulse rounded-full bg-success"></span><span class="text-success-ink">Live</span>
-				{:else if liveStatus === 'connecting'}
-					<span class="text-muted">Connecting live tail…</span>
-				{:else if liveStatus === 'reconnecting'}
-					<span class="text-muted">Reconnecting…</span>
-				{/if}
-				{#if liveNotice}
-					<span class="text-warning-ink">{liveNotice}</span>
-				{/if}
-			</div>
-			<form class="flex flex-wrap items-center gap-1" onsubmit={addColumn}>
-				<label class="sr-only" for="column-path">Add a column</label>
-				<input id="column-path" name="column" placeholder="Add column: field.path" maxlength="324" class="{input} w-52 py-1 text-xs" />
-				<button type="submit" class="{button} btn-sm">Add column</button>
-				{#if columnError}<span class="text-xs text-danger-ink" role="alert">{columnError}</span>{/if}
-			</form>
+	<SegmentedTabs label="Results or patterns" items={tabs} size="sm" />
+
+	{#if data.state.tab === 'patterns'}
+		<div class="card">
+			<PatternsTable patterns={data.patterns} href={patternHref} />
 		</div>
-		{#if shown.length === 0}
-			<p class="px-4 py-12 text-center text-sm text-muted">
-				{#if data.sources.length === 0 && !data.sourcesError}
-					No sources yet — <a href="{path}/sources" class="text-primary">create one</a> to start sending logs.
-				{:else}
-					No logs match in this time range.
-				{/if}
-			</p>
-		{:else}
-			<div class="overflow-x-auto">
-				<table class="w-full table-fixed text-left text-sm">
-					<thead class="text-[11px] tracking-wider text-muted uppercase">
-						<tr class="border-b border-border">
-							<th class="w-48 px-4 py-2 font-medium">Time (UTC)</th>
-							<th class="w-24 px-2 py-2 font-medium">Level</th>
-							<th class="w-36 px-2 py-2 font-medium">Source</th>
-							<th class="min-w-64 px-2 py-2 font-medium">Message</th>
-							{#each data.state.columns as column (column)}
-								<th class="w-40 px-2 py-2 font-medium">
-									<span class="flex items-center gap-1">
-										<code class="truncate">{column}</code>
-										<button
-											type="button"
-											aria-label="Remove column {column}"
-											onclick={() => go({ columns: data.state.columns.filter((other) => other !== column) })}
-											class="text-muted hover:text-danger-ink">×</button
-										>
-									</span>
-								</th>
-							{/each}
-						</tr>
-					</thead>
-					<tbody>
-						{#each shown as row (row.id)}
-							{@const open = expanded.has(row.id)}
-							<tr class="border-b border-border align-top hover:bg-surface-2">
-								<td class="px-4 py-1.5 font-mono text-xs whitespace-nowrap text-ink-2">{formatLogTime(row.dt)}</td>
-								<td class="px-2 py-1.5">
-									<span class="rounded-full px-2 py-0.5 text-xs font-medium {levelClasses(row.level)}">{row.level}</span>
-								</td>
-								<td class="truncate px-2 py-1.5 text-xs text-ink-2">{sourceNames.get(row.source_id) ?? (data.sourcesError ? 'unknown source' : 'deleted source')}</td>
-								<td class="px-2 py-1.5">
-									<button
-										type="button"
-										aria-expanded={open}
-										onclick={() => toggleRow(row)}
-										class="block w-full truncate text-left font-mono text-xs text-ink hover:text-primary"
-										>{row.message || '(no message)'}</button
-									>
-								</td>
+	{:else}
+		<div class="card">
+			<div class="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
+				<div class="flex items-center gap-2 text-sm text-ink-2" role="status" aria-live="polite">
+					{#if liveStatus === 'live'}
+						<span class="h-2 w-2 animate-pulse rounded-full bg-success"></span><span class="text-success-ink">Live</span>
+					{:else if liveStatus === 'connecting'}
+						<span class="text-muted">Connecting live tail…</span>
+					{:else if liveStatus === 'reconnecting'}
+						<span class="text-muted">Reconnecting…</span>
+					{/if}
+					{#if liveNotice}
+						<span class="text-warning-ink">{liveNotice}</span>
+					{/if}
+				</div>
+				<form class="flex flex-wrap items-center gap-1" onsubmit={addColumn}>
+					<label class="sr-only" for="column-path">Add a column</label>
+					<input id="column-path" name="column" placeholder="Add column: field.path" maxlength="324" class="{input} w-52 py-1 text-xs" />
+					<button type="submit" class="{button} btn-sm">Add column</button>
+					{#if columnError}<span class="text-xs text-danger-ink" role="alert">{columnError}</span>{/if}
+				</form>
+			</div>
+			{#if shown.length === 0}
+				<p class="px-4 py-12 text-center text-sm text-muted">
+					{#if data.sources.length === 0 && !data.sourcesError}
+						No sources yet — <a href="{path}/sources" class="text-primary">create one</a> to start sending logs.
+					{:else}
+						No logs match in this time range.
+					{/if}
+				</p>
+			{:else}
+				<div class="overflow-x-auto">
+					<table class="w-full table-fixed text-left text-sm">
+						<thead class="text-[11px] tracking-wider text-muted uppercase">
+							<tr class="border-b border-border">
+								<th class="w-48 px-4 py-2 font-medium">Time (UTC)</th>
+								<th class="w-24 px-2 py-2 font-medium">Level</th>
+								<th class="w-36 px-2 py-2 font-medium">Source</th>
+								<th class="min-w-64 px-2 py-2 font-medium">Message</th>
 								{#each data.state.columns as column (column)}
-									<td class="truncate px-2 py-1.5 font-mono text-xs text-ink-2">{formatFieldValue(fieldAt(row.fields, column))}</td>
+									<th class="w-40 px-2 py-2 font-medium">
+										<span class="flex items-center gap-1">
+											<code class="truncate">{column}</code>
+											<button
+												type="button"
+												aria-label="Remove column {column}"
+												onclick={() => go({ columns: data.state.columns.filter((other) => other !== column) })}
+												class="text-muted hover:text-danger-ink">×</button
+											>
+										</span>
+									</th>
 								{/each}
 							</tr>
-							{#if open}
-								{@const full = fullRows.get(row.id) ?? row}
-								<tr class="border-b border-border bg-surface-2">
-									<td colspan={4 + data.state.columns.length} class="space-y-3 px-4 py-3">
-										{#if full.truncated}
-											<p class="text-xs text-warning-ink" role="status">
-												{#if fullLoading.has(row.id)}
-													Shortened in the list — loading the whole entry…
-												{:else if fullErrors.has(row.id)}
-													Shortened in the list. {fullErrors.get(row.id)}
-													<button type="button" onclick={() => loadFull(row)} class="underline hover:text-warning-ink"
-														>Retry</button
-													>
-												{:else}
-													Shortened in the list.
-												{/if}
-											</p>
-										{/if}
-										<pre class="max-h-96 overflow-auto font-mono text-xs wrap-anywhere whitespace-pre-wrap text-ink">{full.message}</pre>
-										<pre
-											class="max-h-96 overflow-auto rounded-control border border-border bg-surface-2 p-3 font-mono text-xs wrap-anywhere whitespace-pre-wrap text-ink-2">{JSON.stringify(full.fields, null, 2)}</pre>
-										<dl class="grid gap-x-6 gap-y-1 text-xs text-muted sm:grid-cols-2">
-											<div>id <code class="text-ink-2">{row.id}</code></div>
-											<div>pattern <code class="text-ink-2">{row.pattern_hash}</code></div>
-											{#if row.trace_id}<div>trace <code class="text-ink-2">{row.trace_id}</code></div>{/if}
-											{#if row.span_id}<div>span <code class="text-ink-2">{row.span_id}</code></div>{/if}
-										</dl>
-										<CopyButton value={JSON.stringify(full, null, 2)} label="Copy JSON" />
+						</thead>
+						<tbody>
+							{#each shown as row (row.id)}
+								{@const open = expanded.has(row.id)}
+								<tr class="border-b border-border align-top hover:bg-surface-2">
+									<td class="px-4 py-1.5 font-mono text-xs whitespace-nowrap text-ink-2">{formatLogTime(row.dt)}</td>
+									<td class="px-2 py-1.5">
+										<span class="rounded-full px-2 py-0.5 text-xs font-medium {levelClasses(row.level)}">{row.level}</span>
 									</td>
+									<td class="truncate px-2 py-1.5 text-xs text-ink-2">{sourceNames.get(row.source_id) ?? (data.sourcesError ? 'unknown source' : 'deleted source')}</td>
+									<td class="px-2 py-1.5">
+										<button
+											type="button"
+											aria-expanded={open}
+											onclick={() => toggleRow(row)}
+											class="block w-full truncate text-left font-mono text-xs text-ink hover:text-primary"
+											>{row.message || '(no message)'}</button
+										>
+									</td>
+									{#each data.state.columns as column (column)}
+										<td class="truncate px-2 py-1.5 font-mono text-xs text-ink-2">{formatFieldValue(fieldAt(row.fields, column))}</td>
+									{/each}
 								</tr>
-							{/if}
-						{/each}
-					</tbody>
-				</table>
-			</div>
-			<div class="flex items-center justify-center gap-3 px-4 py-3">
-				{#if nextCursor}
-					<button type="button" onclick={loadMore} disabled={loadingMore} class={button}>
-						{loadingMore ? 'Loading…' : 'Load more'}
-					</button>
-				{:else}
-					<span class="text-xs text-muted">End of results in this time range.</span>
-				{/if}
-				{#if loadError}<span class="text-xs text-danger-ink" role="alert">{loadError}</span>{/if}
-			</div>
-		{/if}
-	</div>
+								{#if open}
+									{@const full = fullRows.get(row.id) ?? row}
+									<tr class="border-b border-border bg-surface-2">
+										<td colspan={4 + data.state.columns.length} class="space-y-3 px-4 py-3">
+											{#if full.truncated}
+												<p class="text-xs text-warning-ink" role="status">
+													{#if fullLoading.has(row.id)}
+														Shortened in the list — loading the whole entry…
+													{:else if fullErrors.has(row.id)}
+														Shortened in the list. {fullErrors.get(row.id)}
+														<button type="button" onclick={() => loadFull(row)} class="underline hover:text-warning-ink"
+															>Retry</button
+														>
+													{:else}
+														Shortened in the list.
+													{/if}
+												</p>
+											{/if}
+											<pre class="max-h-96 overflow-auto font-mono text-xs wrap-anywhere whitespace-pre-wrap text-ink">{full.message}</pre>
+											<pre
+												class="max-h-96 overflow-auto rounded-control border border-border bg-surface-2 p-3 font-mono text-xs wrap-anywhere whitespace-pre-wrap text-ink-2">{JSON.stringify(full.fields, null, 2)}</pre>
+											<dl class="grid gap-x-6 gap-y-1 text-xs text-muted sm:grid-cols-2">
+												<div>id <code class="text-ink-2">{row.id}</code></div>
+												<div>pattern <code class="text-ink-2">{row.pattern_hash}</code></div>
+												{#if row.trace_id}<div>trace <code class="text-ink-2">{row.trace_id}</code></div>{/if}
+												{#if row.span_id}<div>span <code class="text-ink-2">{row.span_id}</code></div>{/if}
+											</dl>
+											<CopyButton value={JSON.stringify(full, null, 2)} label="Copy JSON" />
+										</td>
+									</tr>
+								{/if}
+							{/each}
+						</tbody>
+					</table>
+				</div>
+				<div class="flex items-center justify-center gap-3 px-4 py-3">
+					{#if nextCursor}
+						<button type="button" onclick={loadMore} disabled={loadingMore} class={button}>
+							{loadingMore ? 'Loading…' : 'Load more'}
+						</button>
+					{:else}
+						<span class="text-xs text-muted">End of results in this time range.</span>
+					{/if}
+					{#if loadError}<span class="text-xs text-danger-ink" role="alert">{loadError}</span>{/if}
+				</div>
+			{/if}
+		</div>
+	{/if}
 </div>

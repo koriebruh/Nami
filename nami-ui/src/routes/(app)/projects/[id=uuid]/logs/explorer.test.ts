@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { fakeEvent, PROJECT_ID } from '#lib/server/core/fake-event';
-import { load } from './+page.server';
+import { actions, load } from './+page.server';
 
 const SOURCE = '0b6f3f3e-6d2a-4c1e-9b7a-2f1d3c4b5a69';
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
@@ -10,9 +10,13 @@ function engine(
 		search?: Response;
 		histogram?: Response;
 		sources?: Response;
+		patterns?: Response;
+		views?: Response;
 	} = {}
 ) {
 	return (url: URL) => {
+		if (url.pathname.endsWith('/logs/patterns')) return overrides.patterns ?? json({ patterns: [] });
+		if (url.pathname.endsWith('/log-views')) return overrides.views ?? json([]);
 		if (url.pathname.endsWith('/logs/histogram'))
 			return overrides.histogram ?? json({ step_seconds: 60, total: 0, buckets: [] });
 		if (url.pathname.endsWith('/logs')) return overrides.search ?? json({ logs: [], next_cursor: 'c1' });
@@ -92,5 +96,59 @@ describe('explorer load', () => {
 		const fine = fakeEvent({ respond: engine() });
 		const ok: any = await load(fine.event);
 		expect([ok.histogramError, ok.sourcesError]).toEqual([null, null]);
+	});
+});
+
+describe('explorer, part 2', () => {
+	it('the patterns tab loads patterns instead of a results page', async () => {
+		const { event, calls } = fakeEvent({
+			url: 'http://ui.test/p?tab=patterns&level=error&pattern=5',
+			respond: (url) => {
+				if (url.pathname.endsWith('/logs/patterns')) return json({ patterns: [{ pattern_hash: '5', pattern: 'x <num>', count: 3, first_seen: 'a', last_seen: 'b' }] });
+				if (url.pathname.endsWith('/log-views')) return json([]);
+				return engine()(url);
+			}
+		});
+		const data: any = await load(event);
+		expect(data.patterns).toHaveLength(1);
+		const paths = calls().map((c) => c.path);
+		expect(paths).toContain(`/projects/${PROJECT_ID}/logs/patterns`);
+		expect(paths).not.toContain(`/projects/${PROJECT_ID}/logs`);
+		const patterns = calls().find((c) => c.path.endsWith('/logs/patterns'))!;
+		const params = new URLSearchParams(patterns.search);
+		expect(params.getAll('pattern_hash')).toEqual(['5']);
+		expect(params.has('limit') || params.has('cursor')).toBe(false);
+	});
+
+	it('loads saved views, and a failed views call does not break the page', async () => {
+		const views = [{ id: 'v1', name: 'Errors', query: { range: '1h' } }];
+		const ok = fakeEvent({ url: 'http://ui.test/p', respond: (url) => (url.pathname.endsWith('/log-views') ? json(views) : engine()(url)) });
+		expect(((await load(ok.event)) as any).views).toEqual(views);
+		const down = fakeEvent({ url: 'http://ui.test/p', respond: (url) => (url.pathname.endsWith('/log-views') ? json({}, 500) : engine()(url)) });
+		expect(((await load(down.event)) as any).views).toEqual([]);
+	});
+
+	it('saves the current state as a view, without live or tab', async () => {
+		const state = 'range=24h&level=error&live=1&tab=patterns';
+		const { event, calls } = fakeEvent({ form: { name: 'Errors', state }, respond: () => json({ id: 'v1' }, 201) });
+		expect(await actions.saveView(event)).toEqual({ savedView: 'Errors' });
+		expect(calls()[0]).toMatchObject({ method: 'POST', path: `/projects/${PROJECT_ID}/log-views` });
+		expect(JSON.parse(calls()[0].body!)).toEqual({ name: 'Errors', query: { range: '24h', levels: ['error'] } });
+	});
+
+	it('updates and deletes views with checked ids and a confirmed delete', async () => {
+		const VIEW = '0b9d1f6c-5a3e-4c2f-9d47-6e8a1c3b7f25';
+		const update = fakeEvent({ form: { view_id: VIEW, state: 'q=x' }, respond: () => json({ id: VIEW }) });
+		expect(await actions.updateView(update.event)).toEqual({ updatedView: true });
+		expect(update.calls()[0]).toMatchObject({ method: 'PATCH', path: `/projects/${PROJECT_ID}/log-views/${VIEW}` });
+		const bare = fakeEvent({ form: { view_id: VIEW } });
+		expect(await actions.deleteView(bare.event)).toEqual({ confirmDeleteView: VIEW });
+		expect(bare.calls()).toHaveLength(0);
+		// `new Response('', { status: 204 })` throws (204 is a null-body status): answer with a null body.
+		const confirmed = fakeEvent({ form: { view_id: VIEW, confirm: 'yes' }, respond: () => new Response(null, { status: 204 }) });
+		expect(await actions.deleteView(confirmed.event)).toEqual({ deletedView: true });
+		const forged = fakeEvent({ form: { view_id: '../../sources', confirm: 'yes' } });
+		expect(await actions.deleteView(forged.event)).toMatchObject({ status: 400 });
+		expect(forged.calls()).toHaveLength(0);
 	});
 });
