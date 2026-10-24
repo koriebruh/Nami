@@ -45,8 +45,8 @@ pub const MAX_ALERT_EVALUATIONS: usize = 8;
 /// while other projects' alerts wait. Enforced by the claim
 /// ([`claim_due_alerts`]).
 pub const MAX_ALERT_EVALUATIONS_PER_PROJECT: usize = 2;
-// A pass reserves every free place before it claims (`run_pass_with`), which
-// keeps the claims of one instance apart only while one claim can take them all.
+// A pass reserves every free place before it claims (`run_pass_with`): one
+// claim must be able to take them all.
 const _: () = assert!(MAX_ALERT_EVALUATIONS as i64 <= ALERT_CLAIM_BATCH);
 
 /// What the worker shows when a count fails for any reason a user cannot fix.
@@ -385,10 +385,11 @@ pub async fn run_pass_with(
     let Ok(mut reserved) = Arc::clone(budget).try_acquire_many_owned(room as u32) else {
         return Ok(0);
     };
-    // `running` is read and the claimed alerts counted while this pass holds
-    // every free place of the budget, so no other pass sharing it (every pass
-    // of `run_forever`) claims in between: it finds no room. A project then
-    // never gets more than its share.
+    // ponytail: `running` is read before the claim and the claimed alerts
+    // counted after it. `run_forever` starts passes ALERT_TICK apart, so two
+    // claims overlap only when one outlasts a tick (and the later pass finds
+    // a place an ended evaluation gave back); a project can then exceed its
+    // share by those places. Serialize the claims if that shows up.
     let running = &state.logs.alert_evaluations;
     let alerts = claim_due_alerts(&state.db, room as i64, &running.counts()).await?;
     let claimed = alerts.len();
