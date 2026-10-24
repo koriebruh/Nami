@@ -18,8 +18,8 @@ pub const MAX_CONCURRENT_KICKS: usize = 2;
 static KICKS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_KICKS);
 
 /// Kicks every [`TICK`] (missed ticks delayed), one at a time, each in a task
-/// of its own so a panic is logged and never stops the loop. Spawned by
-/// `main` unless `INCIDENTS_WORKER_ENABLED=false`.
+/// of its own so a panic is logged and never stops the loop. Not spawned yet:
+/// NAMI-INC-10 spawns it from `main` unless `INCIDENTS_WORKER_ENABLED=false`.
 pub async fn run_forever(state: AppState) {
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);

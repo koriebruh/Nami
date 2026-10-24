@@ -296,6 +296,31 @@ async fn a_channel_never_receives_more_than_its_per_minute_cap(pool: sqlx::PgPoo
 }
 
 #[sqlx::test]
+async fn a_user_never_receives_more_emails_than_the_per_minute_cap(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (user, email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    for _ in 0..(deliveries::EMAIL_PER_USER_PER_MINUTE + 5) {
+        let incident = open_test_incident(&pool, project, user).await;
+        queue(&pool, incident, "p0r0s0", Target::Email { user_id: user }).await;
+    }
+    run_incident_ticks(&state).await;
+    run_incident_ticks(&state).await;
+    let counts: Vec<(String, i64, i64)> = sqlx::query_as(
+        "select status, count(*), sum(attempts) from notification_deliveries where user_id = $1
+         group by status order by status",
+    )
+    .bind(user)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let cap = deliveries::EMAIL_PER_USER_PER_MINUTE;
+    assert_eq!(counts, [("pending".into(), 5, 0), ("sent".into(), cap, cap)], "the excess waits");
+    assert_eq!(settled_mail(&email, cap as usize).await.len() as i64, cap);
+}
+
+#[sqlx::test]
 async fn a_delivery_whose_channel_no_longer_decrypts_fails_without_sending(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = test_app(pool.clone());
@@ -329,7 +354,7 @@ async fn send_test_reports_the_outcome_and_is_rate_limited(pool: sqlx::PgPool) {
     let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
     let (_, _, member) = user_with_role(&app, &pool, project, Some("member")).await;
     let teams = MockServer::start().await;
-    Mock::given(method("POST")).respond_with(ResponseTemplate::new(202)).expect(1).mount(&teams).await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(202)).expect(2).mount(&teams).await;
     let channel = insert_channel(
         &pool,
         Some(project),
@@ -346,6 +371,14 @@ async fn send_test_reports_the_outcome_and_is_rate_limited(pool: sqlx::PgPool) {
     assert_eq!((status, body["ok"].as_bool()), (StatusCode::OK, Some(true)), "{body}");
     let (status, _) = call(&app, "POST", &test_path, Some(&admin), Some(json!({}))).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    sqlx::query("update notification_channels set last_tested_at = now() - make_interval(secs => $2) where id = $1")
+        .bind(channel)
+        .bind(nami_engine::incidents::channel::model::MIN_TEST_INTERVAL.as_secs_f64() + 1.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let (status, _) = call(&app, "POST", &test_path, Some(&admin), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "a test past the interval goes out again");
     let card: Value = serde_json::from_slice(&teams.received_requests().await.unwrap()[0].body).unwrap();
     assert_eq!(card["attachments"][0]["content"]["type"], "AdaptiveCard");
 }
