@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::{
     core::{error::AppError, state::AppState},
     incidents::{
+        action,
         channel::model as channel,
         format::{IncidentSummary, Message, NotifyEvent},
         lifecycle::{self, EventKind},
@@ -247,6 +248,9 @@ struct Context {
     user_email: Option<String>,
     user_verified: bool,
     user_is_member: bool,
+    /// A project member or admin, or a global admin: the user may act on the
+    /// incident, so their email carries action links (R16).
+    user_can_act: bool,
     channel_kind: Option<String>,
     channel_name: Option<String>,
     channel_enabled: Option<bool>,
@@ -255,6 +259,7 @@ struct Context {
 // $1 = incident, $2 = user (or null), $3 = channel (or null). Membership is
 // `project_members` only: a global admin who is not a member is not paged (R7).
 // A personal channel's owner is checked even when the row names no user.
+// `user_can_act` keeps `action::may_act`'s roles; a channel row has no user.
 const CONTEXT: &str = "select i.project_id, p.name as project_name, i.title, i.cause, i.status, i.source,
         coalesce(s.name, 'unknown') as severity, i.started_at, i.details,
         (select e.metadata->>'reason' from incident_events e
@@ -264,6 +269,11 @@ const CONTEXT: &str = "select i.project_id, p.name as project_name, i.title, i.c
             or exists (select 1 from project_members pm
                        where pm.project_id = i.project_id and pm.user_id = coalesce($2, c.user_id))
             as user_is_member,
+        coalesce(u.global_role = 'admin', false)
+            or exists (select 1 from project_members pm
+                       where pm.project_id = i.project_id and pm.user_id = $2
+                         and pm.project_role in ('member', 'admin'))
+            as user_can_act,
         c.kind as channel_kind, c.name as channel_name, c.enabled as channel_enabled
     from incidents i
     join projects p on p.id = i.project_id
@@ -336,7 +346,13 @@ async fn attempt(state: &AppState, senders: &Senders, row: &Claimed) -> Result<O
             c.project_id,
             row.incident_id
         ),
-        actions: None,
+        // Only a user's own implicit email: a channel may post into a shared room.
+        actions: row
+            .user_id
+            .filter(|_| event == NotifyEvent::Triggered && row.channel_id.is_none() && c.user_can_act)
+            .map(|user_id| {
+                action::token::links(&state.cipher, &state.config.ui_base_url, row.incident_id, user_id, Utc::now())
+            }),
     };
 
     if !renew_lease(&state.db, row).await? {

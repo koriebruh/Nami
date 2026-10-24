@@ -21,7 +21,6 @@ fn token(state: &AppState, incident: Uuid, user: Uuid, action: Action) -> String
 }
 
 #[sqlx::test]
-#[ignore = "needs NAMI-INC-9 (escalation emails) and the deliveries.rs link wiring of NAMI-INC-11"]
 async fn emails_carry_links_that_acknowledge_without_a_session_once(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = test_app(pool.clone());
@@ -50,7 +49,6 @@ async fn emails_carry_links_that_acknowledge_without_a_session_once(pool: sqlx::
 }
 
 #[sqlx::test]
-#[ignore = "needs NAMI-INC-9 (escalation emails) and the deliveries.rs link wiring of NAMI-INC-11"]
 async fn viewers_get_no_links_and_their_tokens_do_nothing(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = test_app(pool.clone());
@@ -65,9 +63,8 @@ async fn viewers_get_no_links_and_their_tokens_do_nothing(pool: sqlx::PgPool) {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-/// The no-email half of the two tests above, until NAMI-INC-9 queues emails:
-/// a link built as an email would carry it inspects without mutating,
-/// acknowledges once as its user, and a replay is refused.
+/// A link built as an email carries it inspects without mutating, reports
+/// what it acts on, acknowledges once as its user, and a replay is refused.
 #[sqlx::test]
 async fn a_link_acknowledges_without_a_session_once(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
