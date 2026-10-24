@@ -34,5 +34,7 @@ describe('channelPayloadFromForm', () => {
 	it('sends only the fields of the chosen kind', () => {
 		expect(channelPayloadFromForm(form({ name: 'w', kind: 'webhook', url: 'https://x.test/h', webhook_url: '', bot_token: '', address: '' }), 'create', 'project'))
 			.toEqual({ ok: true, payload: { name: 'w', kind: 'webhook', config: { url: 'https://x.test/h' }, enabled: true } });
+		expect(channelPayloadFromForm(form({ name: 't', kind: 'telegram', address: '', url: '', webhook_url: '', bot_token: '1:abc', chat_id: '42' }), 'create', 'project'))
+			.toEqual({ ok: true, payload: { name: 't', kind: 'telegram', config: { bot_token: '1:abc', chat_id: '42' }, enabled: true } });
 	});
 });

@@ -2,6 +2,7 @@
      the personal and the project page. Secrets are write-only: no input is
      ever rendered with a stored value, only the engine's kind and summary. -->
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import { enhance, type SubmitFunction } from '$app/forms';
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
@@ -11,6 +12,7 @@
 		isChannelKind,
 		kindsFor,
 		type Channel,
+		type ChannelField,
 		type ChannelKind
 	} from '#lib/incidents/channels';
 
@@ -40,6 +42,25 @@
 	let kind = $state<ChannelKind>(kindsFor(scope)[0]);
 	const label = (k: string) => (isChannelKind(k) ? CHANNEL_LABELS[k] : k);
 	const fieldsOf = (k: string) => (isChannelKind(k) ? CHANNEL_FIELDS[k] : []);
+
+	// Without JavaScript the kind select cannot swap the fields, so the create
+	// form starts with every field of every kind, each once (Slack, Teams and
+	// Discord share `webhook_url`), none required: the action reads only the
+	// chosen kind's. Once hydrated it shows the chosen kind's fields alone.
+	let hydrated = $state(false);
+	onMount(() => (hydrated = true));
+	const allFields = $derived.by(() => {
+		const byName = new Map<string, { field: ChannelField; labels: string[] }>();
+		for (const k of kinds) {
+			for (const field of CHANNEL_FIELDS[k]) {
+				const entry = byName.get(field.name) ?? { field, labels: [] };
+				entry.labels.push(CHANNEL_LABELS[k]);
+				byName.set(field.name, entry);
+			}
+		}
+		return [...byName.values()].map(({ field, labels }) => ({ ...field, label: `${field.label} (${labels.join(', ')})` }));
+	});
+	const newFields = $derived(hydrated ? CHANNEL_FIELDS[kind] : allFields);
 
 	// Buttons stay disabled from a submit until its result is applied.
 	let busy = $state(false);
@@ -133,12 +154,16 @@
 							{#if canEdit}
 								<form method="POST" action="?/test" use:enhance={submit}>
 									<input type="hidden" name="channel_id" value={channel.id} />
-									<button type="submit" disabled={busy} class="btn btn-secondary btn-sm">Send test</button>
+									<button type="submit" disabled={busy} class="btn btn-secondary btn-sm"
+										>Send test<span class="sr-only"> to {channel.name}</span></button
+									>
 								</form>
 								<form method="POST" action="?/delete" use:enhance={submitDelete}>
 									<input type="hidden" name="channel_id" value={channel.id} />
 									<input type="hidden" name="channel_name" value={channel.name} />
-									<button type="submit" disabled={busy} class="btn btn-danger btn-sm">Delete</button>
+									<button type="submit" disabled={busy} class="btn btn-danger btn-sm"
+										>Delete<span class="sr-only"> {channel.name}</span></button
+									>
 								</form>
 							{/if}
 						</div>
@@ -156,7 +181,9 @@
 
 						{#if canEdit}
 							<details>
-								<summary class="cursor-pointer text-sm text-ink-2 hover:text-ink">Edit</summary>
+								<summary class="cursor-pointer text-sm text-ink-2 hover:text-ink"
+									>Edit<span class="sr-only"> {channel.name}</span></summary
+								>
 								<form method="POST" action="?/update" use:enhance={submitReset} class="mt-3 grid gap-3 sm:grid-cols-2">
 									<input type="hidden" name="channel_id" value={channel.id} />
 									<input type="hidden" name="kind" value={channel.kind} />
@@ -173,7 +200,7 @@
 										/>
 									</div>
 									<label class="flex items-center gap-2 self-end text-sm text-ink">
-										<input type="checkbox" name="enabled" defaultChecked={channel.enabled} />
+										<input type="checkbox" name="enabled" defaultChecked={channel.enabled} class="checkbox" />
 										Enabled
 									</label>
 									{#each fieldsOf(channel.kind) as field (field.name)}
@@ -214,20 +241,23 @@
 				</div>
 				<div>
 					<label for="channel-kind" class="label">Kind</label>
-					<select id="channel-kind" name="kind" bind:value={kind} class="input">
+					<select id="channel-kind" name="kind" bind:value={kind} class="select">
 						{#each kinds as k (k)}
 							<option value={k}>{CHANNEL_LABELS[k]}</option>
 						{/each}
 					</select>
 				</div>
-				{#each CHANNEL_FIELDS[kind] as field (field.name)}
+				{#if !hydrated}
+					<p class="text-sm text-muted sm:col-span-2">Fill in the fields of the kind you chose.</p>
+				{/if}
+				{#each newFields as field (field.name)}
 					<div>
 						<label for="new-{field.name}" class="label">{field.label}</label>
 						<input
 							id="new-{field.name}"
 							name={field.name}
-							type={field.secret ? 'password' : kind === 'email' ? 'email' : 'text'}
-							required
+							type={field.secret ? 'password' : field.name === 'address' ? 'email' : 'text'}
+							required={hydrated}
 							autocomplete="off"
 							placeholder={field.placeholder}
 							class="input"

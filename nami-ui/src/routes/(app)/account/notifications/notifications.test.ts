@@ -78,6 +78,21 @@ describe('personal channel actions', () => {
 		});
 	});
 
+	// The no-JS create form posts every kind's fields; only the chosen kind's go.
+	it('creates from the no-JS form, which carries every kind\'s fields', async () => {
+		const { event, calls } = fakeEvent({
+			form: { name: 'D', kind: 'discord', url: '', webhook_url: 'https://discord.com/api/webhooks/1/x', bot_token: '', chat_id: '' },
+			respond: () => json(channel({ kind: 'discord' }), 201)
+		});
+		expect(await actions.create(event)).toEqual({ action: 'create', created: true });
+		expect(JSON.parse(calls()[0].body!)).toEqual({
+			name: 'D',
+			kind: 'discord',
+			config: { webhook_url: 'https://discord.com/api/webhooks/1/x' },
+			enabled: true
+		});
+	});
+
 	it('saves an edit with PATCH, keeping the secret when the field is blank', async () => {
 		const { event, calls } = fakeEvent({
 			form: { channel_id: CHANNEL_ID, name: 'Renamed', kind: 'slack', webhook_url: '' },
@@ -153,6 +168,19 @@ describe('personal channels page', () => {
 		expect(body).toContain('Leave blank to keep the current value');
 		expect(body).not.toContain('<option value="email"');
 		expect(body).toContain('Send test');
+	});
+
+	// svelte/server runs no onMount: this is the markup a browser without JavaScript gets.
+	it('gives a no-JS create form every personal kind\'s fields, once each and none required', () => {
+		const { body } = renderPage(null, []);
+		const inputs = body.match(/<input[^>]*id="new-[^"]*"[^>]*>/g) ?? [];
+		expect(inputs.map((tag) => /id="new-([^"]*)"/.exec(tag)![1])).toEqual(['url', 'webhook_url', 'bot_token', 'chat_id']);
+		for (const tag of inputs) {
+			expect(tag).not.toContain('required');
+			expect(tag).not.toContain('value=');
+			expect(tag).not.toContain('type="email"');
+		}
+		expect(body).toContain('Webhook URL (Slack, Microsoft Teams, Discord)');
 	});
 
 	it('shows the signing secret once with the receiver guidance', () => {

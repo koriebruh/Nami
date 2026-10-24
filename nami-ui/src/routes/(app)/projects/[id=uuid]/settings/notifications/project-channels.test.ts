@@ -159,6 +159,11 @@ describe('project channels page', () => {
 
 	it('shows an admin the forms, with the project email kind', () => {
 		const { body } = renderPage('admin');
+		const created = body.match(/<input[^>]*id="new-[^"]*"[^>]*>/g) ?? [];
+		expect(created.map((tag) => /id="new-([^"]*)"/.exec(tag)![1])).toEqual(['address', 'url', 'webhook_url', 'bot_token', 'chat_id']);
+		for (const tag of created) expect(tag).not.toContain('required');
+		expect(created.find((tag) => tag.includes('name="chat_id"'))).toContain('type="text"');
+		expect(created.find((tag) => tag.includes('name="address"'))).toContain('type="email"');
 		expect(body).toContain('<form');
 		expect(body).toContain('Send test');
 		expect(body).toContain('<option value="email"');
