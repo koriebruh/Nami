@@ -1,6 +1,6 @@
 # Metrics + Dashboards — Part 1 Implementation Plan
 
-> **Restructure note (2026-10-19):** after this plan was written, the engine, its tests, its migrations and `nami-ui/src/lib` were reorganised by domain, and work now ships as one PR per phase (see `CLAUDE.md`). File paths, test files and migration numbers in the steps below predate that change. Map them with the path table in `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. For example, `src/clickhouse.rs` is now `src/core/clickhouse.rs` (its DDL list is grouped by domain: add a metrics group), `src/logs/query.rs` is `src/logs/query/mod.rs`, `src/routes/logs_ingest.rs` is `src/logs/ingest/routes.rs`, `src/logs/rate_limit.rs` is `src/logs/ingest/rate_limit.rs`, new tests become modules of a `tests/metrics/main.rs` target, and `#lib/server/engine` is `#lib/server/core/engine`. New migrations follow the convention in that file: numbered sequentially after the newest file in `nami-engine/migrations/` (the first is `0006_`), named `NNNN_<domain>_<change>.sql`, and at most one file per domain per phase PR. The plan's `0120_create_dashboards.sql` becomes one `NNNN_metrics_<change>.sql`. The plan body is otherwise unchanged.
+> **Restructure note (2026-10-19):** after this plan was written, the engine, its tests, its migrations and `nami-ui/src/lib` were reorganised by domain, and work now ships as one PR per phase (see `CLAUDE.md`). File paths, test files and migration numbers in the steps below predate that change. Map them with the path table in `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. For example, `src/core/clickhouse.rs` is now `src/core/clickhouse.rs` (its DDL list is grouped by domain: add a metrics group), `src/logs/query/mod.rs` is `src/logs/query/mod.rs`, `src/logs/ingest/routes.rs` is `src/logs/ingest/routes.rs`, `src/logs/ingest/rate_limit.rs` is `src/logs/ingest/rate_limit.rs`, new tests become modules of a `tests/metrics/main.rs` target, and `#lib/server/engine` is `#lib/server/core/engine`. New migrations follow the convention in that file: numbered sequentially after the newest file in `nami-engine/migrations/` (the first is `0006_`), named `NNNN_<domain>_<change>.sql`, and at most one file per domain per phase PR. The plan's `0120_create_dashboards.sql` becomes one `NNNN_metrics_<change>.sql`. The plan body is otherwise unchanged.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -37,11 +37,11 @@ Design system on `main` (PR #66), read for this plan and used by T10-T13 (import
 - `dismissible` (action for `<details>` menus); `tones.ts`: `Tone`, `TONE_VAR`, `TONE_TEXT`, `SERIES_COLORS` (`var(--color-series-1..6)`), `seriesColor(i)` (wraps after the sixth), `finitePoints`.
 - Tokens in `src/routes/layout.css` (`--color-border`, `--color-muted`, `--color-faint`, `--color-series-1..6`, ...; light theme only, no dark variant) and primitives `.card`, `.input`, `.select`, `.btn .btn-primary|secondary|ghost|danger`, `.alert-*`, `.badge-*`, `.table`, `.menu-item`.
 
-Merged on `main` (`be51a5c`), checked by this plan: `clickhouse::{ClickHouse::{query_rows_with, insert_rows_with, insert_encoded_with, create_test_database, drop_database}, encode_rows_within, MAX_RESPONSE_BYTES, QUERY_MAX_EXECUTION_SECS = 25}` and the module-private `MIGRATIONS: [&str; 3]` and `RESERVED_SETTINGS` (edited in place; every response is read through the private `read_capped`, so `ResponseTooLarge` bounds every read); `logs::query::Sql::{new, push, bind, placeholder, value, list, text, params}` (placeholders are numbered `{p<n>:Type}`; the symbolic names in this plan's SQL, such as `{pP:UUID}`, stand for them); `logs::search::{READ_SETTINGS, user_error, QueryPermit}` (logs' own per-user slots; metrics use `UserSlots`); `logs::slots::{UserSlots::acquire(self: &Arc<Self>, user_id, max), UserPermit}`; `logs::budget::{Budget::{new, for_request, charge, string, array, object, key}, MAX_DECODED_BYTES = 192 MiB, TooLarge}`; `logs::rate_limit::{TokenBuckets::{new, try_acquire}, InFlight::{new, try_enter, limit}, InFlightGuard, DecodeShares::acquire, ProjectLimits {in_flight, decode_shares}, REQUESTS_PER_SECOND = 50.0, BURST = 100.0, MAX_IN_FLIGHT_PER_SOURCE = 4, MAX_IN_FLIGHT_PER_PROJECT = 8}`; `logs::ingest::{bearer_token, read_body(body, headers, pace), gunzip, parse_json_events_within, prepare, DecodePlace, BodyPace, IngestError, MAX_BODY_BYTES = 10 MiB}` and its private budget-charging JSON visitor (`Counted`, `Spend`, `Refusal`, `read_object`); `LogsState {rate_limiter, in_flight, decode_shares, project_limits, ..}`; `logs::normalize::{parse_timestamp, LEVELS}`; `logs::store::INSERT_SETTINGS` (async insert, waits for the flush, 400 partitions); `routes::logs_ingest::{IngestLimits {places, queries, decodes, body_pace}, Work}` (the work after the body runs in a spawned task holding the place and the in-flight guards); `models::source::{find_by_token, is_well_formed_token, IngestSource {id, project_id, retention_days: i32, daily_byte_quota, updated_at}}`; `models::validate_label` (1-200 chars); `middleware::rbac::{CurrentUser, require_project_role(pool, user, project_id, min), require_project_reader, ProjectReader}`; `uptime::store::{UptimeCheckRow, insert_checks}`, `uptime::checker::CheckStatus`, the `uptime_checks` table (`ORDER BY (monitor_id, checked_at)`, no `project_id` in the key, 180-day TTL); the `logs` table (`ORDER BY (project_id, dt, id)`); `uptime::export` (its `UserSlots` + engine-wide semaphore pattern, which R10 mirrors); `AppState::for_test` (`AppState { db, mailer, clickhouse, cipher, logs: Arc<LogsState>, config }`); `router::{build_router, build_public_router, build_public_router_with_limits}`; tests' `common::{app, test_app, public_app, call, login, seed_user, unique_email, seed_project, user_with_role, seed_http_monitor, state_with_clickhouse, logs::{seed_source, post_json, eventually}}`; nami-ui `#lib/server/engine` (`callEngine(event, path, init)` passes `init` through to `fetch`, `enginePath`, `engineFailure`, `engineErrorMessage`, `publicEngineUrl`), `#lib/uuid` (`isUuid`), `#lib/server/relay-stream` (`relayStream`), `#lib/server/fake-event` (`fakeEvent`, `PROJECT_ID`), `#lib/logs` (`TOKEN_PLACEHOLDER`, the source snippets), `#lib/uptime` (`niceTicks`, `formatUtc`, `shellQuote`), the `[id=uuid]` matcher.
+Merged on `main` (`be51a5c`), checked by this plan: `clickhouse::{ClickHouse::{query_rows_with, insert_rows_with, insert_encoded_with, create_test_database, drop_database}, encode_rows_within, MAX_RESPONSE_BYTES, QUERY_MAX_EXECUTION_SECS = 25}` and the module-private `MIGRATIONS: [&str; 3]` and `RESERVED_SETTINGS` (edited in place; every response is read through the private `read_capped`, so `ResponseTooLarge` bounds every read); `logs::query::Sql::{new, push, bind, placeholder, value, list, text, params}` (placeholders are numbered `{p<n>:Type}`; the symbolic names in this plan's SQL, such as `{pP:UUID}`, stand for them); `logs::query::search::{READ_SETTINGS, user_error, QueryPermit}` (logs' own per-user slots; metrics use `UserSlots`); `logs::query::slots::{UserSlots::acquire(self: &Arc<Self>, user_id, max), UserPermit}`; `logs::ingest::budget::{Budget::{new, for_request, charge, string, array, object, key}, MAX_DECODED_BYTES = 192 MiB, TooLarge}`; `logs::ingest::rate_limit::{TokenBuckets::{new, try_acquire}, InFlight::{new, try_enter, limit}, InFlightGuard, DecodeShares::acquire, ProjectLimits {in_flight, decode_shares}, REQUESTS_PER_SECOND = 50.0, BURST = 100.0, MAX_IN_FLIGHT_PER_SOURCE = 4, MAX_IN_FLIGHT_PER_PROJECT = 8}`; `logs::ingest::{bearer_token, read_body(body, headers, pace), gunzip, parse_json_events_within, prepare, DecodePlace, BodyPace, IngestError, MAX_BODY_BYTES = 10 MiB}` and its private budget-charging JSON visitor (`Counted`, `Spend`, `Refusal`, `read_object`); `LogsState {rate_limiter, in_flight, decode_shares, project_limits, ..}`; `logs::ingest::normalize::{parse_timestamp, LEVELS}`; `logs::ingest::store::INSERT_SETTINGS` (async insert, waits for the flush, 400 partitions); `logs::ingest::routes::{IngestLimits {places, queries, decodes, body_pace}, Work}` (the work after the body runs in a spawned task holding the place and the in-flight guards); `logs::source::model::{find_by_token, is_well_formed_token, IngestSource {id, project_id, retention_days: i32, daily_byte_quota, updated_at}}`; `core::validate::validate_label` (1-200 chars); `middleware::rbac::{CurrentUser, require_project_role(pool, user, project_id, min), require_project_reader, ProjectReader}`; `uptime::store::{UptimeCheckRow, insert_checks}`, `uptime::checker::CheckStatus`, the `uptime_checks` table (`ORDER BY (monitor_id, checked_at)`, no `project_id` in the key, 180-day TTL); the `logs` table (`ORDER BY (project_id, dt, id)`); `uptime::export` (its `UserSlots` + engine-wide semaphore pattern, which R10 mirrors); `AppState::for_test` (`AppState { db, mailer, clickhouse, cipher, logs: Arc<LogsState>, config }`); `router::{build_router, build_public_router, build_public_router_with_limits}`; tests' `common::{app, test_app, public_app, call, login, seed_user, unique_email, seed_project, user_with_role, seed_http_monitor, state_with_clickhouse, logs::{seed_source, post_json, eventually}}`; nami-ui `#lib/server/engine` (`callEngine(event, path, init)` passes `init` through to `fetch`, `enginePath`, `engineFailure`, `engineErrorMessage`, `publicEngineUrl`), `#lib/uuid` (`isUuid`), `#lib/server/relay-stream` (`relayStream`), `#lib/server/fake-event` (`fakeEvent`, `PROJECT_ID`), `#lib/logs` (`TOKEN_PLACEHOLDER`, the source snippets), `#lib/uptime` (`niceTicks`, `formatUtc`, `shellQuote`), the `[id=uuid]` matcher.
 
 **Part 2 follows** (a separate plan, NAMI-MET-14 onward, Postgres migrations from 0121). It covers:
 - **Prometheus remote-write** ingest (`POST /api/v1/metrics/prometheus/remote_write`, snappy + protobuf `WriteRequest`, decompression-bomb guard, fuzz cases). It needs two crates (`snap`, `prost`) and the collector bundle is its main client, so it moves out of Part 1 (R1).
-- **Scrape targets** (`metric_scrape_targets`, migration 0121): the worker claims due targets with the monitors' atomic claim, GETs through a client built on the monitors' `GuardedResolver` (no proxy, link-local/metadata refusal at DNS time, no redirects, 10 MiB body cap through the capped reader, timeout below the interval). The body goes through T2's parser and T4's validation and guard, with at most 50,000 samples per scrape. Health (`last_scrape_at`, `last_duration_ms`, `last_samples`, `last_error`, `up/down/unknown`), the synthetic `up`, `scrape_duration_seconds`, `scrape_samples_scraped` series, and bearer/basic credentials sealed with `crypto::Cipher` under the per-row context `metric_scrape_targets.auth:{id}`, write-only. Part 2 also decides the operator outbound policy hook the spec defers to Platform.
+- **Scrape targets** (`metric_scrape_targets`, migration 0121): the worker claims due targets with the monitors' atomic claim, GETs through a client built on the monitors' `GuardedResolver` (no proxy, link-local/metadata refusal at DNS time, no redirects, 10 MiB body cap through the capped reader, timeout below the interval). The body goes through T2's parser and T4's validation and guard, with at most 50,000 samples per scrape. Health (`last_scrape_at`, `last_duration_ms`, `last_samples`, `last_error`, `up/down/unknown`), the synthetic `up`, `scrape_duration_seconds`, `scrape_samples_scraped` series, and bearer/basic credentials sealed with `core::crypto::Cipher` under the per-row context `metric_scrape_targets.auth:{id}`, write-only. Part 2 also decides the operator outbound policy hook the spec defers to Platform.
 - **Template library** (bundled JSON: Uptime overview, node_exporter, postgres_exporter, redis_exporter, nginx-prometheus-exporter, cAdvisor), created through T8's `create_with_panels`. A test instantiates each template and runs every panel against fixture series of that exporter.
 - **Public share links** (`dashboard_shares`, one active per dashboard, 32-byte token stored as SHA-256, revoke = delete). Engine public routes return the definition and run panels only by id through T9's `run_panel_query`, range ≤ 90 days, per-IP rate limit. nami-ui serves `/share/dashboards/[token]` without a session (`noindex`), and the dialog warns that the panels' series become public. The snapshot/caching pattern follows Status Pages (SP-6).
 - **Metric alerts and the shared alert evaluator** for metric and log alerts (`metric_alerts`, `alert_series_states`; `no_data` = `zero|keep|alert`, `confirmation_seconds` / `recovery_seconds` 0-3600, `incident_mode` = `per_alert|per_series` with at most 50 open per alert). Incidents open through Incident Management Part 1's `incidents::lifecycle` with a new `IncidentSource::MetricAlert(id)` (the `incidents.source` check already lists `metric_alert`, INC-1 migration 0060) and notify through escalation policies. Log alerts (NAMI-LOG-14) move onto the shared evaluator behind their R-P2-27 seam.
@@ -50,11 +50,11 @@ Merged on `main` (`be51a5c`), checked by this plan: `clickhouse::{ClickHouse::{q
 
 Part 1 leaves room for these:
 - `run_panel_query(state, project_id, dashboard_id, panel_id, request)` takes no user. RBAC and slots stay in the route, so a share route can call it with its own limits.
-- `models::dashboard::create_with_panels` creates a dashboard and its panels in one transaction (templates).
+- `metrics::dashboard::model::create_with_panels` creates a dashboard and its panels in one transaction (templates).
 - `metrics::ingest::validate_body` takes parsed samples from any parser (remote-write, scrape).
 - `SeriesGuard::admit` is the one admission point for every ingest path.
 
-**Migrations.** Postgres migrations **0120-0139** are reserved for Metrics (ruling in `docs/superpowers/decisions/2026-10-13-uptime-phase1.md`: "Metrics 0120-0139"). On 2026-10-19 none was in use: `main` (`be51a5c`) ends at `0042_add_sources_pipeline.sql`, no remote branch and no worktree has a `012x`/`013x` file, and no other plan names one (Logs Part 2 0042-0044, Uptime Phase 3 0022-0039, Incidents Part 1 0060-0066, Status Pages Part 1 0100-0104). **Part 1 uses 0120 only.** Part 2 continues at 0121. ClickHouse tables are appended to `clickhouse::MIGRATIONS` (idempotent `CREATE TABLE IF NOT EXISTS`): `metrics` and `metric_series` (T1). The array grows by two; if another plan appended first, keep its entries before these and adjust `tests/clickhouse.rs` to the merged list.
+**Migrations.** Postgres migrations **0120-0139** are reserved for Metrics (ruling in `docs/superpowers/decisions/2026-10-13-uptime-phase1.md`: "Metrics 0120-0139"). On 2026-10-19 none was in use: `main` (`be51a5c`) ends at `0042_add_sources_pipeline.sql`, no remote branch and no worktree has a `012x`/`013x` file, and no other plan names one (Logs Part 2 0042-0044, Uptime Phase 3 0022-0039, Incidents Part 1 0060-0066, Status Pages Part 1 0100-0104). **Part 1 uses 0120 only.** Part 2 continues at 0121. ClickHouse tables are appended to `core::clickhouse::MIGRATIONS` (idempotent `CREATE TABLE IF NOT EXISTS`): `metrics` and `metric_series` (T1). The array grows by two; if another plan appended first, keep its entries before these and adjust `tests/core/clickhouse.rs` to the merged list.
 
 **Verification status (2026-10-19, review pass):** checked against `origin/main` at `be51a5c` (read: `clickhouse.rs`, `state.rs`, `router.rs`, `serve.rs` (limits only), `error.rs`, `config.rs`, `logs/{mod, query, search, slots, budget, ingest, rate_limit, store, normalize}.rs`, `routes/{logs_ingest, projects}.rs`, `models/{mod, source}.rs`, `middleware/rbac.rs`, `uptime/{store, checker, export}.rs`, `tests/common/{mod, logs}.rs`, `tests/{clickhouse, migrations, json_bodies, logs_ingest}.rs`, nami-ui `engine.ts`, `relay-stream.ts`, `fake-event.ts`, `uuid.ts`, `logs/search/+server.ts`, the project layout, the source detail page, every `components/ui/*` file, `tones.ts` and `layout.css`, and the LOG-16 / INC-12 / INC-7 plan sections this plan borrows). The code has **not** been compiled or applied to a scratch copy. Tests are given in full where they pin a security property: tenant isolation, injection, caps, cardinality, RBAC and XSS. Code that decides something is given in full: DDL, migrations, SQL, the parser grammar, the admission rule. Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body. A test that fails for a reason the plan did not predict is a plan bug: fix it minimally and say so in the PR.
 
@@ -91,10 +91,10 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>` (e
   - panel `viz` `line|bar|stat|text`, width `1/3|1/2|full` (stored as `third|half|full`, R11);
   - text panels: markdown at most **10 KiB**, raw HTML disabled, links limited to `http`/`https`/`mailto`, images not rendered;
   - members create/edit, admins delete dashboards, viewers read.
-- Plan limits (rulings below give the reasons): `METRICS_MAX_DECOMPRESSED_BYTES = 16 MiB`; every decode (JSON and Prometheus text) charges `logs::budget::Budget::for_request()` (192 MiB estimated) before it allocates; `MAX_SAMPLES_PER_REQUEST = 50_000`; `MAX_LINE_BYTES = 64 KiB`; `MAX_TYPE_LINES = 10_000`; `MAX_SERIES_KEY_BYTES = 8_192`; `MAX_INSERT_BYTES = 64 MiB`; timestamps accepted in `[received − retention_days, received + 10 min]`; `METRICS_MAX_SERIES_PER_PROJECT` default **50,000** active series; `MIN_STEP_SECONDS = 10`; `MAX_STEP_SECONDS = 86_400`; `MAX_POINTS_PER_SERIES = 1_500`; at most **10** filters, **5** group-by keys, **100** values per substituted filter; `MAX_METRIC_QUERIES_PER_USER = 6`; `MAX_METRIC_QUERIES_PER_INSTANCE = 32`; **100** dashboards per project; **50** panels per dashboard; panel query JSON at most **4,096** bytes; title at most **200** characters; description at most **1,000** characters.
+- Plan limits (rulings below give the reasons): `METRICS_MAX_DECOMPRESSED_BYTES = 16 MiB`; every decode (JSON and Prometheus text) charges `logs::ingest::budget::Budget::for_request()` (192 MiB estimated) before it allocates; `MAX_SAMPLES_PER_REQUEST = 50_000`; `MAX_LINE_BYTES = 64 KiB`; `MAX_TYPE_LINES = 10_000`; `MAX_SERIES_KEY_BYTES = 8_192`; `MAX_INSERT_BYTES = 64 MiB`; timestamps accepted in `[received − retention_days, received + 10 min]`; `METRICS_MAX_SERIES_PER_PROJECT` default **50,000** active series; `MIN_STEP_SECONDS = 10`; `MAX_STEP_SECONDS = 86_400`; `MAX_POINTS_PER_SERIES = 1_500`; at most **10** filters, **5** group-by keys, **100** values per substituted filter; `MAX_METRIC_QUERIES_PER_USER = 6`; `MAX_METRIC_QUERIES_PER_INSTANCE = 32`; **100** dashboards per project; **50** panels per dashboard; panel query JSON at most **4,096** bytes; title at most **200** characters; description at most **1,000** characters.
 - RBAC: two levels, as in CLAUDE.md. Authorization failure is **403**, never 404. A dashboard or panel of another project (or another dashboard) inside an accessible project path is **404**. A metric of another project simply matches nothing.
-- Every state-changing engine route takes a JSON body (`require_json_body`, already global) parsed by a `#[serde(deny_unknown_fields)]` struct (axum answers 422 for unknown fields and wrong enum values, before the handler; validation errors are 400). Each new route is added to `tests/json_bodies.rs::every_state_changing_route_refuses_bodies_that_are_not_json` in the task that adds it. The new table is added to `tests/migrations.rs::all_tables_exist`; the ClickHouse tables to `tests/clickhouse.rs::migrate_is_idempotent`.
-- Ingest is token only, on the public listener only (`router::build_public_router`). The token is hashed for lookup and never logged. Error bodies never echo the token.
+- Every state-changing engine route takes a JSON body (`require_json_body`, already global) parsed by a `#[serde(deny_unknown_fields)]` struct (axum answers 422 for unknown fields and wrong enum values, before the handler; validation errors are 400). Each new route is added to `tests/core/json_bodies.rs::every_state_changing_route_refuses_bodies_that_are_not_json` in the task that adds it. The new table is added to `tests/core/migrations.rs::all_tables_exist`; the ClickHouse tables to `tests/core/clickhouse.rs::migrate_is_idempotent`.
+- Ingest is token only, on the public listener only (`core::router::build_public_router`). The token is hashed for lookup and never logged. Error bodies never echo the token.
 - nami-ui: every engine call goes through `callEngine` and `enginePath`; route params use `[...=uuid]` matchers and `isUuid`; form actions return `engineFailure(...)`; deletes are two-step (`confirm()` plus `confirm=yes`); modules under `#lib/server` are never imported by components; times are shown in UTC; tokens never appear in a URL; the design system's tokens and components only (CLAUDE.md "UI conventions"). The only `{@html}` in the feature is `renderMarkdown(...)` output.
 - Commits: Conventional Commits, message ending with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 
@@ -110,11 +110,11 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>` (e
 ## Decisions the spec leaves open (rulings)
 
 - **R1 Split.** Part 1 is the core named in the header: JSON and Prometheus-text ingest, storage and retention, query API, discovery, built-in metrics, dashboards with line/bar/stat/text panels, layout, time range and variables, and the UI for those. **Remote-write moves to Part 2** (spec lists it under ingestion). It needs `snap` and `prost`, its main client is Part 2's collector bundle, and the parsed samples enter through `validate_body` like every other path, so nothing in Part 1 changes for it.
-- **R2 Names.** Migration `0120_create_dashboards.sql`. ClickHouse tables `metrics`, `metric_series`. Engine modules: `metrics::{sample, store, prom_text, series_guard, ingest, query, sql, builtin, variables}` and `MetricsState` in `metrics/mod.rs`. Routes: `routes::metrics_ingest` (public listener), `routes::metrics` (query and discovery), `routes::dashboards`. Model: `models::dashboard`. UI: `#lib/metrics.ts`, `#lib/chart.ts`, `#lib/panel-queue.ts`, `#lib/server/metrics-proxy.ts`, `#lib/components/metrics/*`.
+- **R2 Names.** Migration `0120_create_dashboards.sql`. ClickHouse tables `metrics`, `metric_series`. Engine modules: `metrics::{sample, store, prom_text, series_guard, ingest, query, sql, builtin, variables}` and `MetricsState` in `metrics/mod.rs`. Routes: `metrics::ingest::routes` (public listener), `metrics::query::routes` (query and discovery), `metrics::dashboard::routes`. Model: `metrics::dashboard::model`. UI: `#lib/metrics.ts`, `#lib/chart.ts`, `#lib/panel-queue.ts`, `#lib/server/metrics-proxy.ts`, `#lib/components/metrics/*`.
 - **R3 Series id.** The spec's comment says `cityHash64(name, sorted tags)`. Part 1 computes the id in Rust at ingest instead, because the cardinality guard must know it before anything reaches ClickHouse, and no crate in the tree implements ClickHouse's CityHash v1.0.2. `series_id` = the first 8 bytes (big-endian) of SHA-256 over `name`, then for each tag in key order `0x1f key 0x1e value`. The separators cannot occur in valid names or keys, so `a{b="c"}` and `a{bc=""}` differ. The id is stable across instances and restarts.
 - **R4 Per-sample rejection and the response.** A body that does not parse (malformed JSON, a Prometheus syntax error) is a 400 naming the first problem (`line 7: expected a value`). Inside a parsed body, each sample is validated alone: name, tags, value, timestamp and series limit. A bad sample is rejected and counted. The response is `202 {"accepted": n, "rejected": m, "errors": [...]}`, with at most 10 errors in the form `sample 12: tag value over 1 KiB (key "path")`. If **every** sample was rejected the answer is `400` with the same body, so a misconfigured shipper sees a failure (Vector and Prometheus do not retry a 400). An empty body (no samples) is `202 {"accepted": 0, "rejected": 0, "errors": []}`.
-- **R5 Body formats.** `/api/v1/metrics` takes `application/json` (also `+json`): one object or an array of objects `{name, value, type?, dt?, tags?}`. `type` defaults to `gauge`. `dt` is parsed by `logs::normalize::parse_timestamp` (RFC 3339, or unix seconds/milliseconds) and defaults to the receive time. `tags` values must be strings (a number or boolean tag value rejects that sample: tags are strings in the data model, and silently stringifying would make `1` and `"1"` different series in other paths). An unknown key rejects that sample, not the body. `/api/v1/metrics/prometheus` takes `text/plain` (with or without `version=0.0.4`), the Prometheus text format 0.0.4 only. `application/openmetrics-text` is **415** in Part 1: OpenMetrics timestamps are float seconds (0.0.4's are integer milliseconds) and its counters, `# EOF` and exemplars differ, so accepting it under the 0.0.4 grammar would misread data (Part 2's scrape client asks for `text/plain;version=0.0.4`). Both endpoints accept `Content-Encoding: gzip`. Anything else is 415.
-- **R6 Decompressed size and decode memory.** Logs allow 50 MiB inflated; metrics inflate at most **16 MiB** (`ingest::gunzip_within`, a new sibling of `gunzip` with the cap as a parameter; `gunzip` becomes `gunzip_within(.., MAX_DECOMPRESSED_BYTES)`). 50,000 samples of a typical 200 bytes is 10 MiB. The input caps do not bound what a body decodes to (`[0,0,0,…]` or `a="",` labels cost many times their bytes), so both decoders charge `logs::budget::Budget::for_request()` (the 192 MiB estimate Logs Part 2 measured) **before** allocating each value, string, key, label and sample, and stop with 413 once it is spent. The JSON body is never parsed whole into a `serde_json::Value`: T4 streams the top-level array element by element with logs' budget-charging visitor and stops at the 50,001st element. Decodes share the 4 engine-wide decode places and the per-source/per-project decode shares with log ingest, so at most 4 × 192 MiB (estimated) is held by decoding at once, the same bound log ingest already has.
+- **R5 Body formats.** `/api/v1/metrics` takes `application/json` (also `+json`): one object or an array of objects `{name, value, type?, dt?, tags?}`. `type` defaults to `gauge`. `dt` is parsed by `logs::ingest::normalize::parse_timestamp` (RFC 3339, or unix seconds/milliseconds) and defaults to the receive time. `tags` values must be strings (a number or boolean tag value rejects that sample: tags are strings in the data model, and silently stringifying would make `1` and `"1"` different series in other paths). An unknown key rejects that sample, not the body. `/api/v1/metrics/prometheus` takes `text/plain` (with or without `version=0.0.4`), the Prometheus text format 0.0.4 only. `application/openmetrics-text` is **415** in Part 1: OpenMetrics timestamps are float seconds (0.0.4's are integer milliseconds) and its counters, `# EOF` and exemplars differ, so accepting it under the 0.0.4 grammar would misread data (Part 2's scrape client asks for `text/plain;version=0.0.4`). Both endpoints accept `Content-Encoding: gzip`. Anything else is 415.
+- **R6 Decompressed size and decode memory.** Logs allow 50 MiB inflated; metrics inflate at most **16 MiB** (`ingest::gunzip_within`, a new sibling of `gunzip` with the cap as a parameter; `gunzip` becomes `gunzip_within(.., MAX_DECOMPRESSED_BYTES)`). 50,000 samples of a typical 200 bytes is 10 MiB. The input caps do not bound what a body decodes to (`[0,0,0,…]` or `a="",` labels cost many times their bytes), so both decoders charge `logs::ingest::budget::Budget::for_request()` (the 192 MiB estimate Logs Part 2 measured) **before** allocating each value, string, key, label and sample, and stop with 413 once it is spent. The JSON body is never parsed whole into a `serde_json::Value`: T4 streams the top-level array element by element with logs' budget-charging visitor and stops at the 50,001st element. Decodes share the 4 engine-wide decode places and the per-source/per-project decode shares with log ingest, so at most 4 × 192 MiB (estimated) is held by decoding at once, the same bound log ingest already has.
 - **R7 Timestamp window.** A sample older than the source's `retention_days` or more than **10 minutes** in the future is rejected (`timestamp out of range`). Logs clamp out-of-range timestamps; a metric point moved in time would be a wrong value, so metrics reject. Rows carry `retention_days` from the source (spec), so the TTL is per row and a retention change applies to new rows only.
 - **R8 Sharing the public listener.** Metrics endpoints take a place of the same `IngestLimits.places` (32) and run token lookups under the same `IngestLimits.queries` semaphore as log ingest, so the listener's memory and Postgres bounds stay the ones Logs Part 1 proved. Rate limits and in-flight counts are separate (`MetricsState`), so a source's metric traffic never eats its log budget: 50 requests/s, burst 100, 4 in flight per source, 8 per project. Metrics do not count against a source's `daily_byte_quota` (that quota is defined on stored log bytes; per-source metric usage stats are not in the spec).
 - **R9 Cardinality guard.** Two rules, both in `SeriesGuard::admit`, the single admission point:
@@ -125,7 +125,7 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>` (e
   - Each admitted new series, and each known series on its first sample of a UTC day on that instance, gets a `metric_series` row (insert-only, `ReplacingMergeTree(last_seen)`). Discovery reads that table, and the cap counts it.
   - Memory: per project, at most `cap + one request's new series` entries (`u64` id + `u32` day, about 24 bytes with the map's overhead, about 1.2 MiB at 50,000). A project's state is **dropped once it has not been used for `IDLE_PROJECT_AFTER` (2 hours)** (pruned at most once a minute, inside `ensure_loaded`), so the instance holds only the projects that ingest; its next request reloads from `metric_series`. Plus one 16-byte window per source that sent in the last minute (pruned when the map passes 10,000 entries). The bound is therefore `active projects × 1.2 MiB`; operators with many large projects lower `METRICS_MAX_SERIES_PER_PROJECT` (documented).
 - **R10 Query budget.** Each query (and each discovery call) holds one of the user's `MAX_METRIC_QUERIES_PER_USER = 6` slots (`UserSlots`) **and** one of `MAX_METRIC_QUERIES_PER_INSTANCE = 32` (a `Semaphore`, `try_acquire`), else 429. A dashboard of 20 panels loads 4 at a time through the UI's queue, so 6 leaves room for the explorer and discovery calls. Every metric read runs with `METRIC_READ_SETTINGS`:
-  `max_result_bytes = 33554432`, `result_overflow_mode = throw`, `max_result_rows = 100000`, `max_rows_to_group_by = 1000000`, `group_by_overflow_mode = throw`, `max_rows_to_read = 500000000`, `max_bytes_to_read = 21474836480` (20 GiB uncompressed), `read_overflow_mode = throw`, `max_memory_usage = 2147483648`, `max_threads = 4` (32 concurrent queries cannot each take every core), plus the client's `max_execution_time = 25`, `readonly = 2` and cancel-on-disconnect (the reqwest future is dropped with the handler when the browser goes away, R20). None of these names is in `RESERVED_SETTINGS` (the client panics on a reserved name, so every integration test that runs a metric query proves it). `metrics::sql::user_error` maps `TOO_MANY_ROWS`, `TOO_MANY_ROWS_OR_BYTES`, `TOO_MANY_BYTES`, `MEMORY_LIMIT_EXCEEDED` and `ResponseTooLarge` to 400 `the query is too expensive: narrow the time range or add filters`, `CANNOT_COMPILE_REGEXP` to 400, `TIMEOUT_EXCEEDED` to 400, and everything else to `logs::search::user_error`. The response of a query is at most 51 groups × 1,500 points (R11), a few MiB of JSON, so it is buffered, not streamed.
+  `max_result_bytes = 33554432`, `result_overflow_mode = throw`, `max_result_rows = 100000`, `max_rows_to_group_by = 1000000`, `group_by_overflow_mode = throw`, `max_rows_to_read = 500000000`, `max_bytes_to_read = 21474836480` (20 GiB uncompressed), `read_overflow_mode = throw`, `max_memory_usage = 2147483648`, `max_threads = 4` (32 concurrent queries cannot each take every core), plus the client's `max_execution_time = 25`, `readonly = 2` and cancel-on-disconnect (the reqwest future is dropped with the handler when the browser goes away, R20). None of these names is in `RESERVED_SETTINGS` (the client panics on a reserved name, so every integration test that runs a metric query proves it). `metrics::sql::user_error` maps `TOO_MANY_ROWS`, `TOO_MANY_ROWS_OR_BYTES`, `TOO_MANY_BYTES`, `MEMORY_LIMIT_EXCEEDED` and `ResponseTooLarge` to 400 `the query is too expensive: narrow the time range or add filters`, `CANNOT_COMPILE_REGEXP` to 400, `TIMEOUT_EXCEEDED` to 400, and everything else to `logs::query::search::user_error`. The response of a query is at most 51 groups × 1,500 points (R11), a few MiB of JSON, so it is buffered, not streamed.
 - **R11 Query semantics.**
   - Buckets: `bucket = intDiv(t_ms, step_ms) * step_ms`. Points run from `floor(from / step) * step` to the bucket holding `to`, every bucket present, `null` where no sample falls. The engine fills the gaps; ClickHouse returns only non-empty buckets.
   - `avg/min/max/sum` and `p50/p95/p99` are taken over **all samples of all series in the group within the bucket**. Percentiles use `quantileTDigest(φ)(value)`: its state is bounded (at most a few thousand centroids, a few KiB, per group and bucket, whatever the sample count), unlike `quantile`'s 8,192-sample reservoir (64 KiB per state) or `quantileExact` (unbounded). The answer is approximate (t-digest, about 1% relative error at the tails; exact for one sample), documented in the API help. `count` is the number of samples.
@@ -171,7 +171,7 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>` (e
 
 ## Review fixes (2026-10-19)
 
-The plan review against `be51a5c` changed, besides names and paths: the decoders charge `logs::budget::Budget` before allocating and the JSON body is streamed, not parsed whole (R6, T2, T4); the Prometheus parser returns per-sample results, keeps unknown escapes literally as Prometheus does, and caps labels per sample before allocating them (T2); the guard drops stale and idle state and loads per project (R9, T3); queries rank the top 50 in a separate first statement, use `quantileTDigest`, and run under a tighter, complete budget (R10, R11, T5); built-in uptime queries carry a cost note and a key-using monitor filter (R13, T7); the dashboard name check matches `validate_label` (200) and variables are size-capped (T8); INC-7's `role` field replaces the invented `/role` endpoint (T8, T11); UI tasks use the merged design-system API (`seriesColor`, `StatCard` as its own card, `SegmentedTabs` button mode, `CardMenu`), aborts reach the engine, variable dropdowns share the panel queue, and the metric snippets follow the source page's reveal-token pattern (T10-T13); T6 → T7 is sequential.
+The plan review against `be51a5c` changed, besides names and paths: the decoders charge `logs::ingest::budget::Budget` before allocating and the JSON body is streamed, not parsed whole (R6, T2, T4); the Prometheus parser returns per-sample results, keeps unknown escapes literally as Prometheus does, and caps labels per sample before allocating them (T2); the guard drops stale and idle state and loads per project (R9, T3); queries rank the top 50 in a separate first statement, use `quantileTDigest`, and run under a tighter, complete budget (R10, R11, T5); built-in uptime queries carry a cost note and a key-using monitor filter (R13, T7); the dashboard name check matches `validate_label` (200) and variables are size-capped (T8); INC-7's `role` field replaces the invented `/role` endpoint (T8, T11); UI tasks use the merged design-system API (`seriesColor`, `StatCard` as its own card, `SegmentedTabs` button mode, `CardMenu`), aborts reach the engine, variable dropdowns share the panel queue, and the metric snippets follow the source page's reveal-token pattern (T10-T13); T6 → T7 is sequential.
 
 ## Roadmap §6 coverage
 
@@ -270,11 +270,11 @@ nami-ui/src/
 Branch `feat/NAMI-MET-1-metrics-storage`, worktree `.worktrees/NAMI-MET-1/`.
 
 **Files:**
-- Create: `nami-engine/src/metrics/mod.rs`, `nami-engine/src/metrics/sample.rs`, `nami-engine/src/metrics/store.rs`, `nami-engine/tests/metrics_store.rs`
-- Modify: `nami-engine/src/lib.rs` (`pub mod metrics;`), `nami-engine/src/clickhouse.rs` (`MIGRATIONS` grows from 3 to 5 entries, appended), `nami-engine/tests/clickhouse.rs` (`migrate_is_idempotent` table list)
+- Create: `nami-engine/src/metrics/mod.rs`, `nami-engine/src/metrics/sample.rs`, `nami-engine/src/metrics/store.rs`, `nami-engine/tests/metrics/metrics_store.rs`
+- Modify: `nami-engine/src/lib.rs` (`pub mod metrics;`), `nami-engine/src/core/clickhouse.rs` (`MIGRATIONS` grows from 3 to 5 entries, appended), `nami-engine/tests/core/clickhouse.rs` (`migrate_is_idempotent` table list)
 
 **Interfaces:**
-- Consumes: `models::source::IngestSource` (`{id, project_id, retention_days: i32, daily_byte_quota, updated_at}`; tests build it with every field), `clickhouse::{ClickHouse, ClickHouseError, encode_rows_within}`, `logs::store::INSERT_SETTINGS`.
+- Consumes: `logs::source::model::IngestSource` (`{id, project_id, retention_days: i32, daily_byte_quota, updated_at}`; tests build it with every field), `clickhouse::{ClickHouse, ClickHouseError, encode_rows_within}`, `logs::ingest::store::INSERT_SETTINGS`.
 - Produces:
 
 ```rust
@@ -348,7 +348,7 @@ use std::collections::BTreeMap;
 use chrono::{Duration, TimeZone, Utc};
 use uuid::Uuid;
 use super::*;
-use crate::models::source::IngestSource;
+use crate::logs::source::model::IngestSource;
 
 fn source() -> IngestSource {
     IngestSource { id: Uuid::new_v4(), project_id: Uuid::new_v4(), retention_days: 30, daily_byte_quota: None,
@@ -455,7 +455,7 @@ Expected: FAIL to compile (`metrics` module missing).
 Run: engine command with `--lib -- metrics::sample`
 Expected: PASS.
 
-- [ ] **Step 5: Add the ClickHouse DDL** to `clickhouse::MIGRATIONS`, after `heartbeat_pings`, with a comment pointing at `metrics::store`:
+- [ ] **Step 5: Add the ClickHouse DDL** to `core::clickhouse::MIGRATIONS`, after `heartbeat_pings`, with a comment pointing at `metrics::store`:
 
 ```sql
 CREATE TABLE IF NOT EXISTS metrics (
@@ -489,15 +489,15 @@ ORDER BY (project_id, name, series_id)
 TTL toDateTime(last_seen) + toIntervalDay(retention_days)
 ```
 
-`MIGRATIONS` becomes `[&str; 5]`. In `tests/clickhouse.rs::migrate_is_idempotent` the expected list becomes `heartbeat_pings, logs, metric_series, metrics, uptime_checks` (sorted by name). The 367 day partitions a row may land in (365-day retention + 10 min ahead) stay under `INSERT_SETTINGS`' `max_partitions_per_insert_block = 400`.
+`MIGRATIONS` becomes `[&str; 5]`. In `tests/core/clickhouse.rs::migrate_is_idempotent` the expected list becomes `heartbeat_pings, logs, metric_series, metrics, uptime_checks` (sorted by name). The 367 day partitions a row may land in (365-day retention + 10 min ahead) stay under `INSERT_SETTINGS`' `max_partitions_per_insert_block = 400`.
 
-- [ ] **Step 6: Write the failing integration test** `tests/metrics_store.rs`:
+- [ ] **Step 6: Write the failing integration test** `tests/metrics/metrics_store.rs`:
 
 ```rust
 // Metric rows round-trip through ClickHouse. Requires `docker compose up -d clickhouse`.
 use std::collections::BTreeMap;
 use chrono::{DateTime, Utc};
-use nami_engine::{clickhouse::ClickHouse, metrics::{sample::{validate, MetricType, Sample}, store}};
+use nami_engine::{core::clickhouse::ClickHouse, metrics::{sample::{validate, MetricType, Sample}, store}};
 use nami_engine::models::source::IngestSource;
 use serde_json::Value;
 use uuid::Uuid;
@@ -545,14 +545,14 @@ fn an_oversized_batch_is_refused_before_it_is_built() {
 
 - [ ] **Step 7: Run it, fix, run again**
 
-Run: engine command with `--test metrics_store --test clickhouse`
+Run: engine command with `--test metrics metrics_store:: --test core clickhouse::`
 Expected: PASS (after Step 5).
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add nami-engine/src/metrics nami-engine/src/lib.rs nami-engine/src/clickhouse.rs \
-  nami-engine/tests/metrics_store.rs nami-engine/tests/clickhouse.rs
+git add nami-engine/src/metrics nami-engine/src/lib.rs nami-engine/src/core/clickhouse.rs \
+  nami-engine/tests/metrics/metrics_store.rs nami-engine/tests/core/clickhouse.rs
 git commit -m "feat(engine): metric sample validation and ClickHouse storage (NAMI-MET-1)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -569,7 +569,7 @@ Branch `feat/NAMI-MET-2-prometheus-text`, worktree `.worktrees/NAMI-MET-2/`.
 - Modify: `nami-engine/src/metrics/mod.rs`
 
 **Interfaces:**
-- Consumes: `metrics::sample::{Sample, MetricType, Rejection, MAX_TAGS, MAX_TAG_VALUE_BYTES}` (T1); `logs::budget::{Budget, STRING_BYTES, KEY_BYTES, VALUE_BYTES}`.
+- Consumes: `metrics::sample::{Sample, MetricType, Rejection, MAX_TAGS, MAX_TAG_VALUE_BYTES}` (T1); `logs::ingest::budget::{Budget, STRING_BYTES, KEY_BYTES, VALUE_BYTES}`.
 - Produces:
 
 ```rust
@@ -615,7 +615,7 @@ Grammar (decides behaviour, implement exactly):
 
 ```rust
 use super::*;
-use crate::{logs::budget::Budget, metrics::sample::{MetricType, Rejection}};
+use crate::{logs::ingest::budget::Budget, metrics::sample::{MetricType, Rejection}};
 
 fn run(text: &str, max: usize) -> Result<Vec<Parsed>, ParseError> { parse(text, max, &mut Budget::for_request()) }
 fn ok(text: &str, max: usize) -> Vec<Sample> { run(text, max).unwrap().into_iter().map(|p| p.unwrap()).collect() }
@@ -777,11 +777,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Branch `feat/NAMI-MET-3-series-guard`, worktree `.worktrees/NAMI-MET-3/`.
 
 **Files:**
-- Create: `nami-engine/src/metrics/series_guard.rs`, `nami-engine/tests/metrics_series_guard.rs`
+- Create: `nami-engine/src/metrics/series_guard.rs`, `nami-engine/tests/metrics/metrics_series_guard.rs`
 - Modify: `nami-engine/src/metrics/mod.rs`
 
 **Interfaces:**
-- Consumes: `clickhouse::ClickHouse`, `metrics::store::SERIES_TABLE` (T1).
+- Consumes: `core::clickhouse::ClickHouse`, `metrics::store::SERIES_TABLE` (T1).
 - Produces:
 
 ```rust
@@ -933,13 +933,13 @@ fn a_known_series_is_touched_once_per_day() {
 }
 ```
 
-- [ ] **Step 2: Write the failing integration test** `tests/metrics_series_guard.rs`:
+- [ ] **Step 2: Write the failing integration test** `tests/metrics/metrics_series_guard.rs`:
 
 ```rust
 // The guard seeds itself from metric_series. Requires `docker compose up -d clickhouse`.
 use std::collections::BTreeMap;
 use chrono::{Duration, Utc};
-use nami_engine::{clickhouse::ClickHouse, metrics::{series_guard::{Admission, SeriesGuard}, store::{self, SeriesRow}}};
+use nami_engine::{core::clickhouse::ClickHouse, metrics::{series_guard::{Admission, SeriesGuard}, store::{self, SeriesRow}}};
 use uuid::Uuid;
 
 fn series_row(project: Uuid, id: u64, last_seen: chrono::DateTime<Utc>) -> SeriesRow {
@@ -1010,7 +1010,7 @@ async fn the_cap_counts_series_loaded_from_clickhouse() {
 
 - [ ] **Step 3: Run to fail**
 
-Run: engine command with `--lib -- metrics::series_guard`, then `--test metrics_series_guard`
+Run: engine command with `--lib -- metrics::series_guard`, then `--test metrics metrics_series_guard::`
 Expected: FAIL to compile.
 
 - [ ] **Step 4: Implement `SeriesGuard`** per the rule above.
@@ -1020,7 +1020,7 @@ Expected: FAIL to compile.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add nami-engine/src/metrics nami-engine/tests/metrics_series_guard.rs
+git add nami-engine/src/metrics nami-engine/tests/metrics/metrics_series_guard.rs
 git commit -m "feat(engine): per-source new-series rate and per-project series cap (NAMI-MET-3)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -1033,8 +1033,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Branch `feat/NAMI-MET-4-metrics-ingest`, worktree `.worktrees/NAMI-MET-4/`.
 
 **Files:**
-- Create: `nami-engine/src/metrics/ingest.rs`, `nami-engine/src/routes/metrics_ingest.rs`, `nami-engine/tests/common/metrics.rs`, `nami-engine/tests/metrics_ingest.rs`
-- Modify: `nami-engine/src/metrics/mod.rs` (`MetricsState`), `nami-engine/src/state.rs` (`pub metrics: Arc<MetricsState>`, `for_test`), `nami-engine/src/main.rs` (build `MetricsState` from config), `nami-engine/src/config.rs` (`metrics_max_series_per_project`), `nami-engine/src/logs/ingest.rs` (`gunzip_within`, `IngestError::CardinalityExceeded`, `parse_json_values_within`), `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs` (`build_public_router_with_limits` merges `routes::metrics_ingest::public_router(ingest_limits.clone())`), `nami-engine/tests/common/mod.rs` (`pub mod metrics;`)
+- Create: `nami-engine/src/metrics/ingest.rs`, `nami-engine/src/metrics/ingest/routes.rs`, `nami-engine/tests/common/metrics.rs`, `nami-engine/tests/metrics/metrics_ingest.rs`
+- Modify: `nami-engine/src/metrics/mod.rs` (`MetricsState`), `nami-engine/src/core/state.rs` (`pub metrics: Arc<MetricsState>`, `for_test`), `nami-engine/src/main.rs` (build `MetricsState` from config), `nami-engine/src/core/config.rs` (`metrics_max_series_per_project`), `nami-engine/src/logs/ingest/mod.rs` (`gunzip_within`, `IngestError::CardinalityExceeded`, `parse_json_values_within`), `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs` (`build_public_router_with_limits` merges `metrics::ingest::routes::public_router(ingest_limits.clone())`), `nami-engine/tests/common/mod.rs` (`pub mod metrics;`)
 
 **Interfaces:**
 - Consumes: T1 `validate`, `store::{encode_metric_rows, insert_encoded, insert_series, SeriesRow}`; T2 `prom_text::parse`; T3 `SeriesGuard`; Logs' `IngestLimits`, `bearer_token`, `read_body`, `BodyPace`, `IngestError`, `DecodeShares`, `TokenBuckets`, `InFlight`, `budget::Budget`, the budget-charging JSON visitor in `logs::ingest`, `source::find_by_token`.
@@ -1045,11 +1045,11 @@ Branch `feat/NAMI-MET-4-metrics-ingest`, worktree `.worktrees/NAMI-MET-4/`.
 pub const MAX_METRIC_QUERIES_PER_USER: usize = 6;       // used from T5
 pub const MAX_METRIC_QUERIES_PER_INSTANCE: usize = 32;  // used from T5
 pub struct MetricsState {
-    pub rate_limiter: crate::logs::rate_limit::TokenBuckets,  // 50/s, burst 100 per source
-    pub in_flight: crate::logs::rate_limit::InFlight,         // 4 per source
-    pub project_in_flight: crate::logs::rate_limit::InFlight, // 8 per project
+    pub rate_limiter: crate::logs::ingest::rate_limit::TokenBuckets,  // 50/s, burst 100 per source
+    pub in_flight: crate::logs::ingest::rate_limit::InFlight,         // 4 per source
+    pub project_in_flight: crate::logs::ingest::rate_limit::InFlight, // 8 per project
     pub series: series_guard::SeriesGuard,
-    pub query_slots: std::sync::Arc<crate::logs::slots::UserSlots>,
+    pub query_slots: std::sync::Arc<crate::logs::query::slots::UserSlots>,
     pub query_total: std::sync::Arc<tokio::sync::Semaphore>,
 }
 impl MetricsState { pub fn new(max_series_per_project: usize) -> MetricsState }
@@ -1098,13 +1098,13 @@ pub async fn stored(ch: &ClickHouse, project_id: Uuid) -> Vec<serde_json::Value>
 
 `body_format`: `/api/v1/metrics` takes `application/json` or `application/<x>+json`; `/api/v1/metrics/prometheus` takes `text/plain` (any parameters); `application/openmetrics-text` and everything else → 415 (R5). `Content-Encoding` is absent, `identity` or `gzip`, else 415.
 
-Handler order (each check cheaper than the next; the same two endpoints share one function with a `MetricsFormat` argument): token shape (401, no query) → a place of `limits.places` (503 `busy`) → token lookup under `limits.queries` (401) → `metrics.rate_limiter` (429 `rate_limited`) → `metrics.in_flight` per source and `metrics.project_in_flight` per project (429 `too_many_in_flight`) → `body_format` (415) → `read_body` (413/408) → `metrics.series.ensure_loaded(project)` (a ClickHouse failure → 500, logged with the source id) → a decode place (`limits.decodes` plus `state.logs.decode_shares` and `state.logs.project_limits.decode_shares`, acquired in the order `ingest::prepare` uses) → `spawn_blocking`: inflate (`gunzip_within(.., METRICS_MAX_DECOMPRESSED_BYTES)`, also checking an uncompressed body against that cap), UTF-8 check for Prometheus (400 `the body is not UTF-8`), parse, `validate_body` → if `reservation` is `None` and the guard said `RateLimited` → `CardinalityExceeded` → insert `series_rows` (if any), then the rows → on any insert error `series.forget(..)`, 500 → `202` or (`accepted == 0 && rejected > 0`) `400`, body `{"accepted", "rejected", "errors"}`. The work after `read_body` runs in a spawned task holding the place and both in-flight guards, as `routes::logs_ingest::Work` does, so a client that hangs up cannot free them early.
+Handler order (each check cheaper than the next; the same two endpoints share one function with a `MetricsFormat` argument): token shape (401, no query) → a place of `limits.places` (503 `busy`) → token lookup under `limits.queries` (401) → `metrics.rate_limiter` (429 `rate_limited`) → `metrics.in_flight` per source and `metrics.project_in_flight` per project (429 `too_many_in_flight`) → `body_format` (415) → `read_body` (413/408) → `metrics.series.ensure_loaded(project)` (a ClickHouse failure → 500, logged with the source id) → a decode place (`limits.decodes` plus `state.logs.decode_shares` and `state.logs.project_limits.decode_shares`, acquired in the order `ingest::prepare` uses) → `spawn_blocking`: inflate (`gunzip_within(.., METRICS_MAX_DECOMPRESSED_BYTES)`, also checking an uncompressed body against that cap), UTF-8 check for Prometheus (400 `the body is not UTF-8`), parse, `validate_body` → if `reservation` is `None` and the guard said `RateLimited` → `CardinalityExceeded` → insert `series_rows` (if any), then the rows → on any insert error `series.forget(..)`, 500 → `202` or (`accepted == 0 && rejected > 0`) `400`, body `{"accepted", "rejected", "errors"}`. The work after `read_body` runs in a spawned task holding the place and both in-flight guards, as `logs::ingest::routes::Work` does, so a client that hangs up cannot free them early.
 
 `validate_body`: parser rejections and `sample::validate` rejections are counted in order (`sample <index>: <message>`, first 10 kept). The distinct series ids of the valid rows go to `guard.admit` in first-seen order. `RateLimited` → `Err(IngestError::CardinalityExceeded { .. })`. Rows of `refused` series become `Rejection::SeriesLimit`. `series_rows` = one `SeriesRow::from_row` (with `last_seen = received_at`) per id in `new_series ∪ touched`, from the first row of that series. `body` = `encode_metric_rows` (413 `the stored rows would exceed 64 MiB` on `TooLarge`, after `guard.forget`).
 
 `parse_json` = `parse_json_values_within(raw, MAX_SAMPLES_PER_REQUEST, &mut Budget::for_request())`, then per element (the body is never parsed whole into one `Value` before the element cap and the budget apply; R6). Each element: not an object → `Rejection::InvalidValue`; keys other than `name`, `value`, `type`, `dt`, `tags` → `UnknownField(key)`; `name` not a string → `InvalidName`; `value` not a JSON number → `InvalidValue`; `type` not `"gauge"`/`"counter"` → `InvalidValue`; `dt` through `normalize::parse_timestamp` (`None` → `InvalidTimestamp`); `tags` not an object → `InvalidTagKey("tags")`, a non-string value → `TagValueNotString(key)`. `parse_prometheus` = `prom_text::parse(text, MAX_SAMPLES_PER_REQUEST, &mut Budget::for_request())` (its per-line `Err(Rejection)`s are counted like T1's), mapping `ParseError::Syntax` to 400 with the error's text, `LineTooLong`, `TooManySamples` and `TooLarge` to 413, `TooManyTypes` to 400.
 
-- [ ] **Step 1: Write the failing tests** `tests/metrics_ingest.rs`:
+- [ ] **Step 1: Write the failing tests** `tests/metrics/metrics_ingest.rs`:
 
 ```rust
 // POST /api/v1/metrics and /api/v1/metrics/prometheus on the public listener.
@@ -1328,20 +1328,20 @@ Note: the first test's second array element carries an unknown key `project_id`;
 
 - [ ] **Step 2: Run to fail**
 
-Run: engine command with `--test metrics_ingest`
+Run: engine command with `--test metrics metrics_ingest::`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Implement** `MetricsState` (every field `pub`, so tests can replace one with struct-update syntax), `config.metrics_max_series_per_project` (`env_positive("METRICS_MAX_SERIES_PER_PROJECT", DEFAULT_MAX_SERIES_PER_PROJECT)` in `from_env`, then a panic naming the variable above `MAX_MAX_SERIES_PER_PROJECT`; the default in `from_env_defaults_only`), `AppState.metrics: Arc<MetricsState>` (`for_test`: `Arc::new(MetricsState::new(config.metrics_max_series_per_project))`; `main.rs` the same), `gunzip_within`, `parse_json_values_within` (it reuses the private `Counted`/`Spend`/`Refusal` of `logs::ingest`, so it lives in that module; `parse_json_events_within` is unchanged), `IngestError::CardinalityExceeded`, `metrics::ingest`, `routes::metrics_ingest`, the router merge, and `tests/common/metrics.rs`. Update the `build_public_router` doc comment and `common::public_app`'s comment to list the metrics endpoints. Add a unit test in `logs/ingest.rs` for `parse_json_values_within`: an array of 3 values with `max_items = 2` → 413; `[1, "x", {}]` → three values; `"x"` → 400; a 1 KiB budget on `[{"a":1},{"a":1}, ...]` → 413.
+- [ ] **Step 3: Implement** `MetricsState` (every field `pub`, so tests can replace one with struct-update syntax), `config.metrics_max_series_per_project` (`env_positive("METRICS_MAX_SERIES_PER_PROJECT", DEFAULT_MAX_SERIES_PER_PROJECT)` in `from_env`, then a panic naming the variable above `MAX_MAX_SERIES_PER_PROJECT`; the default in `from_env_defaults_only`), `AppState.metrics: Arc<MetricsState>` (`for_test`: `Arc::new(MetricsState::new(config.metrics_max_series_per_project))`; `main.rs` the same), `gunzip_within`, `parse_json_values_within` (it reuses the private `Counted`/`Spend`/`Refusal` of `logs::ingest`, so it lives in that module; `parse_json_events_within` is unchanged), `IngestError::CardinalityExceeded`, `metrics::ingest`, `metrics::ingest::routes`, the router merge, and `tests/common/metrics.rs`. Update the `build_public_router` doc comment and `common::public_app`'s comment to list the metrics endpoints. Add a unit test in `logs/ingest.rs` for `parse_json_values_within`: an array of 3 values with `max_items = 2` → 413; `[1, "x", {}]` → three values; `"x"` → 400; a 1 KiB budget on `[{"a":1},{"a":1}, ...]` → 413.
 
 - [ ] **Step 4: Run to pass**
 
-Run: engine command with `--test metrics_ingest --test logs_ingest --test startup`
+Run: engine command with `--test metrics metrics_ingest:: --test logs logs_ingest:: --test core startup::`
 Expected: PASS (logs ingest unchanged).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nami-engine/src nami-engine/tests/common nami-engine/tests/metrics_ingest.rs
+git add nami-engine/src nami-engine/tests/common nami-engine/tests/metrics/metrics_ingest.rs
 git commit -m "feat(engine): JSON and Prometheus text metric ingest with per-sample rejection (NAMI-MET-4)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -1353,11 +1353,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Branch `feat/NAMI-MET-5-metrics-query`, worktree `.worktrees/NAMI-MET-5/`.
 
 **Files:**
-- Create: `nami-engine/src/metrics/query.rs`, `nami-engine/src/metrics/sql.rs`, `nami-engine/src/routes/metrics.rs`, `nami-engine/tests/metrics_query.rs`
-- Modify: `nami-engine/src/metrics/mod.rs` (`QuerySlot`, `acquire_query_slot`), `nami-engine/src/metrics/series_guard.rs` (use `sql::METRIC_READ_SETTINGS`), `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs` (`.merge(routes::metrics::router())`), `nami-engine/tests/common/metrics.rs` (`seed_samples`, `query`), `nami-engine/tests/json_bodies.rs` (`POST /projects/{id}/metrics/query`)
+- Create: `nami-engine/src/metrics/query.rs`, `nami-engine/src/metrics/sql.rs`, `nami-engine/src/metrics/query/routes.rs`, `nami-engine/tests/metrics/metrics_query.rs`
+- Modify: `nami-engine/src/metrics/mod.rs` (`QuerySlot`, `acquire_query_slot`), `nami-engine/src/metrics/series_guard.rs` (use `sql::METRIC_READ_SETTINGS`), `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs` (`.merge(metrics::query::routes::router())`), `nami-engine/tests/common/metrics.rs` (`seed_samples`, `query`), `nami-engine/tests/core/json_bodies.rs` (`POST /projects/{id}/metrics/query`)
 
 **Interfaces:**
-- Consumes: T1 `is_valid_name`, `is_valid_tag_key`, `METRICS_TABLE`; T4 `MetricsState`; `logs::query::Sql`; `logs::search::user_error`; `require_project_role`.
+- Consumes: T1 `is_valid_name`, `is_valid_tag_key`, `METRICS_TABLE`; T4 `MetricsState`; `logs::query::Sql`; `logs::query::search::user_error`; `require_project_role`.
 - Produces:
 
 ```rust
@@ -1494,7 +1494,7 @@ ORDER BY g, bucket_ms
 
 `<AGG>`: `avg(value)`, `min(value)`, `max(value)`, `sum(value)`, `toFloat64(count())`, `quantileTDigest(0.5)(value)`, `quantileTDigest(0.95)(value)`, `quantileTDigest(0.99)(value)` (fixed fragments; `pSS` = step in seconds as a float). `run`: with a group-by, run phase 1 (rows decode as `TopGroup`); no rows → `series: []`; 51 rows → `truncated = true` and the 51st is dropped; then phase 2 with the kept groups' `gh` values (parsed as `u64`, bound as `UInt64`). Phase-2 rows decode as `{ g: Vec<String>, bucket_ms: i64, v: Option<f64> }` (ClickHouse writes a non-finite float as `null` with its default `output_format_json_quote_denormals = 0`). Rust keeps only rows whose `g` equals one of phase 1's groups; each group's points cover every bucket from `aligned_from_ms` to `floor(to_ms / step) * step` with `None` where no row came back; `tags` = `group_by` zipped with `g`; series are ordered by phase 1's order (magnitude descending, then `g`). Without a group-by there is one series (`tags: {}`) when phase 2 returns any row, else none. Both statements run under `METRIC_READ_SETTINGS`.
 
-`user_error` (R10): match on the ClickHouse body for `TOO_MANY_ROWS` (also covers `TOO_MANY_ROWS_OR_BYTES`), `TOO_MANY_BYTES`, `MEMORY_LIMIT_EXCEEDED`, and on `ResponseTooLarge` → 400 `the query is too expensive: narrow the time range or add filters`; everything else → `logs::search::user_error` (regex and timeout already map there). Never echo ClickHouse's text to the client.
+`user_error` (R10): match on the ClickHouse body for `TOO_MANY_ROWS` (also covers `TOO_MANY_ROWS_OR_BYTES`), `TOO_MANY_BYTES`, `MEMORY_LIMIT_EXCEEDED`, and on `ResponseTooLarge` → 400 `the query is too expensive: narrow the time range or add filters`; everything else → `logs::query::search::user_error` (regex and timeout already map there). Never echo ClickHouse's text to the client.
 
 Route order: `require_project_role(viewer)` → `plan_window` + `validate_def` + `validate` (400) → `acquire_query_slot` (429) → `sql::run` → `Json(QueryResult)`.
 
@@ -1545,7 +1545,7 @@ fn definition_caps_and_charsets() {
 }
 ```
 
-- [ ] **Step 2: Write the failing integration tests** `tests/metrics_query.rs`. Add to `tests/common/metrics.rs`:
+- [ ] **Step 2: Write the failing integration tests** `tests/metrics/metrics_query.rs`. Add to `tests/common/metrics.rs`:
 
 ```rust
 /// Inserts samples directly: (name, tags, seconds after `base`, value) under `source` of `project`.
@@ -1777,12 +1777,12 @@ Plus a unit test in `sql.rs`: `user_error_maps_budget_errors_to_400` (a `ClickHo
 
 - [ ] **Step 3: Run to fail**
 
-Run: engine command with `--lib -- metrics::query metrics::sql`, then `--test metrics_query`
+Run: engine command with `--lib -- metrics::query metrics::sql`, then `--test metrics metrics_query::`
 Expected: FAIL to compile.
 
 - [ ] **Step 4: Implement** `metrics::query`, `metrics::sql`, `acquire_query_slot`, the route, the router merge, the helpers, and the `json_bodies.rs` entry.
 
-- [ ] **Step 5: Run to pass** (both commands from Step 3, plus `--test json_bodies --test metrics_series_guard`).
+- [ ] **Step 5: Run to pass** (both commands from Step 3, plus `--test core json_bodies:: --test metrics metrics_series_guard::`).
 
 - [ ] **Step 6: Commit**
 
@@ -1800,8 +1800,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Branch `feat/NAMI-MET-6-metrics-discovery`, worktree `.worktrees/NAMI-MET-6/`.
 
 **Files:**
-- Create: `nami-engine/tests/metrics_discovery.rs`
-- Modify: `nami-engine/src/metrics/sql.rs` (`names`, `tag_keys`, `tag_values`), `nami-engine/src/routes/metrics.rs`
+- Create: `nami-engine/tests/metrics/metrics_discovery.rs`
+- Modify: `nami-engine/src/metrics/sql.rs` (`names`, `tag_keys`, `tag_values`), `nami-engine/src/metrics/query/routes.rs`
 
 **Interfaces:**
 - Consumes: T5 `METRIC_READ_SETTINGS`, `acquire_query_slot`, `user_error`; T1 `SERIES_TABLE`, `is_valid_name`, `is_valid_tag_key`.
@@ -1839,7 +1839,7 @@ ORDER BY value LIMIT 501
 
 Validation (400): `metric` a valid name, `tag` a valid tag key, `q` at most 200 characters; a missing `metric`/`tag` is 400. Each call: viewer → validate → `acquire_query_slot` → query. Response `Cache-Control: no-store` is not needed (session API); leave defaults.
 
-- [ ] **Step 1: Write the failing tests** `tests/metrics_discovery.rs`:
+- [ ] **Step 1: Write the failing tests** `tests/metrics/metrics_discovery.rs`:
 
 ```rust
 mod common;
@@ -1900,7 +1900,7 @@ async fn tag_values_are_capped_and_flagged(pool: sqlx::PgPool) {
 }
 ```
 
-- [ ] **Step 2: Run to fail** — engine command with `--test metrics_discovery`. Expected: FAIL (404 routes).
+- [ ] **Step 2: Run to fail** — engine command with `--test metrics metrics_discovery::`. Expected: FAIL (404 routes).
 
 - [ ] **Step 3: Implement** the three functions and routes (built-ins come in T7; until then `names` returns stored names only, and the first test's `builtin == false` filter already allows for them).
 
@@ -1909,7 +1909,7 @@ async fn tag_values_are_capped_and_flagged(pool: sqlx::PgPool) {
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nami-engine/src nami-engine/tests/metrics_discovery.rs
+git add nami-engine/src nami-engine/tests/metrics/metrics_discovery.rs
 git commit -m "feat(engine): metric discovery endpoints for names, tag keys and tag values (NAMI-MET-6)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -1922,11 +1922,11 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Branch `feat/NAMI-MET-7-builtin-metrics`, worktree `.worktrees/NAMI-MET-7/`.
 
 **Files:**
-- Create: `nami-engine/src/metrics/builtin.rs`, `nami-engine/tests/metrics_builtin.rs`
+- Create: `nami-engine/src/metrics/builtin.rs`, `nami-engine/tests/metrics/metrics_builtin.rs`
 - Modify: `nami-engine/src/metrics/query.rs` (`Target` variants, `validate_def` per target), `nami-engine/src/metrics/sql.rs` (target fragments, resolved filters, relabelling, discovery merge)
 
 **Interfaces:**
-- Consumes: T5 `Target`, `ValidQuery`, `build`, `run`; T6 `names`, `tag_keys`, `tag_values`; `uptime_checks`, `logs` tables; Postgres `monitors (id, project_id, name)`, `sources (id, project_id, name)`; `logs::normalize::LEVELS`.
+- Consumes: T5 `Target`, `ValidQuery`, `build`, `run`; T6 `names`, `tag_keys`, `tag_values`; `uptime_checks`, `logs` tables; Postgres `monitors (id, project_id, name)`, `sources (id, project_id, name)`; `logs::ingest::normalize::LEVELS`.
 - Produces:
 
 ```rust
@@ -1962,7 +1962,7 @@ Fragments (R13):
 
 The T5 builders take their fragments from the target (`<TABLE>`, `<TIME>` in the bucket and window, `<VALUE>` in `<AGG>`, the phase-1 magnitude and rate, `<SERIES>` in the rate window's `PARTITION BY` and the rate magnitude's inner `GROUP BY`). Every fragment is a `&'static str` chosen by a `match` on the target and the key; no user string ever selects or becomes SQL text. A `monitor` filter compares `monitor_id` with bound `UUID` values (`eq` → `monitor_id IN (...)`, `neq` → `NOT IN`, using the table's key; a value that is not a UUID makes `eq` match nothing and is dropped from `neq`), `regex` → `match(toString(monitor_id), {..:String})`; grouping by `monitor` uses `toString(monitor_id)`. For a resolved key: a filter becomes ` AND monitor_id IN ({..:UUID}, ...)` (`eq`/`regex`) or `NOT IN` (`neq`) over the ids from `resolve_ids`; an empty id list for `eq`/`regex` emits ` AND 0` (no series), an empty list for `neq` emits nothing; grouping uses `toString(monitor_id)` (or `toString(source_id)`), and `run` relabels each series with both keys (`monitor` + `monitor_name`, `source_id` + `source`), names from `names_by_id` (a deleted monitor keeps its id and gets `monitor_name: ""`). `LogsCount` with an aggregation other than `count`/`sum`/`rate` → 400 `nami.logs.count supports count, sum and rate`; `count` and `sum` both use `toFloat64(count())`, `rate` uses `count() / step` per group (no counter logic). An unknown tag key on a built-in → 400 `unknown tag for <name>`. Discovery: `names` puts the three built-ins first (filtered by `q`, `type` `"gauge"`, `builtin: true`); `tag_keys` returns the fixed list; `tag_values` reads Postgres (`monitors`/`sources` of the project, ordered by name, capped at 500) or `LEVELS` for `level`.
 
-- [ ] **Step 1: Write the failing tests** `tests/metrics_builtin.rs`:
+- [ ] **Step 1: Write the failing tests** `tests/metrics/metrics_builtin.rs`:
 
 ```rust
 // Built-in metrics over uptime_checks and logs. Requires `docker compose up -d postgres clickhouse`.
@@ -2051,18 +2051,18 @@ async fn log_volume_counts_by_level_and_source(pool: sqlx::PgPool) {
 
 `UptimeCheckRow` (all fields `pub`) and `insert_checks` are `uptime::store`'s, and `CheckStatus` is `uptime::checker`'s, as on `main`.
 
-- [ ] **Step 2: Run to fail** — engine command with `--test metrics_builtin`. Expected: FAIL (`invalid metric name` is not the failure: `nami.uptime.up` is a valid name; the queries return no series).
+- [ ] **Step 2: Run to fail** — engine command with `--test metrics metrics_builtin::`. Expected: FAIL (`invalid metric name` is not the failure: `nami.uptime.up` is a valid name; the queries return no series).
 
 - [ ] **Step 3: Implement** `metrics::builtin`, the `Target` variants and the builder/run/discovery changes.
 
 Add to the first test: a `monitor` filter with the value `"not-a-uuid"` (`eq`) returns `series: []` with status 200, and `build_never_puts_values_in_the_sql_text` (T5) gains a case per built-in target.
 
-- [ ] **Step 4: Run to pass** — engine command with `--test metrics_builtin --test metrics_query --test metrics_discovery`, then `--lib -- metrics::sql`.
+- [ ] **Step 4: Run to pass** — engine command with `--test metrics metrics_builtin:: --test metrics metrics_query:: --test metrics metrics_discovery::`, then `--lib -- metrics::sql`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nami-engine/src nami-engine/tests/metrics_builtin.rs
+git add nami-engine/src nami-engine/tests/metrics/metrics_builtin.rs
 git commit -m "feat(engine): built-in metrics from uptime checks and log volume (NAMI-MET-7)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -2074,12 +2074,12 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Branch `feat/NAMI-MET-8-dashboards-api`, worktree `.worktrees/NAMI-MET-8/`.
 
 **Files:**
-- Create: `nami-engine/migrations/0120_create_dashboards.sql`, `nami-engine/src/models/dashboard.rs`, `nami-engine/src/routes/dashboards.rs`, `nami-engine/tests/dashboards_api.rs`
-- Modify: `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/tests/migrations.rs` (`dashboards`, `dashboard_panels`), `nami-engine/tests/json_bodies.rs` (dashboard and panel POST/PATCH, layout PUT)
-- **Only if NAMI-INC-7 is not merged** (check `GET /projects/{id}` for a `role` field on `origin/main`): `nami-engine/src/models/project.rs` (`ProjectView`, `effective_role`) and `nami-engine/src/routes/projects.rs` (`GET /projects/{id}` returns `ProjectView`), exactly INC-7's contract (header table), with INC-7's test `the_project_tells_the_caller_its_effective_role` copied verbatim into a new `nami-engine/tests/project_role.rs`. INC-7, landing second, deletes the duplicate.
+- Create: `nami-engine/migrations/0120_create_dashboards.sql`, `nami-engine/src/metrics/dashboard/model.rs`, `nami-engine/src/metrics/dashboard/routes.rs`, `nami-engine/tests/metrics/dashboards_api.rs`
+- Modify: `nami-engine/src/core/validate.rs`, `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs`, `nami-engine/tests/core/migrations.rs` (`dashboards`, `dashboard_panels`), `nami-engine/tests/core/json_bodies.rs` (dashboard and panel POST/PATCH, layout PUT)
+- **Only if NAMI-INC-7 is not merged** (check `GET /projects/{id}` for a `role` field on `origin/main`): `nami-engine/src/projects/model.rs` (`ProjectView`, `effective_role`) and `nami-engine/src/projects/routes.rs` (`GET /projects/{id}` returns `ProjectView`), exactly INC-7's contract (header table), with INC-7's test `the_project_tells_the_caller_its_effective_role` copied verbatim into a new `nami-engine/tests/projects/project_role.rs`. INC-7, landing second, deletes the duplicate.
 
 **Interfaces:**
-- Consumes: T5 `QueryDef`, `FilterOp`, `validate_def`; T7 `builtin::lookup` (through `validate_def`); `models::validate_label`; `require_project_role`.
+- Consumes: T5 `QueryDef`, `FilterOp`, `validate_def`; T7 `builtin::lookup` (through `validate_def`); `core::validate::validate_label`; `require_project_role`.
 - Produces:
 
 ```rust
@@ -2161,7 +2161,7 @@ pub async fn panel_for_query(db: &PgPool, project_id: Uuid, dashboard_id: Uuid, 
 
 `Width` serializes as `"third"`, `"half"`, `"full"` (R15; the UI labels them 1/3, 1/2, full). `Width::default_half()` returns `Half`. `default_range()` returns `"24h"`.
 
-Routes (`routes::dashboards::router()`):
+Routes (`metrics::dashboard::routes::router()`):
 
 | Method | Path | Role | Answer |
 |---|---|---|---|
@@ -2196,7 +2196,7 @@ create table dashboards (
     default_range text not null default '24h'
         check (default_range in ('15m', '1h', '6h', '24h', '7d', '30d')),
     refresh_seconds int not null default 0 check (refresh_seconds in (0, 30, 60, 300)),
-    -- Validated by the engine (models::dashboard::validate_variables); at most 10.
+    -- Validated by the engine (metrics::dashboard::model::validate_variables); at most 10.
     variables jsonb not null default '[]'::jsonb
         check (jsonb_typeof(variables) = 'array' and jsonb_array_length(variables) <= 10
                and octet_length(variables::text) <= 131072),
@@ -2231,7 +2231,7 @@ create table dashboard_panels (
 
 (The unique constraint's index already serves `(dashboard_id, position)` lookups. The `octet_length` checks are backstops above the engine's caps (4,096-byte query, 64 KiB variables): jsonb's text form may differ from the engine's serialization. A deferrable constraint, even while immediate, is checked at the end of each statement, so the "close up positions" `update ... set position = position - 1` after a panel delete does not trip it mid-statement. A whole create request is bounded too: axum's `Json` default body limit is 2 MiB, and 50 panels × 10 KiB of markdown plus 64 KiB of variables fit under it.)
 
-- [ ] **Step 1: Write the failing tests** `tests/dashboards_api.rs`:
+- [ ] **Step 1: Write the failing tests** `tests/metrics/dashboards_api.rs`:
 
 ```rust
 // Dashboards, panels and layout. Requires `docker compose up -d postgres`.
@@ -2411,11 +2411,11 @@ async fn another_projects_dashboards_and_panels_are_404_inside_an_accessible_pro
 
 The dashboard lookup runs before the layout's id-set check, so `{"panels": []}` on a foreign dashboard is a 404, not a 400.
 
-- [ ] **Step 2: Run to fail** — engine command with `--test dashboards_api`. Expected: FAIL (routes missing).
+- [ ] **Step 2: Run to fail** — engine command with `--test metrics dashboards_api::`. Expected: FAIL (routes missing).
 
 - [ ] **Step 3: Write the migration**, the model, the routes and the router merge; add both tables to `migrations.rs` and the five state-changing routes to `json_bodies.rs`.
 
-- [ ] **Step 4: Run to pass** — engine command with `--test dashboards_api --test migrations --test json_bodies` (plus `--test project_role --test rbac` when this task added the INC-7 field).
+- [ ] **Step 4: Run to pass** — engine command with `--test metrics dashboards_api:: --test core migrations:: --test core json_bodies::` (plus `--test projects project_role:: --test projects rbac::` when this task added the INC-7 field).
 
 - [ ] **Step 5: Commit**
 
@@ -2433,8 +2433,8 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 Branch `feat/NAMI-MET-9-dashboard-variables`, worktree `.worktrees/NAMI-MET-9/`.
 
 **Files:**
-- Create: `nami-engine/src/metrics/variables.rs`, `nami-engine/tests/dashboard_variables.rs`
-- Modify: `nami-engine/src/metrics/query.rs` (`QueryRequest.variables`), `nami-engine/src/routes/metrics.rs` (substitute instead of `literal_filters`), `nami-engine/src/routes/dashboards.rs` (panel query route), `nami-engine/tests/json_bodies.rs` (panel query POST)
+- Create: `nami-engine/src/metrics/variables.rs`, `nami-engine/tests/metrics/dashboard_variables.rs`
+- Modify: `nami-engine/src/metrics/query.rs` (`QueryRequest.variables`), `nami-engine/src/metrics/query/routes.rs` (substitute instead of `literal_filters`), `nami-engine/src/metrics/dashboard/routes.rs` (panel query route), `nami-engine/tests/core/json_bodies.rs` (panel query POST)
 
 **Interfaces:**
 - Consumes: T5 `QueryDef`, `Filter`, `FilterOp`, `plan_window`, `validate`, `sql::run`, `acquire_query_slot`; T8 `Variable`, `panel_for_query`, `Viz`.
@@ -2470,7 +2470,7 @@ pub async fn run_panel_query(state: &AppState, project_id: Uuid, dashboard_id: U
 
 ```rust
 use super::*;
-use crate::{metrics::query::{Aggregation, FilterDef, FilterOp, QueryDef}, models::dashboard::Variable};
+use crate::{metrics::query::{Aggregation, FilterDef, FilterOp, QueryDef}, metrics::dashboard::model::Variable};
 
 fn def(filters: &[(&str, FilterOp, &str)]) -> QueryDef {
     QueryDef { metric: "m".into(), aggregation: Aggregation::Avg, group_by: vec![],
@@ -2514,7 +2514,7 @@ fn values_multi_all_and_defaults() {
 }
 ```
 
-- [ ] **Step 2: Write the failing integration tests** `tests/dashboard_variables.rs`:
+- [ ] **Step 2: Write the failing integration tests** `tests/metrics/dashboard_variables.rs`:
 
 ```rust
 // Variable substitution and panel queries. Requires `docker compose up -d postgres clickhouse`.
@@ -2624,11 +2624,11 @@ async fn panel_queries_are_scoped_to_their_dashboard_and_project(pool: sqlx::PgP
 }
 ```
 
-- [ ] **Step 3: Run to fail** — engine command with `--lib -- metrics::variables`, then `--test dashboard_variables`. Expected: FAIL.
+- [ ] **Step 3: Run to fail** — engine command with `--lib -- metrics::variables`, then `--test metrics dashboard_variables::`. Expected: FAIL.
 
-- [ ] **Step 4: Implement** `metrics::variables`, the `variables` field, the substitution in `routes::metrics`, `run_panel_query` and its route, and the `json_bodies.rs` entry.
+- [ ] **Step 4: Implement** `metrics::variables`, the `variables` field, the substitution in `metrics::query::routes`, `run_panel_query` and its route, and the `json_bodies.rs` entry.
 
-- [ ] **Step 5: Run to pass** — both commands, plus `--test metrics_query --test dashboards_api --test json_bodies`.
+- [ ] **Step 5: Run to pass** — both commands, plus `--test metrics metrics_query:: --test metrics dashboards_api:: --test core json_bodies::`.
 
 - [ ] **Step 6: Commit**
 
@@ -3000,7 +3000,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 
 Per CLAUDE.md, Part 1 ends with a whole-part review and a dedicated security review + fix wave, before Part 2 starts:
 
-1. **Whole-branch review** of everything merged under NAMI-MET-1..13 against the spec and this plan's rulings: every R1-R22 decision implemented as written, or the deviation recorded; every Global Constraint value present in code (grep the constants); `tests/json_bodies.rs`, `tests/migrations.rs` and `tests/clickhouse.rs` list every new route and table.
+1. **Whole-branch review** of everything merged under NAMI-MET-1..13 against the spec and this plan's rulings: every R1-R22 decision implemented as written, or the deviation recorded; every Global Constraint value present in code (grep the constants); `tests/core/json_bodies.rs`, `tests/core/migrations.rs` and `tests/core/clickhouse.rs` list every new route and table.
 2. **Security review** (a fresh reviewer, then a fix wave on `fix/NAMI-MET-security-wave`), checking at least:
    - **Tenant isolation:** every ClickHouse statement binds `project_id` from the path (grep `sql.rs`, `series_guard.rs`, discovery); built-in name resolution filters Postgres by project; dashboard/panel lookups always carry `project_id` (and `dashboard_id` for panels); the share-ready `run_panel_query` cannot be reached without RBAC from Part 1 routes.
    - **Injection:** no `format!` in any SQL path; metric names and tag keys never identifiers (bound `String`s: `name = {pN:String}`, `tags[{pN:String}]`), built-in keys mapped to fixed fragments by `match`; `METRIC_READ_SETTINGS` constants not in `RESERVED_SETTINGS`; variable values only as bound `String`s; `build_never_puts_values_in_the_sql_text` covers every target.

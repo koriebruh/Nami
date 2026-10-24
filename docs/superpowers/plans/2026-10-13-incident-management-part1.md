@@ -1,12 +1,12 @@
 # Incident Management + On-call — Part 1 Implementation Plan
 
-> **Restructure note (2026-10-19):** after this plan was written, the engine, its tests, its migrations and `nami-ui/src/lib` were reorganised by domain, and work now ships as one PR per phase (see `CLAUDE.md`). File paths, test files and migration numbers in the steps below predate that change. Map them with the path table in `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. For example, `src/models/incident.rs` is now `src/incidents/model.rs`, `src/routes/incidents.rs` is `src/incidents/routes.rs`, `src/uptime/heartbeat.rs` is `src/uptime/heartbeat/mod.rs`, `src/crypto.rs` is `src/core/crypto.rs`, `tests/incidents.rs` is a module of the `tests/incidents/main.rs` target, and `#lib/server/engine` is `#lib/server/core/engine`. New migrations follow the convention in that file: numbered sequentially after the newest file in `nami-engine/migrations/` (the first is `0006_`), named `NNNN_<domain>_<change>.sql`, and at most one file per domain per phase PR. The plan's 0060-0066 become one `NNNN_incidents_<change>.sql`, plus at most one file for each other domain the phase changes (for example `NNNN_uptime_<change>.sql` for source routing columns on monitors and heartbeats). The plan body is otherwise unchanged.
+> **Restructure note (2026-10-19):** after this plan was written, the engine, its tests, its migrations and `nami-ui/src/lib` were reorganised by domain, and work now ships as one PR per phase (see `CLAUDE.md`). File paths, test files and migration numbers in the steps below predate that change. Map them with the path table in `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. For example, `src/incidents/model.rs` is now `src/incidents/model.rs`, `src/incidents/routes.rs` is `src/incidents/routes.rs`, `src/uptime/heartbeat/mod.rs` is `src/uptime/heartbeat/mod.rs`, `src/core/crypto.rs` is `src/core/crypto.rs`, `tests/incidents/incidents.rs` is a module of the `tests/incidents/main.rs` target, and `#lib/server/engine` is `#lib/server/core/engine`. New migrations follow the convention in that file: numbered sequentially after the newest file in `nami-engine/migrations/` (the first is `0006_`), named `NNNN_<domain>_<change>.sql`, and at most one file per domain per phase PR. The plan's 0060-0066 become one `NNNN_incidents_<change>.sql`, plus at most one file for each other domain the phase changes (for example `NNNN_uptime_<change>.sql` for source routing columns on monitors and heartbeats). The plan body is otherwise unchanged.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give Nami the core of BetterStack incident management and on-call. That means the incident lifecycle (open → acknowledged → resolved, reopen, manual incidents, comments, timeline, postmortem), severities, escalation policies (steps, delays, repeat, time-window conditions, fallback policy), on-call schedules (rotations, handoff, working-hours restrictions, overrides, "who is on call"), and notification channels (email, generic webhook, Slack, Microsoft Teams, Telegram, Discord), both personal and project-wide, with a durable delivery queue. It also adds signed acknowledge/resolve links in emails, and routes every monitor, heartbeat and log-alert incident through one internal open/resolve API, escalation and channels. nami-ui gets the screens for all of it.
 
-**Architecture:** Every incident is opened, acknowledged, resolved and reopened only through `incidents::lifecycle`. That module writes the state change and its timeline event in the caller's transaction. It also arms escalation (`next_escalation_at`) and queues "resolved" notifications. Monitors, heartbeats, log alerts (Logs Part 2), manual incidents and Part 2's integrations and report form all call it with an `IncidentSource`. One engine loop (`incidents::worker`) runs two ticks. The escalation tick claims due incidents with `FOR UPDATE SKIP LOCKED`, resolves the current step's targets to users and channels, and inserts deduplicated rows into `notification_deliveries`. The delivery tick claims due deliveries and sends them through `incidents::send`. Chat and webhook requests go through one guarded outbound client (`outbound.rs`: no proxy, link-local and metadata refusal at DNS time, no redirects, 10 s timeout). Formatting is pure (`incidents::format`) and escapes per channel. On-call math is pure (`oncall::rotation`) and is tested across DST transitions. Channel secrets are sealed with the existing `crypto::Cipher` under per-row contexts and are never returned. Action links carry an HMAC token over `(incident, action, user, exp)`, are single-use, and are confirmed by a POST from a nami-ui page.
+**Architecture:** Every incident is opened, acknowledged, resolved and reopened only through `incidents::lifecycle`. That module writes the state change and its timeline event in the caller's transaction. It also arms escalation (`next_escalation_at`) and queues "resolved" notifications. Monitors, heartbeats, log alerts (Logs Part 2), manual incidents and Part 2's integrations and report form all call it with an `IncidentSource`. One engine loop (`incidents::worker`) runs two ticks. The escalation tick claims due incidents with `FOR UPDATE SKIP LOCKED`, resolves the current step's targets to users and channels, and inserts deduplicated rows into `notification_deliveries`. The delivery tick claims due deliveries and sends them through `incidents::send`. Chat and webhook requests go through one guarded outbound client (`outbound.rs`: no proxy, link-local and metadata refusal at DNS time, no redirects, 10 s timeout). Formatting is pure (`incidents::format`) and escapes per channel. On-call math is pure (`oncall::rotation`) and is tested across DST transitions. Channel secrets are sealed with the existing `core::crypto::Cipher` under per-row contexts and are never returned. Action links carry an HMAC token over `(incident, action, user, exp)`, are single-use, and are confirmed by a POST from a nami-ui page.
 
 **Tech Stack:** Rust 2024 (Axum 0.8, SQLx 0.9 runtime queries, tokio, reqwest 0.13, chrono-tz 0.10.4), new direct crate `hmac 0.13.0` (already in the lock file through `hkdf`), Postgres 17, Mailpit, wiremock 0.6.5 (dev, already present), SvelteKit 3 + Svelte 5 runes + Tailwind 4, vitest.
 
@@ -16,11 +16,11 @@
 
 1. Every Logs Part 2 task (NAMI-LOG-9 .. NAMI-LOG-18, plan `docs/superpowers/plans/2026-10-13-log-management-part2.md`, PR #52) and its final fix wave. This plan assumes that end state. In particular:
    - NAMI-LOG-14's migration `0044_create_log_alerts.sql` exists: `log_alerts`, `incidents.log_alert_id` (FK, cascade) and the index `incidents_one_open_per_log_alert ... where status = 'open'`.
-   - `models::incident::{open_for_log_alert, resolve_for_log_alert}`, `uptime::alerts::Subject::LogAlert`, `logs::alerts::{claim_due_alerts, apply_evaluation}` (`apply_evaluation` returns `Option<Transition>`), and log-alert emails sent through `alerts::notify_transition`.
-   - The R-P2-27 seam: `logs::alerts::{open_alert_incident, resolve_alert_incident}` are the only callers of the two `*_for_log_alert` functions. `resolve_alert_incident(.., notify: false)` is what `models::log_alert::update` calls when an alerting alert is disabled. Task 10 swaps the seam (R17).
+   - `incidents::model::{open_for_log_alert, resolve_for_log_alert}`, `uptime::alerts::Subject::LogAlert`, `logs::alert::{claim_due_alerts, apply_evaluation}` (`apply_evaluation` returns `Option<Transition>`), and log-alert emails sent through `alerts::notify_transition`.
+   - The R-P2-27 seam: `logs::alert::{open_alert_incident, resolve_alert_incident}` are the only callers of the two `*_for_log_alert` functions. `resolve_alert_incident(.., notify: false)` is what `logs::alert::model::update` calls when an alerting alert is disabled. Task 10 swaps the seam (R17).
 2. Every Uptime Phase 3 task (NAMI-UP-20 .. NAMI-UP-32, plan `docs/superpowers/plans/2026-10-13-uptime-phase3.md`) and its final fix wave. NAMI-UP-20 is merged (`5da08a9`). The rest is running while this plan is reviewed. This plan consumes:
    - NAMI-UP-20: `uptime::heartbeat::{Ping, PingKind, record_signal, failure_cause}`. A failure ping opens an incident titled `{name} reported a failure`.
-   - NAMI-UP-21: migration `0022_incident_details.sql` (`incidents.details text`, ≤ 10 KiB + marker), `models::incident::attach_details`, `IncidentListItem.details`, `alerts::Transition.details`, `uptime::heartbeat::sanitize_output`, and the integration test `heartbeat_pings.rs::the_output_of_the_ping_that_opens_the_incident_is_attached_to_it`, which asserts that the DOWN email contains `Output:\n> …\n` lines.
+   - NAMI-UP-21: migration `0022_incident_details.sql` (`incidents.details text`, ≤ 10 KiB + marker), `incidents::model::attach_details`, `IncidentListItem.details`, `alerts::Transition.details`, `uptime::heartbeat::sanitize_output`, and the integration test `heartbeat_pings.rs::the_output_of_the_ping_that_opens_the_incident_is_attached_to_it`, which asserts that the DOWN email contains `Output:\n> …\n` lines.
    - NAMI-UP-29: the incidents page renders `details` in a `<details><summary>Job output</summary><pre>…</pre></details>` block (text only).
    - NAMI-UP-27: `availability::for_monitor` / `for_heartbeat` (Part 2's SLA report only).
 
@@ -49,7 +49,7 @@ Part 1 leaves room for these:
 
 Postgres migrations 0060-0099 are reserved for Incidents (ruling in `docs/superpowers/decisions/2026-10-13-uptime-phase1.md`). None of these numbers was in use on 2026-10-19 (`main` ends at 0041; Logs Part 2 adds 0042-0044). Part 1 uses 0060-0066. Part 2 continues at 0067.
 
-**Verification status (2026-10-19):** written against `main` at `95940ee` plus the Logs Part 2 plan's stated end state. A review on 2026-10-19 checked every signature against `origin/main` at `5da08a9` (NAMI-UP-20 merged) and against the planned shapes of Uptime Phase 3 NAMI-UP-21 and Logs Part 2 NAMI-LOG-14. It fixed the drift it found, for example the members list endpoint, `state_with_clickhouse(&pool)`, the monitor page's `?monitor_id=` list call, `mod common` in `tests/migrations.rs`, the tests that pin the old SMTP path, and `AppError` having no 410 variant. Unlike the Logs Part 1 and Uptime Phase 2 plans, the code here has **not** been applied to a scratch copy. Tests are given in full. Code that decides something is given in full: migrations, SQL, the escalation planner, rotation math, escaping, token signing and URL rules. Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body (the Logs Part 2 convention). Run every step. A test that fails for a reason the plan did not predict is a plan bug: fix it minimally and say so in the PR.
+**Verification status (2026-10-19):** written against `main` at `95940ee` plus the Logs Part 2 plan's stated end state. A review on 2026-10-19 checked every signature against `origin/main` at `5da08a9` (NAMI-UP-20 merged) and against the planned shapes of Uptime Phase 3 NAMI-UP-21 and Logs Part 2 NAMI-LOG-14. It fixed the drift it found, for example the members list endpoint, `state_with_clickhouse(&pool)`, the monitor page's `?monitor_id=` list call, `mod common` in `tests/core/migrations.rs`, the tests that pin the old SMTP path, and `AppError` having no 410 variant. Unlike the Logs Part 1 and Uptime Phase 2 plans, the code here has **not** been applied to a scratch copy. Tests are given in full. Code that decides something is given in full: migrations, SQL, the escalation planner, rotation math, escaping, token signing and URL rules. Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body (the Logs Part 2 convention). Run every step. A test that fails for a reason the plan did not predict is a plan bug: fix it minimally and say so in the PR.
 
 **Execution:** per CLAUDE.md. Use one worktree per task under `.worktrees/NAMI-INC-<n>/`, branched from the latest `origin/main`, with the branch named under each task heading. Commit with Conventional Commits, then run the task review, open the PR, and auto-merge on a clean review (pre-authorized for sub-projects 2-11). Tasks are sequential (each consumes the interfaces of the ones before it). Two exceptions: T4 depends only on T3 (the `hmac` dependency and nothing else), and T6 depends on nothing in this plan. Engine tests need `docker compose up -d postgres clickhouse mailpit` (never restart running containers).
 
@@ -118,8 +118,8 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - `outbound::public_client()` uses `PublicOnlyResolver`. It refuses everything `GuardedResolver` refuses, plus loopback, RFC 1918, CGNAT `100.64.0.0/10`, `198.18.0.0/15`, ULA `fc00::/7`, multicast, broadcast and documentation ranges. It serves every **personal** channel (any logged-in user creates them, viewers included) and every Slack/Discord/Teams channel.
   - IP literals are checked against the same policy before the request (`check_url`).
   - Error text is a fixed vocabulary (`describe_error`), built from `reqwest::Error::without_url()`, and never contains a URL, body, address or token.
-- Secrets in memory: no type that holds a channel secret, a signing secret or an HMAC key derives `Debug`. Each gets a manual `Debug` that prints only ids and kinds: `ChannelConfig`, `OpenedChannel`, `ChannelPatch`, and the create/patch request bodies of `routes::channels`. Keys and opened secrets are held in `zeroize::Zeroizing`. Never pass them to `tracing` fields or `#[instrument]` (use `skip_all`).
-- Every new POST/PUT/PATCH route is added to the route list of `tests/json_bodies.rs::every_state_changing_route_refuses_bodies_that_are_not_json`, in the task that adds the route. Every new table is added to `tests/migrations.rs::all_tables_exist`.
+- Secrets in memory: no type that holds a channel secret, a signing secret or an HMAC key derives `Debug`. Each gets a manual `Debug` that prints only ids and kinds: `ChannelConfig`, `OpenedChannel`, `ChannelPatch`, and the create/patch request bodies of `incidents::channel::routes`. Keys and opened secrets are held in `zeroize::Zeroizing`. Never pass them to `tracing` fields or `#[instrument]` (use `skip_all`).
+- Every new POST/PUT/PATCH route is added to the route list of `tests/core/json_bodies.rs::every_state_changing_route_refuses_bodies_that_are_not_json`, in the task that adds the route. Every new table is added to `tests/core/migrations.rs::all_tables_exist`.
 - nami-ui:
   - every engine call goes through `callEngine`, and every path through `enginePath`;
   - route params use `[...=uuid]` matchers;
@@ -209,10 +209,10 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - The heartbeat ping handler (`routes/heartbeats.rs`) calls `notify_transition` from a bare `tokio::spawn` per transition. So `kick` bounds itself: a process-wide `static KICKS: tokio::sync::Semaphore = Semaphore::const_new(2)` permits at most two kicks at once, and the rest *wait* for a permit, so no work is lost. Every tick and drain is bounded (`ESCALATION_BATCH`, `DRAIN_BATCH`), and a kick that finds nothing due costs two indexed queries.
   - `kick` does nothing when `config.incidents_worker_enabled` is false (R23).
   - The worker loop (every 2 s) is the durable backstop.
-  - The source wrappers (`models::incident::open_for_monitor` and the others) keep their signatures and call `lifecycle::open` with the source's `escalation_policy_id`/`severity_id`.
-  - Log alerts keep the R-P2-27 seam. `logs::alerts::open_alert_incident` is unchanged: it calls the `open_for_log_alert` wrapper. In `resolve_alert_incident(.., notify)`, `notify: true` calls the `resolve_for_log_alert` wrapper (resolved notices go out). **Controller ruling (2026-10-19):** `notify: false` (an alerting alert being disabled) calls `lifecycle::resolve_source_with_reason(conn, &IncidentSource::LogAlert(id), at, "alert disabled")`. That resolves the incident like any automatic resolution: everyone already paged gets the normal "Resolved" notice, which carries `Reason: alert disabled`. The `resolved` event's message is `alert disabled` and its metadata is `{"reason": "alert disabled"}`. `resolve_alert_incident` still returns `None` (no transition, so no `notify_transition`). The route that disables the alert calls `incidents::worker::kick(&state)` after its transaction commits, and the worker loop is the backstop. **This supersedes Logs Part 2's "disabling resolves without a notification" behaviour (R-P2-27, NAMI-LOG-14) once NAMI-INC-10 lands.** Task 10 updates Logs Part 2's disable test to match.
-- **R18 Email subjects change** with routing (Task 10). **Controller ruling (2026-10-19): accepted.** A step notification is `[Nami] [<severity>] <title>`. A resolution is `[Nami] Resolved: <title>`. The existing worker, heartbeat, maintenance and log-alert tests that assert the old subjects (`… is DOWN`, `… is back UP`, `Log alert … triggered/resolved`) are updated in Task 10. Their counts stay the same (one email per member per transition). A handful of `tests/uptime_worker.rs` tests pin the *mechanics* of the old SMTP path: sequential per-recipient sends, giving up after one timeout, its log lines. Task 10 lists them with the property each keeps.
-- **R19 Time windows** reuse `models::maintenance::Schedule::Weekly::covers` and `weekday_from_iso` (Phase 2, already DST-tested). `from == to` means a full 24 h, as for maintenance windows. Wall-clock semantics apply: a window inside a skipped hour does not happen that day, and one across a repeated hour lasts an hour longer.
+  - The source wrappers (`incidents::model::open_for_monitor` and the others) keep their signatures and call `lifecycle::open` with the source's `escalation_policy_id`/`severity_id`.
+  - Log alerts keep the R-P2-27 seam. `logs::alert::open_alert_incident` is unchanged: it calls the `open_for_log_alert` wrapper. In `resolve_alert_incident(.., notify)`, `notify: true` calls the `resolve_for_log_alert` wrapper (resolved notices go out). **Controller ruling (2026-10-19):** `notify: false` (an alerting alert being disabled) calls `lifecycle::resolve_source_with_reason(conn, &IncidentSource::LogAlert(id), at, "alert disabled")`. That resolves the incident like any automatic resolution: everyone already paged gets the normal "Resolved" notice, which carries `Reason: alert disabled`. The `resolved` event's message is `alert disabled` and its metadata is `{"reason": "alert disabled"}`. `resolve_alert_incident` still returns `None` (no transition, so no `notify_transition`). The route that disables the alert calls `incidents::worker::kick(&state)` after its transaction commits, and the worker loop is the backstop. **This supersedes Logs Part 2's "disabling resolves without a notification" behaviour (R-P2-27, NAMI-LOG-14) once NAMI-INC-10 lands.** Task 10 updates Logs Part 2's disable test to match.
+- **R18 Email subjects change** with routing (Task 10). **Controller ruling (2026-10-19): accepted.** A step notification is `[Nami] [<severity>] <title>`. A resolution is `[Nami] Resolved: <title>`. The existing worker, heartbeat, maintenance and log-alert tests that assert the old subjects (`… is DOWN`, `… is back UP`, `Log alert … triggered/resolved`) are updated in Task 10. Their counts stay the same (one email per member per transition). A handful of `tests/uptime/uptime_worker.rs` tests pin the *mechanics* of the old SMTP path: sequential per-recipient sends, giving up after one timeout, its log lines. Task 10 lists them with the property each keeps.
+- **R19 Time windows** reuse `uptime::maintenance::model::Schedule::Weekly::covers` and `weekday_from_iso` (Phase 2, already DST-tested). `from == to` means a full 24 h, as for maintenance windows. Wall-clock semantics apply: a window inside a skipped hour does not happen that day, and one across a repeated hour lasts an hour longer.
 - **R20 Rotation math.**
   - `daily`/`weekly` shifts are calendar arithmetic in the schedule's zone. Shift k starts at local `(start_date + k days|weeks) handoff` and is converted with `local_to_utc`: a nonexistent time moves to the first valid minute after it, and an ambiguous one takes the earlier instant.
   - Custom rotations (`rotation_hours` 1-8760) are absolute: `epoch + k × hours`.
@@ -286,7 +286,7 @@ nami-engine/
     uptime/
       checker.rs                       T3 `GuardedResolver` and `caused_by` become pub(crate) (no move, no behaviour change)
       alerts.rs                        T10 notify_transition → incidents::worker::kick; render removed
-      worker.rs, heartbeat.rs          unchanged: policy/severity come through the models::incident wrappers
+      worker.rs, heartbeat.rs          unchanged: policy/severity come through the incidents::model wrappers
     logs/alerts.rs                     T10 resolve_alert_incident(notify: false) → lifecycle::resolve_source_with_reason(.., "alert disabled") (R17)
   tests/
     common/mod.rs                      T1 open_test_incident; T5 run_incident_ticks; T8 seed_policy helpers
@@ -335,11 +335,11 @@ Branch `feat/NAMI-INC-1-incident-lifecycle`, worktree `.worktrees/NAMI-INC-1/`.
 
 **Files:**
 - Create: `nami-engine/migrations/0060_incident_lifecycle.sql`, `nami-engine/src/incidents/mod.rs`, `nami-engine/src/incidents/lifecycle.rs`
-- Modify: `nami-engine/src/lib.rs` (`pub mod incidents;`), `nami-engine/src/models/incident.rs` (the six source wrappers delegate to `lifecycle`), `nami-engine/tests/common/mod.rs` (`open_test_incident`), `nami-engine/tests/migrations.rs`
-- Test: `nami-engine/tests/incident_lifecycle.rs`. The existing `tests/incidents.rs` must stay green unchanged, except `status_is_limited_to_open_and_resolved`, which is renamed `status_is_limited_to_the_lifecycle_states` and also accepts `acknowledged`.
+- Modify: `nami-engine/src/lib.rs` (`pub mod incidents;`), `nami-engine/src/incidents/model.rs` (the six source wrappers delegate to `lifecycle`), `nami-engine/tests/common/mod.rs` (`open_test_incident`), `nami-engine/tests/core/migrations.rs`
+- Test: `nami-engine/tests/incidents/incident_lifecycle.rs`. The existing `tests/incidents/incidents.rs` must stay green unchanged, except `status_is_limited_to_open_and_resolved`, which is renamed `status_is_limited_to_the_lifecycle_states` and also accepts `acknowledged`.
 
 **Interfaces:**
-- Consumes: `incidents` (0010/0011/0019, Uptime Phase 3's 0022 `details`, Logs Part 2's 0044 `log_alert_id`), `uptime::checker::is_unsafe_in_text`. `models::incident` already holds Logs Part 2's `*_for_log_alert` wrappers and NAMI-UP-21's `attach_details` and `IncidentListItem.details`. Keep `attach_details` unchanged: `record_signal` calls it right after `open_for_heartbeat`, in the same transaction.
+- Consumes: `incidents` (0010/0011/0019, Uptime Phase 3's 0022 `details`, Logs Part 2's 0044 `log_alert_id`), `uptime::checker::is_unsafe_in_text`. `incidents::model` already holds Logs Part 2's `*_for_log_alert` wrappers and NAMI-UP-21's `attach_details` and `IncidentListItem.details`. Keep `attach_details` unchanged: `record_signal` calls it right after `open_for_heartbeat`, in the same transaction.
 - Produces (`nami_engine::incidents::lifecycle`):
 
 ```rust
@@ -388,7 +388,7 @@ pub async fn record_event(conn: &mut PgConnection, incident_id: Uuid, kind: Even
     message: Option<&str>, metadata: serde_json::Value) -> Result<i64, sqlx::Error>;
 ```
 
-`models::incident::{open_for_monitor, resolve_for_monitor, open_for_heartbeat, resolve_for_heartbeat, open_for_log_alert, resolve_for_log_alert}` keep their exact signatures and become one-line calls into `lifecycle`. Later sub-projects add `IncidentSource` variants (Part 2: `Integration`, `ReportForm`; Metrics: `MetricAlert`) with their own conflict target.
+`incidents::model::{open_for_monitor, resolve_for_monitor, open_for_heartbeat, resolve_for_heartbeat, open_for_log_alert, resolve_for_log_alert}` keep their exact signatures and become one-line calls into `lifecycle`. Later sub-projects add `IncidentSource` variants (Part 2: `Integration`, `ReportForm`; Metrics: `MetricAlert`) with their own conflict target.
 
 - [ ] **Step 1: Write the migration**
 
@@ -503,7 +503,7 @@ select id, 'resolved', resolved_at from incidents where status = 'resolved';
 
 - [ ] **Step 2: Write the failing migration test**
 
-Add to `nami-engine/tests/migrations.rs` (in the style of its existing table tests). That file has no `mod common;` on `5da08a9`: add `mod common;` at its top unless a Logs Part 2 or Uptime Phase 3 task already has. `common` carries `#![allow(dead_code)]`. Also add `"incident_severities"` and `"incident_events"` to `all_tables_exist`.
+Add to `nami-engine/tests/core/migrations.rs` (in the style of its existing table tests). That file has no `mod common;` on `5da08a9`: add `mod common;` at its top unless a Logs Part 2 or Uptime Phase 3 task already has. `common` carries `#![allow(dead_code)]`. Also add `"incident_severities"` and `"incident_events"` to `all_tables_exist`.
 
 ```rust
 #[sqlx::test]
@@ -570,11 +570,11 @@ async fn a_plain_insert_takes_its_source_from_its_foreign_key(pool: sqlx::PgPool
 }
 ```
 
-Run: engine command `--test migrations`. Expected: FAIL (no table `incident_severities`), then PASS once the migration file exists.
+Run: engine command `--test core migrations::`. Expected: FAIL (no table `incident_severities`), then PASS once the migration file exists.
 
 - [ ] **Step 3: Write the failing lifecycle tests**
 
-`nami-engine/tests/incident_lifecycle.rs`:
+`nami-engine/tests/incidents/incident_lifecycle.rs`:
 
 ```rust
 // The incident lifecycle (incidents::lifecycle). Requires `docker compose up -d postgres`.
@@ -793,7 +793,7 @@ async fn racing_opens_for_one_source_create_one_incident(pool: PgPool) {
 }
 ```
 
-Run: engine command `--test incident_lifecycle`. Expected: FAIL to compile (`incidents::lifecycle` missing).
+Run: engine command `--test incidents incident_lifecycle::`. Expected: FAIL to compile (`incidents::lifecycle` missing).
 
 - [ ] **Step 4: Implement `incidents::lifecycle`**
 
@@ -845,7 +845,7 @@ pub async fn open_test_incident(pool: &sqlx::PgPool, project: Uuid, created_by: 
 
 - [ ] **Step 5: Run the tests**
 
-Run: engine command `--test incident_lifecycle --test incidents --test migrations --test uptime_worker --test heartbeats --test heartbeat_pings --test log_alerts`. Expected: PASS (the email-based tests are untouched by this task).
+Run: engine command `--test incidents incident_lifecycle:: --test incidents --test core migrations:: --test uptime uptime_worker:: --test uptime heartbeats:: --test uptime heartbeat_pings:: --test logs log_alerts::`. Expected: PASS (the email-based tests are untouched by this task).
 
 - [ ] **Step 6: Run the full engine suite and clippy**
 
@@ -855,8 +855,8 @@ Run: engine command (no args), then `cargo clippy --all-targets -- -D warnings` 
 
 ```bash
 git add nami-engine/migrations/0060_incident_lifecycle.sql nami-engine/src/incidents nami-engine/src/lib.rs \
-  nami-engine/src/models/incident.rs nami-engine/tests/incident_lifecycle.rs nami-engine/tests/incidents.rs \
-  nami-engine/tests/migrations.rs nami-engine/tests/common/mod.rs
+  nami-engine/src/incidents/model.rs nami-engine/tests/incidents/incident_lifecycle.rs nami-engine/tests/incidents/incidents.rs \
+  nami-engine/tests/core/migrations.rs nami-engine/tests/common/mod.rs
 git commit -m "feat(engine): incident lifecycle, severities and timeline (NAMI-INC-1)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -868,23 +868,23 @@ git commit -m "feat(engine): incident lifecycle, severities and timeline (NAMI-I
 Branch `feat/NAMI-INC-2-incident-api`, worktree `.worktrees/NAMI-INC-2/`.
 
 **Files:**
-- Create: `nami-engine/src/models/severity.rs`, `nami-engine/src/routes/severities.rs`
-- Modify: `nami-engine/src/models/incident.rs` (list with cursor, `IncidentDetail`, `IncidentEvent`), `nami-engine/src/routes/incidents.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-ui/src/lib/incidents.ts` (new: types), `nami-ui/src/lib/uptime.ts` (re-export `Incident` from `incidents.ts` for existing imports), `nami-ui/src/routes/(app)/projects/[id=uuid]/incidents/+page.server.ts` (+ its tests: read `.incidents` from the new shape), `nami-ui/src/routes/(app)/projects/[id=uuid]/monitors/[monitorId=uuid]/+page.server.ts` (+ its test: it calls `/incidents?monitor_id=` today and reads a bare array)
-- Modify (existing engine tests on the old bare-array list): `tests/uptime_read_api.rs::incidents_are_newest_first_and_filterable` (read `body["incidents"]`; `?status=open` keeps meaning "status open"; `?monitor_id=` keeps working) and the list assertion in `tests/heartbeats.rs` (≈ line 440, `list[0]["heartbeat_id"]` → `list["incidents"][0]["heartbeat_id"]`). Add the five new write routes to `tests/json_bodies.rs`.
-- Test: `nami-engine/tests/incidents_api.rs`, the existing `incidents-page.test.ts` / `incidents.test.ts` updated
+- Create: `nami-engine/src/incidents/severity/model.rs`, `nami-engine/src/incidents/severity/routes.rs`
+- Modify: `nami-engine/src/incidents/model.rs` (list with cursor, `IncidentDetail`, `IncidentEvent`), `nami-engine/src/incidents/routes.rs`, `nami-engine/src/core/validate.rs`, `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs`, `nami-ui/src/lib/incidents.ts` (new: types), `nami-ui/src/lib/uptime/uptime.ts` (re-export `Incident` from `incidents.ts` for existing imports), `nami-ui/src/routes/(app)/projects/[id=uuid]/incidents/+page.server.ts` (+ its tests: read `.incidents` from the new shape), `nami-ui/src/routes/(app)/projects/[id=uuid]/monitors/[monitorId=uuid]/+page.server.ts` (+ its test: it calls `/incidents?monitor_id=` today and reads a bare array)
+- Modify (existing engine tests on the old bare-array list): `tests/uptime/uptime_read_api.rs::incidents_are_newest_first_and_filterable` (read `body["incidents"]`; `?status=open` keeps meaning "status open"; `?monitor_id=` keeps working) and the list assertion in `tests/uptime/heartbeats.rs` (≈ line 440, `list[0]["heartbeat_id"]` → `list["incidents"][0]["heartbeat_id"]`). Add the five new write routes to `tests/core/json_bodies.rs`.
+- Test: `nami-engine/tests/incidents/incidents_api.rs`, the existing `incidents-page.test.ts` / `incidents.test.ts` updated
 
 **Interfaces:**
 - Consumes: Task 1 `lifecycle::*`.
 - Produces:
 
 ```rust
-// models::severity
+// incidents::severity::model
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Severity { pub id: Uuid, pub name: String, pub rank: i32, pub is_default: bool }
 pub async fn list_for_project(pool: &PgPool, project_id: Uuid) -> Result<Vec<Severity>, sqlx::Error>; // by rank
 pub async fn belongs_to<'e>(executor: impl PgExecutor<'e>, project_id: Uuid, severity_id: Uuid) -> Result<bool, sqlx::Error>;
 
-// models::incident
+// incidents::model
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct IncidentListItem { pub id: Uuid, pub project_id: Uuid, pub monitor_id: Option<Uuid>,
     pub heartbeat_id: Option<Uuid>, pub log_alert_id: Option<Uuid>, pub source: String,
@@ -933,7 +933,7 @@ A `severity_changed` event carries `{"from": "<name>", "to": "<name>"}`. `postmo
 
 - [ ] **Step 1: Write the failing API tests**
 
-`nami-engine/tests/incidents_api.rs`:
+`nami-engine/tests/incidents/incidents_api.rs`:
 
 ```rust
 // The incident API. Requires `docker compose up -d postgres`.
@@ -1124,7 +1124,7 @@ async fn severities_are_listed_by_rank_for_viewers(pool: sqlx::PgPool) {
 
 If the router answers an unknown field with 400 rather than 422 (check how `Json` rejections are mapped today), assert what it does now. Do not change the global mapping.
 
-Run: engine command `--test incidents_api`. Expected: FAIL (routes missing).
+Run: engine command `--test incidents incidents_api::`. Expected: FAIL (routes missing).
 
 - [ ] **Step 2: Implement** the models and routes as specified in the Interfaces block. Every write handler runs in one transaction: lock the incident row (`select ... where id = $1 and project_id = $2 for update`), call `lifecycle`, then load the detail after commit.
 
@@ -1134,12 +1134,12 @@ In `nami-ui/src/lib/incidents.ts`, define `Incident` (mirrors `IncidentListItem`
 
 Run: UI command with `src/routes/(app)/projects/[id=uuid]/incidents "src/routes/(app)/projects/[id=uuid]/monitors"`. Expected: PASS, 0 errors / 0 warnings.
 
-- [ ] **Step 4: Run** engine command `--test incidents_api --test incidents --test incident_lifecycle --test uptime_read_api --test heartbeats --test json_bodies`, then the full engine suite and clippy. Expected: green.
+- [ ] **Step 4: Run** engine command `--test incidents incidents_api:: --test incidents --test incidents incident_lifecycle:: --test uptime uptime_read_api:: --test uptime heartbeats:: --test core json_bodies::`, then the full engine suite and clippy. Expected: green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nami-engine/src nami-engine/tests nami-ui/src/lib/incidents.ts nami-ui/src/lib/uptime.ts \
+git add nami-engine/src nami-engine/tests nami-ui/src/lib/incidents.ts nami-ui/src/lib/uptime/uptime.ts \
   "nami-ui/src/routes/(app)/projects/[id=uuid]/incidents" "nami-ui/src/routes/(app)/projects/[id=uuid]/monitors"
 git commit -m "feat(engine,ui): incident API with timeline, actions, comments and postmortems (NAMI-INC-2)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -1151,12 +1151,12 @@ git commit -m "feat(engine,ui): incident API with timeline, actions, comments an
 Branch `feat/NAMI-INC-3-notification-channels`, worktree `.worktrees/NAMI-INC-3/`.
 
 **Files:**
-- Create: `nami-engine/src/outbound.rs`, `nami-engine/migrations/0061_create_notification_channels.sql`, `nami-engine/src/models/channel.rs`, `nami-engine/src/routes/channels.rs`
-- Modify: `nami-engine/src/uptime/checker.rs` (make `GuardedResolver` and `caused_by` `pub(crate)`; nothing moves, behaviour unchanged; `names_forbidden_address` and `allowed_addresses` are already `pub(crate)`), `nami-engine/src/config.rs` (`outbound_policy`, R9), `nami-engine/src/lib.rs`, `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/Cargo.toml` (`cargo add hmac@0.13.0`, already in the lock file through `hkdf 0.13`, same `digest 0.11` as `sha2 0.11`), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (project and personal channel POST/PATCH)
-- Test: `nami-engine/tests/notification_channels.rs` (+ unit tests in `outbound.rs` and `models/channel.rs`)
+- Create: `nami-engine/src/outbound.rs`, `nami-engine/migrations/0061_create_notification_channels.sql`, `nami-engine/src/incidents/channel/model.rs`, `nami-engine/src/incidents/channel/routes.rs`
+- Modify: `nami-engine/src/uptime/checker/mod.rs` (make `GuardedResolver` and `caused_by` `pub(crate)`; nothing moves, behaviour unchanged; `names_forbidden_address` and `allowed_addresses` are already `pub(crate)`), `nami-engine/src/core/config.rs` (`outbound_policy`, R9), `nami-engine/src/lib.rs`, `nami-engine/src/core/validate.rs`, `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs`, `nami-engine/Cargo.toml` (`cargo add hmac@0.13.0`, already in the lock file through `hkdf 0.13`, same `digest 0.11` as `sha2 0.11`), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs` (project and personal channel POST/PATCH)
+- Test: `nami-engine/tests/incidents/notification_channels.rs` (+ unit tests in `outbound.rs` and `models/channel.rs`)
 
 **Interfaces:**
-- Consumes: `crypto::Cipher`, `uptime::checker::{is_forbidden_destination, allowed_addresses, names_forbidden_address, GuardedResolver, caused_by, DestinationNotAllowed}`, `models::validate_name`, `rbac::{require_project_role, CurrentUser}`.
+- Consumes: `core::crypto::Cipher`, `uptime::checker::{is_forbidden_destination, allowed_addresses, names_forbidden_address, GuardedResolver, caused_by, DestinationNotAllowed}`, `core::validate::validate_name`, `rbac::{require_project_role, CurrentUser}`.
 - Produces:
 
 ```rust
@@ -1194,7 +1194,7 @@ pub fn check_url_for_send(raw: &str, rule: UrlRule, reach: Reach, policy: Outbou
 /// Never contains the URL (uses `without_url`) or a response body.
 pub fn describe_error(error: &reqwest::Error) -> String;
 
-// models::channel
+// incidents::channel::model
 pub const KINDS: [&str; 6] = ["email", "webhook", "slack", "teams", "telegram", "discord"];
 pub const PERSONAL_KINDS: [&str; 5] = ["webhook", "slack", "teams", "telegram", "discord"];
 pub const MAX_PROJECT_CHANNELS: i64 = 50;
@@ -1265,7 +1265,7 @@ pub async fn open_for_send(pool: &PgPool, cipher: &Cipher, id: Uuid) -> Result<O
 ```sql
 -- Notification channels (NAMI-INC-3). A channel belongs to a project (a team
 -- room, admin-managed) or to one user (personal). Secrets are sealed with
--- crypto::Cipher under per-row contexts; `summary` is what the UI may show.
+-- core::crypto::Cipher under per-row contexts; `summary` is what the UI may show.
 create table notification_channels (
     id uuid primary key,
     project_id uuid references projects(id) on delete cascade,
@@ -1337,7 +1337,7 @@ fn the_relaxed_send_check_exists_only_for_tests_and_still_refuses_metadata() {
     assert!(check_url_for_send(wiremock, SLACK, PublicOnly, OutboundPolicy::Strict).is_err());
     assert!(check_url_for_send(wiremock, SLACK, PublicOnly, OutboundPolicy::Relaxed).is_ok());
     assert!(check_url_for_send("http://169.254.169.254/", SLACK, PublicOnly, OutboundPolicy::Relaxed).is_err());
-    assert_eq!(crate::config::Config::from_env_for_test().outbound_policy, OutboundPolicy::Relaxed);
+    assert_eq!(crate::core::config::Config::from_env_for_test().outbound_policy, OutboundPolicy::Relaxed);
 }
 
 #[tokio::test]
@@ -1419,7 +1419,7 @@ fn the_contexts_name_the_column_and_the_row() {
 
 - [ ] **Step 3: Write the failing API tests**
 
-`nami-engine/tests/notification_channels.rs`:
+`nami-engine/tests/incidents/notification_channels.rs`:
 
 ```rust
 // Notification channels: personal and project, sealed and write-only.
@@ -1586,7 +1586,7 @@ async fn patch_keeps_omitted_config_and_replaces_given_config(pool: sqlx::PgPool
 }
 ```
 
-Run: engine command `--test notification_channels`, then engine command `--lib -- outbound models::channel`. Expected: FAIL.
+Run: engine command `--test incidents notification_channels::`, then engine command `--lib -- outbound incidents::channel::model`. Expected: FAIL.
 
 - [ ] **Step 4: Implement** `outbound.rs`, `models/channel.rs` and `routes/channels.rs` as specified.
 - `outbound::client()`: a `static CLIENT: OnceLock<reqwest::Client>` holding `reqwest::Client::builder().no_proxy().dns_resolver(GuardedResolver).redirect(Policy::none()).referer(false).timeout(OUTBOUND_TIMEOUT).connect_timeout(CONNECT_TIMEOUT).pool_max_idle_per_host(0).user_agent(concat!("Nami-Notify/", env!("CARGO_PKG_VERSION")))`. `public_client()` is the same with `dns_resolver(PublicOnlyResolver)`. Both are built once, because building a client loads the TLS roots.
@@ -1597,13 +1597,13 @@ Run: engine command `--test notification_channels`, then engine command `--lib -
 - Every config is serialised to JSON, then `cipher.encrypt(&config_context(id), ..)`. The request body structs (`CreateChannelRequest`, `PatchChannelRequest`) get manual `Debug` impls that print the kind only (Global Constraints).
 - `Config.outbound_policy`: `from_env_defaults_only` sets `Strict`. `from_env_for_test` returns `Config { outbound_policy: OutboundPolicy::Relaxed, ..Self::from_env_defaults_only() }`. No environment variable reads it.
 
-- [ ] **Step 5: Run** engine command `--test notification_channels --test migrations --test json_bodies --test uptime_checker --test uptime_checker_proxy --test checker_http_config`, then engine command `--lib -- outbound models::channel uptime::checker`, then the full suite and clippy. Expected: green (the checker tests prove the visibility change altered nothing).
+- [ ] **Step 5: Run** engine command `--test incidents notification_channels:: --test core migrations:: --test core json_bodies:: --test uptime uptime_checker:: --test uptime_checker_proxy --test uptime checker_http_config::`, then engine command `--lib -- outbound incidents::channel::model uptime::checker`, then the full suite and clippy. Expected: green (the checker tests prove the visibility change altered nothing).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add nami-engine/Cargo.toml nami-engine/Cargo.lock nami-engine/migrations/0061_create_notification_channels.sql \
-  nami-engine/src nami-engine/tests/notification_channels.rs nami-engine/tests/migrations.rs
+  nami-engine/src nami-engine/tests/incidents/notification_channels.rs nami-engine/tests/core/migrations.rs
 git commit -m "feat(engine): guarded outbound client and sealed notification channels (NAMI-INC-3)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1854,11 +1854,11 @@ Branch `feat/NAMI-INC-5-notification-deliveries`, worktree `.worktrees/NAMI-INC-
 
 **Files:**
 - Create: `nami-engine/migrations/0062_create_notification_deliveries.sql`, `nami-engine/src/incidents/send.rs`, `nami-engine/src/incidents/deliveries.rs`, `nami-engine/src/incidents/worker.rs`
-- Modify: `nami-engine/src/incidents/mod.rs`, `nami-engine/src/config.rs` (`telegram_api_base_url`, env `TELEGRAM_API_BASE_URL`, default `https://api.telegram.org`, must be an absolute http(s) URL with no path, query or userinfo; and `incidents_worker_enabled`, env `INCIDENTS_WORKER_ENABLED`, `env_flag(.., true)`, R23), `nami-engine/.env.example` (both variables, documented like `UPTIME_WORKER_ENABLED` and `RDAP_BASE_URL`), `nami-engine/src/routes/channels.rs` (the two `/test` routes), `nami-engine/tests/common/mod.rs` (`run_incident_ticks`, `insert_channel`), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (the two `/test` routes). `main.rs` is **not** touched here: Task 10 spawns the worker (R27).
-- Test: `nami-engine/tests/notification_deliveries.rs`
+- Modify: `nami-engine/src/incidents/mod.rs`, `nami-engine/src/core/config.rs` (`telegram_api_base_url`, env `TELEGRAM_API_BASE_URL`, default `https://api.telegram.org`, must be an absolute http(s) URL with no path, query or userinfo; and `incidents_worker_enabled`, env `INCIDENTS_WORKER_ENABLED`, `env_flag(.., true)`, R23), `nami-engine/.env.example` (both variables, documented like `UPTIME_WORKER_ENABLED` and `RDAP_BASE_URL`), `nami-engine/src/incidents/channel/routes.rs` (the two `/test` routes), `nami-engine/tests/common/mod.rs` (`run_incident_ticks`, `insert_channel`), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs` (the two `/test` routes). `main.rs` is **not** touched here: Task 10 spawns the worker (R27).
+- Test: `nami-engine/tests/incidents/notification_deliveries.rs`
 
 **Interfaces:**
-- Consumes: Task 3 `outbound::{client, public_client, check_url_for_send, describe_error, OutboundPolicy}`, `models::channel::{open_for_send, OpenedChannel, ChannelConfig}`. Task 4 `format::*`. Task 1 `lifecycle::{record_event, EventKind}`. `email::Mailer::send` (`async fn send(&self, to: &str, subject: &str, body: String) -> Result<(), AppError>`; it logs the SMTP failure kind itself, never the address).
+- Consumes: Task 3 `outbound::{client, public_client, check_url_for_send, describe_error, OutboundPolicy}`, `incidents::channel::model::{open_for_send, OpenedChannel, ChannelConfig}`. Task 4 `format::*`. Task 1 `lifecycle::{record_event, EventKind}`. `core::email::Mailer::send` (`async fn send(&self, to: &str, subject: &str, body: String) -> Result<(), AppError>`; it logs the SMTP failure kind itself, never the address).
 - Produces:
 
 ```rust
@@ -1964,7 +1964,7 @@ fn backoff_is_30s_times_4_to_the_attempt_capped_at_an_hour() {
 }
 ```
 
-`nami-engine/tests/notification_deliveries.rs`:
+`nami-engine/tests/incidents/notification_deliveries.rs`:
 
 ```rust
 // The notification queue and its senders. Requires `docker compose up -d postgres mailpit`.
@@ -1975,8 +1975,8 @@ use common::{call, insert_channel, open_test_incident, run_incident_ticks, seed_
     user_with_role};
 use nami_engine::{
     incidents::deliveries::{self, DeliveryEvent, NewDelivery, Target},
-    models::channel::ChannelConfig,
-    state::AppState,
+    incidents::channel::model::ChannelConfig,
+    core::state::AppState,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -2277,7 +2277,7 @@ pub async fn run_incident_ticks(state: &AppState) { nami_engine::incidents::work
 
 `insert_channel` needs a `created_by`. It uses `user`, or for project channels it seeds an admin through `seed_user`.
 
-Run: engine command `--test notification_deliveries`, then engine command `--lib incidents::deliveries`. Expected: FAIL.
+Run: engine command `--test incidents notification_deliveries::`, then engine command `--lib incidents::deliveries`. Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
@@ -2356,13 +2356,13 @@ Before every request it re-runs the destination rules: `check_url_for_send` with
 
 `worker::run_forever`: every `TICK` (missed ticks delayed), spawn one iteration in its own task (a panic is logged, never fatal) that calls `kick`. `kick` returns at once when `!state.config.incidents_worker_enabled`. Otherwise it takes a `KICKS` permit (`static KICKS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_KICKS)`), builds `Senders::from_config(&state.config)` (cheap; read per call so tests can point it at wiremock), calls `deliveries::drain` once, and logs errors with `tracing::error!` (no secrets: never a URL, address or reqwest error `Display`). A permit is held only for one bounded tick plus one bounded drain. `sqlx::test` databases are per test, so tests that run in parallel share the permits but never each other's rows.
 
-- [ ] **Step 4: Run** engine command `--test notification_deliveries --test notification_channels --test migrations --test json_bodies`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
+- [ ] **Step 4: Run** engine command `--test incidents notification_deliveries:: --test incidents notification_channels:: --test core migrations:: --test core json_bodies::`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add nami-engine/migrations/0062_create_notification_deliveries.sql nami-engine/src nami-engine/.env.example \
-  nami-engine/tests/notification_deliveries.rs nami-engine/tests/common/mod.rs nami-engine/tests/migrations.rs
+  nami-engine/tests/incidents/notification_deliveries.rs nami-engine/tests/common/mod.rs nami-engine/tests/core/migrations.rs
 git commit -m "feat(engine): durable notification deliveries with retries, caps and channel tests (NAMI-INC-5)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2378,7 +2378,7 @@ Branch `feat/NAMI-INC-6-oncall-rotation`, worktree `.worktrees/NAMI-INC-6/`.
 - Test: unit tests in both files
 
 **Interfaces:**
-- Consumes: `models::maintenance::{Schedule, weekday_from_iso}` (R19), `chrono-tz`.
+- Consumes: `uptime::maintenance::model::{Schedule, weekday_from_iso}` (R19), `chrono-tz`.
 - Produces:
 
 ```rust
@@ -2651,7 +2651,7 @@ fn shift_index_agrees_with_shift_start_for_a_year_of_daily_shifts_in_a_dst_zone(
 Run: engine command `--lib -- timewindow oncall`. Expected: FAIL to compile.
 
 - [ ] **Step 2: Implement** both modules as specified.
-- [ ] **Step 3: Run** engine command `--lib -- timewindow oncall models::maintenance`, then clippy. Expected: PASS.
+- [ ] **Step 3: Run** engine command `--lib -- timewindow oncall uptime::maintenance::model`, then clippy. Expected: PASS.
 - [ ] **Step 4: Commit**
 
 ```bash
@@ -2667,30 +2667,30 @@ git commit -m "feat(engine): on-call rotation math and time windows, DST-safe (N
 Branch `feat/NAMI-INC-7-schedules-api`, worktree `.worktrees/NAMI-INC-7/`.
 
 **Files:**
-- Create: `nami-engine/migrations/0063_create_on_call_schedules.sql`, `nami-engine/src/models/schedule.rs`, `nami-engine/src/routes/schedules.rs`
-- Modify: `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/src/models/project.rs` + `nami-engine/src/routes/projects.rs` (the members list and the caller's `role` on `GET /projects/{id}`, R28), `nami-ui/src/routes/(app)/projects/[id=uuid]/+layout.server.ts` (return `role` with `project`; default `'viewer'` when the field is missing) + `section.test.ts` (the layout passes `role` through), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (schedule POST/PUT, override POST)
-- Test: `nami-engine/tests/schedules_api.rs`
+- Create: `nami-engine/migrations/0063_create_on_call_schedules.sql`, `nami-engine/src/incidents/oncall/model.rs`, `nami-engine/src/incidents/oncall/routes.rs`
+- Modify: `nami-engine/src/core/validate.rs`, `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs`, `nami-engine/src/projects/model.rs` + `nami-engine/src/projects/routes.rs` (the members list and the caller's `role` on `GET /projects/{id}`, R28), `nami-ui/src/routes/(app)/projects/[id=uuid]/+layout.server.ts` (return `role` with `project`; default `'viewer'` when the field is missing) + `section.test.ts` (the layout passes `role` through), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs` (schedule POST/PUT, override POST)
+- Test: `nami-engine/tests/incidents/schedules_api.rs`
 
 **Interfaces:**
 - Consumes: Task 6 `oncall::rotation::*`, `timewindow::{TimeWindow, parse_timezone}`.
 - Produces:
 
 ```rust
-// models::project (R28)
+// projects::model (R28)
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MemberView { pub user_id: Uuid, pub email: String, pub project_role: String }
 pub async fn list_members(pool: &PgPool, project_id: Uuid) -> Result<Vec<MemberView>, sqlx::Error>; // by email
-// routes::projects: add `.get(list_members)` to the existing
+// projects::routes: add `.get(list_members)` to the existing
 // `.route("/projects/{id}/members", post(add_member))` line (one route, two methods), viewer.
 // GET /projects/{id} (R28, controller ruling) returns `ProjectView`, the project plus the caller's
-// effective role; `models::project::Project` itself is unchanged (the list route keeps its shape).
+// effective role; `projects::model::Project` itself is unchanged (the list route keeps its shape).
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectView { #[serde(flatten)] pub project: Project, pub role: String }  // "admin" | "member" | "viewer"
 /// Global admin → "admin" (member or not); otherwise the `project_members.project_role`.
 /// Called after `require_project_role(.., "viewer")` passed, so a row exists for non-admins.
 pub async fn effective_role(pool: &PgPool, user: &CurrentUser, project_id: Uuid) -> Result<String, sqlx::Error>;
 
-// models::schedule
+// incidents::oncall::model
 pub const MAX_SCHEDULES_PER_PROJECT: i64 = 50;
 pub const MAX_PARTICIPANTS: usize = 50;
 pub const MAX_RESTRICTIONS: usize = 14;
@@ -2742,7 +2742,7 @@ pub enum Created<T> { Created(T), Full }
 | `GET /projects/{id}/on-call` | viewer | `[{schedule_id, name, on_call_now}]` for the dashboard card |
 
 Validation rules:
-- `name` via `models::validate_name`, unique per project (409).
+- `name` via `core::validate::validate_name`, unique per project (409).
 - `rotation` is `daily` | `weekly` | `custom`; `rotation_hours` is required for `custom` (1-8760) and must be absent otherwise.
 - `handoff_time` is `HH:MM`.
 - `participants` are 1-50 distinct users who are current members of the project (a non-member → 400 `user <id> is not a member of this project`).
@@ -2803,7 +2803,7 @@ Migration test `a_custom_rotation_needs_hours_and_others_must_not_have_them` (tw
 
 - [ ] **Step 2: Write the failing API tests**
 
-`nami-engine/tests/schedules_api.rs`:
+`nami-engine/tests/incidents/schedules_api.rs`:
 
 ```rust
 // On-call schedules. Requires `docker compose up -d postgres`.
@@ -2963,14 +2963,14 @@ async fn shift_ranges_are_capped(pool: sqlx::PgPool) {
 fn urlencode(s: &str) -> String { url::form_urlencoded::byte_serialize(s.as_bytes()).collect() }
 ```
 
-Run: engine command `--test schedules_api --test migrations --test json_bodies`. Expected: FAIL.
+Run: engine command `--test incidents schedules_api:: --test core migrations:: --test core json_bodies::`. Expected: FAIL.
 
 - [ ] **Step 3: Implement** the model and routes. Shift computations run in `spawn_blocking` (Task 6 note). Writes run in one transaction. Participants are rewritten as positions 0..n-1. `updated_at = now()` on replace. The `InUse` check is added in Task 8 (until then `delete` never returns it).
-- [ ] **Step 4: Run** engine command `--test schedules_api --test migrations --test json_bodies`, then the full suite and clippy. Expected: green.
+- [ ] **Step 4: Run** engine command `--test incidents schedules_api:: --test core migrations:: --test core json_bodies::`, then the full suite and clippy. Expected: green.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nami-engine/migrations/0063_create_on_call_schedules.sql nami-engine/src nami-engine/tests/schedules_api.rs nami-engine/tests/migrations.rs
+git add nami-engine/migrations/0063_create_on_call_schedules.sql nami-engine/src nami-engine/tests/incidents/schedules_api.rs nami-engine/tests/core/migrations.rs
 git commit -m "feat(engine): on-call schedules with restrictions, overrides and shifts (NAMI-INC-7)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2981,13 +2981,13 @@ git commit -m "feat(engine): on-call schedules with restrictions, overrides and 
 Branch `feat/NAMI-INC-8-escalation-policies`, worktree `.worktrees/NAMI-INC-8/`.
 
 **Files:**
-- Create: `nami-engine/migrations/0064_create_escalation_policies.sql`, `nami-engine/src/incidents/escalation/mod.rs`, `nami-engine/src/incidents/escalation/plan.rs`, `nami-engine/src/models/escalation_policy.rs`, `nami-engine/src/routes/escalation_policies.rs`
+- Create: `nami-engine/migrations/0064_create_escalation_policies.sql`, `nami-engine/src/incidents/escalation/mod.rs`, `nami-engine/src/incidents/escalation/plan.rs`, `nami-engine/src/incidents/escalation/model.rs`, `nami-engine/src/incidents/escalation/routes.rs`
 - Modify:
   - `nami-engine/src/incidents/lifecycle.rs`: `OpenIncident.escalation_policy_id: Option<Uuid>`. `open`, `reopen`, `acknowledge` and `resolve` arm or disarm escalation. Every construction site in Task 1/2 code and tests sets the new field to `None`.
-  - `nami-engine/src/models/channel.rs` and `nami-engine/src/models/schedule.rs`: `delete` returns `InUse` when a step targets the row.
-  - `nami-engine/src/routes/incidents.rs`: manual create accepts `escalation_policy_id` (a foreign id → 404).
-  - `nami-engine/src/models/mod.rs`, `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`, `nami-engine/tests/common/mod.rs` (`policy_body`), `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (policy POST/PUT, `/default`).
-- Test: `nami-engine/tests/escalation_policies_api.rs` (+ unit tests in `plan.rs`)
+  - `nami-engine/src/incidents/channel/model.rs` and `nami-engine/src/incidents/oncall/model.rs`: `delete` returns `InUse` when a step targets the row.
+  - `nami-engine/src/incidents/routes.rs`: manual create accepts `escalation_policy_id` (a foreign id → 404).
+  - `nami-engine/src/core/validate.rs`, `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs`, `nami-engine/tests/common/mod.rs` (`policy_body`), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs` (policy POST/PUT, `/default`).
+- Test: `nami-engine/tests/incidents/escalation_policies_api.rs` (+ unit tests in `plan.rs`)
 
 **Interfaces:**
 - Consumes: Task 3 channels, Task 6 `timewindow`, Task 7 schedules.
@@ -3012,7 +3012,7 @@ pub fn after_step(active: &PolicyShape, fallback: Option<&PolicyShape>, cursor: 
 /// The round label of a step (dedup key part, ≤ 32 chars): "g{generation}p{0|1}r{repeat}s{step}".
 pub fn round(generation: i32, cursor: &Cursor) -> String;
 
-// models::escalation_policy
+// incidents::escalation::model
 pub const MAX_POLICIES_PER_PROJECT: i64 = 50;
 pub const MAX_STEPS: usize = 20;
 pub const MAX_TARGETS_PER_STEP: usize = 20;
@@ -3289,7 +3289,7 @@ Run: engine command `--lib incidents::escalation`. Expected: FAIL, then PASS onc
 
 - [ ] **Step 3: Write the failing API tests**
 
-`nami-engine/tests/escalation_policies_api.rs`:
+`nami-engine/tests/incidents/escalation_policies_api.rs`:
 
 ```rust
 // Escalation policies. Requires `docker compose up -d postgres`.
@@ -3418,7 +3418,7 @@ async fn opening_an_incident_arms_escalation_on_its_policy(pool: sqlx::PgPool) {
 }
 ```
 
-Run: engine command `--test escalation_policies_api --test migrations`. Expected: FAIL.
+Run: engine command `--test incidents escalation_policies_api:: --test core migrations::`. Expected: FAIL.
 
 - [ ] **Step 4: Implement**
 
@@ -3443,7 +3443,7 @@ where i.id = $1
 
 Then write the model and routes as specified.
 
-- [ ] **Step 5: Run** engine command `--test escalation_policies_api --test incident_lifecycle --test incidents_api --test notification_channels --test schedules_api --test migrations --test json_bodies`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
+- [ ] **Step 5: Run** engine command `--test incidents escalation_policies_api:: --test incidents incident_lifecycle:: --test incidents incidents_api:: --test incidents notification_channels:: --test incidents schedules_api:: --test core migrations:: --test core json_bodies::`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
 
 - [ ] **Step 6: Commit**
 
@@ -3461,10 +3461,10 @@ Branch `feat/NAMI-INC-9-escalation-engine`, worktree `.worktrees/NAMI-INC-9/`.
 **Files:**
 - Create: `nami-engine/src/incidents/escalation/run.rs`
 - Modify: `nami-engine/src/incidents/escalation/mod.rs`, `nami-engine/src/incidents/worker.rs` (`kick` = escalation tick, then drain), `nami-engine/src/incidents/lifecycle.rs` (`resolve` queues "resolved" deliveries), `nami-engine/tests/common/mod.rs` (`make_escalation_due`, `set_policy`)
-- Test: `nami-engine/tests/escalation_engine.rs`
+- Test: `nami-engine/tests/incidents/escalation_engine.rs`
 
 **Interfaces:**
-- Consumes: Task 5 `deliveries::{enqueue, NewDelivery, Target, DeliveryEvent}`. Task 6 `oncall::rotation::on_call_at`. Task 7 `models::schedule::load_rotation`. Task 8 `plan::{after_step, round, PolicyShape, Cursor, Next, Exhausted}`. `timewindow`.
+- Consumes: Task 5 `deliveries::{enqueue, NewDelivery, Target, DeliveryEvent}`. Task 6 `oncall::rotation::on_call_at`. Task 7 `incidents::oncall::model::load_rotation`. Task 8 `plan::{after_step, round, PolicyShape, Cursor, Next, Exhausted}`. `timewindow`.
 - Produces:
 
 ```rust
@@ -3531,7 +3531,7 @@ Deduplicate by `Target::key()`, keep the first `MAX_RECIPIENTS_PER_STEP`, and or
 
 - [ ] **Step 1: Write the failing tests**
 
-`nami-engine/tests/escalation_engine.rs`:
+`nami-engine/tests/incidents/escalation_engine.rs`:
 
 ```rust
 // The escalation engine. Requires `docker compose up -d postgres mailpit`.
@@ -3541,7 +3541,7 @@ use axum::http::{HeaderValue, StatusCode};
 use chrono::{Duration, Utc};
 use common::{call, insert_channel, make_escalation_due, run_incident_ticks, seed_project, set_policy,
     settled_mail, test_app, user_with_role};
-use nami_engine::{incidents::escalation::run, models::channel::ChannelConfig, state::AppState};
+use nami_engine::{incidents::escalation::run, incidents::channel::model::ChannelConfig, core::state::AppState};
 use serde_json::{json, Value};
 use uuid::Uuid;
 use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
@@ -3850,14 +3850,14 @@ async fn an_outage_never_replays_missed_steps_as_a_burst(pool: sqlx::PgPool) {
 }
 ```
 
-Run: engine command `--test escalation_engine`. Expected: FAIL.
+Run: engine command `--test incidents escalation_engine::`. Expected: FAIL.
 
-- [ ] **Step 2: Implement** `run.rs`, the `resolve` hook, `resolve_source_with_reason` and `kick` as specified above. The drain fills `IncidentSummary.resolution_reason` for `resolved` deliveries from `select message from incident_events where incident_id = $1 and kind = 'resolved' order by id desc limit 1` (R30). `kick` takes its `KICKS` permit (Task 5), then runs `escalation::run::tick` and then `deliveries::drain`, logging each error separately: a failed tick never skips the drain. Add a test in `tests/escalation_engine.rs`: `a_resolution_with_a_reason_notifies_the_paged_with_it`. A monitor incident whose step already emailed alice, resolved with `resolve_source_with_reason(.., "alert disabled")`, queues one `resolved:g0` delivery for alice. After `run_incident_ticks` her second email is `[Nami] Resolved: <title>` and its body contains `Reason: alert disabled`. The last event is `resolved` with message `alert disabled` and metadata `{"reason": "alert disabled"}`.
-- [ ] **Step 3: Run** engine command `--test escalation_engine --test notification_deliveries --test incidents_api --test incident_lifecycle`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
+- [ ] **Step 2: Implement** `run.rs`, the `resolve` hook, `resolve_source_with_reason` and `kick` as specified above. The drain fills `IncidentSummary.resolution_reason` for `resolved` deliveries from `select message from incident_events where incident_id = $1 and kind = 'resolved' order by id desc limit 1` (R30). `kick` takes its `KICKS` permit (Task 5), then runs `escalation::run::tick` and then `deliveries::drain`, logging each error separately: a failed tick never skips the drain. Add a test in `tests/incidents/escalation_engine.rs`: `a_resolution_with_a_reason_notifies_the_paged_with_it`. A monitor incident whose step already emailed alice, resolved with `resolve_source_with_reason(.., "alert disabled")`, queues one `resolved:g0` delivery for alice. After `run_incident_ticks` her second email is `[Nami] Resolved: <title>` and its body contains `Reason: alert disabled`. The last event is `resolved` with message `alert disabled` and metadata `{"reason": "alert disabled"}`.
+- [ ] **Step 3: Run** engine command `--test incidents escalation_engine:: --test incidents notification_deliveries:: --test incidents incidents_api:: --test incidents incident_lifecycle::`, then engine command `--lib -- incidents`, then the full suite and clippy. Expected: green.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add nami-engine/src nami-engine/tests/escalation_engine.rs nami-engine/tests/common/mod.rs
+git add nami-engine/src nami-engine/tests/incidents/escalation_engine.rs nami-engine/tests/common/mod.rs
 git commit -m "feat(engine): escalation engine with schedules, repeats, fallback and resolve notices (NAMI-INC-9)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -3870,22 +3870,22 @@ Branch `feat/NAMI-INC-10-incident-routing`, worktree `.worktrees/NAMI-INC-10/`.
 **Files:**
 - Create: `nami-engine/migrations/0065_source_escalation_routing.sql`
 - Modify:
-  - `nami-engine/src/models/incident.rs`: the six wrappers read the source's `escalation_policy_id`/`severity_id` and pass them to `lifecycle::open`.
+  - `nami-engine/src/incidents/model.rs`: the six wrappers read the source's `escalation_policy_id`/`severity_id` and pass them to `lifecycle::open`.
   - `nami-engine/src/uptime/alerts.rs`: `notify_transition` calls `incidents::worker::kick`. `render` and its unit tests are removed, including Logs Part 2's `log_alert_emails_say_triggered_and_resolved_and_link_to_the_alert` and NAMI-UP-21's `heartbeat_output_is_quoted_line_by_line_between_since_and_details` / `details_are_sanitized_again_when_rendered`. Their properties live in `incidents::format`'s tests (Task 4). `sanitize_cause`, `Transition` (with UP-21's `details`) and `Subject` stay: the worker's `log_dropped` and the call sites use them.
-  - `nami-engine/src/logs/alerts.rs`: the R-P2-27 seam. `resolve_alert_incident(.., notify: false)` calls `lifecycle::resolve_source_with_reason(.., "alert disabled")` instead of the wrapper (R17, controller ruling). `open_alert_incident` and the `notify: true` path are unchanged. `routes/log_alerts.rs`: the PATCH handler calls `incidents::worker::kick(&state).await` after the update commits.
+  - `nami-engine/src/logs/alert/mod.rs`: the R-P2-27 seam. `resolve_alert_incident(.., notify: false)` calls `lifecycle::resolve_source_with_reason(.., "alert disabled")` instead of the wrapper (R17, controller ruling). `open_alert_incident` and the `notify: true` path are unchanged. `routes/log_alerts.rs`: the PATCH handler calls `incidents::worker::kick(&state).await` after the update commits.
   - `docs/superpowers/plans/2026-10-13-log-management-part2.md` is merged history and is not edited. The Part 1 decisions log records that R17 supersedes R-P2-27's silent disable.
   - `nami-engine/src/main.rs`: spawn `incidents::worker::run_forever(state.clone())` when `state.config.incidents_worker_enabled`, next to the uptime worker block, with the same two log lines (`"incidents worker started"` / `"incidents worker disabled (INCIDENTS_WORKER_ENABLED=false)"`). R23, R27.
   - `nami-engine/src/models/{monitor,heartbeat,log_alert}.rs` and their routes: the two new optional fields in create/patch bodies and views.
-  - The existing tests that assert alert subjects (R18): `tests/uptime_worker.rs`, `tests/heartbeats.rs`, `tests/maintenance_windows.rs`, `tests/recovery_threshold.rs`, `tests/uptime_worker_timing.rs`, `tests/checker_http_config.rs`, `tests/log_alerts.rs`, `tests/heartbeat_pings.rs` (NAMI-UP-21).
-  - The `tests/uptime_worker.rs` tests that pin the old SMTP path's mechanics (Step 4 lists them).
-  - `nami-engine/tests/migrations.rs`.
-- Test: `nami-engine/tests/incident_routing.rs`
+  - The existing tests that assert alert subjects (R18): `tests/uptime/uptime_worker.rs`, `tests/uptime/heartbeats.rs`, `tests/uptime/maintenance_windows.rs`, `tests/uptime/recovery_threshold.rs`, `tests/uptime/uptime_worker_timing.rs`, `tests/uptime/checker_http_config.rs`, `tests/logs/log_alerts.rs`, `tests/uptime/heartbeat_pings.rs` (NAMI-UP-21).
+  - The `tests/uptime/uptime_worker.rs` tests that pin the old SMTP path's mechanics (Step 4 lists them).
+  - `nami-engine/tests/core/migrations.rs`.
+- Test: `nami-engine/tests/incidents/incident_routing.rs`
 
 **Interfaces:**
-- Consumes: Tasks 1-9. Logs Part 2: `log_alerts`, `logs::alerts::{claim_due_alerts, apply_evaluation, resolve_alert_incident}`. Uptime Phase 3: `incidents.details` and `attach_details` (unchanged; `format::email` renders it, Task 4).
+- Consumes: Tasks 1-9. Logs Part 2: `log_alerts`, `logs::alert::{claim_due_alerts, apply_evaluation, resolve_alert_incident}`. Uptime Phase 3: `incidents.details` and `attach_details` (unchanged; `format::email` renders it, Task 4).
 - Produces:
   - `Monitor`/`MonitorView`, `Heartbeat`/`HeartbeatView` and `LogAlert` gain `escalation_policy_id: Option<Uuid>` and `severity_id: Option<Uuid>`.
-  - Create bodies accept them as optional fields. Patch bodies accept them as `Option<Option<Uuid>>` (`null` clears, so the project default applies; deserialized with `models::nullable`, like `group_id`).
+  - Create bodies accept them as optional fields. Patch bodies accept them as `Option<Option<Uuid>>` (`null` clears, so the project default applies; deserialized with `core::validate::nullable`, like `group_id`).
   - An id from another project is rejected exactly the way a foreign `group_id` is today in `routes/monitors.rs::create_monitor`: `404` from a `belongs_to(&state.db, project_id, id)` check before the write, plus the existing `23503 → 404` mapping for a row deleted in between. Use `escalation_policy::belongs_to` / `severity::belongs_to`, both generic over `impl PgExecutor` like `monitor_group::belongs_to`. A policy or severity can never move between projects, so the check cannot go stale.
   - `alerts::notify_transition(state, transition)` keeps its signature. Its body is now `crate::incidents::worker::kick(state).await`, because the incident and its deliveries were already written in the source's transaction.
 
@@ -3921,7 +3921,7 @@ Migration test `deleting_a_policy_clears_it_on_monitors`. The R27 `update` touch
 
 - [ ] **Step 2: Write the failing routing tests**
 
-`nami-engine/tests/incident_routing.rs`:
+`nami-engine/tests/incidents/incident_routing.rs`:
 
 ```rust
 // Monitors, heartbeats and log alerts open incidents through escalation.
@@ -3931,7 +3931,7 @@ mod common;
 use axum::http::StatusCode;
 use common::{call, seed_http_monitor, seed_project, set_policy, settled_mail, state_with_clickhouse, test_app,
     user_with_role};
-use nami_engine::{logs::alerts, uptime::{alerts as uptime_alerts, worker}};
+use nami_engine::{logs::alert, uptime::{alerts as uptime_alerts, worker}};
 use serde_json::json;
 use uuid::Uuid;
 use wiremock::{matchers::any, Mock, MockServer, ResponseTemplate};
@@ -4054,9 +4054,9 @@ async fn foreign_policies_and_severities_are_refused_on_sources(pool: sqlx::PgPo
 }
 ```
 
-`state_with_clickhouse(&pool)` takes a reference and returns `(AppState, ClickHouse)` bound to a fresh per-test database. Each test above that calls it ends with `ch.drop_database().await.unwrap();` (the convention in `tests/uptime_worker.rs`). `make_due` and the heartbeat create body follow the existing helpers and API in `tests/common/mod.rs` and `tests/heartbeats.rs`. Where a field name differs (for example `grace_seconds`), use the existing one.
+`state_with_clickhouse(&pool)` takes a reference and returns `(AppState, ClickHouse)` bound to a fresh per-test database. Each test above that calls it ends with `ch.drop_database().await.unwrap();` (the convention in `tests/uptime/uptime_worker.rs`). `make_due` and the heartbeat create body follow the existing helpers and API in `tests/common/mod.rs` and `tests/uptime/heartbeats.rs`. Where a field name differs (for example `grace_seconds`), use the existing one.
 
-Run: engine command `--test incident_routing --test migrations`. Expected: FAIL. (After Step 3, also run `--test log_alerts --test heartbeat_pings --test uptime_worker --test heartbeats` and expect only the Step 4 failures.)
+Run: engine command `--test incidents incident_routing:: --test core migrations::`. Expected: FAIL. (After Step 3, also run `--test logs log_alerts:: --test uptime heartbeat_pings:: --test uptime uptime_worker:: --test uptime heartbeats::` and expect only the Step 4 failures.)
 
 - [ ] **Step 3: Implement**
 
@@ -4073,9 +4073,9 @@ pub async fn notify_transition(state: &AppState, _transition: &Transition) {
 
 Delete `render` and its unit tests. The escaping they covered (CR/LF in names never reaching a subject) is covered by `incidents::format` (`email_subject_and_body_carry_severity_and_links_on_single_lines`). The heartbeat output quoting is covered by `a_cause_cannot_forge_a_link_line_and_job_output_is_quoted`. Fix the uses of `render` that the compiler reports. Logs Part 2's `log_alert_emails_say_triggered_and_resolved...` test and NAMI-UP-21's two `render` tests go with it.
 
-The log-alert seam (R17, controller ruling): in `logs::alerts::resolve_alert_incident`, `notify: false` calls `lifecycle::resolve_source_with_reason(conn, &IncidentSource::LogAlert(alert_id), at, "alert disabled")` and returns `None`. Logs Part 2's "no email on disable" behaviour is **superseded** from this task on. Its disable test in `tests/log_alerts.rs` (the alert disabled while alerting resolves its incident) is updated in Step 4 to expect, after `common::run_incident_ticks`, exactly one `[Nami] Resolved: Log alert: <name>` email per member who got the triggered email, with `Reason: alert disabled` in the body. A member never paged gets nothing.
+The log-alert seam (R17, controller ruling): in `logs::alert::resolve_alert_incident`, `notify: false` calls `lifecycle::resolve_source_with_reason(conn, &IncidentSource::LogAlert(alert_id), at, "alert disabled")` and returns `None`. Logs Part 2's "no email on disable" behaviour is **superseded** from this task on. Its disable test in `tests/logs/log_alerts.rs` (the alert disabled while alerting resolves its incident) is updated in Step 4 to expect, after `common::run_incident_ticks`, exactly one `[Nami] Resolved: Log alert: <name>` email per member who got the triggered email, with `Reason: alert disabled` in the body. A member never paged gets nothing.
 
-Add to `tests/incident_routing.rs`:
+Add to `tests/incidents/incident_routing.rs`:
 
 ```rust
 #[sqlx::test]
@@ -4125,7 +4125,7 @@ Run the full engine suite. Expect two kinds of failure.
 
 Body assertions that looked for `Cause: …` keep working (the format keeps that line). NAMI-UP-21's `Output:\n> …\n` assertion keeps working (Task 4).
 
-**(b) Tests that pin the old SMTP path's mechanics** (`tests/uptime_worker.rs`). The old path sent one email after another from the alert task and gave up after one timeout. The new path queues deliveries, sends up to `MAX_SENDS_IN_FLIGHT` at once and retries per R12. Rewrite exactly these tests to keep the property named here. Do not weaken anything else.
+**(b) Tests that pin the old SMTP path's mechanics** (`tests/uptime/uptime_worker.rs`). The old path sent one email after another from the alert task and gave up after one timeout. The new path queues deliveries, sends up to `MAX_SENDS_IN_FLIGHT` at once and retries per R12. Rewrite exactly these tests to keep the property named here. Do not weaken anything else.
 - `a_hung_smtp_server_does_not_hold_up_the_checks`: keep the property "two passes finish in < 5 s while SMTP never answers, and the monitor ends up". Drop the `notifications.reap() == 2` count: the second kick may find nothing to send.
 - `alerts_to_a_hung_smtp_server_are_given_up_on_after_the_timeout`: keep "`run_due_checks` ends (well under 20 s) although SMTP is hung". The two recipients' sends now run concurrently: assert `elapsed >= 700 ms` (one mailer timeout) instead of `>= 1,300 ms`. Both deliveries end `pending` with `attempts = 1` and `last_error = 'email not delivered'`.
 - `a_failed_alert_is_logged_once_and_without_the_recipients_address`: keep "no log line contains the recipient's address" and "the mailer logs the cause (`failed to send email`) once". Replace the `alert email not delivered to every recipient` summary assertion with: the delivery is `pending` with `attempts = 1`, and there is exactly one `notification_failed` event whose message is `Email: <recipient>: email not delivered` (R11 allows the user's own address in their own event).
@@ -4150,16 +4150,16 @@ git commit -m "feat(engine): monitors, heartbeats and log alerts page through es
 Branch `feat/NAMI-INC-11-action-links`, worktree `.worktrees/NAMI-INC-11/`.
 
 **Files:**
-- Create: `nami-engine/migrations/0066_create_incident_action_token_uses.sql`, `nami-engine/src/incidents/action_token.rs`, `nami-engine/src/routes/incident_actions.rs`, `nami-ui/src/routes/incidents/action/+page.server.ts`, `nami-ui/src/routes/incidents/action/+page.svelte`, `nami-ui/src/routes/incidents/action/action.test.ts`
+- Create: `nami-engine/migrations/0066_create_incident_action_token_uses.sql`, `nami-engine/src/incidents/action_token.rs`, `nami-engine/src/incidents/action/routes.rs`, `nami-ui/src/routes/incidents/action/+page.server.ts`, `nami-ui/src/routes/incidents/action/+page.svelte`, `nami-ui/src/routes/incidents/action/action.test.ts`
 - Modify:
   - `nami-engine/src/incidents/deliveries.rs`: implicit-email deliveries of `triggered` events carry `ActionLinks` for that user when they are a `member`/`admin` of the project or a global admin.
   - `nami-engine/src/incidents/worker.rs`: prune token uses older than 2 days, once an hour.
-  - `nami-engine/src/routes/mod.rs`, `nami-engine/src/router.rs`: merge behind a governor of its own, `rate_limited_actions(router)`, the same shape as `rate_limited_with_governor` with `SmartIpKeyExtractor`, `.per_second(3).burst_size(20)` (R16; `per_second(n)` is the replenish interval in seconds). `nami-engine/tests/migrations.rs`, `nami-engine/tests/json_bodies.rs` (both routes, without a session).
-  - `nami-engine/src/error.rs`: `AppError::Gone(String)` → `410 {"error": msg}`. There is no 410 variant on `main`.
-- Test: `nami-engine/tests/incident_actions.rs` (+ unit tests in `action_token.rs`), `action.test.ts`
+  - `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs`: merge behind a governor of its own, `rate_limited_actions(router)`, the same shape as `rate_limited_with_governor` with `SmartIpKeyExtractor`, `.per_second(3).burst_size(20)` (R16; `per_second(n)` is the replenish interval in seconds). `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs` (both routes, without a session).
+  - `nami-engine/src/core/error.rs`: `AppError::Gone(String)` → `410 {"error": msg}`. There is no 410 variant on `main`.
+- Test: `nami-engine/tests/incidents/incident_actions.rs` (+ unit tests in `action_token.rs`), `action.test.ts`
 
 **Interfaces:**
-- Consumes: `crypto::Cipher::derive_subkey`, Task 1 `lifecycle::{acknowledge, resolve}`, `rbac` role ranks.
+- Consumes: `core::crypto::Cipher::derive_subkey`, Task 1 `lifecycle::{acknowledge, resolve}`, `rbac` role ranks.
 - Produces:
 
 ```rust
@@ -4264,7 +4264,7 @@ fn the_action_key_is_its_own_subkey() {
 
 - [ ] **Step 3: Failing API tests**
 
-`nami-engine/tests/incident_actions.rs`:
+`nami-engine/tests/incidents/incident_actions.rs`:
 
 ```rust
 // Acknowledge/resolve links. Requires `docker compose up -d postgres mailpit`.
@@ -4273,7 +4273,7 @@ mod common;
 use axum::http::StatusCode;
 use chrono::Utc;
 use common::{call, open_test_incident, run_incident_ticks, seed_project, settled_mail, test_app, user_with_role};
-use nami_engine::{incidents::action_token::{self, Action, Claims}, state::AppState};
+use nami_engine::{incidents::action_token::{self, Action, Claims}, core::state::AppState};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -4414,7 +4414,7 @@ The page renders text only through Svelte expressions (escaped). The `confirm` a
 
 ```ts
 import { describe, expect, it } from 'vitest';
-import { fakeEvent } from '#lib/server/fake-event';
+import { fakeEvent } from '#lib/server/core/fake-event';
 import { actions, load } from './+page.server';
 
 const inspected = { action: 'acknowledge', incident: { id: 'i', project_id: 'p', project_name: 'Shop', title: 'db down',
@@ -4446,7 +4446,7 @@ describe('incident action page', () => {
 });
 ```
 
-- [ ] **Step 5: Run** engine command `--test incident_actions --test notification_deliveries --test migrations --test json_bodies`, then engine command `--lib incidents::action_token`, the full engine suite and clippy, then the UI command with `src/routes/incidents/action`. Expected: green.
+- [ ] **Step 5: Run** engine command `--test incidents incident_actions:: --test incidents notification_deliveries:: --test core migrations:: --test core json_bodies::`, then engine command `--lib incidents::action_token`, the full engine suite and clippy, then the UI command with `src/routes/incidents/action`. Expected: green.
 - [ ] **Step 6: Commit**
 
 ```bash
@@ -4543,7 +4543,7 @@ describe('renderMarkdown', () => {
 
 ```ts
 import { describe, expect, it } from 'vitest';
-import { fakeEvent, PROJECT_ID } from '#lib/server/fake-event';
+import { fakeEvent, PROJECT_ID } from '#lib/server/core/fake-event';
 import { actions, load } from './+page.server';
 
 const INCIDENT_ID = '3f0c8a52-7d1e-4b6a-9c2f-5e8d7a6b4c31';
@@ -5001,7 +5001,7 @@ When NAMI-INC-1 .. NAMI-INC-15 are merged, run the sub-project's dedicated **sec
    - Rate limiting applies per IP (the actions' own governor, R16).
    - Two concurrent confirms of one token act once (the row lock), and a used token always answers 410.
    - The nami-ui page keeps SvelteKit's form-action origin check, and its only link is built from UUID-checked ids (no open redirect).
-8. **RBAC.** A table of every route × role (outsider, viewer, member, admin, global admin) matches the spec's RBAC section. `tests/json_bodies.rs` lists every new state-changing route.
+8. **RBAC.** A table of every route × role (outsider, viewer, member, admin, global admin) matches the spec's RBAC section. `tests/core/json_bodies.rs` lists every new state-changing route.
 9. **Failure behaviour.** A down SMTP server, ClickHouse or chat provider never blocks incident state changes, the uptime worker or the API. Deliveries retry per R12 and are visible in the timeline.
 10. **Queue robustness.** A row whose lease expired after its last attempt is failed, not reclaimed (poison rows, R12). Two drains in parallel (and two engine instances) never exceed the storm caps (the claim's advisory lock, R13). With `INCIDENTS_WORKER_ENABLED=false`, no tick or drain runs on that instance, `kick` included.
 

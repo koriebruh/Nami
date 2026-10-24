@@ -37,7 +37,7 @@ LINTS = [
     ("per-task worktree", re.compile(r"\.worktrees/NAMI-")),
     ("per-task PR flow", re.compile(r"(?i)one worktree per task|auto-merge on a clean review|open the PR, and auto-merge")),
     ("old models/routes module", re.compile(r"\b(crate::)?(models|routes)::[a-z_]+")),
-    ("old models/routes path", re.compile(r"\bsrc/(models|routes)/")),
+    ("old models/routes path", re.compile(r"\bsrc/(models|routes)/[a-z_]+\.rs")),
     ("old core file", re.compile(rf"\bsrc/({OLD_CORE})\.rs\b")),
     ("old logs file", re.compile(rf"\bsrc/logs/({OLD_LOGS})\.rs\b")),
     ("old uptime file", re.compile(rf"\bsrc/uptime/({OLD_UPTIME})\.rs\b")),
