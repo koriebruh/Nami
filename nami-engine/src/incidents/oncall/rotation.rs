@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::incidents::timewindow::ValidWindow;
 
+/// How long one rotation shift lasts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotationLength {
     Daily,
@@ -17,6 +18,9 @@ pub enum RotationLength {
     Hours(u32),
 }
 
+/// A schedule's rotation: participants take turns, one shift each, from
+/// `start_date` at the local `handoff`, only inside `restrictions` (empty =
+/// always).
 #[derive(Debug, Clone)]
 pub struct Rotation {
     pub timezone: Tz,
@@ -27,6 +31,7 @@ pub struct Rotation {
     pub restrictions: Vec<ValidWindow>,
 }
 
+/// `user_id` is on call in `[starts_at, ends_at)`, whatever the rotation says.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Override {
     pub id: Uuid,
@@ -36,6 +41,8 @@ pub struct Override {
     pub created_at: DateTime<Utc>,
 }
 
+/// One merged stretch of [`shifts`]: `user_id` on call in `[starts_at,
+/// ends_at)`, through `override_id` when an override put them there.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Shift {
     pub user_id: Uuid,
@@ -44,6 +51,7 @@ pub struct Shift {
     pub override_id: Option<Uuid>,
 }
 
+/// The longest range [`shifts`] evaluates; a longer one is cut to this.
 pub const MAX_SHIFT_RANGE: chrono::Duration = chrono::Duration::days(70);
 
 /// Ambiguous (fall back): the earlier instant. Nonexistent (spring forward):
@@ -343,6 +351,16 @@ mod tests {
             .is_empty(),
             "no participants: nobody"
         );
+    }
+
+    #[test]
+    fn a_zero_hour_rotation_counts_as_one_hour_instead_of_hanging() {
+        let zero = rotation("UTC", "2026-10-19", "09:00", RotationLength::Hours(0), 2);
+        let one = rotation("UTC", "2026-10-19", "09:00", RotationLength::Hours(1), 2);
+        let at = utc("2026-10-19T12:30:00Z");
+        assert_eq!(shift_start(&zero, 3), shift_start(&one, 3));
+        assert_eq!(shift_index(&zero, at), Some(3));
+        assert_eq!(rotation_user_at(&zero, at), rotation_user_at(&one, at));
     }
 
     #[test]

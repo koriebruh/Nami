@@ -310,7 +310,13 @@ pub async fn reopen_source_within(
     at: DateTime<Utc>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     let (monitor, heartbeat, log_alert) = source.keys();
-    let reopened: Option<Uuid> = sqlx::query_scalar(
+    // `latest` and `not exists` read the statement's snapshot, so a manual
+    // reopen committed meanwhile is invisible to them: `i.status` is
+    // rechecked on the locked row, and the unique index (another incident of
+    // the source reopened) is caught in a savepoint so the caller's
+    // transaction survives it.
+    let mut savepoint = conn.begin().await?;
+    let reopened = sqlx::query_scalar::<_, Uuid>(
         "update incidents i
          set status = 'open', resolved_at = null, resolved_by = null,
              acknowledged_at = null, acknowledged_by = null,
@@ -320,7 +326,7 @@ pub async fn reopen_source_within(
                order by started_at desc
                limit 1) latest
          where i.id = latest.id
-           and latest.status = 'resolved'
+           and i.status = 'resolved'
            and latest.resolved_at > $6 - make_interval(secs => $7)
            and not exists (select 1 from incidents
                            where (monitor_id = $1 or heartbeat_id = $2 or log_alert_id = $3)
@@ -334,8 +340,16 @@ pub async fn reopen_source_within(
     .bind(cause)
     .bind(at)
     .bind(window_secs)
-    .fetch_optional(&mut *conn)
-    .await?;
+    .fetch_optional(&mut *savepoint)
+    .await;
+    let reopened = match reopened {
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            savepoint.rollback().await?;
+            return Ok(None);
+        }
+        reopened => reopened?,
+    };
+    savepoint.commit().await?;
     if let Some(id) = reopened {
         record_event(conn, id, EventKind::Reopened, None, None, json!({})).await?;
     }

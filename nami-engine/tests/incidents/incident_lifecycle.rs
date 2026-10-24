@@ -361,3 +361,126 @@ async fn a_heartbeat_incident_resolved_moments_ago_is_reopened_with_an_event(poo
         &("reopened".to_string(), None)
     );
 }
+
+/// Opens a monitor incident started at `at(started)`, then resolves it at
+/// `at(started + 10)`. Returns its id.
+async fn resolved_monitor_incident(pool: &PgPool, project: Uuid, monitor: Uuid, started: i64) -> Uuid {
+    let mut conn = pool.acquire().await.unwrap();
+    let source = IncidentSource::Monitor(monitor);
+    let id = lifecycle::open(
+        &mut conn,
+        &OpenIncident {
+            project_id: project,
+            source: source.clone(),
+            title: "api is down",
+            cause: None,
+            severity_id: None,
+            metadata: None,
+            started_at: at(started),
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    lifecycle::resolve_source(&mut conn, &source, at(started + 10))
+        .await
+        .unwrap();
+    id
+}
+
+async fn title_and_status(pool: &PgPool, incident: Uuid) -> (String, String) {
+    sqlx::query_as("select title, status from incidents where id = $1")
+        .bind(incident)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test]
+async fn an_automatic_reopen_leaves_the_latest_incident_alone_while_an_older_one_is_unresolved(
+    pool: PgPool,
+) {
+    let project = seed_project(&pool).await;
+    let monitor = seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    let user = seed_user(&pool, &unique_email("m"), "member").await;
+    let older = resolved_monitor_incident(&pool, project, monitor, 0).await;
+    let latest = resolved_monitor_incident(&pool, project, monitor, 20).await;
+    let mut conn = pool.acquire().await.unwrap();
+    assert_eq!(
+        lifecycle::reopen(&mut conn, older, user, at(40)).await.unwrap(),
+        Reopen::Reopened
+    );
+
+    let reopened = lifecycle::reopen_source_within(
+        &mut conn,
+        &IncidentSource::Monitor(monitor),
+        300,
+        "flapping",
+        None,
+        at(60),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(reopened, None);
+    assert_eq!(
+        title_and_status(&pool, latest).await,
+        ("api is down".into(), "resolved".into())
+    );
+    assert_eq!(
+        events(&pool, latest).await,
+        [("opened".into(), None), ("resolved".into(), None)]
+    );
+}
+
+#[sqlx::test]
+async fn an_automatic_reopen_racing_a_manual_reopen_of_another_incident_returns_none(
+    pool: PgPool,
+) {
+    let project = seed_project(&pool).await;
+    let monitor = seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    let user = seed_user(&pool, &unique_email("m"), "member").await;
+    let older = resolved_monitor_incident(&pool, project, monitor, 0).await;
+    let latest = resolved_monitor_incident(&pool, project, monitor, 20).await;
+
+    let mut manual = pool.begin().await.unwrap();
+    assert_eq!(
+        lifecycle::reopen(&mut manual, older, user, at(40)).await.unwrap(),
+        Reopen::Reopened
+    );
+    // Its snapshot predates the manual reopen, so only the unique index can
+    // stop it: it waits for that transaction, then must return None and
+    // leave its own transaction usable.
+    let racing = tokio::spawn({
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            let reopened = lifecycle::reopen_source_within(
+                &mut tx,
+                &IncidentSource::Monitor(monitor),
+                300,
+                "flapping",
+                None,
+                at(60),
+            )
+            .await
+            .unwrap();
+            sqlx::query("select 1").execute(&mut *tx).await.unwrap();
+            tx.commit().await.unwrap();
+            reopened
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !racing.is_finished(),
+        "the automatic reopen must wait for the manual one"
+    );
+    manual.commit().await.unwrap();
+
+    assert_eq!(racing.await.unwrap(), None);
+    assert_eq!(title_and_status(&pool, older).await.1, "open");
+    assert_eq!(
+        title_and_status(&pool, latest).await,
+        ("api is down".into(), "resolved".into())
+    );
+}

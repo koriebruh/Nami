@@ -1082,8 +1082,8 @@ async fn a_ping_touches_only_the_heartbeat_that_holds_the_token(pool: sqlx::PgPo
     }
 }
 
-/// A heartbeat has at most one open incident, and can open a new one once the
-/// last is resolved (`incidents_one_open_per_heartbeat`).
+/// A heartbeat has at most one unresolved incident, and can open a new one
+/// once the last is resolved (`incidents_one_unresolved_per_heartbeat`).
 #[sqlx::test]
 async fn a_heartbeat_has_at_most_one_open_incident(pool: sqlx::PgPool) {
     let project = seed_project(&pool).await;
