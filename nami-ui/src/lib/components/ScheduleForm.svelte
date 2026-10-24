@@ -83,6 +83,11 @@
 		const next = participants[i] ?? participants[i - 1];
 		focusLater(next ? id(`remove-${next.user_id}`) : id('pick'));
 	}
+	function removeRestriction(i: number) {
+		restrictions.splice(i, 1);
+		const next = Math.min(i, restrictions.length - 1);
+		focusLater(next >= 0 ? id(`r${next}-remove`) : id('add-restriction'));
+	}
 
 	let submitting = $state(false);
 	let generation = $state(0);
@@ -130,7 +135,7 @@
 		</div>
 		<div>
 			<label for={id('rotation')} class="label">Rotation</label>
-			<select id={id('rotation')} name="rotation" bind:value={rotation} class="input">
+			<select id={id('rotation')} name="rotation" bind:value={rotation} class="select">
 				<option value="daily">Daily</option>
 				<option value="weekly">Weekly</option>
 				<option value="custom">Custom length</option>
@@ -179,10 +184,10 @@
 		<div class="flex flex-wrap items-end gap-2">
 			<div class="min-w-[14rem] flex-1">
 				<label for={id('pick')} class="sr-only">Member to add</label>
-				<select id={id('pick')} bind:value={pick} class="input">
+				<select id={id('pick')} bind:value={pick} class="select">
 					<option value="">Add a member…</option>
 					{#each addable as member (member.user_id)}
-						<option value={member.user_id}>{member.email}</option>
+						<option value={member.user_id}>{member.email} ({member.project_role})</option>
 					{/each}
 				</select>
 			</div>
@@ -213,12 +218,12 @@
 						<label for={id(`r${i}-to`)} class="label">Until</label>
 						<input id={id(`r${i}-to`)} name="restriction_{i}_to" type="time" required bind:value={restriction.to} class="input" />
 					</div>
-					<button type="button" class="btn btn-ghost btn-sm" onclick={() => restrictions.splice(i, 1)}>Remove</button>
+					<button type="button" id={id(`r${i}-remove`)} class="btn btn-ghost btn-sm" onclick={() => removeRestriction(i)} aria-label="Remove restriction {i + 1}">Remove</button>
 				</div>
 			</div>
 		{/each}
 		{#if restrictions.length < 14}
-			<button type="button" class="btn btn-secondary btn-sm" onclick={() => restrictions.push({ weekdays: [1, 2, 3, 4, 5], from: '09:00', to: '17:00' })}>
+			<button type="button" id={id('add-restriction')} class="btn btn-secondary btn-sm" onclick={() => restrictions.push({ weekdays: [1, 2, 3, 4, 5], from: '09:00', to: '17:00' })}>
 				Add restriction
 			</button>
 		{/if}

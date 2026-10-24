@@ -185,10 +185,10 @@
 				<input type="hidden" name="timezone" value={zone} />
 				<div>
 					<label for="override-user" class="label">Who takes over</label>
-					<select id="override-user" name="user_id" required class="input">
+					<select id="override-user" name="user_id" required class="select">
 						<option value="">Pick a member…</option>
 						{#each data.members as member (member.user_id)}
-							<option value={member.user_id}>{member.email}</option>
+							<option value={member.user_id}>{member.email} ({member.project_role})</option>
 						{/each}
 					</select>
 				</div>

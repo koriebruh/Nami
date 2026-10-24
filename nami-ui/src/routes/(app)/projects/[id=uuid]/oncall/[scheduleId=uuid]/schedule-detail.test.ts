@@ -219,6 +219,8 @@ describe('schedule detail page', () => {
 		// Reordering is announced, and focus finds its way back to the buttons.
 		expect(body).toMatch(/role="status" aria-live="polite"/);
 		expect(body).toContain(`id="${SCHEDULE_ID}-down-`);
+		// The pickers name each member's project role.
+		expect(body).toContain('ann@b.test (member)');
 	});
 
 	it('flags participants who are no longer project members', () => {
