@@ -33,6 +33,7 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "on_call_schedules",
         "on_call_participants",
         "on_call_overrides",
+        "notification_deliveries",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -510,6 +511,55 @@ async fn on_call_constraints_are_all_named(pool: sqlx::PgPool) {
             "on_call_schedules_restrictions_is_array",
             "on_call_schedules_rotation_hours_range",
             "on_call_schedules_rotation_known",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn a_target_gets_one_delivery_per_incident_round(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let user = common::seed_user(&pool, &common::unique_email("member"), "member").await;
+    let incident = common::open_test_incident(&pool, project, user).await;
+    let insert = || {
+        sqlx::query(
+            "insert into notification_deliveries (incident_id, event, round, target_key, user_id)
+             values ($1, 'triggered', 'p0r0s0', 'email:x', $2)",
+        )
+        .bind(incident)
+        .bind(user)
+        .execute(&pool)
+    };
+    insert().await.unwrap();
+    let error = insert().await.unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23505"));
+}
+
+/// Every constraint of `notification_deliveries` carries the name its
+/// migration gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn notification_deliveries_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid = 'public.notification_deliveries'::regclass order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "notification_deliveries_attempts_range",
+            "notification_deliveries_channel_id_fkey",
+            "notification_deliveries_event_known",
+            "notification_deliveries_has_target",
+            "notification_deliveries_incident_id_fkey",
+            "notification_deliveries_last_error_length",
+            "notification_deliveries_pkey",
+            "notification_deliveries_round_length",
+            "notification_deliveries_sent_has_time",
+            "notification_deliveries_status_known",
+            "notification_deliveries_target_unique",
+            "notification_deliveries_user_id_fkey",
         ]
     );
 }

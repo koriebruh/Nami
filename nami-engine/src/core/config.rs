@@ -86,6 +86,14 @@ pub struct Config {
     /// but `from_env_for_test`: no environment variable reads it, so no
     /// deployment can relax it.
     pub outbound_policy: OutboundPolicy,
+    /// Where Telegram notifications are sent (`TELEGRAM_API_BASE_URL`, default
+    /// [`DEFAULT_TELEGRAM_API_BASE_URL`]; a local Bot API server works too).
+    /// An absolute http(s) URL with no path, query or userinfo, stored without
+    /// a trailing slash.
+    pub telegram_api_base_url: String,
+    /// `INCIDENTS_WORKER_ENABLED=false` sends no incident notifications from
+    /// this instance (same spellings as `UPTIME_WORKER_ENABLED`). Default true.
+    pub incidents_worker_enabled: bool,
 }
 
 /// The send-time destination rules of notification channels (R9).
@@ -145,6 +153,9 @@ impl Config {
                 "MAX_SOURCES_PER_PROJECT",
                 DEFAULT_MAX_SOURCES_PER_PROJECT,
             ),
+            telegram_api_base_url: or_stop(parse_telegram_api_base_url(
+                std::env::var("TELEGRAM_API_BASE_URL").ok().as_deref(),
+            )),
             ..Self::from_env_defaults_only()
         }
         .with_distinct_ports()
@@ -244,8 +255,41 @@ impl Config {
                 .unwrap_or_else(|_| crate::uptime::checker::DEFAULT_RDAP_BASE_URL.to_string()),
             max_sources_per_project: DEFAULT_MAX_SOURCES_PER_PROJECT,
             outbound_policy: OutboundPolicy::Strict,
+            telegram_api_base_url: DEFAULT_TELEGRAM_API_BASE_URL.to_string(),
+            incidents_worker_enabled: env_flag("INCIDENTS_WORKER_ENABLED", true),
         }
     }
+}
+
+/// `TELEGRAM_API_BASE_URL` when unset.
+pub const DEFAULT_TELEGRAM_API_BASE_URL: &str = "https://api.telegram.org";
+
+/// `TELEGRAM_API_BASE_URL`: unset or empty means
+/// [`DEFAULT_TELEGRAM_API_BASE_URL`]; otherwise an absolute http(s) URL with a
+/// host and no path (but `/`), query, fragment or userinfo, returned without a
+/// trailing slash. The bot token is appended as a path, so anything else
+/// could send it somewhere unintended.
+fn parse_telegram_api_base_url(value: Option<&str>) -> Result<String, String> {
+    let Some(raw) = value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(DEFAULT_TELEGRAM_API_BASE_URL.to_string());
+    };
+    let refused = || {
+        format!(
+            "TELEGRAM_API_BASE_URL must be an absolute http(s) URL with no path, query or user info, got {raw:?}"
+        )
+    };
+    let url = url::Url::parse(raw).map_err(|_| refused())?;
+    let ok = matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some_and(|h| !h.is_empty())
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none();
+    if !ok {
+        return Err(refused());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 /// `MAX_SOURCES_PER_PROJECT` when unset.
@@ -456,8 +500,8 @@ fn parse_bool_flag(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, flag_from_value, load_dotenv, locate_unparsable_line, parse_bool_flag,
-        positive_from_value,
+        Config, DEFAULT_TELEGRAM_API_BASE_URL, flag_from_value, load_dotenv,
+        locate_unparsable_line, parse_bool_flag, parse_telegram_api_base_url, positive_from_value,
     };
 
     /// A fresh, empty directory of this test's own under the system temp dir.
@@ -559,8 +603,39 @@ mod tests {
             "UI_BASE_URL",
             "UPTIME_WORKER_ENABLED",
             "NAMI_ENCRYPTION_KEY",
+            "INCIDENTS_WORKER_ENABLED",
+            "TELEGRAM_API_BASE_URL",
         ] {
             assert!(value(key).is_some(), "{key} is read");
+        }
+    }
+
+    #[test]
+    fn the_telegram_api_base_url_is_a_bare_http_origin() {
+        assert_eq!(
+            parse_telegram_api_base_url(None).unwrap(),
+            DEFAULT_TELEGRAM_API_BASE_URL
+        );
+        assert_eq!(
+            parse_telegram_api_base_url(Some("")).unwrap(),
+            DEFAULT_TELEGRAM_API_BASE_URL
+        );
+        for (raw, stored) in [
+            ("https://api.telegram.org", "https://api.telegram.org"),
+            ("http://localhost:8081/", "http://localhost:8081"),
+        ] {
+            assert_eq!(parse_telegram_api_base_url(Some(raw)).unwrap(), stored, "{raw}");
+        }
+        for bad in [
+            "api.telegram.org",
+            "ftp://api.telegram.org",
+            "https://api.telegram.org/bot",
+            "https://api.telegram.org/?x=1",
+            "https://api.telegram.org/#x",
+            "https://user:pw@api.telegram.org",
+        ] {
+            let error = parse_telegram_api_base_url(Some(bad)).unwrap_err();
+            assert!(error.starts_with("TELEGRAM_API_BASE_URL must be"), "{bad}: {error}");
         }
     }
 

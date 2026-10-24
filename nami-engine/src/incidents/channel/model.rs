@@ -31,6 +31,8 @@ pub const MAX_PERSONAL_CHANNELS: i64 = 10;
 pub const MAX_NAME_CHARS: usize = 100;
 /// The longest email address a channel may hold, in bytes.
 pub const MAX_ADDRESS_BYTES: usize = 254;
+/// The shortest time between two "send test" requests to one channel.
+pub const MIN_TEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// AAD prefix of `config_enc` (see [`config_context`]).
 pub const CONFIG_CONTEXT: &str = "notification_channels.config";
 /// AAD prefix of `signing_secret_enc` (see [`signing_secret_context`]).
@@ -107,7 +109,7 @@ impl ChannelConfig {
     }
 
     /// The URL a send goes to and its rule; `None` for email and Telegram.
-    fn destination(&self) -> Option<(&str, UrlRule)> {
+    pub(crate) fn destination(&self) -> Option<(&str, UrlRule)> {
         match self {
             ChannelConfig::Webhook { url } => Some((url, UrlRule::HttpOrHttps)),
             ChannelConfig::Slack { webhook_url } => Some((webhook_url, SLACK)),
@@ -418,6 +420,29 @@ pub async fn delete(pool: &PgPool, owner: &Owner, id: Uuid) -> Result<Deleted, s
     } else {
         Deleted::NotFound
     })
+}
+
+/// Takes the owner's channel `id`'s "send test" slot: at most one test per
+/// [`MIN_TEST_INTERVAL`], enforced atomically on `last_tested_at`. `None` =
+/// not the owner's channel; `Some(false)` = tested too recently.
+pub async fn take_test_slot(pool: &PgPool, owner: &Owner, id: Uuid) -> Result<Option<bool>, sqlx::Error> {
+    let (project_id, user_id) = owner.ids();
+    let taken: Option<Uuid> = sqlx::query_scalar(
+        "update notification_channels set last_tested_at = now()
+         where id = $1 and (project_id = $2 or user_id = $3)
+           and (last_tested_at is null or last_tested_at < now() - make_interval(secs => $4))
+         returning id",
+    )
+    .bind(id)
+    .bind(project_id)
+    .bind(user_id)
+    .bind(MIN_TEST_INTERVAL.as_secs_f64())
+    .fetch_optional(pool)
+    .await?;
+    if taken.is_some() {
+        return Ok(Some(true));
+    }
+    Ok(find(pool, owner, id).await?.map(|_| false))
 }
 
 /// Everything a sender needs, opened.

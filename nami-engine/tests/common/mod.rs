@@ -227,6 +227,40 @@ pub async fn open_test_incident(pool: &sqlx::PgPool, project: Uuid, created_by: 
     .expect("a manual incident has no conflict target, so it always opens")
 }
 
+/// Seals and inserts an enabled channel without the destination rules (R9),
+/// so tests can target wiremock. A project channel's creator is a freshly
+/// seeded admin; a personal channel's is its user.
+pub async fn insert_channel(
+    pool: &sqlx::PgPool,
+    project: Option<Uuid>,
+    user: Option<Uuid>,
+    name: &str,
+    config: nami_engine::incidents::channel::model::ChannelConfig,
+) -> Uuid {
+    use nami_engine::incidents::channel::model::{self as channel, Inserted, Owner};
+    let (owner, created_by) = match (project, user) {
+        (Some(project), None) => (
+            Owner::Project(project),
+            seed_user(pool, &unique_email("channel-admin"), "admin").await,
+        ),
+        (None, Some(user)) => (Owner::User(user), user),
+        _ => panic!("a channel has exactly one owner"),
+    };
+    match channel::insert(pool, &test_cipher(), owner, name, &config, true, created_by)
+        .await
+        .unwrap()
+    {
+        Inserted::Created(created) => created.channel.id,
+        _ => panic!("the channel was not inserted"),
+    }
+}
+
+/// One escalation tick (from Task 9 on) and one delivery drain, as the
+/// worker would run them.
+pub async fn run_incident_ticks(state: &AppState) {
+    nami_engine::incidents::worker::kick(state).await
+}
+
 /// AppState whose ClickHouse client is bound to a fresh per-test database.
 /// Call `clickhouse.drop_database()` at the end of the test.
 pub async fn state_with_clickhouse(

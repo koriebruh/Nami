@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     extract::{Path, State},
     http::StatusCode,
-    routing::{get, patch},
+    routing::{get, patch, post},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -22,6 +22,7 @@ use crate::{
         self as channel, Channel, ChannelConfig, ChannelPatch, CreatedChannel, Deleted, Inserted,
         KINDS, MAX_NAME_CHARS, MAX_PERSONAL_CHANNELS, MAX_PROJECT_CHANNELS, Owner,
     },
+    incidents::send,
 };
 
 #[derive(Deserialize)]
@@ -76,6 +77,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/account/notification-channels/{channel_id}",
             patch(patch_personal).delete(delete_personal),
+        )
+        .route(
+            "/projects/{id}/notification-channels/{channel_id}/test",
+            post(test_project),
+        )
+        .route(
+            "/account/notification-channels/{channel_id}/test",
+            post(test_personal),
         )
 }
 
@@ -155,6 +164,25 @@ async fn remove(state: &AppState, owner: Owner, id: Uuid) -> Result<StatusCode, 
     }
 }
 
+/// "Send test": 200 `{"ok": true}`, 502 `{"error": "<what failed>"}`, or 429
+/// within `MIN_TEST_INTERVAL` of the last test. Disabled channels too.
+async fn test(state: &AppState, owner: Owner, id: Uuid) -> Result<(StatusCode, Json<Value>), AppError> {
+    match channel::take_test_slot(&state.db, &owner, id).await? {
+        None => return Err(AppError::NotFound),
+        Some(false) => {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "error": "wait a few seconds before testing again" })),
+            ));
+        }
+        Some(true) => {}
+    }
+    Ok(match send::send_test(state, id).await? {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.message }))),
+    })
+}
+
 async fn list_project(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -193,6 +221,15 @@ async fn delete_project(
     remove(&state, Owner::Project(project_id), id).await
 }
 
+async fn test_project(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((project_id, id)): Path<(Uuid, Uuid)>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    require_project_role(&state.db, &user, project_id, Role::Admin).await?;
+    test(&state, Owner::Project(project_id), id).await
+}
+
 async fn list_personal(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -223,4 +260,12 @@ async fn delete_personal(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     remove(&state, Owner::User(user.id), id).await
+}
+
+async fn test_personal(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(id): Path<Uuid>,
+) -> Result<(StatusCode, Json<Value>), AppError> {
+    test(&state, Owner::User(user.id), id).await
 }

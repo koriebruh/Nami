@@ -208,3 +208,43 @@ create table on_call_overrides (
 );
 -- The current and upcoming overrides of one schedule.
 create index on_call_overrides_schedule_idx on on_call_overrides (schedule_id, ends_at);
+
+-- The durable notification queue (NAMI-INC-5). One row per (incident,
+-- round, target): `round` names the escalation pass and step that queued it
+-- (e.g. 'p0r0s1', see incidents::escalation) or 'resolved', so re-running a
+-- step never notifies the same target twice and a sent row is never resent.
+create table notification_deliveries (
+    id uuid default gen_random_uuid() constraint notification_deliveries_pkey primary key,
+    incident_id uuid not null
+        constraint notification_deliveries_incident_id_fkey references incidents(id) on delete cascade,
+    event text not null
+        constraint notification_deliveries_event_known check (event in ('triggered', 'resolved')),
+    round text not null
+        constraint notification_deliveries_round_length check (char_length(round) between 1 and 32),
+    target_key text not null,
+    user_id uuid
+        constraint notification_deliveries_user_id_fkey references users(id) on delete cascade,
+    channel_id uuid
+        constraint notification_deliveries_channel_id_fkey references notification_channels(id) on delete cascade,
+    status text not null default 'pending'
+        constraint notification_deliveries_status_known
+        check (status in ('pending', 'sending', 'sent', 'failed', 'cancelled')),
+    attempts int not null default 0
+        constraint notification_deliveries_attempts_range check (attempts between 0 and 5),
+    next_attempt_at timestamptz not null default now(),
+    locked_until timestamptz,
+    last_error text
+        constraint notification_deliveries_last_error_length check (char_length(last_error) <= 200),
+    created_at timestamptz not null default now(),
+    sent_at timestamptz,
+    constraint notification_deliveries_target_unique unique (incident_id, round, target_key),
+    constraint notification_deliveries_has_target check (user_id is not null or channel_id is not null),
+    constraint notification_deliveries_sent_has_time check (status <> 'sent' or sent_at is not null)
+);
+create index notification_deliveries_due_idx on notification_deliveries (next_attempt_at)
+    where status in ('pending', 'sending');
+-- Rate caps look at recent sends per channel and per user.
+create index notification_deliveries_channel_sent_idx on notification_deliveries (channel_id, sent_at)
+    where channel_id is not null and status = 'sent';
+create index notification_deliveries_email_sent_idx on notification_deliveries (user_id, sent_at)
+    where channel_id is null and status = 'sent';

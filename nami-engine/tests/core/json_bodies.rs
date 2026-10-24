@@ -183,6 +183,8 @@ async fn every_state_changing_route_refuses_bodies_that_are_not_json(pool: sqlx:
         ("PATCH", format!("/projects/{project}/notification-channels/{}", Uuid::new_v4())),
         ("POST", "/account/notification-channels".to_string()),
         ("PATCH", format!("/account/notification-channels/{}", Uuid::new_v4())),
+        ("POST", format!("/projects/{project}/notification-channels/{}/test", Uuid::new_v4())),
+        ("POST", format!("/account/notification-channels/{}/test", Uuid::new_v4())),
         ("POST", format!("/projects/{project}/incidents")),
         ("PATCH", format!("/projects/{project}/incidents/{incident}")),
         ("POST", format!("/projects/{project}/incidents/{incident}/acknowledge")),
