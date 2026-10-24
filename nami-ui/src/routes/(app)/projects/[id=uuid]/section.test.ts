@@ -217,16 +217,25 @@ describe('on call now card (NAMI-INC-15)', () => {
 });
 
 describe('new monitor load', () => {
-	it('offers the groups of the project', async () => {
+	it('offers the groups, escalation policies and severities of the project', async () => {
 		const groups = [{ id: 'g1', name: 'APIs' }];
-		const { event, calls } = fakeEvent({ body: JSON.stringify(groups) });
-		expect(await loadNew(event)).toEqual({ groups });
-		expect(calls().map((call) => call.path)).toEqual([`/projects/${PROJECT_ID}/monitor-groups`]);
+		const policies = [{ id: 'p1', name: 'Default', is_default: true }];
+		const severities = [{ id: 's1', name: 'high', rank: 2, is_default: true }];
+		const { event, calls } = fakeEvent({
+			respond: (url) =>
+				new Response(JSON.stringify(url.pathname.endsWith('/severities') ? severities : url.pathname.endsWith('/escalation-policies') ? policies : groups))
+		});
+		expect(await loadNew(event)).toEqual({ groups, policies, severities });
+		expect(calls().map((call) => call.path)).toEqual([
+			`/projects/${PROJECT_ID}/monitor-groups`,
+			`/projects/${PROJECT_ID}/escalation-policies`,
+			`/projects/${PROJECT_ID}/severities`
+		]);
 	});
 
-	it('offers no groups, and still opens, when they cannot be loaded', async () => {
+	it('offers no groups, policies or severities, and still opens, when they cannot be loaded', async () => {
 		const { event } = fakeEvent({ status: 500, body: '{"error":"internal error"}' });
-		expect(await loadNew(event)).toEqual({ groups: [] });
+		expect(await loadNew(event)).toEqual({ groups: [], policies: [], severities: [] });
 	});
 
 	it('sends a visitor whose session is gone to the login page', async () => {

@@ -434,3 +434,28 @@ describe('monitorPayloadFromForm advanced options', () => {
 		).toBe(true);
 	});
 });
+
+describe('monitorPayloadFromForm escalation policy and severity (NAMI-INC-14)', () => {
+	const P = '0b9d1f6c-5a3e-4c2f-9d47-6e8a1c3b7f25';
+	const tcp = { name: 'A', check_type: 'tcp', host: 'h', port: '1' };
+
+	it('omits empty values on create and sends the chosen ids', () => {
+		const empty = monitorPayloadFromForm(form({ ...tcp, escalation_policy_id: '', severity_id: '' }));
+		expect(empty.ok && ('escalation_policy_id' in empty.payload || 'severity_id' in empty.payload)).toBe(false);
+		const set = monitorPayloadFromForm(form({ ...tcp, escalation_policy_id: P, severity_id: P }));
+		expect(set.ok && set.payload).toMatchObject({ escalation_policy_id: P, severity_id: P });
+	});
+
+	it('sends null for an empty value on edit', () => {
+		const result = monitorPayloadFromForm(form({ ...tcp, escalation_policy_id: '', severity_id: '' }), 'edit');
+		expect(result.ok && result.payload).toMatchObject({ escalation_policy_id: null, severity_id: null });
+	});
+
+	it('refuses a value that is not a UUID', () => {
+		expect(monitorPayloadFromForm(form({ ...tcp, escalation_policy_id: '../auth/me' }), 'edit')).toEqual({
+			ok: false,
+			message: 'Pick the escalation policy from the list.'
+		});
+		expect(monitorPayloadFromForm(form({ ...tcp, severity_id: 'high' })).ok).toBe(false);
+	});
+});

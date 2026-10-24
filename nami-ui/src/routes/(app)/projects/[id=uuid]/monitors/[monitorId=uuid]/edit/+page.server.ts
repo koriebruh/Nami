@@ -6,6 +6,7 @@ import {
 	enginePath,
 	redirectToLoginIfUnauthorized
 } from '#lib/server/core/engine';
+import { loadRoutingChoices } from '#lib/server/incidents/policy-form';
 import { monitorPayloadFromForm } from '#lib/server/uptime/monitor-form';
 import type { Monitor, MonitorGroup } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad } from './$types';
@@ -17,9 +18,10 @@ export const load: PageServerLoad = async (event) => {
 	// too), and only here: SvelteKit throws when a header is set twice.
 	event.setHeaders({ 'cache-control': 'private, no-store' });
 
-	const [response, groupsResponse] = await Promise.all([
+	const [response, groupsResponse, routing] = await Promise.all([
 		callEngine(event, enginePath`/projects/${event.params.id}/monitors/${event.params.monitorId}`),
-		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`)
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`),
+		loadRoutingChoices(event)
 	]);
 	redirectToLoginIfUnauthorized(response);
 	if (response.status === 404) throw error(404, 'Monitor not found.');
@@ -28,7 +30,7 @@ export const load: PageServerLoad = async (event) => {
 	}
 	const monitor: Monitor = await response.json();
 	const groups: MonitorGroup[] = groupsResponse.ok ? await groupsResponse.json() : [];
-	return { monitor, groups };
+	return { monitor, groups, ...routing };
 };
 
 export const actions: Actions = {

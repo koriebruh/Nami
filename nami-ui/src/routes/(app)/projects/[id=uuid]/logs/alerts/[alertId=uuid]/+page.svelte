@@ -103,7 +103,15 @@
 		<!-- Keyed, so that opening another alert starts from its own values. -->
 		{#key data.alert.id}
 			<form method="POST" action="?/update" use:enhance={submitWith(false)}>
-				<LogAlertForm initial={data.alert} sources={data.sources} previewUrl="{list}/preview" submitLabel="Save" {busy} />
+				<LogAlertForm
+					initial={data.alert}
+					sources={data.sources}
+					policies={data.policies}
+					severities={data.severities}
+					previewUrl="{list}/preview"
+					submitLabel="Save"
+					{busy}
+				/>
 			</form>
 		{/key}
 	</div>

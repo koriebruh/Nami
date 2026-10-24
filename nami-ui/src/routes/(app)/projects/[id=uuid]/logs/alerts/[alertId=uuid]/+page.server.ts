@@ -3,6 +3,7 @@ import { callEngine, engineFailure, enginePath } from '#lib/server/core/engine';
 import { formText } from '#lib/server/uptime/monitor-form';
 import { logAlertPayloadFromForm } from '#lib/server/logs/log-alert-form';
 import { loaded, loadSources } from '#lib/server/logs/log-alert-load';
+import { loadRoutingChoices } from '#lib/server/incidents/policy-form';
 import type { LogAlert } from '#lib/logs/log-alerts';
 import type { Actions, PageServerLoad } from './$types';
 
@@ -12,12 +13,13 @@ function alertPath(params: { id: string; alertId: string }): string {
 
 export const load: PageServerLoad = async (event) => {
 	const alert = await loaded<LogAlert>(await callEngine(event, alertPath(event.params)), 'log alert');
-	return { alert, sources: await loadSources(event) };
+	const [sources, routing] = await Promise.all([loadSources(event), loadRoutingChoices(event)]);
+	return { alert, sources, ...routing };
 };
 
 export const actions: Actions = {
 	update: async (event) => {
-		const parsed = logAlertPayloadFromForm(await event.request.formData());
+		const parsed = logAlertPayloadFromForm(await event.request.formData(), 'edit');
 		if (!parsed.ok) return fail(400, { action: 'update' as const, message: parsed.message });
 		const response = await callEngine(event, alertPath(event.params), {
 			method: 'PATCH',

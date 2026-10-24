@@ -35,4 +35,19 @@ describe('logAlertPayloadFromForm', () => {
 		expect(logAlertPayloadFromForm(form([...base, ['source', 'not-a-uuid']])).ok).toBe(false);
 		expect(logAlertPayloadFromForm(form([...base, ['filter', '{nope']])).ok).toBe(false);
 	});
+	it('omits an empty policy and severity on create, sends null on edit, refuses junk (NAMI-INC-14)', () => {
+		const P = '0b9d1f6c-5a3e-4c2f-9d47-6e8a1c3b7f25';
+		const empty: [string, string][] = [...base, ['escalation_policy_id', ''], ['severity_id', '']];
+		const created = logAlertPayloadFromForm(form(empty));
+		expect(created.ok && ('escalation_policy_id' in created.payload || 'severity_id' in created.payload)).toBe(false);
+		expect(logAlertPayloadFromForm(form(empty), 'edit')).toMatchObject({ ok: true, payload: { escalation_policy_id: null, severity_id: null } });
+		expect(logAlertPayloadFromForm(form([...base, ['escalation_policy_id', P], ['severity_id', P]]))).toMatchObject({
+			ok: true,
+			payload: { escalation_policy_id: P, severity_id: P }
+		});
+		expect(logAlertPayloadFromForm(form([...base, ['escalation_policy_id', 'nope']]), 'edit')).toEqual({
+			ok: false,
+			message: 'Pick the escalation policy from the list.'
+		});
+	});
 });

@@ -11,6 +11,7 @@
 			{ href: `/projects/${data.project.id}/monitors`, label: 'Monitors' },
 			{ href: `/projects/${data.project.id}/heartbeats`, label: 'Heartbeats' },
 			{ href: `/projects/${data.project.id}/incidents`, label: 'Incidents' },
+			{ href: `/projects/${data.project.id}/escalation`, label: 'Escalation' },
 			{ href: `/projects/${data.project.id}/oncall`, label: 'On-call' },
 			{ href: `/projects/${data.project.id}/logs`, label: 'Logs' },
 			{ href: `/projects/${data.project.id}/maintenance`, label: 'Maintenance' },

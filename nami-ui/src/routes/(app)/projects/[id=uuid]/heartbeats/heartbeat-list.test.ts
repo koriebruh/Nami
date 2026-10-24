@@ -4,11 +4,14 @@ import { actions, load } from './+page.server';
 
 const heartbeatsPath = `/projects/${PROJECT_ID}/heartbeats`;
 
-/** The heartbeats call and the groups call answer differently. */
+/** The heartbeats call and the groups call answer differently; the policy and severity selects get none. */
 const answer = (heartbeats: unknown, groups: unknown, groupsStatus = 200) => (url: URL) =>
 	url.pathname.endsWith('/monitor-groups')
 		? new Response(JSON.stringify(groups), { status: groupsStatus })
-		: new Response(JSON.stringify(heartbeats), { status: 200 });
+		: /\/(escalation-policies|severities)$/.test(url.pathname)
+			? new Response('[]')
+			: new Response(JSON.stringify(heartbeats), { status: 200 });
+const noRouting = { policies: [], severities: [] };
 
 type Scenario = [name: string, engine: Parameters<typeof fakeEvent>[0], rejection: { status: number } | null];
 
@@ -26,10 +29,12 @@ describe('heartbeat list load', () => {
 		process.env.PUBLIC_ENGINE_URL = 'https://engine.example.com/';
 		const heartbeats = [{ id: HEARTBEAT_ID, name: 'Backup', token: 'a'.repeat(64) }];
 		const { event, calls } = fakeEvent({ respond: answer(heartbeats, []) });
-		expect(await load(event)).toEqual({ heartbeats, groups: [], engineUrl: 'https://engine.example.com' });
+		expect(await load(event)).toEqual({ heartbeats, groups: [], engineUrl: 'https://engine.example.com', ...noRouting });
 		expect(calls()).toEqual([
 			{ method: 'GET', path: heartbeatsPath, search: '', body: undefined },
-			{ method: 'GET', path: `/projects/${PROJECT_ID}/monitor-groups`, search: '', body: undefined }
+			{ method: 'GET', path: `/projects/${PROJECT_ID}/monitor-groups`, search: '', body: undefined },
+			{ method: 'GET', path: `/projects/${PROJECT_ID}/escalation-policies`, search: '', body: undefined },
+			{ method: 'GET', path: `/projects/${PROJECT_ID}/severities`, search: '', body: undefined }
 		]);
 	});
 
@@ -39,7 +44,7 @@ describe('heartbeat list load', () => {
 		const heartbeats = [{ id: HEARTBEAT_ID, name: 'Backup', token: null }];
 		const { event } = fakeEvent({ respond: answer(heartbeats, []) });
 		const data = await load(event);
-		expect(data).toEqual({ heartbeats, groups: [], engineUrl: 'http://localhost:8081' });
+		expect(data).toEqual({ heartbeats, groups: [], engineUrl: 'http://localhost:8081', ...noRouting });
 		expect(data).toHaveProperty('heartbeats.0.token', null);
 	});
 
@@ -74,7 +79,9 @@ describe('heartbeat list load', () => {
 		await load(event);
 		expect(calls().map((call) => call.path + call.search)).toEqual([
 			'/projects/..%2Fauth%2Fme%3F/heartbeats',
-			'/projects/..%2Fauth%2Fme%3F/monitor-groups'
+			'/projects/..%2Fauth%2Fme%3F/monitor-groups',
+			'/projects/..%2Fauth%2Fme%3F/escalation-policies',
+			'/projects/..%2Fauth%2Fme%3F/severities'
 		]);
 	});
 
@@ -193,5 +200,24 @@ describe('new heartbeat action', () => {
 		await expect(actions.default(event)).rejects.toMatchObject({
 			location: `${heartbeatsPath}/..%2F..%2Fauth%2Fme%3F`
 		});
+	});
+});
+
+describe('new heartbeat action, escalation policy and severity (NAMI-INC-14)', () => {
+	const fields = { name: 'Nightly backup', period_seconds: '86400' };
+
+	it('omits "Project default" on create and sends a chosen id', async () => {
+		const empty = fakeEvent({ form: { ...fields, escalation_policy_id: '', severity_id: '' }, status: 201, body: JSON.stringify({ id: HEARTBEAT_ID }) });
+		await expect(actions.default(empty.event)).rejects.toMatchObject({ status: 303 });
+		expect(empty.calls()[0].body).toBe('{"name":"Nightly backup","period_seconds":86400}');
+		const set = fakeEvent({ form: { ...fields, severity_id: HEARTBEAT_ID }, status: 201, body: JSON.stringify({ id: HEARTBEAT_ID }) });
+		await expect(actions.default(set.event)).rejects.toMatchObject({ status: 303 });
+		expect(JSON.parse(set.calls()[0].body!)).toMatchObject({ severity_id: HEARTBEAT_ID });
+	});
+
+	it('refuses a value that is not a UUID without calling the engine', async () => {
+		const { event, calls } = fakeEvent({ form: { ...fields, severity_id: 'high' } });
+		expect(await actions.default(event)).toMatchObject({ status: 400, data: { message: 'Pick the severity from the list.' } });
+		expect(calls()).toEqual([]);
 	});
 });

@@ -1,4 +1,5 @@
 import { isUuid } from '#lib/core/uuid';
+import { addRouting } from '#lib/server/incidents/policy-form';
 import {
 	INTERVAL_RANGE,
 	MAX_THRESHOLD,
@@ -16,6 +17,9 @@ export type LogAlertPayload = {
 	window_seconds: number;
 	interval_seconds: number;
 	enabled: boolean;
+	/** Omitted: the project default (create) or unchanged (edit); null on edit: back to the default. */
+	escalation_policy_id?: string | null;
+	severity_id?: string | null;
 };
 
 type Result = { ok: true; payload: LogAlertPayload } | { ok: false; message: string };
@@ -36,7 +40,7 @@ function inRange(raw: string, range: { min: number; max: number }): number | nul
  * Invalid input is refused rather than dropped: an alert must count exactly
  * what the form showed. The engine validates everything again.
  */
-export function logAlertPayloadFromForm(form: FormData): Result {
+export function logAlertPayloadFromForm(form: FormData, mode: 'create' | 'edit' = 'create'): Result {
 	const name = last(form, 'name');
 	const length = [...name].length;
 	if (length < 1 || length > 200) return { ok: false, message: 'The name must be 1 to 200 characters.' };
@@ -80,16 +84,16 @@ export function logAlertPayloadFromForm(form: FormData): Result {
 	}
 	if (patterns.length) query.pattern_hashes = [...new Set(patterns)];
 
-	return {
-		ok: true,
-		payload: {
-			name,
-			query,
-			threshold,
-			comparison,
-			window_seconds: window,
-			interval_seconds: interval,
-			enabled: form.has('enabled')
-		}
+	const payload: LogAlertPayload = {
+		name,
+		query,
+		threshold,
+		comparison,
+		window_seconds: window,
+		interval_seconds: interval,
+		enabled: form.has('enabled')
 	};
+	const routingError = addRouting(form, payload, mode);
+	if (routingError) return { ok: false, message: routingError };
+	return { ok: true, payload };
 }

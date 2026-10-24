@@ -70,3 +70,18 @@ describe('new log alert', () => {
 		});
 	});
 });
+
+describe('new log alert, escalation policy and severity (NAMI-INC-14)', () => {
+	it('omits "Project default" on create', async () => {
+		const { event, calls } = fakeEvent({ form: { ...form, escalation_policy_id: '', severity_id: '' }, respond: () => json(alert, 201) });
+		await expect(newActions.create(event)).rejects.toMatchObject({ status: 303 });
+		expect(JSON.parse(calls()[0].body!)).not.toHaveProperty('escalation_policy_id');
+		expect(JSON.parse(calls()[0].body!)).not.toHaveProperty('severity_id');
+	});
+
+	it('refuses a value that is not a UUID without calling the engine', async () => {
+		const { event, calls } = fakeEvent({ form: { ...form, escalation_policy_id: '../auth/me' } });
+		expect(await newActions.create(event)).toMatchObject({ status: 400 });
+		expect(calls()).toEqual([]);
+	});
+});

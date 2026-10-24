@@ -40,7 +40,9 @@ describe('heartbeat detail load', () => {
 			['GET', heartbeatPath],
 			['GET', pingsPath],
 			['GET', groupsPath],
-			['GET', `${heartbeatPath}/availability`]
+			['GET', `${heartbeatPath}/availability`],
+			['GET', `/projects/${PROJECT_ID}/escalation-policies`],
+			['GET', `/projects/${PROJECT_ID}/severities`]
 		]);
 		expect(calls()[1].search).toBe('?limit=50');
 		expect(calls()[3].search).toMatch(/^\?from=[^&]+&to=[^&]+$/);
@@ -72,7 +74,8 @@ describe('heartbeat detail load', () => {
 		});
 		const data = (await load(event)) as any;
 		expect(data.availability).toMatchObject({ range: { key: '7d' }, data: availability, unavailable: false });
-		expect(calls()).toHaveLength(4);
+		// The heartbeat, pings, groups, availability, policies and severities.
+		expect(calls()).toHaveLength(6);
 	});
 
 	it('is a 404 for a heartbeat the engine does not have', async () => {
@@ -118,7 +121,9 @@ describe('heartbeat detail load', () => {
 			`${base}/heartbeats/${HEARTBEAT_ID}`,
 			`${base}/heartbeats/${HEARTBEAT_ID}/pings`,
 			`${base}/monitor-groups`,
-			`${base}/heartbeats/${HEARTBEAT_ID}/availability`
+			`${base}/heartbeats/${HEARTBEAT_ID}/availability`,
+			`${base}/escalation-policies`,
+			`${base}/severities`
 		]);
 
 		const heartbeat = fakeEvent({ params: { heartbeatId: hostile }, body: '{}' });
@@ -127,7 +132,9 @@ describe('heartbeat detail load', () => {
 			`${listPath}/${hostileSegment}`,
 			`${listPath}/${hostileSegment}/pings`,
 			groupsPath,
-			`${listPath}/${hostileSegment}/availability`
+			`${listPath}/${hostileSegment}/availability`,
+			`/projects/${PROJECT_ID}/escalation-policies`,
+			`/projects/${PROJECT_ID}/severities`
 		]);
 	});
 

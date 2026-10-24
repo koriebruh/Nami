@@ -14,6 +14,8 @@
 	<MonitorForm
 		monitor={data.monitor}
 		groups={data.groups}
+		policies={data.policies}
+		severities={data.severities}
 		submitLabel="Save changes"
 		message={form?.message ?? null}
 		cancelHref="/projects/{data.project.id}/monitors/{data.monitor.id}"

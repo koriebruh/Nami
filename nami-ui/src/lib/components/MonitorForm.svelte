@@ -17,16 +17,22 @@
 		type Monitor,
 		type MonitorGroup
 	} from '#lib/uptime/uptime';
+	import type { PolicyOption, Severity } from '#lib/incidents/incidents';
+	import RoutingSelects from './RoutingSelects.svelte';
 
 	let {
 		monitor = null,
 		groups = [],
+		policies = [],
+		severities = [],
 		submitLabel,
 		message = null,
 		cancelHref
 	}: {
 		monitor?: Monitor | null;
 		groups?: MonitorGroup[];
+		policies?: PolicyOption[];
+		severities?: Severity[];
 		submitLabel: string;
 		message?: string | null;
 		cancelHref: string;
@@ -645,6 +651,10 @@
 					<option value={group.id}>{group.name}</option>
 				{/each}
 			</select>
+		</div>
+
+		<div class="grid gap-4 sm:grid-cols-2">
+			<RoutingSelects {policies} {severities} policyId={monitor?.escalation_policy_id} severityId={monitor?.severity_id} idPrefix="monitor" />
 		</div>
 	</fieldset>
 

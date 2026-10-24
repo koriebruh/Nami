@@ -90,6 +90,9 @@ export type Monitor = {
 	use_tls: boolean;
 	udp_payload: string | null;
 	group_id: string | null;
+	/** null: the project default. */
+	escalation_policy_id?: string | null;
+	severity_id?: string | null;
 	in_maintenance: boolean;
 	/** True when fields were masked (`***`) for the reader, a viewer. */
 	redacted: boolean;
@@ -170,6 +173,9 @@ export type Heartbeat = {
 	created_at: string;
 	in_maintenance: boolean;
 	group_id: string | null;
+	/** null: the project default. */
+	escalation_policy_id?: string | null;
+	severity_id?: string | null;
 };
 
 /** One ping a heartbeat received; `output` is plain text, never markup. */

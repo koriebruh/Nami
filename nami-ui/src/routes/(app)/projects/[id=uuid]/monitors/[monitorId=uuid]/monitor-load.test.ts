@@ -158,8 +158,14 @@ describe('edit page load', () => {
 		const { event, calls } = fakeEvent({
 			respond: (url) => new Response(JSON.stringify(url.pathname.endsWith('/monitor-groups') ? groups : monitor))
 		});
-		expect(await loadEdit(event)).toEqual({ monitor, groups });
-		expect(calls().map((call) => call.path)).toEqual([monitorPath, `/projects/${PROJECT_ID}/monitor-groups`]);
+		// The policies and severities calls get the monitor too, which is no list: their selects stay empty.
+		expect(await loadEdit(event)).toEqual({ monitor, groups, policies: [], severities: [] });
+		expect(calls().map((call) => call.path)).toEqual([
+			monitorPath,
+			`/projects/${PROJECT_ID}/monitor-groups`,
+			`/projects/${PROJECT_ID}/escalation-policies`,
+			`/projects/${PROJECT_ID}/severities`
+		]);
 	});
 
 	it('still opens, with no groups to pick, when they cannot be loaded', async () => {
@@ -170,7 +176,7 @@ describe('edit page load', () => {
 					? new Response('{"error":"internal error"}', { status: 500 })
 					: new Response(JSON.stringify(monitor))
 		});
-		expect(await loadEdit(event)).toEqual({ monitor, groups: [] });
+		expect(await loadEdit(event)).toEqual({ monitor, groups: [], policies: [], severities: [] });
 	});
 });
 
@@ -274,5 +280,25 @@ describe('edit page action', () => {
 	it('sends a visitor whose session is gone to the login page', async () => {
 		const { event } = fakeEvent({ form: fields, status: 401, body: '{"error":"unauthorized"}' });
 		await expect(editActions.default(event)).rejects.toMatchObject({ status: 303, location: '/login' });
+	});
+});
+
+describe('edit page action, escalation policy and severity (NAMI-INC-14)', () => {
+	const POLICY_ID = '7e8f9a0b-1c2d-4e3f-8a5b-6c7d8e9f0a1b';
+	const fields = { name: 'API', check_type: 'ping', host: 'example.com' };
+
+	it('sends null for "Project default" and the id otherwise', async () => {
+		const cleared = fakeEvent({ form: { ...fields, escalation_policy_id: '', severity_id: '' } });
+		await expect(editActions.default(cleared.event)).rejects.toMatchObject({ status: 303 });
+		expect(JSON.parse(cleared.calls()[0].body!)).toMatchObject({ escalation_policy_id: null, severity_id: null });
+		const set = fakeEvent({ form: { ...fields, escalation_policy_id: POLICY_ID, severity_id: POLICY_ID } });
+		await expect(editActions.default(set.event)).rejects.toMatchObject({ status: 303 });
+		expect(JSON.parse(set.calls()[0].body!)).toMatchObject({ escalation_policy_id: POLICY_ID, severity_id: POLICY_ID });
+	});
+
+	it('refuses a value that is not a UUID without calling the engine', async () => {
+		const { event, calls } = fakeEvent({ form: { ...fields, escalation_policy_id: '../auth/me' } });
+		expect(await editActions.default(event)).toMatchObject({ status: 400 });
+		expect(calls()).toEqual([]);
 	});
 });

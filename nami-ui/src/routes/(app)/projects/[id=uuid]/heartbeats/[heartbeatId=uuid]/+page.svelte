@@ -5,6 +5,7 @@
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import EmptyState from '#lib/components/ui/EmptyState.svelte';
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
+	import RoutingSelects from '#lib/components/RoutingSelects.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
 	import { exitCodeCommand, failUrl, formatSeconds, formatUtc, pingCommand, pingUrl, timeAgo } from '#lib/uptime/uptime';
 	import type { PageProps } from './$types';
@@ -322,6 +323,15 @@
 					<!-- Groups did not load: keep the heartbeat's group instead of ungrouping it. -->
 					<input type="hidden" name="group_id" value={savedGroup} />
 				{/if}
+				<div class="grid gap-4 sm:col-span-3 sm:grid-cols-2">
+					<RoutingSelects
+						policies={data.policies}
+						severities={data.severities}
+						policyId={data.heartbeat.escalation_policy_id}
+						severityId={data.heartbeat.severity_id}
+						idPrefix="hb"
+					/>
+				</div>
 				{@render submitButton('Save', primaryButton)}
 				<p id="hb-hint" class="text-xs text-muted sm:col-span-4">
 					Period: at least 30, grace: 0 or more, both at most 2678400 (31 days).

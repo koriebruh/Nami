@@ -33,7 +33,15 @@
 			<div role="alert" class="alert alert-danger">{form.message}</div>
 		{/if}
 		<form method="POST" action="?/create" use:enhance={submit}>
-			<LogAlertForm initial={data.initial} sources={data.sources} previewUrl="{base}/preview" submitLabel="Create alert" {busy} />
+			<LogAlertForm
+				initial={data.initial}
+				sources={data.sources}
+				policies={data.policies}
+				severities={data.severities}
+				previewUrl="{base}/preview"
+				submitLabel="Create alert"
+				{busy}
+			/>
 		</form>
 	</div>
 </div>
