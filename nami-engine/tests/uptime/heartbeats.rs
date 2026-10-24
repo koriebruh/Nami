@@ -3312,6 +3312,55 @@ async fn a_flapping_heartbeat_keeps_one_incident_and_sends_one_pair_of_emails(po
     );
 }
 
+/// A held heartbeat page waits for a project-wide maintenance window to end
+/// (ruling on NAMI-INC-10; Phase 3's held-DOWN case under escalation).
+#[sqlx::test]
+async fn a_held_heartbeat_page_waits_for_maintenance_to_end(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let public = unthrottled_public(state.clone());
+    let (project, recipient) = project_with_recipient(&pool).await;
+    let (id, token) = seed_heartbeat(&pool, project, "Flaky job", 3600, 60, 0).await;
+    for (n, path) in ["fail", "0", "fail"].into_iter().enumerate() {
+        let (status, _, _) =
+            ping_with(&public, &format!("/api/v1/heartbeat/{token}/{path}"), vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+        if n == 0 {
+            // Let the first page leave before the recovery resolves it; the
+            // second failure falls inside the paging gap (R31).
+            settled_mail(&recipient, 1).await;
+        }
+    }
+    let window: Uuid = sqlx::query_scalar(
+        "insert into maintenance_windows (project_id, title, kind, starts_at, ends_at)
+         values ($1, 'maintenance', 'once', now() - interval '5 minutes', now() + interval '1 hour')
+         returning id",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let held: Uuid =
+        sqlx::query_scalar("select id from incidents where heartbeat_id = $1 and status = 'open'")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    common::make_escalation_due(&pool, held).await;
+    common::run_incident_ticks(&state).await;
+    assert_eq!(settled_mail(&recipient, 2).await.len(), 2, "held by the window");
+
+    sqlx::query("delete from maintenance_windows where id = $1")
+        .bind(window)
+        .execute(&pool)
+        .await
+        .unwrap();
+    common::make_escalation_due(&pool, held).await;
+    common::run_incident_ticks(&state).await;
+    let mail = settled_mail(&recipient, 3).await;
+    assert_eq!(mail.len(), 3);
+    assert_eq!(mail[2].0, "[Nami] [high] Flaky job reported a failure");
+}
+
 /// A failure soon after a recovery reopens the same incident (same id, the
 /// latest cause and output); one after the reopen window opens a new one,
 /// and alerts.
@@ -3380,8 +3429,7 @@ async fn a_failure_reopens_a_recent_incident_and_opens_a_new_one_later(pool: sql
     .await
     .unwrap();
     sqlx::query(
-        "update notification_deliveries set created_at = created_at - interval '7 minutes'
-         where incident_id in (select id from incidents where heartbeat_id = $1)",
+        "update heartbeats set last_paged_at = last_paged_at - interval '7 minutes' where id = $1",
     )
     .bind(id)
     .execute(&pool)

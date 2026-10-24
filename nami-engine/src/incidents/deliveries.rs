@@ -457,7 +457,29 @@ async fn record(pool: &PgPool, row: &Claimed, outcome: Outcome) -> Result<(), sq
         lifecycle::record_event(&mut tx, row.incident_id, kind, None, Some(&recorded(&message)), json!({}))
             .await?;
     }
-    tx.commit().await
+    tx.commit().await?;
+    if updated == 1 && status == "sent" && row.event == "triggered" {
+        note_page(pool, row.incident_id).await;
+    }
+    Ok(())
+}
+
+// R31: the source of the incident (none for a manual one) was paged now.
+const NOTE_PAGE: &str = "with i as (select monitor_id, heartbeat_id, log_alert_id from incidents where id = $1),
+    m as (update monitors set last_paged_at = now() where id = (select monitor_id from i)),
+    h as (update heartbeats set last_paged_at = now() where id = (select heartbeat_id from i))
+    update log_alerts set last_paged_at = now() where id = (select log_alert_id from i)";
+
+/// Sets the incident's source's `last_paged_at`, which holds the source's
+/// next automatic incident off (`lifecycle::SOURCE_PAGE_GAP_SECS`). Its own
+/// statement, after the delivery's transaction: the source row is the lock
+/// the uptime worker and the heartbeat ping take before the incident, and
+/// that transaction holds a key share on the incident. A failure is logged;
+/// the notification itself was sent and recorded.
+async fn note_page(pool: &PgPool, incident_id: Uuid) {
+    if let Err(e) = sqlx::query(NOTE_PAGE).bind(incident_id).execute(pool).await {
+        tracing::warn!(%incident_id, error = %e, "recording the source's last page failed");
+    }
 }
 
 #[cfg(test)]

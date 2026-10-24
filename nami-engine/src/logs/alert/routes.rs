@@ -108,6 +108,13 @@ async fn checked(
 }
 
 /// A policy or severity of another project is a 404, like any foreign id.
+///
+/// A foreign *source* in the query is a 400 (`saved_query::check_sources`),
+/// so one request can answer either. Sources follow STANDARDS §4, an id of
+/// another project stored in a row is a 400, as for saved views. The policy
+/// and severity follow the incident plan (NAMI-INC-10), which gives monitors,
+/// heartbeats and log alerts the same 404 as a foreign `group_id` on a
+/// monitor. Kept on controller ruling; recorded in the phase's decisions.
 async fn check_routing(
     state: &AppState,
     project_id: Uuid,
@@ -232,9 +239,12 @@ async fn patch_alert(
     match updated {
         UpdatedAlert::Updated(alert) => {
             // Disabling an alerting alert resolved its incident (R17): send
-            // the resolved notices now, not at the worker's next tick.
+            // the resolved notices now, not at the worker's next tick. In a
+            // task of its own: a drain waits for every send it claimed, which
+            // a slow SMTP server stretches far past a request's patience, and
+            // the queue is durable (the worker loop is the backstop).
             if disabling {
-                crate::incidents::worker::kick(&state).await;
+                tokio::spawn(async move { crate::incidents::worker::kick(&state).await });
             }
             Ok(Json(alert))
         }

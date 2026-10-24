@@ -19,3 +19,10 @@ create index monitors_severity_idx on monitors (severity_id) where severity_id i
 create index heartbeats_escalation_policy_idx on heartbeats (escalation_policy_id)
     where escalation_policy_id is not null;
 create index heartbeats_severity_idx on heartbeats (severity_id) where severity_id is not null;
+-- R31: when one of the source's step notifications was last sent
+-- (incidents::deliveries). An automatic open or reopen of its incident runs
+-- its first step no sooner than SOURCE_PAGE_GAP_SECS after it. Read by
+-- primary key, so the hold costs the same however many incidents the source
+-- has had.
+alter table monitors add column last_paged_at timestamptz;
+alter table heartbeats add column last_paged_at timestamptz;

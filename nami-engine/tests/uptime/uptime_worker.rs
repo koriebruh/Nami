@@ -1731,3 +1731,96 @@ async fn a_flapping_monitor_sends_one_pair_per_window_and_reports_staying_down_l
     assert_eq!(mail.len(), 3, "sent once");
     assert_eq!(mail[2].0, "[Nami] [high] Flaky API is down");
 }
+
+/// A monitor whose page R31 holds: down (paged), up, down again inside the
+/// paging gap. Returns the monitor and its held incident.
+async fn monitor_with_held_page(
+    state: &AppState,
+    pool: &sqlx::PgPool,
+    project: Uuid,
+    recipient: &str,
+) -> (Uuid, Uuid) {
+    let monitor = seed_http_monitor(pool, project, "Held API", "http://127.0.0.1:9/", 1).await;
+    let snapshot = claimed_snapshot(pool, monitor).await;
+    for (second, check) in [
+        (60, failed_check()),
+        (120, passed_check()),
+        (180, failed_check()),
+    ] {
+        let transition = apply_outcome(pool, &snapshot, &at(check, second))
+            .await
+            .unwrap()
+            .expect("a transition");
+        notify_transition(state, &transition).await;
+    }
+    assert_eq!(settled_mail(recipient, 2).await.len(), 2, "down and resolved");
+    let held = sqlx::query_scalar("select id from incidents where monitor_id = $1 and status = 'open'")
+        .bind(monitor)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    (monitor, held)
+}
+
+/// A held page goes out once the gap is over only for a monitor still
+/// watched (ruling on NAMI-INC-10; Phase 3's held-DOWN cases under
+/// escalation): pausing the monitor stops its incident's escalation,
+/// deleting it takes the incident along, and a maintenance window (scoped to
+/// it or project-wide) defers the page until the window ends.
+#[sqlx::test]
+async fn a_held_page_waits_for_paused_deleted_or_maintained_monitors(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    for case in ["still down", "paused", "deleted", "scoped maintenance", "project maintenance"] {
+        let (project, recipient) = project_with_recipient(&pool).await;
+        let (monitor, held) = monitor_with_held_page(&state, &pool, project, &recipient).await;
+        let window = match case {
+            "paused" | "deleted" => {
+                let sql = if case == "paused" {
+                    "update monitors set paused = true where id = $1"
+                } else {
+                    "delete from monitors where id = $1"
+                };
+                sqlx::query(sql).bind(monitor).execute(&pool).await.unwrap();
+                None
+            }
+            "still down" => None,
+            _ => {
+                let scope = (case == "scoped maintenance").then_some(monitor);
+                let id: Uuid = sqlx::query_scalar(
+                    "insert into maintenance_windows (project_id, monitor_id, title, kind, starts_at, ends_at)
+                     values ($1, $2, 'maintenance', 'once', now() - interval '5 minutes', now() + interval '1 hour')
+                     returning id",
+                )
+                .bind(project)
+                .bind(scope)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                Some(id)
+            }
+        };
+        make_escalation_due(&pool, held).await;
+        run_incident_ticks(&state).await;
+        let mail = settled_mail(&recipient, 3).await;
+        if case == "still down" {
+            assert_eq!(mail.len(), 3, "{case}");
+            assert_eq!(mail[2].0, "[Nami] [high] Held API is down", "{case}");
+            continue;
+        }
+        assert_eq!(mail.len(), 2, "{case}: held");
+        let Some(window) = window else {
+            continue;
+        };
+        // The window ends: the deferred page goes out.
+        sqlx::query("delete from maintenance_windows where id = $1")
+            .bind(window)
+            .execute(&pool)
+            .await
+            .unwrap();
+        make_escalation_due(&pool, held).await;
+        run_incident_ticks(&state).await;
+        let mail = settled_mail(&recipient, 3).await;
+        assert_eq!(mail.len(), 3, "{case}");
+        assert_eq!(mail[2].0, "[Nami] [high] Held API is down", "{case}");
+    }
+}

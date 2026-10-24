@@ -3,7 +3,7 @@ use crate::common;
 
 use chrono::{DateTime, Utc};
 use common::{seed_http_monitor, seed_project, seed_user, unique_email};
-use nami_engine::incidents::lifecycle::{self, IncidentSource, OpenIncident, Reopen};
+use nami_engine::incidents::lifecycle::{self, IncidentSource, OpenIncident, Reopen, Routing};
 use nami_engine::incidents::model as incident;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -420,7 +420,7 @@ async fn an_automatic_reopen_leaves_the_latest_incident_alone_while_an_older_one
         300,
         "flapping",
         None,
-        None,
+        Routing::default(),
         at(60),
     )
     .await
@@ -465,7 +465,7 @@ async fn an_automatic_reopen_racing_a_manual_reopen_of_another_incident_returns_
                 300,
                 "flapping",
                 None,
-                None,
+                Routing::default(),
                 at(60),
             )
             .await

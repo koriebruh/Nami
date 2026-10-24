@@ -5,7 +5,7 @@ use serde_json::json;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::incidents::lifecycle::{self, EventKind, IncidentSource, OpenIncident};
+use crate::incidents::lifecycle::{self, EventKind, IncidentSource, OpenIncident, Routing};
 
 /// Longest incident title, in characters (one line).
 pub const MAX_TITLE_CHARS: usize = 255;
@@ -447,7 +447,8 @@ pub const HEARTBEAT_REOPEN_WINDOW_SECS: i32 = 5 * 60;
 /// heartbeat's latest incident was resolved less than
 /// [`HEARTBEAT_REOPEN_WINDOW_SECS`] before `started_at`, that incident is
 /// reopened (`lifecycle::reopen_source_within`: status open, title and cause
-/// replaced, details cleared for the caller to attach the new ones; its id
+/// replaced, details cleared for the caller to attach the new ones, the
+/// heartbeat's current policy and severity or the project's defaults; its id
 /// and `started_at` stay) and its id returned, instead of a new row. A job
 /// that fails and succeeds in turn (`/fail`, then `/0`, as fast as the ping
 /// rate limit allows) therefore keeps one incident row, however long it
@@ -470,7 +471,7 @@ pub async fn open_for_heartbeat(
         HEARTBEAT_REOPEN_WINDOW_SECS,
         title,
         cause,
-        escalation_policy_id,
+        Routing { escalation_policy_id, severity_id },
         started_at,
     )
     .await?;

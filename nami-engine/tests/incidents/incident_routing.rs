@@ -7,7 +7,14 @@ use common::{
     call, seed_http_monitor, seed_project, set_policy, settled_mail, state_with_clickhouse,
     test_app, user_with_role,
 };
+use chrono::{DateTime, Utc};
 use nami_engine::{
+    core::state::AppState,
+    incidents::{
+        escalation::run,
+        lifecycle::{self, IncidentSource, OpenIncident, SOURCE_PAGE_GAP_SECS},
+        model as incident,
+    },
     logs::alert,
     uptime::{alerts as uptime_alerts, worker},
 };
@@ -133,6 +140,9 @@ async fn a_log_alert_opens_its_incident_on_its_policy_and_severity(pool: sqlx::P
     ch.drop_database().await.unwrap();
 }
 
+/// A policy or severity of another project is a 404 on every source, create
+/// and patch alike (like a foreign `group_id`; log alerts answer a foreign
+/// log source with a 400, see `logs::alert::routes::check_routing`).
 #[sqlx::test]
 async fn foreign_policies_and_severities_are_refused_on_sources(pool: sqlx::PgPool) {
     let app = test_app(pool.clone());
@@ -174,11 +184,11 @@ async fn foreign_policies_and_severities_are_refused_on_sources(pool: sqlx::PgPo
         assert_eq!((status, &cleared["severity_id"]), (StatusCode::OK, &json!(null)), "PATCH {item}: {cleared}");
         for field in [json!({"escalation_policy_id": foreign_policy}), json!({"severity_id": foreign_severity})] {
             let (status, _) = call(&app, "PATCH", item, Some(&admin), Some(field.clone())).await;
-            assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND, "PATCH {item} {field}: {status}");
+            assert_eq!(status, StatusCode::NOT_FOUND, "PATCH {item} {field}");
             let mut body = create.clone();
             body.as_object_mut().unwrap().extend(field.as_object().unwrap().clone());
             let (status, _) = call(&app, "POST", list, Some(&admin), Some(body)).await;
-            assert!(status == StatusCode::BAD_REQUEST || status == StatusCode::NOT_FOUND, "POST {list} {field}: {status}");
+            assert_eq!(status, StatusCode::NOT_FOUND, "POST {list} {field}");
         }
     }
 }
@@ -219,8 +229,7 @@ async fn disabling_an_alerting_log_alert_resolves_and_tells_the_paged_why(pool: 
 /// inside its paging gap pages at once.
 #[sqlx::test]
 async fn a_manual_reopen_inside_the_paging_gap_pages_at_once(pool: sqlx::PgPool) {
-    use nami_engine::incidents::model as incident;
-    let state = nami_engine::core::state::AppState::for_test(pool.clone());
+    let state = AppState::for_test(pool.clone());
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
     let (_, email, member) = user_with_role(&app, &pool, project, Some("member")).await;
@@ -239,4 +248,210 @@ async fn a_manual_reopen_inside_the_paging_gap_pages_at_once(pool: sqlx::PgPool)
     let mail = settled_mail(&email, 3).await;
     let subjects: Vec<&str> = mail.iter().map(|(s, _)| s.as_str()).collect();
     assert_eq!(subjects, ["[Nami] [high] api is down", "[Nami] Resolved: api is down", "[Nami] [high] api is down"]);
+}
+
+/// The messages of the incident's `escalation_exhausted` events, oldest first.
+async fn exhausted(pool: &sqlx::PgPool, incident: Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "select message from incident_events where incident_id = $1 and kind = 'escalation_exhausted' order by id")
+        .bind(incident).fetch_all(pool).await.unwrap()
+}
+
+async fn next_escalation_at(pool: &sqlx::PgPool, incident: Uuid) -> Option<DateTime<Utc>> {
+    sqlx::query_scalar("select next_escalation_at from incidents where id = $1")
+        .bind(incident).fetch_one(pool).await.unwrap()
+}
+
+/// A step that comes due while its monitor or heartbeat is paused does not
+/// page (ruling on NAMI-INC-10): escalation stops and the timeline says why.
+/// Resuming the source runs that step, in the same generation, so the
+/// resolved notice reaches everyone paged before the pause as well.
+#[sqlx::test]
+async fn a_paused_source_stops_its_escalation_and_resuming_runs_the_due_step(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    for kind in ["monitor", "heartbeat"] {
+        let project = seed_project(&pool).await;
+        let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+        let (alice, alice_email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+        let (bob, bob_email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+        set_policy(&app, project, &admin, json!({"name": "Default", "steps": [
+            {"delay_minutes": 0, "targets": [{"type": "user", "id": alice}]},
+            {"delay_minutes": 10, "targets": [{"type": "user", "id": bob}]}]})).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let (path, id) = if kind == "monitor" {
+            let monitor = seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+            let id = incident::open_for_monitor(&mut conn, project, monitor, "api is down", None, Utc::now())
+                .await.unwrap().expect("opened");
+            (format!("/projects/{project}/monitors/{monitor}"), id)
+        } else {
+            let (status, hb) = call(&app, "POST", &format!("/projects/{project}/heartbeats"), Some(&admin),
+                Some(json!({"name": "api", "period_seconds": 60}))).await;
+            assert_eq!(status, StatusCode::CREATED, "{hb}");
+            let heartbeat: Uuid = hb["id"].as_str().unwrap().parse().unwrap();
+            let id = incident::open_for_heartbeat(&mut conn, project, heartbeat, "api is down", None, Utc::now())
+                .await.unwrap().expect("opened");
+            (format!("/projects/{project}/heartbeats/{heartbeat}"), id)
+        };
+        common::run_incident_ticks(&state).await;
+        assert_eq!(settled_mail(&alice_email, 1).await.len(), 1, "{kind}");
+
+        let (status, body) = call(&app, "PATCH", &path, Some(&admin), Some(json!({"paused": true}))).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+        common::make_escalation_due(&pool, id).await;
+        common::run_incident_ticks(&state).await;
+        common::run_incident_ticks(&state).await;
+        assert!(settled_mail(&bob_email, 0).await.is_empty(), "{kind}: step 2 came due while paused");
+        assert_eq!(next_escalation_at(&pool, id).await, None, "{kind}");
+        assert_eq!(exhausted(&pool, id).await, [format!("Escalation stopped: the {kind} is paused")]);
+
+        let (status, body) = call(&app, "PATCH", &path, Some(&admin), Some(json!({"paused": false}))).await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {body}");
+        common::run_incident_ticks(&state).await;
+        let mail = settled_mail(&bob_email, 1).await;
+        let subjects: Vec<&str> = mail.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(subjects, ["[Nami] [high] api is down"], "{kind}");
+        assert_eq!(settled_mail(&alice_email, 1).await.len(), 1, "{kind}: step 1 does not run again");
+
+        lifecycle::resolve(&mut conn, id, None, Utc::now()).await.unwrap();
+        common::run_incident_ticks(&state).await;
+        for email in [&alice_email, &bob_email] {
+            let mail = settled_mail(email, 2).await;
+            assert_eq!(mail.len(), 2, "{kind}: {mail:?}");
+            assert_eq!(mail[1].0, "[Nami] Resolved: api is down", "{kind}");
+        }
+    }
+}
+
+/// A maintenance window defers a due step until it is over, looking again
+/// at each tick (ruling on NAMI-INC-10). Only project-wide windows cover a
+/// log alert, as when it is evaluated. A manual incident is never held.
+#[sqlx::test]
+async fn maintenance_defers_a_log_alert_page_until_the_window_ends(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (member, email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let monitor = seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    let alert: Uuid = sqlx::query_scalar(
+        "insert into log_alerts (project_id, name, threshold, comparison, window_seconds, interval_seconds)
+         values ($1, 'Checkout errors', 10, 'gt', 300, 60) returning id")
+        .bind(project).fetch_one(&pool).await.unwrap();
+    let due = alert::claim_due_alerts(&pool, 10, &[]).await.unwrap();
+    alert::apply_evaluation(&pool, &due[0], 12, Utc::now()).await.unwrap().expect("alerting");
+    let id: Uuid = sqlx::query_scalar("select id from incidents where log_alert_id = $1")
+        .bind(alert).fetch_one(&pool).await.unwrap();
+    // Both windows begin after the incident opened, before its first step ran.
+    let mut windows = Vec::new();
+    for scope in [Some(monitor), None] {
+        let window: Uuid = sqlx::query_scalar(
+            "insert into maintenance_windows (project_id, monitor_id, title, kind, starts_at, ends_at)
+             values ($1, $2, 'maintenance', 'once', now() - interval '5 minutes', now() + interval '1 hour')
+             returning id")
+            .bind(project).bind(scope).fetch_one(&pool).await.unwrap();
+        windows.push(window);
+    }
+    common::run_incident_ticks(&state).await;
+    assert!(settled_mail(&email, 0).await.is_empty(), "deferred");
+    assert!(next_escalation_at(&pool, id).await.is_some_and(|at| at > Utc::now()), "looked at again later");
+    assert!(exhausted(&pool, id).await.is_empty(), "deferred, not stopped");
+
+    let mut conn = pool.acquire().await.unwrap();
+    lifecycle::open(&mut conn, &OpenIncident {
+        project_id: project, source: IncidentSource::Manual { created_by: member }, title: "Payments degraded",
+        cause: None, severity_id: None, metadata: None, escalation_policy_id: None, started_at: Utc::now(),
+    }).await.unwrap().expect("opened");
+    common::run_incident_ticks(&state).await;
+    let mail = settled_mail(&email, 1).await;
+    let subjects: Vec<&str> = mail.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(subjects, ["[Nami] [high] Payments degraded"], "a manual incident is never held");
+
+    // The project-wide window ends; the one scoped to a monitor never held the alert.
+    sqlx::query("delete from maintenance_windows where id = $1").bind(windows[1]).execute(&pool).await.unwrap();
+    common::make_escalation_due(&pool, id).await;
+    common::run_incident_ticks(&state).await;
+    let mail = settled_mail(&email, 2).await;
+    assert_eq!(mail.len(), 2, "{mail:?}");
+    assert_eq!(mail[1].0, "[Nami] [high] Log alert: Checkout errors");
+}
+
+/// A heartbeat incident reopened by a new failure takes the heartbeat's
+/// current policy and severity, and the project's defaults where it names
+/// none, never the incident's previous ones (ruling on NAMI-INC-10).
+#[sqlx::test]
+async fn a_reopened_heartbeat_incident_takes_the_heartbeats_current_routing(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (alice, alice_email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, bob_email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (status, policy) = call(&app, "POST", &format!("/projects/{project}/escalation-policies"), Some(&admin), Some(json!({
+        "name": "jobs", "steps": [{"delay_minutes": 0, "targets": [{"type": "user", "id": alice}]}]}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{policy}");
+    let critical = severity(&pool, project, "critical").await;
+    let (status, hb) = call(&app, "POST", &format!("/projects/{project}/heartbeats"), Some(&admin), Some(json!({
+        "name": "nightly backup", "period_seconds": 60, "escalation_policy_id": policy["id"], "severity_id": critical}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{hb}");
+    let heartbeat: Uuid = hb["id"].as_str().unwrap().parse().unwrap();
+    let title = "nightly backup reported a failure";
+    let mut conn = pool.acquire().await.unwrap();
+    let id = incident::open_for_heartbeat(&mut conn, project, heartbeat, title, None, Utc::now())
+        .await.unwrap().expect("opened");
+    common::run_incident_ticks(&state).await;
+    assert_eq!(settled_mail(&alice_email, 1).await[0].0, "[Nami] [critical] nightly backup reported a failure");
+
+    let (status, body) = call(&app, "PATCH", &format!("/projects/{project}/heartbeats/{heartbeat}"), Some(&admin),
+        Some(json!({"escalation_policy_id": null, "severity_id": null}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    incident::resolve_for_heartbeat(&mut conn, heartbeat, Utc::now()).await.unwrap();
+    let reopened = incident::open_for_heartbeat(&mut conn, project, heartbeat, title, None, Utc::now()).await.unwrap();
+    assert_eq!(reopened, Some(id), "the same incident, reopened");
+    let routing: (Uuid, Uuid) = sqlx::query_as("select escalation_policy_id, severity_id from incidents where id = $1")
+        .bind(id).fetch_one(&pool).await.unwrap();
+    let default_policy: Uuid = sqlx::query_scalar("select id from escalation_policies where project_id = $1 and is_default")
+        .bind(project).fetch_one(&pool).await.unwrap();
+    assert_eq!(routing, (default_policy, severity(&pool, project, "high").await));
+
+    // R31 holds the reopened page: alice was paged moments ago.
+    common::make_escalation_due(&pool, id).await;
+    common::run_incident_ticks(&state).await;
+    let mail = settled_mail(&bob_email, 1).await;
+    let subjects: Vec<&str> = mail.iter().map(|(s, _)| s.as_str()).collect();
+    assert_eq!(subjects, ["[Nami] [high] nightly backup reported a failure"], "the default policy pages every member");
+}
+
+/// R31 counts only pages that went out: a step notification cancelled by a
+/// quick resolve does not hold the monitor's next incident, and a sent one
+/// holds it until SOURCE_PAGE_GAP_SECS after it was sent.
+#[sqlx::test]
+async fn only_a_sent_page_holds_the_sources_next_incident(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, email, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let monitor = seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    let mut conn = pool.acquire().await.unwrap();
+    incident::open_for_monitor(&mut conn, project, monitor, "api is down", None, Utc::now())
+        .await.unwrap().expect("opened");
+    run::tick(&state).await.unwrap();
+    incident::resolve_for_monitor(&mut conn, monitor, Utc::now()).await.unwrap();
+    let statuses: Vec<String> = sqlx::query_scalar(
+        "select d.status from notification_deliveries d join incidents i on i.id = d.incident_id where i.monitor_id = $1")
+        .bind(monitor).fetch_all(&pool).await.unwrap();
+    assert_eq!(statuses, ["cancelled"]);
+
+    let second = incident::open_for_monitor(&mut conn, project, monitor, "api is down", None, Utc::now())
+        .await.unwrap().expect("opened");
+    assert!(next_escalation_at(&pool, second).await.is_some_and(|at| at <= Utc::now()), "a cancelled page paged nobody");
+    common::run_incident_ticks(&state).await;
+    assert_eq!(settled_mail(&email, 1).await.len(), 1);
+    incident::resolve_for_monitor(&mut conn, monitor, Utc::now()).await.unwrap();
+
+    let third = incident::open_for_monitor(&mut conn, project, monitor, "api is down", None, Utc::now())
+        .await.unwrap().expect("opened");
+    let (next, paged): (DateTime<Utc>, DateTime<Utc>) = sqlx::query_as(
+        "select i.next_escalation_at, m.last_paged_at from incidents i join monitors m on m.id = i.monitor_id where i.id = $1")
+        .bind(third).fetch_one(&pool).await.unwrap();
+    assert_eq!(next, paged + chrono::Duration::seconds(SOURCE_PAGE_GAP_SECS.into()));
 }

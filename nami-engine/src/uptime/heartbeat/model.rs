@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::core::error::AppError;
 use crate::core::validate::{nullable, validate_name, with_unchanged_values};
+use crate::incidents::lifecycle;
 use crate::uptime::group::model as monitor_group;
 
 /// The longest a heartbeat's period, or its grace, may be: 31 days.
@@ -408,6 +409,11 @@ pub async fn update_in_project(
         }
         _ => AppError::Database(e),
     })?;
+    if resumed {
+        // Under the heartbeat's lock, the order the ping and the sweep take too.
+        let source = lifecycle::IncidentSource::Heartbeat(heartbeat_id);
+        lifecycle::resume_source(&mut tx, &source, Utc::now()).await?;
+    }
     tx.commit().await?;
     Ok(Some(updated))
 }

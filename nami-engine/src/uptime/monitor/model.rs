@@ -19,6 +19,7 @@ use super::{
 use crate::core::validate::{
     has_invisible_or_bidi, nullable, validate_name, with_unchanged_values,
 };
+use crate::incidents::lifecycle;
 use crate::uptime::group::model as monitor_group;
 use crate::{
     core::crypto::{Cipher, SecretString},
@@ -1619,6 +1620,11 @@ pub async fn update_in_project(
             }
             _ => AppError::Database(e),
         })?;
+    if resumed {
+        // Under the monitor's lock, the order the worker takes too.
+        let source = lifecycle::IncidentSource::Monitor(monitor_id);
+        lifecycle::resume_source(&mut tx, &source, Utc::now()).await?;
+    }
     tx.commit().await?;
     Ok(Some(updated))
 }

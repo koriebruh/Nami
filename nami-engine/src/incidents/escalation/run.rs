@@ -17,9 +17,11 @@ use crate::{
             model::StepCondition,
             plan::{self, Cursor, Exhausted, Next, PolicyShape},
         },
-        lifecycle::{self, EventKind},
+        lifecycle::{self, EventKind, PAUSED_STOP},
         oncall::{model::load_rotation, rotation::on_call_at},
+        worker::TICK,
     },
+    uptime::maintenance::model as maintenance,
 };
 
 /// Most incidents one tick escalates.
@@ -47,13 +49,16 @@ struct Due {
     escalation_on_fallback: bool,
     escalation_notified: i32,
     next_escalation_at: DateTime<Utc>,
+    monitor_id: Option<Uuid>,
+    heartbeat_id: Option<Uuid>,
+    log_alert_id: Option<Uuid>,
     now: DateTime<Utc>,
 }
 
 // $1 = the incidents this tick already took (done, or failed).
 const CLAIM: &str = "select id, project_id, escalation_policy_id, escalation_generation,
         escalation_step, escalation_repeat, escalation_on_fallback, escalation_notified,
-        next_escalation_at, now() as now
+        next_escalation_at, monitor_id, heartbeat_id, log_alert_id, now() as now
     from incidents
     where status = 'open' and next_escalation_at <= now() and not (id = any($1))
     order by next_escalation_at
@@ -140,9 +145,78 @@ async fn load_policy(
     }))
 }
 
+/// Why a due step of a monitor, heartbeat or log alert incident does not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceHold {
+    /// The monitor or heartbeat is paused, or the log alert disabled; the
+    /// message names it.
+    Paused(&'static str),
+    /// A maintenance window that applies to the source is in effect.
+    Maintenance,
+}
+
+/// Whether the incident's source holds its due step (ruling on NAMI-INC-10),
+/// judged at `due.now`. Plain reads: the tick holds the incident's lock, and
+/// the uptime worker and the heartbeat ping lock the source before the
+/// incident. Log alerts are covered by project-wide windows only, as when
+/// they are evaluated. A manual incident is never held.
+async fn source_hold(conn: &mut PgConnection, due: &Due) -> Result<Option<SourceHold>, sqlx::Error> {
+    let (sql, id, paused) = match (due.monitor_id, due.heartbeat_id, due.log_alert_id) {
+        (Some(id), ..) => ("select paused from monitors where id = $1", id, "the monitor is paused"),
+        (_, Some(id), _) => ("select paused from heartbeats where id = $1", id, "the heartbeat is paused"),
+        (.., Some(id)) => ("select not enabled from log_alerts where id = $1", id, "the log alert is disabled"),
+        _ => return Ok(None),
+    };
+    let is_paused: Option<bool> = sqlx::query_scalar(sql).bind(id).fetch_optional(&mut *conn).await?;
+    if is_paused == Some(true) {
+        return Ok(Some(SourceHold::Paused(paused)));
+    }
+    let windows = maintenance::active_windows(&mut *conn, due.project_id, due.now).await?;
+    let covered = match (due.monitor_id, due.heartbeat_id) {
+        (Some(monitor), _) => windows.covers_monitor(monitor),
+        (_, Some(_)) => windows.covers_heartbeats(),
+        _ => windows.covers_project(),
+    };
+    Ok(covered.then_some(SourceHold::Maintenance))
+}
+
+/// A held step does not page. A paused source stops escalation for this
+/// generation (the cursor is kept; `lifecycle::resume_source` or a reopen
+/// re-arms it) and says so on the timeline. A source in maintenance defers
+/// the step to the next tick, which looks again: it runs once the window is
+/// over, and the policy's clock restarts then (R14's lag rule).
+async fn hold(conn: &mut PgConnection, due: &Due, hold: SourceHold) -> Result<(), sqlx::Error> {
+    match hold {
+        SourceHold::Paused(why) => {
+            sqlx::query("update incidents set next_escalation_at = null where id = $1")
+                .bind(due.id)
+                .execute(&mut *conn)
+                .await?;
+            let message = format!("Escalation stopped: {why}");
+            let kind = EventKind::EscalationExhausted;
+            let metadata = json!({ "stop": PAUSED_STOP });
+            lifecycle::record_event(conn, due.id, kind, None, Some(&message), metadata).await?;
+        }
+        SourceHold::Maintenance => {
+            let recheck = Duration::from_std(TICK).expect("TICK is a few seconds");
+            sqlx::query("update incidents set next_escalation_at = $2 where id = $1")
+                .bind(due.id)
+                .bind(due.now + recheck)
+                .execute(&mut *conn)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Runs the incident's due steps, at most [`MAX_STEPS_PER_TICK`], and saves
-/// where its escalation stands. Returns how many steps ran or were skipped.
+/// where its escalation stands, unless its source holds them ([`hold`]).
+/// Returns how many steps ran or were skipped.
 async fn escalate(conn: &mut PgConnection, due: &Due) -> Result<usize, sqlx::Error> {
+    if let Some(held) = source_hold(conn, due).await? {
+        hold(conn, due, held).await?;
+        return Ok(0);
+    }
     let own = match due.escalation_policy_id {
         Some(id) => load_policy(conn, due.project_id, id).await?,
         None => None,
