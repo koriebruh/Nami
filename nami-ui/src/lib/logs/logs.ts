@@ -300,7 +300,7 @@ function isoOrNull(raw: string | null): string | null {
 	return Number.isNaN(time) ? null : new Date(time).toISOString();
 }
 
-function parseFilter(raw: string): FieldFilter | null {
+export function parseFilter(raw: string): FieldFilter | null {
 	try {
 		const value = JSON.parse(raw);
 		if (!value || typeof value.path !== 'string' || !isFieldPath(value.path)) return null;

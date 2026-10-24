@@ -153,6 +153,7 @@ export type Incident = {
 	project_id: string;
 	monitor_id: string | null;
 	heartbeat_id: string | null;
+	log_alert_id: string | null;
 	source_name: string | null;
 	title: string;
 	cause: string | null;

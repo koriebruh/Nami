@@ -12,6 +12,7 @@ function incident(overrides: Partial<Incident> = {}): Incident {
 		project_id: PROJECT_ID,
 		monitor_id: MONITOR_ID,
 		heartbeat_id: null,
+		log_alert_id: null,
 		source_name: 'API',
 		title: 'API is down',
 		cause: 'connection refused',
@@ -42,6 +43,16 @@ describe('incidents page', () => {
 		expect(body).toContain(`<a href="/projects/${PROJECT_ID}/monitors/${MONITOR_ID}" class="hover:text-primary">API is down</a>`);
 		expect(body).toContain(
 			`<a href="/projects/${PROJECT_ID}/heartbeats/${HEARTBEAT_ID}" class="hover:text-primary">Backup missed its heartbeat</a>`
+		);
+	});
+
+	it('links a log alert incident to its alert', () => {
+		const ALERT_ID = '3d0c5b1e-8f7a-4c2d-9e6b-1a2b3c4d5e6f';
+		const { body } = renderPage([
+			incident({ monitor_id: null, log_alert_id: ALERT_ID, title: 'Log alert Checkout errors triggered' })
+		]);
+		expect(body).toContain(
+			`<a href="/projects/${PROJECT_ID}/logs/alerts/${ALERT_ID}" class="hover:text-primary">Log alert Checkout errors triggered</a>`
 		);
 	});
 
