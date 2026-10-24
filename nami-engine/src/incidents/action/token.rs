@@ -216,6 +216,24 @@ mod tests {
         assert_eq!(verify(&cipher, &sign_payload(&format!("{at_cap}n")), now()), Err(Invalid::Malformed));
     }
 
+    /// The single-use key is the hash of the token's text, so no second
+    /// spelling of a valid token may verify: 43 base64 chars carry 258 bits
+    /// for a 32-byte MAC, and the 2 spare bits must be zero.
+    #[test]
+    fn a_mac_spelled_with_other_trailing_bits_is_refused() {
+        let cipher = Cipher::new(&TEST_KEY);
+        let token = sign(&cipher, &claims(Action::Acknowledge, 60));
+        let (payload, tag) = token.split_once('.').unwrap();
+        let last = tag.chars().last().unwrap();
+        const ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let index = ALPHABET.find(last).unwrap();
+        for spare in 1..4 {
+            let respelled = ALPHABET.as_bytes()[index ^ spare] as char;
+            let forged = format!("{payload}.{}{respelled}", &tag[..tag.len() - 1]);
+            assert_eq!(verify(&cipher, &forged, now()), Err(Invalid::Malformed), "{forged}");
+        }
+    }
+
     #[test]
     fn links_carry_distinct_tokens_for_each_action() {
         let cipher = Cipher::new(&TEST_KEY);

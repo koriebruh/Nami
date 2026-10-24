@@ -115,6 +115,35 @@ async fn an_acknowledge_cancels_queued_step_notifications(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test]
+async fn a_quick_reopen_never_sends_the_previous_generations_queued_page(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (bob, bob_email, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    set_policy(&app, project, &admin, json!({"name": "Default", "steps": [one_step(0, json!([{"type": "user", "id": bob}]))]}))
+        .await;
+    let id = open(&app, project, &member).await;
+    run::tick(&state).await.unwrap(); // generation 0's page queued, not yet sent
+    act(&app, project, &member, &id, "resolve").await;
+    act(&app, project, &member, &id, "reopen").await;
+    run_incident_ticks(&state).await;
+    let mail = settled_mail(&bob_email, 1).await;
+    assert_eq!(mail.len(), 1, "one page for the reopened incident, not two");
+    let statuses: Vec<(String, String)> = sqlx::query_as(
+        "select round, status from notification_deliveries where incident_id = $1::uuid order by round",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        statuses,
+        [("g0p0r0s0".to_string(), "cancelled".to_string()), ("g1p0r0s0".to_string(), "sent".to_string())]
+    );
+}
+
+#[sqlx::test]
 async fn a_schedule_target_pages_whoever_is_on_call_when_the_step_runs(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
     let app = test_app(pool.clone());

@@ -246,8 +246,9 @@ pub const MAX_REASON_CHARS: usize = 200;
 /// open|acknowledged -> resolved at `at`, which stops escalation. `actor:
 /// None` = automatic. Queues a `resolved` notice for every target the
 /// current escalation generation has notified (`QUEUE_RESOLVED`; for a
-/// legacy incident, every verified member). `false` when it was already
-/// resolved (or does not exist).
+/// legacy incident, every verified member) and cancels the step
+/// notifications still queued. `false` when it was already resolved (or does
+/// not exist).
 pub async fn resolve(
     conn: &mut PgConnection,
     incident_id: Uuid,
@@ -279,6 +280,12 @@ const QUEUE_RESOLVED_LEGACY: &str = "insert into notification_deliveries
     where i.id = $1
     on conflict on constraint notification_deliveries_target_unique do nothing";
 
+// Step notifications still waiting (a retry backoff, a storm cap deferral) are
+// cancelled now, not when claimed: a reopen makes the incident open again, and
+// the drain would then send this generation's page next to the new one's.
+const CANCEL_QUEUED_PAGES: &str = "update notification_deliveries set status = 'cancelled'
+    where incident_id = $1 and event = 'triggered' and status = 'pending'";
+
 /// [`resolve`], with the `resolved` event carrying `reason` as its message
 /// and `metadata.reason` (R30).
 async fn resolve_with_reason(
@@ -309,6 +316,7 @@ async fn resolve_with_reason(
         .bind(generation)
         .execute(&mut *conn)
         .await?;
+    sqlx::query(CANCEL_QUEUED_PAGES).bind(incident_id).execute(&mut *conn).await?;
     Ok(true)
 }
 
