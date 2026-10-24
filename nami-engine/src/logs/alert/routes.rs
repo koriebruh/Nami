@@ -164,6 +164,8 @@ async fn patch_alert(
         .transpose()
         .map_err(AppError::Validation)?;
     if let Some(query) = &payload.query {
+        // Shape first: it caps `source_ids` before they reach Postgres.
+        query.to_filters().map_err(AppError::Validation)?;
         saved_query::check_sources(&state.db, project_id, &query.source_ids).await?;
     }
     let patch = LogAlertPatch {
