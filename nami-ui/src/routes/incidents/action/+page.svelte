@@ -14,13 +14,15 @@
 			? `/projects/${inspected.incident.project_id}/incidents/${inspected.incident.id}`
 			: null
 	);
+	// Engine messages are lowercase phrases; the page's own end in a full stop.
+	const sentence = (text: string) => (/[.!?]$/.test(text) ? text : `${text}.`);
 </script>
 
 <AuthCard title={inspected ? `${verb} incident` : 'Incident link'} subtitle="From a Nami incident email.">
 	{#if form && 'done' in form}
 		<div role="status" class="alert alert-success">The incident is {form.status} now.</div>
 	{:else if data.problem}
-		<div role="alert" class="alert alert-danger first-letter:uppercase">{data.problem}.</div>
+		<div role="alert" class="alert alert-danger first-letter:uppercase">{sentence(data.problem)}</div>
 	{:else if inspected && data.token}
 		<dl class="mb-6 grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
 			<dt class="text-muted">Project</dt>
@@ -39,7 +41,7 @@
 			<dd class="text-ink">{formatUtc(inspected.incident.started_at)}</dd>
 		</dl>
 		{#if form?.message}
-			<div role="alert" class="alert alert-danger mb-4 first-letter:uppercase">{form.message}.</div>
+			<div role="alert" class="alert alert-danger mb-4 first-letter:uppercase">{sentence(form.message)}</div>
 		{/if}
 		<!-- The token stays in the action URL so the page can load again after the POST; the action reads it from the body. -->
 		<form method="POST" action="?/confirm&token={encodeURIComponent(data.token)}" class="flex flex-col gap-3">
