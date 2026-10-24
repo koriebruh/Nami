@@ -241,24 +241,55 @@ async fn a_schedule_holds_at_most_its_override_limit(pool: sqlx::PgPool) {
     let (alice, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
     let (_, created) = call(&app, "POST", &format!("/projects/{project}/schedules"), Some(&admin), Some(schedule_body(&[alice]))).await;
     let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
-    // Ended overrides do not count.
+    let window = Duration::days(MAX_SHIFT_DAYS + MAX_OVERRIDE_DAYS);
+    // Upcoming ones, plus one that ended inside the window, count; one that
+    // ended before the window does not.
     sqlx::query(
         "insert into on_call_overrides (schedule_id, user_id, starts_at, ends_at)
          select $1, $2, now() + interval '1 hour', now() + interval '2 hours' from generate_series(1, $3::int)
-         union all select $1, $2, now() - interval '2 hours', now() - interval '1 hour'",
+         union all select $1, $2, now() - interval '2 hours', now() - interval '1 hour'
+         union all select $1, $2, now() - $4 - interval '2 hours', now() - $4 - interval '1 hour'",
     )
     .bind(id)
     .bind(alice)
-    .bind(MAX_OVERRIDES_PER_SCHEDULE - 1)
+    .bind(MAX_OVERRIDES_PER_SCHEDULE - 2)
+    .bind(window)
     .execute(&pool)
     .await
     .unwrap();
     let overrides = format!("/projects/{project}/schedules/{id}/overrides");
-    let window = json!({"user_id": alice, "starts_at": Utc::now(), "ends_at": Utc::now() + Duration::hours(1)});
-    let (status, body) = call(&app, "POST", &overrides, Some(&admin), Some(window.clone())).await;
-    assert_eq!(status, StatusCode::CREATED, "the last place: {body}");
-    let (status, _) = call(&app, "POST", &overrides, Some(&admin), Some(window)).await;
-    assert_eq!(status, StatusCode::CONFLICT);
+    let body = json!({"user_id": alice, "starts_at": Utc::now(), "ends_at": Utc::now() + Duration::hours(1)});
+    let (status, created) = call(&app, "POST", &overrides, Some(&admin), Some(body.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "the last place: {created}");
+    let (status, _) = call(&app, "POST", &overrides, Some(&admin), Some(body)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "the ended one still counts");
+}
+
+#[sqlx::test]
+async fn an_override_that_ended_before_the_window_does_not_count(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (alice, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (_, created) = call(&app, "POST", &format!("/projects/{project}/schedules"), Some(&admin), Some(schedule_body(&[alice]))).await;
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let window = Duration::days(MAX_SHIFT_DAYS + MAX_OVERRIDE_DAYS);
+    // A full set of overrides that all ended just before the window.
+    sqlx::query(
+        "insert into on_call_overrides (schedule_id, user_id, starts_at, ends_at)
+         select $1, $2, now() - $4 - interval '2 hours', now() - $4 - interval '1 hour' from generate_series(1, $3::int)",
+    )
+    .bind(id)
+    .bind(alice)
+    .bind(MAX_OVERRIDES_PER_SCHEDULE)
+    .bind(window)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let overrides = format!("/projects/{project}/schedules/{id}/overrides");
+    let body = json!({"user_id": alice, "starts_at": Utc::now(), "ends_at": Utc::now() + Duration::hours(1)});
+    let (status, created) = call(&app, "POST", &overrides, Some(&admin), Some(body)).await;
+    assert_eq!(status, StatusCode::CREATED, "none of them counts: {created}");
 }
 
 #[sqlx::test]

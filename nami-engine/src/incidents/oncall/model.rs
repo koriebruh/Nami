@@ -27,7 +27,11 @@ pub const MAX_ROTATION_HOURS: i32 = 8760;
 /// [`EARLIEST_TIME`]..[`LATEST_TIME`] ([`check_start_date`]).
 pub const MAX_START_DATE_YEARS: u32 = 5;
 pub const MAX_OVERRIDE_DAYS: i64 = 90;
-/// Overrides of one schedule that have not ended yet.
+/// Overrides of one schedule that have not ended or ended less than
+/// [`MAX_SHIFT_DAYS`] + [`MAX_OVERRIDE_DAYS`] days ago. That window bounds the
+/// overrides one shifts range can overlap, so `GET .../shifts` loads at most
+/// this many rows; counting only unended overrides would let short ones pile
+/// up unbounded.
 pub const MAX_OVERRIDES_PER_SCHEDULE: i64 = 100;
 /// The default shifts range, and how far ahead "on call now" looks for `until`.
 pub const DEFAULT_SHIFT_DAYS: i64 = 14;
@@ -820,7 +824,7 @@ pub struct OverrideView {
 /// Puts `user_id` on call in `[starts_at, ends_at)` (times checked by
 /// [`check_override`]); `Ok(None)`: the schedule is not in the project.
 /// Errors: 400 for a user who is not a project member, 409 for a schedule
-/// at [`MAX_OVERRIDES_PER_SCHEDULE`].
+/// at [`MAX_OVERRIDES_PER_SCHEDULE`] (counted over the window documented there).
 pub async fn add_override(
     pool: &PgPool,
     project_id: Uuid,
@@ -844,14 +848,15 @@ pub async fn add_override(
     }
     check_members(&mut tx, project_id, &[user_id]).await?;
     let open: i64 = sqlx::query_scalar(
-        "select count(*) from on_call_overrides where schedule_id = $1 and ends_at > now()",
+        "select count(*) from on_call_overrides where schedule_id = $1 and ends_at > $2",
     )
     .bind(schedule_id)
+    .bind(Utc::now() - TimeDelta::days(MAX_SHIFT_DAYS + MAX_OVERRIDE_DAYS))
     .fetch_one(&mut *tx)
     .await?;
     if open >= MAX_OVERRIDES_PER_SCHEDULE {
         return Err(AppError::Conflict(format!(
-            "override limit reached ({MAX_OVERRIDES_PER_SCHEDULE} current and upcoming per schedule)"
+            "override limit reached ({MAX_OVERRIDES_PER_SCHEDULE} current, upcoming and recently ended per schedule)"
         )));
     }
     let created: OverrideView = sqlx::query_as(concat!(
