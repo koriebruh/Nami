@@ -2,11 +2,11 @@
 use crate::common;
 
 use axum::http::StatusCode;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Months, NaiveDate, Utc};
 use common::{call, seed_project, test_app, user_with_role};
 use nami_engine::incidents::oncall::model::{
     self as oncall, EARLIEST_TIME, LATEST_TIME, MAX_OVERRIDE_DAYS, MAX_OVERRIDES_PER_SCHEDULE,
-    MAX_SCHEDULES_PER_PROJECT, MAX_SHIFT_DAYS,
+    MAX_SCHEDULES_PER_PROJECT, MAX_SHIFT_DAYS, MAX_START_DATE_YEARS,
 };
 use nami_engine::incidents::oncall::rotation::RotationLength;
 use serde_json::{Value, json};
@@ -301,6 +301,42 @@ async fn admins_replace_and_delete_schedules(pool: sqlx::PgPool) {
         let (status, _) = call(&app, method, &one, Some(&admin), None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{method}");
     }
+}
+
+#[sqlx::test]
+async fn a_replace_may_keep_an_old_start_date_but_a_changed_one_must_be_recent(pool: sqlx::PgPool) {
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (_, _, admin) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (alice, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let path = format!("/projects/{project}/schedules");
+    let (_, created) = call(&app, "POST", &path, Some(&admin), Some(schedule_body(&[alice]))).await;
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    let one = format!("{path}/{id}");
+    let set_stored = |date: NaiveDate| {
+        sqlx::query("update on_call_schedules set start_date = $2 where id = $1").bind(id).bind(date).execute(&pool)
+    };
+    let old = Utc::now().date_naive() - Months::new(12 * (MAX_START_DATE_YEARS + 2));
+    set_stored(old).await.unwrap();
+
+    let mut body = schedule_body(&[alice]);
+    body["start_date"] = json!(old);
+    let (status, replaced) = call(&app, "PUT", &one, Some(&admin), Some(body.clone())).await;
+    assert_eq!((status, replaced["start_date"].clone()), (StatusCode::OK, json!(old)), "kept: {replaced}");
+    body["start_date"] = json!(old + Duration::days(1));
+    let (status, response) = call(&app, "PUT", &one, Some(&admin), Some(body.clone())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "changed to another old date: {response}");
+
+    let before_range = EARLIEST_TIME.date_naive() - Duration::days(1);
+    set_stored(before_range).await.unwrap();
+    body["start_date"] = json!(before_range);
+    let (status, response) = call(&app, "PUT", &one, Some(&admin), Some(body.clone())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "kept but before the API range: {response}");
+
+    body["name"] = json!("another");
+    body["start_date"] = json!(old);
+    let (status, response) = call(&app, "POST", &path, Some(&admin), Some(body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a create gets the five-year rule: {response}");
 }
 
 #[sqlx::test]

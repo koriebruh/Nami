@@ -4,7 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use chrono::{DateTime, Months, NaiveDate, NaiveTime, TimeDelta, Utc};
+use chrono::{
+    DateTime, LocalResult, Months, NaiveDate, NaiveTime, Offset, TimeDelta, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool};
@@ -20,7 +22,9 @@ pub const MAX_PARTICIPANTS: usize = 50;
 pub const MAX_RESTRICTIONS: usize = 14;
 pub const MIN_ROTATION_HOURS: i32 = 1;
 pub const MAX_ROTATION_HOURS: i32 = 8760;
-/// `start_date` lies at most this many years before or after today.
+/// A new `start_date` lies at most this many years before or after today;
+/// a replace that keeps the stored one only needs it in
+/// [`EARLIEST_TIME`]..[`LATEST_TIME`] ([`check_start_date`]).
 pub const MAX_START_DATE_YEARS: u32 = 5;
 pub const MAX_OVERRIDE_DAYS: i64 = 90;
 /// Overrides of one schedule that have not ended yet.
@@ -92,14 +96,10 @@ pub struct ValidSchedule {
     participants: Vec<Uuid>,
 }
 
-/// Checks a schedule body against today (UTC); `Err` carries a 400's
-/// message. Whether the participants are project members is checked when
-/// writing.
+/// Checks a schedule body; `Err` carries a 400's message. `start_date`
+/// ([`check_start_date`]) and whether the participants are project members
+/// are checked when writing.
 pub fn validate(input: ScheduleInput) -> Result<ValidSchedule, String> {
-    validate_at(input, Utc::now().date_naive())
-}
-
-fn validate_at(input: ScheduleInput, today: NaiveDate) -> Result<ValidSchedule, String> {
     let name = validate_name(&input.name)?;
     let timezone = parse_timezone(&input.timezone)?;
     let length = match (input.rotation.as_str(), input.rotation_hours) {
@@ -120,12 +120,6 @@ fn validate_at(input: ScheduleInput, today: NaiveDate) -> Result<ValidSchedule, 
         _ => return Err("rotation must be daily, weekly or custom".into()),
     };
     let handoff = parse_hhmm("handoff_time", &input.handoff_time)?;
-    let years = Months::new(12 * MAX_START_DATE_YEARS);
-    let too_early = today.checked_sub_months(years).is_none_or(|d| input.start_date < d);
-    let too_late = today.checked_add_months(years).is_none_or(|d| input.start_date > d);
-    if too_early || too_late {
-        return Err(format!("start_date must be within {MAX_START_DATE_YEARS} years of today"));
-    }
     if input.restrictions.len() > MAX_RESTRICTIONS {
         return Err(format!("at most {MAX_RESTRICTIONS} restrictions are allowed"));
     }
@@ -150,6 +144,32 @@ fn validate_at(input: ScheduleInput, today: NaiveDate) -> Result<ValidSchedule, 
         restrictions,
         participants: input.participants,
     })
+}
+
+/// A new `start_date` (create, or a replace that changes it) lies within
+/// [`MAX_START_DATE_YEARS`] of `today`. A replace that keeps the `stored`
+/// one accepts it anywhere from [`EARLIEST_TIME`] to before [`LATEST_TIME`],
+/// so a schedule that has run for years can still be edited. `Err` carries a
+/// 400's message.
+pub fn check_start_date(
+    start_date: NaiveDate,
+    stored: Option<NaiveDate>,
+    today: NaiveDate,
+) -> Result<(), String> {
+    if stored == Some(start_date) {
+        let (earliest, latest) = (EARLIEST_TIME.date_naive(), LATEST_TIME.date_naive());
+        if !(earliest..latest).contains(&start_date) {
+            return Err(format!("start_date must be on or after {earliest} and before {latest}"));
+        }
+        return Ok(());
+    }
+    let years = Months::new(12 * MAX_START_DATE_YEARS);
+    let too_early = today.checked_sub_months(years).is_none_or(|d| start_date < d);
+    let too_late = today.checked_add_months(years).is_none_or(|d| start_date > d);
+    if too_early || too_late {
+        return Err(format!("start_date must be within {MAX_START_DATE_YEARS} years of today"));
+    }
+    Ok(())
 }
 
 fn out_of_range(fields: &str) -> String {
@@ -222,12 +242,14 @@ pub struct ShiftView {
 }
 
 /// One schedule with what evaluating it needs: its rotation, its overrides
-/// in the loaded range, and the email and membership of everyone in either.
+/// in the loaded range, its restrictions' edge times, and the email and
+/// membership of everyone in either.
 #[derive(Debug, Clone)]
 pub struct Loaded {
     pub view: ScheduleView,
     rotation: Rotation,
     overrides: Vec<Override>,
+    edges: Vec<NaiveTime>,
     people: HashMap<Uuid, Participant>,
 }
 
@@ -253,16 +275,123 @@ impl Loaded {
 
     /// Who is on call at `now`, until the end of their merged shift (at most
     /// [`DEFAULT_SHIFT_DAYS`] ahead, the range to load); `None` when nobody
-    /// is. CPU-bound: call it off the async workers.
+    /// is. The first of [`Self::shifts`] when it starts at `now`, at the cost
+    /// of [`current_shift`] (about a thousand evaluations at most, not one
+    /// per minute). Run it off the async workers.
     pub fn on_call_now(&self, now: DateTime<Utc>) -> Option<OnCallNow> {
-        let first = self.shifts(now, now + TimeDelta::days(DEFAULT_SHIFT_DAYS)).into_iter().next()?;
-        // Outside every restriction the first shift is a later one.
-        (first.starts_at == now).then(|| OnCallNow {
-            user_id: first.user_id,
-            email: first.email,
-            until: first.ends_at,
-        })
+        let horizon = now + TimeDelta::days(DEFAULT_SHIFT_DAYS);
+        let (user_id, _, until) =
+            current_shift(&self.rotation, &self.overrides, &self.edges, now, horizon)?;
+        let email = self.people.get(&user_id).map(|p| p.email.clone()).unwrap_or_default();
+        Some(OnCallNow { user_id, email, until })
     }
+}
+
+/// `(user, override id, until)`: who [`rotation::on_call_at`] puts on call
+/// at `now`, and the first instant in `(now, horizon)` where its answer
+/// changes, else `horizon`. Equals the first of `rotation::shifts(now,
+/// horizon)` when that starts at `now`. It evaluates only
+/// [`change_candidates`], in order, and stops at the first change.
+fn current_shift(
+    r: &Rotation,
+    overrides: &[Override],
+    edges: &[NaiveTime],
+    now: DateTime<Utc>,
+    horizon: DateTime<Utc>,
+) -> Option<(Uuid, Option<Uuid>, DateTime<Utc>)> {
+    let current = rotation::on_call_at(r, overrides, now)?;
+    let until = change_candidates(r, overrides, edges, now, horizon)
+        .into_iter()
+        .find(|t| rotation::on_call_at(r, overrides, *t) != Some(current))
+        .unwrap_or(horizon);
+    Some((current.0, current.1, until))
+}
+
+/// Every instant in `(now, horizon)` where `on_call_at` can change, sorted:
+/// override edges and rotation handoffs and, when restrictions apply, each
+/// restriction edge (`edges`, local) on each local day (both instants of
+/// an ambiguous time) and every UTC offset change. Restrictions compare the
+/// wall clock, so they can also flip where it jumps, at no edge: a window
+/// ending at 02:30 turns back on when 03:00 falls back to 02:00.
+fn change_candidates(
+    r: &Rotation,
+    overrides: &[Override],
+    edges: &[NaiveTime],
+    now: DateTime<Utc>,
+    horizon: DateTime<Utc>,
+) -> Vec<DateTime<Utc>> {
+    let mut out: Vec<DateTime<Utc>> =
+        overrides.iter().flat_map(|o| [o.starts_at, o.ends_at]).collect();
+    if !r.participants.is_empty() {
+        // The handoff after `now` (`shift_start` grows with k, and is
+        // `MAX_UTC` past chrono's range).
+        let mut k = rotation::shift_index(r, now).map_or(0, |k| k + 1);
+        loop {
+            let start = rotation::shift_start(r, k);
+            if start >= horizon {
+                break;
+            }
+            out.push(start);
+            k += 1;
+        }
+    }
+    if !r.participants.is_empty() && !r.restrictions.is_empty() {
+        let tz = r.timezone;
+        let mut day = now.with_timezone(&tz).date_naive() - TimeDelta::days(1);
+        let last = horizon.with_timezone(&tz).date_naive() + TimeDelta::days(1);
+        while day <= last {
+            for edge in edges {
+                match tz.from_local_datetime(&day.and_time(*edge)) {
+                    LocalResult::Single(t) => out.push(t.with_timezone(&Utc)),
+                    LocalResult::Ambiguous(a, b) => {
+                        out.extend([a.with_timezone(&Utc), b.with_timezone(&Utc)]);
+                    }
+                    // Skipped by a spring-forward: the offset change below.
+                    LocalResult::None => {}
+                }
+            }
+            day += TimeDelta::days(1);
+        }
+        // Hourly samples, then the exact second: real zones never change
+        // their offset twice within an hour.
+        let offset = |s: i64| {
+            DateTime::from_timestamp(s, 0)
+                .map(|t| tz.offset_from_utc_datetime(&t.naive_utc()).fix())
+        };
+        let (mut s, end) = (now.timestamp(), horizon.timestamp());
+        while s < end {
+            let next = (s + 3600).min(end);
+            if offset(next) != offset(s) {
+                let (mut lo, mut hi) = (s, next);
+                while hi - lo > 1 {
+                    let mid = lo + (hi - lo) / 2;
+                    if offset(mid) == offset(s) {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                out.extend(DateTime::from_timestamp(hi, 0));
+            }
+            s = next;
+        }
+    }
+    out.retain(|t| now < *t && *t < horizon);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The distinct local times where restriction windows start or end.
+fn edge_times(windows: &[TimeWindow]) -> Vec<NaiveTime> {
+    let mut edges: Vec<NaiveTime> = windows
+        .iter()
+        .flat_map(|w| [parse_hhmm("from", &w.from).ok(), parse_hhmm("to", &w.to).ok()])
+        .flatten()
+        .collect();
+    edges.sort_unstable();
+    edges.dedup();
+    edges
 }
 
 #[derive(sqlx::FromRow)]
@@ -390,6 +519,7 @@ async fn load(
 
 fn loaded(row: ScheduleRow, participants: Vec<Participant>, overrides: Vec<OverrideRow>) -> Loaded {
     let rotation = rotation_of(&row, participants.iter().map(|p| p.user_id).collect());
+    let edges = edge_times(&row.restrictions);
     let mut people: HashMap<Uuid, Participant> =
         participants.iter().map(|p| (p.user_id, p.clone())).collect();
     for o in &overrides {
@@ -423,7 +553,7 @@ fn loaded(row: ScheduleRow, participants: Vec<Participant>, overrides: Vec<Overr
         created_at: row.created_at,
         updated_at: row.updated_at,
     };
-    Loaded { view, rotation, overrides, people }
+    Loaded { view, rotation, overrides, edges, people }
 }
 
 /// The rotation a stored row describes. A row that no longer validates (a
@@ -557,8 +687,11 @@ async fn write_participants(
 /// Creates a schedule and returns its id. Errors: 404 for a project that
 /// does not exist (a global admin passes the role check for any id), 409
 /// for a taken name or a project at [`MAX_SCHEDULES_PER_PROJECT`], 400 for a
-/// participant who is not a project member.
+/// `start_date` [`check_start_date`] refuses or a participant who is not a
+/// project member.
 pub async fn create(pool: &PgPool, project_id: Uuid, v: &ValidSchedule) -> Result<Uuid, AppError> {
+    check_start_date(v.start_date, None, Utc::now().date_naive())
+        .map_err(AppError::Validation)?;
     let mut tx = pool.begin().await?;
     // Serialises creates in one project, so the count below is exact.
     let project: Option<Uuid> =
@@ -603,7 +736,8 @@ pub async fn create(pool: &PgPool, project_id: Uuid, v: &ValidSchedule) -> Resul
 }
 
 /// Replaces a schedule's fields and participants; `Ok(false)`: not in the
-/// project. Errors as for [`create`], without the limit.
+/// project. Errors as for [`create`], without the limit; `start_date` is
+/// checked against the stored one.
 pub async fn replace(
     pool: &PgPool,
     project_id: Uuid,
@@ -611,8 +745,20 @@ pub async fn replace(
     v: &ValidSchedule,
 ) -> Result<bool, AppError> {
     let mut tx = pool.begin().await?;
+    let stored: Option<NaiveDate> = sqlx::query_scalar(
+        "select start_date from on_call_schedules where id = $1 and project_id = $2 for update",
+    )
+    .bind(id)
+    .bind(project_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(stored) = stored else {
+        return Ok(false);
+    };
+    check_start_date(v.start_date, Some(stored), Utc::now().date_naive())
+        .map_err(AppError::Validation)?;
     let (rotation, hours) = rotation_columns(v.length);
-    let updated = sqlx::query(
+    sqlx::query(
         "update on_call_schedules
          set name = $3, timezone = $4, rotation = $5, rotation_hours = $6, handoff_time = $7,
              start_date = $8, restrictions = $9, updated_at = now()
@@ -630,9 +776,6 @@ pub async fn replace(
     .execute(&mut *tx)
     .await
     .map_err(name_taken)?;
-    if updated.rows_affected() == 0 {
-        return Ok(false);
-    }
     check_members(&mut tx, project_id, &v.participants).await?;
     sqlx::query("delete from on_call_participants where schedule_id = $1")
         .bind(id)
@@ -804,16 +947,17 @@ mod tests {
     }
 
     #[test]
-    fn start_date_lies_within_five_years_of_today() {
+    fn a_new_start_date_lies_within_five_years_of_today() {
         let today = date("2026-10-25");
+        let stored = Some(date("2026-01-01"));
         for (start, ok) in [
             ("2021-10-25", true),
             ("2021-10-24", false),
             ("2031-10-25", true),
             ("2031-10-26", false),
         ] {
-            let result = validate_at(ScheduleInput { start_date: date(start), ..input() }, today);
-            assert_eq!(result.is_ok(), ok, "{start}");
+            assert_eq!(check_start_date(date(start), None, today).is_ok(), ok, "create {start}");
+            assert_eq!(check_start_date(date(start), stored, today).is_ok(), ok, "changed {start}");
         }
         // From a leap day, five years either way is the last day of February.
         let leap = date("2028-02-29");
@@ -823,14 +967,33 @@ mod tests {
             ("2033-02-28", true),
             ("2033-03-01", false),
         ] {
-            let result = validate_at(ScheduleInput { start_date: date(start), ..input() }, leap);
-            assert_eq!(result.is_ok(), ok, "{start}");
+            assert_eq!(check_start_date(date(start), None, leap).is_ok(), ok, "{start}");
         }
     }
 
     #[test]
-    fn custom_rotation_hours_are_bounded() {
+    fn a_kept_start_date_only_has_to_lie_in_the_api_range() {
         let today = date("2026-10-25");
+        let earliest = EARLIEST_TIME.date_naive();
+        let latest = LATEST_TIME.date_naive();
+        let day = TimeDelta::days(1);
+        for (start, ok) in [
+            (date("2016-10-25"), true),
+            (earliest, true),
+            (earliest - day, false),
+            (latest - day, true),
+            (latest, false),
+        ] {
+            assert_eq!(check_start_date(start, Some(start), today).is_ok(), ok, "kept {start}");
+        }
+        assert!(
+            check_start_date(date("2016-10-25"), Some(date("2016-10-24")), today).is_err(),
+            "a changed date gets the five-year rule"
+        );
+    }
+
+    #[test]
+    fn custom_rotation_hours_are_bounded() {
         for (hours, ok) in [
             (MIN_ROTATION_HOURS, true),
             (MAX_ROTATION_HOURS, true),
@@ -843,23 +1006,22 @@ mod tests {
                 rotation_hours: Some(hours),
                 ..input()
             };
-            assert_eq!(validate_at(custom, today).is_ok(), ok, "{hours}");
+            assert_eq!(validate(custom).is_ok(), ok, "{hours}");
         }
         let weekly_with_hours = ScheduleInput { rotation_hours: Some(24), ..input() };
-        assert!(validate_at(weekly_with_hours, today).is_err());
+        assert!(validate(weekly_with_hours).is_err());
     }
 
     #[test]
     fn participants_and_restrictions_are_capped() {
-        let today = date("2026-10-25");
         let users = |n: usize| (0..n).map(|i| Uuid::from_u128(i as u128 + 1)).collect::<Vec<_>>();
         let with =
             |participants, restrictions| ScheduleInput { participants, restrictions, ..input() };
-        assert!(validate_at(with(users(MAX_PARTICIPANTS), vec![]), today).is_ok());
-        assert!(validate_at(with(users(MAX_PARTICIPANTS + 1), vec![]), today).is_err());
-        let valid = validate_at(with(users(1), vec![window(); MAX_RESTRICTIONS]), today).unwrap();
+        assert!(validate(with(users(MAX_PARTICIPANTS), vec![])).is_ok());
+        assert!(validate(with(users(MAX_PARTICIPANTS + 1), vec![])).is_err());
+        let valid = validate(with(users(1), vec![window(); MAX_RESTRICTIONS])).unwrap();
         assert_eq!(valid.restrictions[0].weekdays, [1, 5], "weekdays are stored sorted");
-        assert!(validate_at(with(users(1), vec![window(); MAX_RESTRICTIONS + 1]), today).is_err());
+        assert!(validate(with(users(1), vec![window(); MAX_RESTRICTIONS + 1])).is_err());
     }
 
     #[test]
@@ -906,5 +1068,79 @@ mod tests {
             assert_eq!(shift_range(Some(from), Some(to), now).is_ok(), ok, "{from} .. {to}");
         }
         assert!(shift_range(Some(DateTime::<Utc>::MAX_UTC), None, now).is_err());
+    }
+
+    fn tw(weekdays: &[u8], from: &str, to: &str) -> TimeWindow {
+        TimeWindow { weekdays: weekdays.to_vec(), from: from.into(), to: to.into() }
+    }
+
+    fn stand_in(id: u128, user: u128, starts_at: DateTime<Utc>, hours: i64) -> Override {
+        Override {
+            id: Uuid::from_u128(id),
+            user_id: Uuid::from_u128(user),
+            starts_at,
+            ends_at: starts_at + TimeDelta::hours(hours),
+            created_at: starts_at - TimeDelta::days(1) + TimeDelta::seconds(id as i64),
+        }
+    }
+
+    /// `current_shift` against its definition, the first merged shift of the
+    /// minute-by-minute `rotation::shifts`, for `now` stepping through the
+    /// days around DST changes. The restrictions end inside a skipped or
+    /// repeated hour, span midnight or start at it, and two overrides hand
+    /// over to the same user.
+    #[test]
+    fn current_shift_agrees_with_the_minute_by_minute_shifts() {
+        let all = [1, 2, 3, 4, 5, 6, 7];
+        let berlin = ["2026-03-29T01:00:00Z", "2026-10-25T01:00:00Z"];
+        let santiago = ["2026-04-05T03:00:00Z", "2026-09-06T04:00:00Z"];
+        let ending_in_the_dst_hour = vec![
+            tw(&all, "01:00", "02:30"),
+            tw(&[1, 3, 5, 7], "22:00", "06:00"),
+            tw(&[7], "02:15", "02:45"),
+        ];
+        let around_midnight = vec![tw(&[6, 7], "23:30", "00:30"), tw(&[1, 2, 3, 4, 5], "00:00", "12:00")];
+        let cases = [
+            ("Europe/Berlin", RotationLength::Daily, "02:30", 3, berlin, ending_in_the_dst_hour),
+            ("Europe/Berlin", RotationLength::Daily, "09:00", 1, berlin, vec![tw(&all, "01:00", "02:30")]),
+            ("Europe/Berlin", RotationLength::Hours(5), "20:00", 2, berlin, vec![]),
+            ("Europe/Berlin", RotationLength::Weekly, "09:00", 1, berlin, vec![tw(&all, "00:00", "00:00")]),
+            ("America/Santiago", RotationLength::Daily, "00:00", 2, santiago, around_midnight),
+        ];
+        let horizon = TimeDelta::hours(30);
+        let mut checked = 0;
+        for (zone, length, handoff, n, transitions, windows) in cases {
+            let tz: Tz = zone.parse().unwrap();
+            let r = Rotation {
+                timezone: tz,
+                start_date: date("2026-01-05"),
+                handoff: parse_hhmm("handoff", handoff).unwrap(),
+                length,
+                participants: (0..n).map(|i| Uuid::from_u128(i + 1)).collect(),
+                restrictions: windows.iter().map(|w| w.validate(tz).unwrap()).collect(),
+            };
+            let edges = edge_times(&windows);
+            for transition in transitions.map(utc) {
+                // Clear of the transition, so they never mask the restrictions there.
+                let overrides = [
+                    stand_in(10, 9, transition - TimeDelta::hours(22), 2),
+                    stand_in(11, 9, transition - TimeDelta::hours(20), 2),
+                    stand_in(12, 1, transition + TimeDelta::hours(5), 1),
+                ];
+                let mut now = transition - TimeDelta::hours(26) + TimeDelta::seconds(17);
+                while now < transition + TimeDelta::hours(3) {
+                    let expected = rotation::shifts(&r, &overrides, now, now + horizon)
+                        .into_iter()
+                        .next()
+                        .filter(|s| s.starts_at == now)
+                        .map(|s| (s.user_id, s.override_id, s.ends_at));
+                    let actual = current_shift(&r, &overrides, &edges, now, now + horizon);
+                    assert_eq!(actual, expected, "{zone} {handoff} at {now}");
+                    checked += 1;
+                    now += TimeDelta::minutes(23);
+                }
+            }
+        }
+        assert!(checked > 700, "{checked}");
     }
 }

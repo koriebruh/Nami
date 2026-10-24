@@ -71,8 +71,9 @@ struct OverrideInput {
 }
 
 /// Runs the rotation math on a blocking thread, never an async worker: a
-/// 14-day look-ahead is ~20k evaluations per schedule. A panic there is
-/// re-raised here.
+/// shifts range samples every minute (~45k evaluations for 31 days), and
+/// "on call now" for 50 schedules is up to ~1k evaluations each. A panic
+/// there is re-raised here.
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     match tokio::task::spawn_blocking(work).await {
         Ok(value) => value,
