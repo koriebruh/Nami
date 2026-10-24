@@ -1,6 +1,32 @@
 # Status Pages — Part 1 Implementation Plan
 
-> **Restructure note (2026-10-19):** after this plan was written, the engine, its tests, its migrations and `nami-ui/src/lib` were reorganised by domain, and work now ships as one PR per phase (see `CLAUDE.md`). File paths, test files and migration numbers in the steps below predate that change. Map them with the path table in `docs/superpowers/decisions/2026-10-19-domain-restructure.md`. For example, `src/uptime/availability.rs` stays where it is, `src/uptime/monitor/model.rs` is now `src/uptime/monitor/model.rs`, `src/core/router.rs` is `src/core/router.rs`, `src/core/email.rs` is `src/core/email.rs`, new tests become modules of a domain target such as `tests/statuspages/main.rs`, and `#lib/server/engine` is `#lib/server/core/engine`. New migrations follow the convention in that file: numbered sequentially after the newest file in `nami-engine/migrations/` (the first is `0006_`), named `NNNN_<domain>_<change>.sql`, and at most one file per domain per phase PR. The plan's 0100-0104 become one `NNNN_statuspages_<change>.sql` (plus at most one file per other domain touched, e.g. the delivery-queue change under `incidents`). The plan body is otherwise unchanged.
+> **Status:** ready (starts after Incidents Part 1 merges). Nothing of this phase is merged; NAMI-SP-1 is next.
+> **Branch:** `feat/statuspages-part1` in `.worktrees/statuspages-part1/`.
+> **Depends on:** Logs Part 2 and Incidents Part 1, both merged to `main` with their security review and fix wave. Incidents Part 1's migrations are its per-domain phase files (such as `NNNN_incidents_part1.sql`, formerly the plan's 0060-0066); this phase numbers its own files after them.
+
+## Roadmap coverage
+
+Roadmap §5 (`docs/superpowers/roadmap.md`). Part 2 (NAMI-SP-17 onward) delivers the halves marked **partial**.
+
+| Roadmap | Item | Tasks |
+|---|---|---|
+| R5.01 | Public status page per slug (no auth), branding (name, logo URL, accent colour), plus verified custom domains | NAMI-SP-1, NAMI-SP-2, NAMI-SP-3, NAMI-SP-6, NAMI-SP-13 |
+| R5.02 | Theme (light/dark/system), up to 4 navigation links, dark-mode logo | NAMI-SP-1, NAMI-SP-2, NAMI-SP-11, NAMI-SP-13 |
+| R5.03 | Sections and components bound to monitors/heartbeats, group import | NAMI-SP-1, NAMI-SP-2, NAMI-SP-11 |
+| R5.04 | 90-day uptime bars, overall status banner | NAMI-SP-4, NAMI-SP-6, NAMI-SP-13 |
+| R5.05 | Status updates (investigating / identified / monitoring / resolved) and scheduled maintenance announcements | NAMI-SP-5, NAMI-SP-6, NAMI-SP-12, NAMI-SP-13 |
+| R5.06 | Per-update "notify subscribers" toggle (email; webhook subscribers honour the same flag once Part 2 adds them) | NAMI-SP-5, NAMI-SP-10, NAMI-SP-12 |
+| R5.07 | Automatic reports from bound monitor/heartbeat incidents, per page | NAMI-SP-8, NAMI-SP-10 |
+| R5.08 | Email subscribers (double opt-in, manage, unsubscribe, RFC 8058 one-click) | NAMI-SP-9, NAMI-SP-10, NAMI-SP-12, NAMI-SP-14 |
+| R5.09 | Component-level email subscriptions | NAMI-SP-9, NAMI-SP-10, NAMI-SP-14 |
+| R5.10 | **Partial, Part 1 half: groundwork only.** `allow_webhook_subscribers` column (NAMI-SP-1), shown disabled in the editor (NAMI-SP-11), DTO `subscriptions.webhook: false` (NAMI-SP-6), queue extension with room for webhook rows (NAMI-SP-9). Webhook subscribers themselves are Part 2 | NAMI-SP-1, NAMI-SP-6, NAMI-SP-9, NAMI-SP-11 |
+| R5.11 | Password-protected (private) pages | NAMI-SP-1, NAMI-SP-2, NAMI-SP-7, NAMI-SP-13 |
+| R5.12 | IP allowlist for private pages; `noindex` toggle | NAMI-SP-1, NAMI-SP-2, NAMI-SP-6, NAMI-SP-7, NAMI-SP-11, NAMI-SP-13 |
+| R5.13 | Atom feed (the spec names Atom only, no RSS), embeddable status badge (SVG) | NAMI-SP-15 |
+| R5.14 | Public JSON status API | NAMI-SP-15 |
+| R5.15 | **Partial, Part 1 half: the data only.** `status.json` with `Access-Control-Allow-Origin: *` and the exact shape the widget reads. The widget itself (`widget.js`) is Part 2 | NAMI-SP-15 |
+| R5.16 | **Partial, Part 1 half:** admin list, editor, reports, subscribers and the public pages (subscribe flows, feed, badge, JSON). The editor's widget snippet and the webhook subscriber UI are Part 2 | NAMI-SP-11, NAMI-SP-12, NAMI-SP-13, NAMI-SP-14, NAMI-SP-15 |
+| (phase) | Part 1 security review and fix wave | NAMI-SP-16 |
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -12,36 +38,38 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-13-status-pages-design.md`, including its "Parity additions (2026-10-13)". Roadmap: `docs/superpowers/roadmap.md` §5 (the definition of done).
 
-**When to start:** after **Incident Management Part 1** (NAMI-INC-1 .. NAMI-INC-15, plan `docs/superpowers/plans/2026-10-13-incident-management-part1.md`, PR #54) is merged to `main` with its final fix wave. That plan in turn needs Logs Part 2 (its 0044 `incidents.log_alert_id`), so Logs Part 2 is a transitive prerequisite. **Uptime Phase 3 NAMI-UP-27** (availability) is already merged (`9599bb8`, PR #61), so Task 4 has no open dependency.
+**When to start:** after **Incident Management Part 1** (NAMI-INC-1 .. NAMI-INC-15 and its security review and fix wave, plan `docs/superpowers/plans/2026-10-13-incident-management-part1.md`, branch `feat/incidents-part1`) has merged to `main`. That phase in turn needs Logs Part 2 (NAMI-LOG-14 adds `incidents.log_alert_id`), so Logs Part 2 is a transitive prerequisite. **Uptime Phase 3 NAMI-UP-27** (availability) is already on `main`, so Task 4 has no open dependency.
 
-Which tasks need unmerged INC work (everything else builds on `main` at `a1192a0` alone):
+Which tasks build on Incidents Part 1 (everything else needs only what is on `main` today, `56916be`):
 
 | Task | Needs |
 |---|---|
-| T1, T2, T4, T5, T6, T7 | nothing unmerged |
-| T3 | NAMI-INC-3 (`hmac`) |
-| T7 | NAMI-INC-3 (`hmac`) |
+| T1, T2, T4, T5 | nothing beyond `main` |
+| T3, T7 | NAMI-INC-3 (`hmac`) |
+| T6 | NAMI-INC-1 (`incidents.postmortem`, which the leak fixture seeds) |
 | T8 | NAMI-INC-1, NAMI-INC-9 (`resolve_source_with_reason`), NAMI-INC-10 |
 | T9, T10 | NAMI-INC-1 (`open_test_incident`), NAMI-INC-3, NAMI-INC-5 (queue, drain, `kick`, `run_incident_ticks`) |
 | T11, T12 | NAMI-INC-7 (`data.role`); T12 and T13 also NAMI-INC-12 (`renderMarkdown`) |
 
-### Interfaces assumed from unmerged plans
+### Interfaces assumed from Incidents Part 1 (planned, not on `main` yet)
 
-Each line gives what this plan uses and the task that uses it. If the merged code differs in a name or a line, adapt minimally (same behaviour, same tests) and say so in the PR. If it differs in behaviour, stop and ask the controller.
+Each line gives what this plan uses and the task that uses it. If the merged code differs in a name or a line, adapt minimally (same behaviour, same tests) and say so in the phase PR. If it differs in behaviour, stop and ask the controller.
 
 | From | Interface | Used by |
 |---|---|---|
-| NAMI-INC-1 | `incidents::lifecycle::{IncidentSource::{Monitor, Heartbeat, Manual { created_by }, ..}, OpenIncident { project_id, source, title, cause, severity_id, metadata, started_at }, open, resolve, resolve_source}`, each taking `&mut PgConnection` inside the caller's transaction. `open` returns `Option<Uuid>`, `resolve` returns `bool`, `resolve_source` returns `Option<Uuid>`. Incident statuses are `open`/`acknowledged`/`resolved`; 0060 adds `incidents.{source, severity_id, metadata, postmortem, ..}` with a trigger that derives `source` for plain-SQL inserts. `tests/common::open_test_incident(pool, project, created_by) -> Uuid`. | T8, T9 |
+| NAMI-INC-1 | `incidents::lifecycle::{IncidentSource::{Monitor, Heartbeat, Manual { created_by }, ..}, OpenIncident { project_id, source, title, cause, severity_id, metadata, started_at }, open, resolve, resolve_source}`, each taking `&mut PgConnection` inside the caller's transaction. `open` returns `Option<Uuid>`, `resolve` returns `bool`, `resolve_source` returns `Option<Uuid>`. Incident statuses are `open`/`acknowledged`/`resolved`; Incidents Part 1's phase file (`NNNN_incidents_part1.sql`, planned in NAMI-INC-1) adds `incidents.{source, severity_id, metadata, postmortem, ..}` with a trigger that derives `source` for plain-SQL inserts. `tests/common::open_test_incident(pool, project, created_by) -> Uuid`. | T8, T9 |
 | NAMI-INC-3 | `hmac 0.13` as a direct dependency. `outbound::is_non_public(ip)` (Part 2 webhooks only). | T3, T7, T9 |
-| NAMI-INC-5 | `notification_deliveries` (migration 0062) exactly as that plan writes it (`round` 1-32 chars, unnamed checks on `event` and on `(user_id, channel_id)`), the claim SQL in its Task 5 Step 3 (a)-(c), the per-row steps (2a)-(2f), `deliveries::{drain, enqueue, NewDelivery, DeliveryEvent, Target, MAX_ATTEMPTS, DRAIN_BATCH, backoff, LEASE}`, `send::{SendError { message, retry }, Retry::{Never, After}}`, `incidents::worker::kick(&AppState)`, `Config.incidents_worker_enabled`, `tests/common::run_incident_ticks(&AppState)`. | T9, T10 |
-| NAMI-INC-7 | `GET /projects/{id}` returns `role: "admin" \| "member" \| "viewer"`. The project layout passes it on as `data.role`. | T11, T12 |
+| NAMI-INC-5 | `notification_deliveries` (created in Incidents Part 1's phase file, planned in NAMI-INC-5) exactly as that plan writes it (`round` 1-32 chars, unnamed checks on `event` and on `(user_id, channel_id)`), the claim SQL in its Task 5 Step 3 (a)-(c), the per-row steps (2a)-(2f), `deliveries::{drain, enqueue, NewDelivery, DeliveryEvent, Target, MAX_ATTEMPTS, DRAIN_BATCH, backoff, LEASE}`, `send::{SendError { message, retry }, Retry::{Never, After}}`, `incidents::worker::kick(&AppState)`, `Config.incidents_worker_enabled`, `tests/common::run_incident_ticks(&AppState)`, the test files `tests/incidents/incident_lifecycle.rs` and `tests/incidents/notification_deliveries.rs`. | T8, T9, T10 |
+| NAMI-INC-7 | `GET /projects/{id}` returns `role: "admin" \| "member" \| "viewer"`. The project layout passes it on as `data.role` (on `main` the layout load returns `{ project }` only). | T11, T12 |
 | NAMI-INC-9 | `lifecycle::resolve_source_with_reason(conn, source, at, reason)`. | T8 |
 | NAMI-INC-10 | `main.rs` spawns `incidents::worker::run_forever`. `alerts::notify_transition` calls `kick`. | T8, T10 |
-| NAMI-INC-12 | `nami-ui/src/lib/markdown.ts` `renderMarkdown(source: string): string` (escape first, fixed subset, `http(s)` links with `rel="noopener noreferrer nofollow"`). | T12, T13 |
+| NAMI-INC-12 | `renderMarkdown(source: string): string` (escape first, fixed subset, `http(s)` links with `rel="noopener noreferrer nofollow"`), planned as `nami-ui/src/lib/markdown.ts`; import it from the path it merges at. | T12, T13 |
 
-Merged on `main` (`9599bb8` and later), checked by this review: `uptime::maintenance::model::{Span, MaintenanceWindow::{spans, applies_to_monitor, applies_to_heartbeats}, list_for_project, active_windows, ActiveWindows::{covers_monitor, covers_heartbeats}}`, `uptime::availability::{compute, union, subtract, seconds, Availability}` (`Availability` has **no** `Default`; `subtract_sorted` and `incident_spans` are private and not used here). This plan no longer uses `AppError::Gone` (NAMI-INC-11): status routes answer their fixed bodies through one local helper (see Global Constraints).
+On `main`, re-checked against `56916be` on 2026-10-24 (names below are current): `uptime::maintenance::model::{Span, MaintenanceWindow::{spans, applies_to_monitor, applies_to_heartbeats}, list_for_project, active_windows, ActiveWindows::{covers_monitor, covers_heartbeats}}`, `uptime::availability::{compute, union, subtract, seconds, Availability}` (`Availability` has **no** `Default`; `subtract_sorted` and `incident_spans` are private and not used here), `core::config::Config::{from_env, from_env_for_test}` (both still end in the private `from_env_defaults_only`), `core::crypto::{Cipher::{new, derive_subkey}, TEST_KEY}`, `core::email::Mailer::send` (SMTP failures are `AppError::Validation("could not send email")`), `core::router::{build_router, build_public_router, with_fallback_connect_info}`, `core::validate::{validate_label, nullable, is_invisible_or_bidi_char}` (the last is `pub(crate)`), `core::middleware::rbac::require_project_role`, `auth::password::{hash_password, verify_password}`, `uptime::checker::is_unsafe_in_text`, `uptime::checker::dns::{build_resolver, readable}` (both private; Task 3 makes them `pub(crate)`), and in `tests/common`: `app`, `test_app`, `public_app`, `call`, `login`, `user_with_role`, `seed_user`, `seed_project`, `seed_http_monitor`, `unique_email`, `settled_mail`, `stored_mail_for`, `StoredMail`, `test_cipher`. `heartbeats` still has no `unique (id, project_id)` (`0003_uptime.sql`). This plan no longer uses `AppError::Gone` (NAMI-INC-11): status routes answer their fixed bodies through one local helper (see Global Constraints).
 
-**Part 2 follows** (a separate plan, NAMI-SP-16 onward, migrations from 0105). It covers:
+**Drift (2026-10-24).** The UI is no longer the dark theme this plan was written against. Every app page now uses the light "Atom" design tokens of `nami-ui/src/routes/layout.css` and the components of `nami-ui/src/lib/components/ui/` (for example `nami-ui/src/routes/(app)/projects/[id=uuid]/maintenance/+page.svelte:46`, `card`, `text-ink`, `text-muted`), and the project tabs are a `SegmentedTabs` list (`nami-ui/src/routes/(app)/projects/[id=uuid]/+layout.svelte:11-16`). Wherever a task below says "dark theme classes", "copy the maintenance page classes" or "a Tailwind bg class", read: the design tokens and `$lib/components/ui` components named in CLAUDE.md ("UI conventions"), never raw hex values or Tailwind's stock palette. Status colours map onto the `status-*`, `success`/`warning`/`danger`/`info` tokens. The public page keeps its own `light`/`dark`/`system` theme (spec) and the validated accent as `--accent`, built from the same tokens.
+
+**Part 2 follows** (a separate plan, NAMI-SP-17 onward, with its own phase migration files). It covers:
 - webhook subscribers: the public form when `allow_webhook_subscribers` is on, admin add, the `{"type":"verification","challenge":…}` handshake within 10 s, strict public-only outbound with DNS-rebinding-safe connects and no redirects, per-subscriber sealed HMAC secret shown once, `X-Nami-Signature`, auto-disable after 20 consecutive failures. They go through the same queue extension as Part 1's email rows (Task 9 leaves `webhook_subscriber_id` room for them);
 - the `component.status_changed` event (the snapshot builder records each component's last published status);
 - the embeddable announcement widget (`widget.js`, Shadow DOM, constructable stylesheets, 5 KiB gzip budget, DOM tests) and the editor's widget snippet;
@@ -52,20 +80,24 @@ Part 1 leaves room for these:
 - The DTO's `subscriptions.webhook` is always `false` in Part 1.
 - `status.json` already sends `Access-Control-Allow-Origin: *` and the exact shape the widget reads.
 
-**Migrations.** Postgres migrations 0100-0119 are reserved for status pages (ruling in `docs/superpowers/decisions/2026-10-13-uptime-phase1.md`: "Status 0100-0119"). On 2026-10-19 none of them was in use: `main` (`a1192a0`) ends at 0042 (LOG-10; UP-23 added 0024). Logs Part 2 plans 0042-0044, Uptime Phase 3 0022-0039 and Incidents Part 1 0060-0066. No plan or branch names a 01xx file. Part 1 uses 0100-0104. Part 2 continues at 0105.
+**Migrations.** The phase adds three Postgres files. NNNN is the next free number in `nami-engine/migrations/` when the phase starts (after Logs Part 2's and Incidents Part 1's phase files), and the files are numbered in this order because their foreign keys depend on each other:
+1. `NNNN_uptime_statuspages_part1.sql` (created by NAMI-SP-1): `heartbeats_id_project_key`, the key the components' composite foreign key needs. `heartbeats` is an uptime table, so the change goes in an uptime file.
+2. `NNNN_statuspages_part1.sql` (created by NAMI-SP-1; NAMI-SP-5, NAMI-SP-7 and NAMI-SP-9 append to it, which is allowed because it has not merged): pages, sections, components, reports, rate-limit hits, subscribers.
+3. `NNNN_incidents_statuspages_part1.sql` (created by NAMI-SP-9): the `notification_deliveries` extension (R17). It references `status_pages`, `status_page_subscribers` and `status_report_updates`, so it comes last.
 
-**Verification status (2026-10-19):** this plan was written against `main` at `30d24d7` plus the stated end state of the Incident Management Part 1 and Uptime Phase 3 plans, then reviewed against `main` at `9599bb8`, rebased onto `a1192a0` (NAMI-UP-23 and NAMI-LOG-10 merged; UP-23 adds `monitors.{ip_version, remember_cookies, proxy_url, proxy_username, proxy_password_enc}`, now in the leak fixture) (signatures spot-checked: `availability.rs`, `maintenance.rs`, monitor/heartbeat/group models and migrations, `crypto.rs`, `config.rs`, `error.rs`, `email.rs`, `router.rs`, `serve.rs`, `tests/common`, `nami-ui` `engine.ts`/`fake-event.ts`/`params.ts`/`vite.config.ts`/`package.json`, `@sveltejs/kit` 3.0.1 types and the `@sveltejs/adapter-node@6.0.0` source). Its code has **not** been applied to a scratch copy. Tests are given in full where they pin a security property: leaks, tenant isolation, tokens, private access, escaping and rate limits. Code that decides something is given in full: migrations, SQL, token formats, the status and history rules, the queue extension and the DTO shape. Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body (the Incidents Part 1 convention). A test that fails for a reason the plan did not predict is a plan bug: fix it minimally and say so in the PR.
+`sqlx` records each applied file's checksum, so a local dev database that applied the statuspages file before a later task appended to it must be recreated; `#[sqlx::test]` databases are fresh for every test. No ClickHouse DDL. Part 2 adds its own phase files.
 
-**Execution:** per CLAUDE.md. Use one worktree per task under `.worktrees/NAMI-SP-<n>/`, branched from the latest `origin/main`, with the branch named under each task heading. Commit with Conventional Commits whose message ends with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Then run the task review, open the PR (stating "No CI is configured on this repo yet" and the commands run), and auto-merge on a clean review (pre-authorized for sub-projects 2-11). Tasks are sequential except: T3 depends only on T1/T2; T11 depends on T2, T3 and T5 only. T15 renders from Task 13's helpers but runs **after** T14, because its last step ticks the roadmap's subscriber bullets. Engine tests need `docker compose up -d postgres mailpit` (never restart running containers; ClickHouse is not used by this plan).
+**Verification status (2026-10-24):** this plan was written against `main` at `30d24d7` plus the stated end state of the Incident Management Part 1 and Uptime Phase 3 plans, reviewed against `main` at `9599bb8`, rebased onto `a1192a0` (NAMI-UP-23 and NAMI-LOG-10 merged; UP-23 adds `monitors.{ip_version, remember_cookies, proxy_url, proxy_username, proxy_password_enc}`, now in the leak fixture), and re-checked on 2026-10-24 against `main` at `56916be` after the domain restructure (paths, modules, test targets and migration names translated; interfaces above). Signatures spot-checked: `uptime/availability.rs`, `uptime/maintenance/model.rs`, the monitor/heartbeat/group models and `0003_uptime.sql`, `core/{crypto,config,error,email,router,serve,state}.rs`, `tests/common/mod.rs`, nami-ui `lib/server/core/{engine,fake-event}.ts`, `params.ts`, `vite.config.ts`, `package.json`, `@sveltejs/kit` 3 types and the `@sveltejs/adapter-node@6.0.0` source. Its code has **not** been applied to a scratch copy. Tests are given in full where they pin a security property: leaks, tenant isolation, tokens, private access, escaping and rate limits. Code that decides something is given in full: migrations, SQL, token formats, the status and history rules, the queue extension and the DTO shape. Elsewhere the plan gives exact signatures, names and values, and the implementer writes the body (the Incidents Part 1 convention). A test that fails for a reason the plan did not predict is a plan bug: fix it minimally and say so in the phase PR.
+
+**Execution:** one phase, one branch (CLAUDE.md "Git branching workflow", `docs/superpowers/plan-conventions.md`): `feat/statuspages-part1` in `.worktrees/statuspages-part1/`, from the latest `origin/main` once Incidents Part 1 has merged. Each task is one or more commits on that branch with its task ID in the message (Conventional Commits, ending with the `Co-Authored-By` line of Global Constraints), then a task review (spec compliance and quality) with fix commits on the same branch until it is clean, then the next task. Tasks run in order. T3 depends only on T1/T2 and T11 only on T2, T3 and T5; if they run in parallel, they use an extra worktree on a short-lived local branch that is merged back into `feat/statuspages-part1` before its review (CLAUDE.md rule 5). T15 renders from Task 13's helpers but runs after T14. After T15 comes NAMI-SP-16, the phase security review and fix wave (last section), which also writes the decisions doc and ticks the roadmap; then the one phase PR. Engine tests need `docker compose up -d postgres mailpit` (never restart running containers; ClickHouse is not used by this plan).
 
 The **engine command** is used throughout:
 
 ```bash
-cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami CARGO_PROFILE_DEV_DEBUG=0 \
-  CARGO_TARGET_DIR=/Users/mitengineer/development/nami/.worktrees/.cargo-target cargo test <args>
+cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test <args>
 ```
 
-Test filters follow the Incidents Part 1 rule: several `--test <binary>` flags in one command with no filter are fine; unit tests by module go in their own command (`--lib -- <filter> <filter>`); never combine `--test x` with a `--lib` filter.
+Integration tests live in domain targets: this phase adds `tests/statuspages/main.rs` (Task 2) and also runs `core`, `incidents` and `uptime`. `cargo test` takes one positional filter, so several targets and files go in one command as `--test statuspages --test core -- status_pages_api:: json_bodies::` (every target runs the tests that match any filter). Unit tests by module go in their own command (`--lib -- <filter> <filter>`); never combine `--test x` with a `--lib` filter.
 
 The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
 
@@ -103,7 +135,7 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
   - form actions return `engineFailure(...)`;
   - deletes take two steps (`confirm=yes`);
   - follow SvelteKit 3 conventions (`#lib`, `process.env` in server code, runes, `page` from `$app/state`, `defaultValue`/`defaultChecked`);
-  - admin pages copy the existing dark theme classes.
+  - admin pages use the design tokens and `$lib/components/ui` components (CLAUDE.md "UI conventions"; see Drift (2026-10-24) above).
 - Tests: Mailpit assertions filter by their own unique recipient and never delete messages.
 - Fixed public error bodies. `AppError` on `main` has no variant for a custom 401/410/429 message (`Unauthorized` says `unauthorized`, `RateLimited` says `too many requests`). Status routes therefore answer their fixed bodies through one helper in `statuspages::public::routes`: `pub(crate) fn json_error(status: StatusCode, message: &'static str) -> Response` (`{"error": message}`). Every message is a `&'static str` literal, so no public error body ever echoes input. A 404 is always `json_error(NOT_FOUND, "not found")`, byte-identical to `AppError::NotFound`.
 - Test literals: an array that mixes string literals with `&format!(..)` or `&x.to_string()` does not compile (`expected &str, found &String`). Write `format!(..).as_str()` / `x.to_string().as_str()` instead (temporaries in a `for` iterator expression live for the whole loop).
@@ -122,7 +154,7 @@ The **UI command** is `cd nami-ui && npm run check && npx vitest run <files>`.
 
 ## Controller rulings (2026-10-19)
 
-Recorded in the decisions log by the final review, verbatim:
+Recorded in the decisions log by NAMI-SP-16, verbatim:
 
 1. **Signed subscriber tokens replace "hashed at rest" (spec deviation).** Subscriber links are HMAC-SHA256 tokens under `cipher.derive_subkey("nami/status-subscriber/v1")` (a label of their own), each with a purpose tag (confirm / manage / unsubscribe), checked in constant time. Confirm tokens expire after **48 h**. Manage and unsubscribe tokens never expire, and are invalidated when the subscriber is deleted (their nonce lives on the subscriber row). The spec's "single-purpose and hashed at rest" becomes "single-purpose, signed, nothing usable stored" (R14).
 2. **Bar thresholds accepted:** 100 % operational, ≥ 99 % degraded, ≥ 95 % partial outage, below that major outage (R7).
@@ -151,18 +183,20 @@ The review of PR #62 against `main` at `9599bb8` fixed, among smaller things:
 - **Enumeration (R15).** A full page answers 429 for **every** address, so the cap cannot tell a known address from a new one.
 - **One-click unsubscribe (R16, T10).** Idempotent: a valid token whose subscriber is already gone answers 200. The governor no longer keys a mail provider's whole burst on one proxy peer, and the test router gets `with_fallback_connect_info`.
 - **Unlock (R12, R13).** argon2 off the async threads with a concurrency cap; a per-address bucket across pages (`unlock-ip`, 30 / 15 min).
-- **Drift fixes.** `Availability` has no `Default`; `Config::from_env` spreads `from_env_defaults_only`, so `TxtLookup` is set in both places; `bytes` is not a dependency (`axum::body::Bytes`); `Mailer::send` reports SMTP failures as `Validation` too, so the header test compares messages; `PAGE_COLUMNS` must be a `macro_rules!` for `concat!`; mixed-literal test arrays; `tokio::spawn(kick(..))` borrows; INC-9's `resolve_source_with_reason` gets the automatic-report hook too; the 0104 constraint swap asserts it dropped exactly two checks.
+- **Drift fixes.** `Availability` has no `Default`; `Config::from_env` spreads `from_env_defaults_only`, so `TxtLookup` is set in both places; `bytes` is not a dependency (`axum::body::Bytes`); `Mailer::send` reports SMTP failures as `Validation` too, so the header test compares messages; `PAGE_COLUMNS` must be a `macro_rules!` for `concat!`; mixed-literal test arrays; `tokio::spawn(kick(..))` borrows; INC-9's `resolve_source_with_reason` gets the automatic-report hook too; the delivery-queue constraint swap (now in the incidents file) asserts it dropped exactly two checks.
 - **Leak tests** now also seed heartbeat tokens, header names, basic-auth users, proxy URLs and users (UP-23), group names, incident `details` and `postmortem`, and an automatic-report email is checked for monitor names, targets and causes.
 
 ## Decisions the spec leaves open (rulings)
 
-- **R1 Split.** Roadmap §5 has 17 bullets. Planned whole, they need about 18 tasks. Part 1 is the core named in the header (15 tasks). Part 2 is webhook subscribers, `component.status_changed` and the widget. Those three are self-contained, and the Part 1 data model already carries their columns and toggles.
+- **R1 Split.** Roadmap §5 has 16 items (R5.01..R5.16). Planned whole, they need about 18 tasks. Part 1 is the core named in the header (15 tasks plus the security review, NAMI-SP-16; see Roadmap coverage). Part 2 is webhook subscribers, `component.status_changed` and the widget. Those three are self-contained, and the Part 1 data model already carries their columns and toggles.
 - **R2 Migrations.**
-  - `0100_create_status_pages.sql`: pages, sections, components, plus `unique (id, project_id)` on heartbeats for the components' composite FKs (monitors have had it since 0017).
-  - `0101_create_status_reports.sql`: reports, affected components, updates.
-  - `0102_create_status_page_rate_hits.sql`: DB-backed rate limits (multi-instance safe).
-  - `0103_create_status_page_subscribers.sql`: email subscribers and their component subsets.
-  - `0104_status_page_deliveries.sql`: extends `notification_deliveries`.
+  - `NNNN_uptime_statuspages_part1.sql` (T1): `unique (id, project_id)` on heartbeats for the components' composite FKs (monitors have it in `0003_uptime.sql`). Applied first.
+  - `NNNN_statuspages_part1.sql`, one file built up by four tasks in this order:
+    - T1: pages, sections, components;
+    - T5 appends: reports, affected components, updates;
+    - T7 appends: DB-backed rate limits (multi-instance safe);
+    - T9 appends: email subscribers and their component subsets.
+  - `NNNN_incidents_statuspages_part1.sql` (T9): extends `notification_deliveries`. Applied last (it references status pages, subscribers and report updates).
 - **R3 Who serves the public pages: nami-ui, with the DTO on the engine's private API.** The spec names `hooks.server.ts` and nami-ui routes, so nami-ui renders HTML, feed, badge and JSON. The DTO routes (`/public/status-pages/…`, `/public/status-domains/…`, `/public/status-subscriptions/…`) are added to `build_router` (the private API), not to the public listener:
   - IP allowlists and rate limits need a client address. The private API gets it from nami-ui (`getClientAddress()` → `X-Forwarded-For`, as login does). The public listener is reached directly by any shipper, and its forwarded headers are forgeable.
   - The public listener would also put a second, cacheable HTML-free surface on the internet with its own rate limiting.
@@ -213,13 +247,13 @@ The review of PR #62 against `main` at `9599bb8` fixed, among smaller things:
   - Impacts are `degraded`, `partial_outage`, `major_outage`, `maintenance`. Maintenance reports require `starts_at < ends_at` (≤ 366 days apart).
   - Creating a report creates its first update (the initial message and status) in the same transaction. Posting an update sets the report's status (any status of the report's kind, in any order) and `updated_at`.
   - `published_at` = creation time (no drafts in Part 1). The public page lists active reports, upcoming maintenance (`scheduled`, `starts_at > now`), and history (reports created in the last 90 days, newest first, at most 50, each with at most 20 newest updates).
-- **R9 Automatic reports.** `lifecycle::open` (Monitor/Heartbeat sources only) calls `status_pages::automatic::on_incident_opened(conn, incident_id, &source, at)` in the same transaction.
+- **R9 Automatic reports.** `lifecycle::open` (Monitor/Heartbeat sources only) calls `statuspages::automatic::on_incident_opened(conn, incident_id, &source, at)` in the same transaction.
   - For every page with `automatic_reports` that has a component bound to the source, it inserts a report: kind `incident`, status `investigating`, impact `major_outage` on each bound component of that page, `incident_id`, `automatic = true`.
   - Its title is `"{display names joined ', '} — service disruption"`, truncated to 255 chars with `…`. Its first update reads `We are investigating a disruption affecting {names}.` with `notify_subscribers = page.automatic_reports_notify`. The insert uses `on conflict (status_page_id, incident_id) where incident_id is not null do nothing`.
   - Every resolve path calls `on_incident_resolved(conn, incident_id, at)`: `lifecycle::resolve`, `resolve_source`, and NAMI-INC-9's `resolve_source_with_reason`. Put the call in the one internal function they share if the merged code has one; otherwise in each of the three. It posts a `resolved` update `This incident has been resolved.` (notify per the same flag) to every report with that `incident_id`, `automatic = true` and a status other than `resolved`.
   - A member resolving the report by hand sets `automatic = false`, which ends automatic handling. An update to another status leaves it automatic.
   - Text uses component display names only.
-- **R10 Snapshot cache.** It is `status_pages::cache::SnapshotCache` in `AppState.status_pages`, in-process and per instance.
+- **R10 Snapshot cache.** It is `statuspages::cache::SnapshotCache` in `AppState.status_pages`, in-process and per instance.
   - Every public request first reads the page row (`find_by_slug` / `find_by_verified_domain`, one indexed query). **Access (R12) is decided from that fresh row, never from a cached snapshot**, so a password, allowlist or visibility change applies at once on every instance. The snapshot holds only public DTO bytes.
   - An entry is keyed by page id and holds `(version, built_at, Snapshot)`, where `version` is the row's `updated_at`. It is served while `built_at + 30 s > now` **and** its version equals the fresh row's `updated_at`; otherwise it is rebuilt. A `tokio::sync::Mutex` per page id gives single flight: concurrent misses wait for one build.
   - Every write that changes what the DTO shows bumps `status_pages.updated_at = now()` in its own transaction: page PATCH (already does), section and component writes, report create/PATCH/delete, posted updates, and automatic reports (T8, inside the lifecycle transaction). So every instance sees a new version on its next request, and the in-process `invalidate(page_id)` after commit is only a fast path. Monitor and heartbeat state changes rely on the 30 s TTL (accepted).
@@ -282,9 +316,9 @@ The review of PR #62 against `main` at `9599bb8` fixed, among smaller things:
   - Headers: `List-Unsubscribe: <{public_engine_url}/api/v1/status-subscriptions/one-click/{unsubscribe token}>` and `List-Unsubscribe-Post: List-Unsubscribe=One-Click`, via a new `Mailer::send_with_headers` (lettre 0.11.23 `HeaderName::new_from_ascii_str` + `HeaderValue::new` + `MessageBuilder::raw_header`; lettre itself RFC 2047-encodes any word holding CR or LF, and `send_with_headers` refuses such a value before that). lettre may fold a long header line, so tests unfold headers before comparing.
   - One-click is idempotent (RFC 8058, mail providers retry): a token with a valid MAC answers `200 unsubscribed` whether or not the subscriber still exists; only a token whose MAC fails is 404. The same holds for `POST /public/status-subscriptions/unsubscribe`. A MAC-valid token proves Nami issued it, so the 200 tells an attacker nothing.
   - `Config.public_engine_url` (env `PUBLIC_ENGINE_URL`, default `http://localhost:8081`, same validation as nami-ui's) is the base.
-- **R17 Queue extension.** Migration 0104 makes `notification_deliveries.incident_id` nullable. It adds `status_page_id`, `subscriber_id`, `status_report_update_id` and `priority smallint` (0 = incidents, 1 = status pages), adds the events `sp_confirm`, `sp_subscribed`, `sp_update`, and replaces the due index with `(priority, next_attempt_at)`.
+- **R17 Queue extension.** `NNNN_incidents_statuspages_part1.sql` makes `notification_deliveries.incident_id` nullable. It adds `status_page_id`, `subscriber_id`, `status_report_update_id` and `priority smallint` (0 = incidents, 1 = status pages), adds the events `sp_confirm`, `sp_subscribed`, `sp_update`, and replaces the due index with `(priority, next_attempt_at)`.
   - The claim orders candidates `by priority, next_attempt_at, id`. Status-page rows bucket as `'p:' || status_page_id` with the cap `STATUS_PAGE_PER_MINUTE = 600`.
-  - The drain sends incident rows exactly as before. Rows with `status_page_id` branch off **before** the Incidents plan's per-row step (2a) (they have no incident to check) and go to `status_pages::deliver::send(state, row)`. Those never write `incident_events`, and they are cancelled when the subscriber is gone or unconfirmed (`sp_update`). The claimed-row struct's `incident_id` becomes `Option<Uuid>`.
+  - The drain sends incident rows exactly as before. Rows with `status_page_id` branch off **before** the Incidents plan's per-row step (2a) (they have no incident to check) and go to `statuspages::deliver::send(state, row)`. Those never write `incident_events`, and they are cancelled when the subscriber is gone or unconfirmed (`sp_update`). The claimed-row struct's `incident_id` becomes `Option<Uuid>`.
   - Dedupe: `unique (status_page_id, round, target_key) where status_page_id is not null`, with `round` = the update id in simple hex (32 chars) or `confirm-{n}`, and `target_key = 'sub:{subscriber_id}'`.
   - `INCIDENTS_WORKER_ENABLED=false` stops status-page mail on that instance too (one worker).
 - **R18 No uploads.** The spec makes logos `https` URLs (`logo_url`, `logo_dark_url`), so Part 1 has no upload endpoint, and the upload rules (magic bytes, size, `nosniff`, SVG) do not apply.
@@ -309,21 +343,21 @@ The review of PR #62 against `main` at `9599bb8` fixed, among smaller things:
 ```
 nami-engine/
   Cargo.toml                                   (no new crates; lettre raw_header already available)
-  .env.example                                 T3 (none), T10 PUBLIC_ENGINE_URL
-  migrations/
-    0100_create_status_pages.sql               T1
-    0101_create_status_reports.sql             T5
-    0102_create_status_page_rate_hits.sql      T7
-    0103_create_status_page_subscribers.sql    T9
-    0104_status_page_deliveries.sql            T9
+  .env.example                                 T10 PUBLIC_ENGINE_URL
+  migrations/                                  numbered at phase start, applied in this order (Migrations above)
+    NNNN_uptime_statuspages_part1.sql          T1 heartbeats_id_project_key
+    NNNN_statuspages_part1.sql                 T1 pages, sections, components; T5 reports; T7 rate hits; T9 subscribers
+    NNNN_incidents_statuspages_part1.sql       T9 notification_deliveries extension
   src/
-    lib.rs                                     T1 pub mod status_pages
-    config.rs                                  T3 txt_lookup (TxtLookup); T10 public_engine_url
-    state.rs                                   T6 status_pages: Arc<status_pages::cache::SnapshotCache>
-    email.rs                                   T10 Mailer::send_with_headers
-    router.rs                                  T2/T5 admin routers; T6 public status router (+ governor); T9 token router; T10 one-click on public listener
-    status_pages/
-      mod.rs                                   T1
+    lib.rs                                     T1 pub mod statuspages
+    main.rs                                    T6 SnapshotCache in AppState
+    core/config.rs                             T3 txt_lookup (TxtLookup); T10 public_engine_url
+    core/state.rs                              T6 status_pages: Arc<statuspages::cache::SnapshotCache>
+    core/email.rs                              T10 Mailer::send_with_headers
+    core/router.rs                             T2/T5 admin routers; T6 public status router (+ governor); T9 token router; T10 one-click on public listener
+    uptime/checker/dns.rs                      T3 build_resolver, readable become pub(crate)
+    statuspages/
+      mod.rs                                   T1, then one `pub mod` per new module
       validate.rs                              T1 pure validators
       domain.rs                                T3 verification record + TXT check
       status.rs                                T4 ComponentStatus, derive, override, worst
@@ -336,26 +370,22 @@ nami-engine/
       tokens.rs                                T9 subscriber tokens
       deliver.rs                               T9 confirmation mail; T10 update mail
       notify.rs                                T10 fan-out of an update to subscribers
-    models/
-      status_page.rs                           T1 rows + CRUD; T2 sections/components
-      status_report.rs                         T5
-      status_subscriber.rs                     T9
-    routes/
-      status_pages.rs                          T2 admin; T3 verify
-      status_reports.rs                        T5
-      status_public.rs                         T6 DTO; T7 unlock; T9 subscribe
-      status_subscriptions.rs                  T9 confirm; T10 inspect/manage/unsubscribe/one-click; T10 admin subscribers list
-    incidents/lifecycle.rs                     T8 two hook calls
-    incidents/deliveries.rs                    T9 claim order, bucket, dispatch
+      page/{mod,model,routes}.rs               T2 pages, sections, components (admin); T3 custom domain, verify, domain check
+      report/{mod,model,routes}.rs             T5 reports and updates
+      public/{mod,routes}.rs                   T6 DTO; T7 unlock; T9 subscribe; json_error
+      subscriber/{mod,model,routes}.rs         T9 rows, confirm; T10 inspect/manage/unsubscribe/one-click, admin subscriber list
+    incidents/lifecycle.rs                     T8 hook calls (file planned in NAMI-INC-1)
+    incidents/deliveries.rs, incidents/worker.rs  T9 claim order, bucket, dispatch, hourly prune (planned in NAMI-INC-5)
   tests/
-    common/mod.rs                              T1 seed_status_page, seed_component, seed_heartbeat; T5 seed_report
-    status_pages_api.rs                        T2, T3
-    status_history.rs                          T4
-    status_reports_api.rs                      T5
-    status_public.rs                           T6, T7
-    status_automatic.rs                        T8
-    status_subscribers.rs                      T9, T10
-    migrations.rs, json_bodies.rs              every task that adds tables/routes
+    common/mod.rs                              T1 seed_status_page, seed_component, seed_heartbeat; T5 seed_report; T6 call_raw
+    statuspages/main.rs                        T2 (new target: mounts ../common, one `mod` per file below)
+    statuspages/status_pages_api.rs            T2, T3
+    statuspages/status_history.rs              T4
+    statuspages/status_reports_api.rs          T5
+    statuspages/status_public.rs               T6, T7
+    statuspages/status_automatic.rs            T8
+    statuspages/status_subscribers.rs          T9, T10
+    core/migrations.rs, core/json_bodies.rs    every task that adds tables/routes
 
 nami-ui/
   package.json                                 T13 @sveltejs/adapter-node@6.0.0 (replaces adapter-auto)
@@ -365,11 +395,14 @@ nami-ui/
   src/
     hooks.ts                                   T13 reroute
     hooks.server.ts                            T13 security headers for status routes
-    lib/status-pages.ts (+ .test.ts)           T11 types, labels, colours; T15 xml escape, badge
-    lib/server/engine.ts                       T13 callPublicEngine
-    lib/server/status-page-form.ts (+ .test)   T11 editor form → engine body
-    lib/server/status-public.ts (+ .test)      T13 page ref, access cookie, DTO fetch
-    lib/components/UptimeBars.svelte           T13
+    lib/statuspages/status-pages.ts (+ .test.ts)            T11 types, labels, colours; T15 xml escape, badge
+    lib/statuspages/status-routing.ts (+ .test.ts)          T13 reroute rule
+    lib/server/core/engine.ts (+ engine.test.ts)            T13 callPublicEngine
+    lib/server/core/fake-event.ts                           T13 headers and cookies options
+    lib/server/statuspages/status-page-form.ts (+ .test)    T11 editor form → engine body
+    lib/server/statuspages/status-report-form.ts (+ .test)  T12 composer and update forms
+    lib/server/statuspages/status-public.ts (+ .test)       T13 page ref, access cookie, DTO fetch
+    lib/components/UptimeBars.svelte                        T13
     routes/(app)/projects/[id=uuid]/
       +layout.svelte                           T11 "Status pages" tab
       status-pages/+page.*                     T11 list + create
@@ -391,16 +424,14 @@ nami-ui/
 ---
 ### Task 1 (NAMI-SP-1): Status page schema and pure validators
 
-Branch `feat/NAMI-SP-1-status-page-schema`, worktree `.worktrees/NAMI-SP-1/`.
-
 **Files:**
-- Create: `nami-engine/migrations/0100_create_status_pages.sql`, `nami-engine/src/status_pages/mod.rs`, `nami-engine/src/status_pages/validate.rs`
-- Modify: `nami-engine/src/lib.rs` (`pub mod status_pages;`), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/common/mod.rs`
+- Create: `nami-engine/migrations/NNNN_uptime_statuspages_part1.sql`, `nami-engine/migrations/NNNN_statuspages_part1.sql` (numbered in that order, Migrations above), `nami-engine/src/statuspages/mod.rs`, `nami-engine/src/statuspages/validate.rs`
+- Modify: `nami-engine/src/lib.rs` (`pub mod statuspages;`), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/common/mod.rs`
 - Test: unit tests in `validate.rs`; `tests/core/migrations.rs`
 
 **Interfaces:**
-- Consumes: `models::{validate_label, is_invisible_or_bidi_char}`, `chrono_tz::Tz`, `reqwest::Url`.
-- Produces (`nami_engine::status_pages::validate`):
+- Consumes: `core::validate::{validate_label, is_invisible_or_bidi_char}`, `chrono_tz::Tz`, `reqwest::Url`.
+- Produces (`nami_engine::statuspages::validate`):
 
 ```rust
 pub const MAX_PAGES_PER_PROJECT: i64 = 20;
@@ -440,18 +471,24 @@ pub fn display_name(raw: &str) -> Result<String, String>;          // validate_l
 pub fn section_name(raw: &str) -> Result<String, String>;          // validate_label("name", raw)
 ```
 
-- [ ] **Step 1: Write the migration**
+- [ ] **Step 1: Write the migrations**
 
-`nami-engine/migrations/0100_create_status_pages.sql`:
+`nami-engine/migrations/NNNN_uptime_statuspages_part1.sql` (an uptime table, so an uptime file, applied before the statuspages file):
 
 ```sql
--- Status pages (NAMI-SP-1). Migrations 0100-0119 are reserved for status pages.
-
+-- Uptime changes of Status Pages Part 1 (NAMI-SP-1).
 -- Components reference their monitor/heartbeat together with the project,
 -- so a source of another project can never be bound. Monitors already have
--- `monitors_id_project_key` (0017); heartbeats get the same key.
+-- `monitors_id_project_key` (0003_uptime.sql); heartbeats get the same key.
 alter table heartbeats add constraint heartbeats_id_project_key unique (id, project_id);
+```
 
+`nami-engine/migrations/NNNN_statuspages_part1.sql` (created here; Tasks 5, 7 and 9 append to it):
+
+```sql
+-- Status pages Part 1 (NAMI-SP-1, NAMI-SP-5, NAMI-SP-7, NAMI-SP-9).
+
+-- Pages, sections and components (NAMI-SP-1).
 create table status_pages (
     id uuid primary key default gen_random_uuid(),
     project_id uuid not null references projects(id) on delete cascade,
@@ -651,7 +688,7 @@ fn custom_domains_are_hostnames_other_than_the_app() {
 }
 ```
 
-Run: engine command `--lib -- status_pages::validate`, then engine command `--test core migrations::`. Expected: FAIL (module missing).
+Run: engine command `--lib -- statuspages::validate`, then engine command `--test core -- migrations::`. Expected: FAIL (module missing).
 
 - [ ] **Step 3: Implement** `validate.rs`.
   - `nav_links`: trim the url. Accept `https:` only when `reqwest::Url::parse` gives scheme `https`, a host, no userinfo and ≤ 2048 chars. Accept `mailto:` only when the rest (percent-decoded) is one address that parses as `lettre::Address` and has no control characters. Anything else → the fixed message. Labels: trimmed, 1-40 chars, no control or `is_invisible_or_bidi_char` characters.
@@ -663,7 +700,7 @@ Run: engine command `--lib -- status_pages::validate`, then engine command `--te
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nami-engine/migrations/0100_create_status_pages.sql nami-engine/src/status_pages nami-engine/src/lib.rs nami-engine/tests
+git add nami-engine/migrations/NNNN_uptime_statuspages_part1.sql nami-engine/migrations/NNNN_statuspages_part1.sql nami-engine/src/statuspages nami-engine/src/lib.rs nami-engine/tests
 git commit -m "feat(engine): status page schema and validators (NAMI-SP-1)" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
@@ -671,14 +708,12 @@ git commit -m "feat(engine): status page schema and validators (NAMI-SP-1)" -m "
 
 ### Task 2 (NAMI-SP-2): Admin API — pages, sections, components, group import
 
-Branch `feat/NAMI-SP-2-status-page-admin-api`, worktree `.worktrees/NAMI-SP-2/`.
-
 **Files:**
-- Create: `nami-engine/src/statuspages/page/model.rs`, `nami-engine/src/statuspages/page/routes.rs`, `nami-engine/tests/statuspages/status_pages_api.rs`
-- Modify: `nami-engine/src/core/validate.rs`, `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs` (`.merge(statuspages::page::routes::router())`), `nami-engine/tests/core/json_bodies.rs`
+- Create: `nami-engine/src/statuspages/page/{mod,model,routes}.rs`, `nami-engine/tests/statuspages/main.rs` (the new domain target: `#[path = "../common/mod.rs"] mod common;` and one `mod <file>;` per test file, each later task adding its own), `nami-engine/tests/statuspages/status_pages_api.rs`
+- Modify: `nami-engine/src/statuspages/mod.rs` (`pub mod page;`), `nami-engine/src/core/router.rs` (`build_router` merges `router()` of `statuspages::page`), `nami-engine/tests/core/json_bodies.rs`
 
 **Interfaces:**
-- Consumes: Task 1 validators; `auth::password::hash_password`; `rbac::require_project_role`; `core::validate::nullable`.
+- Consumes: Task 1 validators; `auth::password::hash_password`; `core::middleware::rbac::require_project_role`; `core::validate::nullable`.
 - Produces:
 
 ```rust
@@ -746,7 +781,7 @@ A section or component id that belongs to another page of the same project, or a
 
 ```rust
 // Status page admin API. Requires `docker compose up -d postgres`.
-mod common;
+use crate::common;
 
 use axum::http::StatusCode;
 use common::{call, seed_http_monitor, seed_project, test_app, user_with_role};
@@ -916,7 +951,7 @@ async fn limits_are_enforced(pool: sqlx::PgPool) {
 
 Add every new POST/PATCH route to `json_bodies.rs`, seeding one page, section and component the way the existing entries seed monitors.
 
-Run: engine command `--test statuspages status_pages_api:: --test core json_bodies::`. Expected: FAIL.
+Run: engine command `--test statuspages --test core -- status_pages_api:: json_bodies::`. Expected: FAIL.
 
 - [ ] **Step 2: Implement** the model and routes. Counts are checked inside the insert's transaction (`select count(*) … for update` on the project's pages is not possible; use `pg_advisory_xact_lock(hashtext('status_pages:' || project_id))` before counting, and the same with the page id for sections/components). `import-group` inserts in one transaction: section `name = group.name` and position after the last, then components for `select id, name from monitors where group_id = $1 and project_id = $2` and the same for heartbeats, ordered by name.
 
@@ -934,18 +969,16 @@ git commit -m "feat(engine): status page admin API with sections, components and
 
 ### Task 3 (NAMI-SP-3): Custom domains with DNS TXT verification
 
-Branch `feat/NAMI-SP-3-custom-domains`, worktree `.worktrees/NAMI-SP-3/`.
-
 **Files:**
-- Create: `nami-engine/src/status_pages/domain.rs`
-- Modify: `nami-engine/src/core/config.rs` (`txt_lookup`), `nami-engine/src/statuspages/page/routes.rs` (accept `custom_domain` in PATCH; verify route; `custom_domain_verification` in `GET /{page_id}`), `nami-engine/src/statuspages/page/model.rs`, `nami-engine/tests/statuspages/status_pages_api.rs`, `nami-engine/tests/core/json_bodies.rs`
+- Create: `nami-engine/src/statuspages/domain.rs`
+- Modify: `nami-engine/src/core/config.rs` (`txt_lookup`), `nami-engine/src/uptime/checker/dns.rs` (`build_resolver`, `readable` become `pub(crate)`), `nami-engine/src/statuspages/mod.rs`, `nami-engine/src/statuspages/page/routes.rs` (accept `custom_domain` in PATCH; verify route; `custom_domain_verification` in `GET /{page_id}`), `nami-engine/src/statuspages/page/model.rs`, `nami-engine/tests/statuspages/status_pages_api.rs`, `nami-engine/tests/core/json_bodies.rs`
 
 **Interfaces:**
 - Consumes: Task 1 `validate::custom_domain`, Task 2 routes, `core::crypto::Cipher::derive_subkey`, `hmac 0.13` + `sha2`, `hickory_resolver`.
 - Produces:
 
 ```rust
-// status_pages::domain
+// statuspages::domain
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TxtLookup { System, Fixed(std::collections::BTreeMap<String, Vec<String>>) }   // Config.txt_lookup (R5)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -964,16 +997,16 @@ Routes:
 
 - `GET /public/status-domain-check/{host}` (no session; nami-ui's `/_nami/tls-ask` is its only caller, R4) → `204` when `host` is a verified custom domain of any page, public or private, otherwise `404`. It says nothing else about the page.
 
-`from_env` sets `TxtLookup::System` explicitly; `from_env_defaults_only` (which `from_env_for_test` is, and which `from_env` spreads last) sets `TxtLookup::Fixed(BTreeMap::new())`. Neither reads an environment variable for it. A `config.rs` unit test asserts `from_env_for_test().txt_lookup == Fixed(empty)`; `from_env` needs `DATABASE_URL` and the key, so its `System` value is pinned by reading the code in review.
+`from_env` sets `TxtLookup::System` explicitly; `from_env_defaults_only` (which `from_env_for_test` is, and which `from_env` spreads last) sets `TxtLookup::Fixed(BTreeMap::new())`. Neither reads an environment variable for it. A `core/config.rs` unit test asserts `from_env_for_test().txt_lookup == Fixed(empty)`; `from_env` needs `DATABASE_URL` and the key, so its `System` value is pinned by reading the code in review.
 
-The domain-check route is added to `statuspages::page::routes::public_router()` in this task (no governor yet); Task 6 moves it behind the public status governor with the DTO routes.
+The domain-check route is added to a `public_router()` in `statuspages::page::routes` in this task (no governor yet); Task 6 moves it behind the public status governor with the DTO routes.
 
 - [ ] **Step 1: Write the failing tests** (append to `tests/statuspages/status_pages_api.rs`)
 
 ```rust
 #[sqlx::test]
 async fn a_custom_domain_routes_only_after_its_txt_record_is_verified(pool: sqlx::PgPool) {
-    let mut state = nami_engine::state::AppState::for_test(pool.clone());
+    let mut state = nami_engine::core::state::AppState::for_test(pool.clone());
     state.config.ui_base_url = "https://nami.acme.test".into();
     let project = seed_project(&pool).await;
     let app = common::app(state.clone());
@@ -987,9 +1020,9 @@ async fn a_custom_domain_routes_only_after_its_txt_record_is_verified(pool: sqlx
     let (status, body) = call(&app, "PATCH", &uri, Some(&admin), Some(json!({ "custom_domain": "Status.Acme.Test" }))).await;
     assert_eq!((status, body["custom_domain"].as_str(), body["custom_domain_verified"].as_bool()),
         (StatusCode::OK, Some("status.acme.test"), Some(false)));
-    assert!(nami_engine::models::status_page::find_by_verified_domain(&pool, "status.acme.test").await.unwrap().is_none());
+    assert!(nami_engine::statuspages::page::model::find_by_verified_domain(&pool, "status.acme.test").await.unwrap().is_none());
 
-    let record = nami_engine::status_pages::domain::verification_record(&state.cipher, page_id, "status.acme.test");
+    let record = nami_engine::statuspages::domain::verification_record(&state.cipher, page_id, "status.acme.test");
     assert_eq!(record.name, "_nami-verify.status.acme.test");
     assert!(record.value.starts_with("nami-verify=") && record.value.len() == "nami-verify=".len() + 32);
     let (_, detail) = call(&app, "GET", &uri, Some(&admin), None).await;
@@ -1001,13 +1034,13 @@ async fn a_custom_domain_routes_only_after_its_txt_record_is_verified(pool: sqlx
 
     // The record appears (a wrong value first, then the right one among others).
     let mut with_record = state.clone();
-    with_record.config.txt_lookup = nami_engine::status_pages::domain::TxtLookup::Fixed(
+    with_record.config.txt_lookup = nami_engine::statuspages::domain::TxtLookup::Fixed(
         [(record.name.clone(), vec!["nami-verify=wrong".into(), "v=spf1 -all".into(), record.value.clone()])].into());
     let app2 = common::app(with_record);
     let admin2 = common::login(&app2, &admin_email).await;
     let (status, body) = call(&app2, "POST", &verify, Some(&admin2), Some(json!({}))).await;
     assert_eq!((status, body["verified"].as_bool()), (StatusCode::OK, Some(true)), "{body}");
-    let found = nami_engine::models::status_page::find_by_verified_domain(&pool, "status.acme.test").await.unwrap();
+    let found = nami_engine::statuspages::page::model::find_by_verified_domain(&pool, "status.acme.test").await.unwrap();
     assert_eq!(found.map(|p| p.id), Some(page_id));
     assert_eq!(call(&app2, "GET", "/public/status-domain-check/status.acme.test", None, None).await.0, StatusCode::NO_CONTENT);
     assert_eq!(call(&app2, "GET", "/public/status-domain-check/other.acme.test", None, None).await.0, StatusCode::NOT_FOUND);
@@ -1023,7 +1056,7 @@ async fn a_custom_domain_routes_only_after_its_txt_record_is_verified(pool: sqlx
 fn a_verified_token_is_bound_to_the_page_and_the_domain() {
     let cipher = common::test_cipher();
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
-    use nami_engine::status_pages::domain::verification_record as r;
+    use nami_engine::statuspages::domain::verification_record as r;
     assert_eq!(r(&cipher, a, "s.acme.test"), r(&cipher, a, "s.acme.test"));
     assert_ne!(r(&cipher, a, "s.acme.test").value, r(&cipher, b, "s.acme.test").value);
     assert_ne!(r(&cipher, a, "s.acme.test").value, r(&cipher, a, "t.acme.test").value);
@@ -1048,7 +1081,7 @@ Each `common::app(state)` has its own in-memory session store, so the test logs 
 
 Add the verify route to `json_bodies.rs`.
 
-Run: engine command `--test statuspages status_pages_api:: --test core json_bodies::`, then `--lib -- status_pages::domain`. Expected: FAIL.
+Run: engine command `--test statuspages --test core -- status_pages_api:: json_bodies::`, then `--lib -- statuspages::domain`. Expected: FAIL.
 
 - [ ] **Step 2: Implement.** `verification_record`: `hex(HMAC-SHA256(Zeroizing(derive_subkey("nami/status-domain/v1")), "{page_id}|{domain}"))[..32]`. `lookup_txt(System, ..)` reuses `uptime::checker::dns`: make `build_resolver(nameserver, timeout)` and `readable(&RData)` `pub(crate)` (no behaviour change; the DNS monitor tests stay green) and call `build_resolver(None, Duration::from_secs(4))` (it adds 1 s, so 5 s in all; system config read once off the async threads, hosts file never, no cache). Query `"{name}."` for `RecordType::TXT`; `readable` already concatenates a record's strings. A NXDOMAIN or no-records error (`is_nx_domain()` / `is_no_records_found()`) is `Ok(vec![])`. `Fixed` reads the map.
 
@@ -1066,18 +1099,16 @@ git commit -m "feat(engine): custom domains for status pages with TXT verificati
 
 ### Task 4 (NAMI-SP-4): Component status and 90-day history
 
-Branch `feat/NAMI-SP-4-status-and-history`, worktree `.worktrees/NAMI-SP-4/`. Needs NAMI-UP-27 merged.
-
 **Files:**
-- Create: `nami-engine/src/status_pages/status.rs`, `nami-engine/src/status_pages/history.rs`, `nami-engine/tests/statuspages/status_history.rs`
-- Modify: `nami-engine/src/status_pages/mod.rs`
+- Create: `nami-engine/src/statuspages/status.rs`, `nami-engine/src/statuspages/history.rs`, `nami-engine/tests/statuspages/status_history.rs`
+- Modify: `nami-engine/src/statuspages/mod.rs`
 
 **Interfaces:**
 - Consumes: `uptime::availability::{compute, Availability}`, `uptime::maintenance::model::{Span, MaintenanceWindow, list_for_project, active_windows, ActiveWindows}`, Task 2 `statuspages::page::model::Component`.
 - Produces:
 
 ```rust
-// status_pages::status
+// statuspages::status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ComponentStatus { NoData, Operational, Maintenance, Degraded, PartialOutage, MajorOutage }  // declaration order = severity, worst last
@@ -1090,7 +1121,7 @@ pub fn derive(source: SourceState<'_>) -> ComponentStatus;                      
 pub fn effective(derived: ComponentStatus, impacts: &[ComponentStatus]) -> ComponentStatus;
 pub fn worst(statuses: impl IntoIterator<Item = ComponentStatus>) -> ComponentStatus;  // empty → NoData
 
-// status_pages::history
+// statuspages::history
 pub const DAYS: usize = 90;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Bar { pub date: NaiveDate, pub status: ComponentStatus, pub uptime_pct: Option<f64>,
@@ -1216,9 +1247,9 @@ fn thresholds_and_report_titles() {
 
 ```rust
 // Loading a page's history inputs. Requires `docker compose up -d postgres`.
-mod common;
+use crate::common;
 use chrono::{TimeDelta, Utc};
-use nami_engine::status_pages::history;
+use nami_engine::statuspages::history;
 
 #[sqlx::test]
 async fn inputs_are_per_component_and_respect_window_scope(pool: sqlx::PgPool) {
@@ -1256,7 +1287,7 @@ async fn inputs_are_per_component_and_respect_window_scope(pool: sqlx::PgPool) {
 }
 ```
 
-Run: engine command `--lib -- status_pages::status status_pages::history`, then engine command `--test statuspages status_history::`. Expected: FAIL.
+Run: engine command `--lib -- statuspages::status statuspages::history`, then engine command `--test statuspages -- status_history::`. Expected: FAIL.
 
 - [ ] **Step 2: Implement.**
   - `day_spans`: `today = now.with_timezone(&tz).date_naive()`. For `d` in `today - 89 ..= today`: `start = tz.from_local_datetime(&d.and_hms(0,0,0)).earliest()`, else step forward a minute at a time (at most 180 steps) until one exists. `end` is the next day's start.
@@ -1268,7 +1299,7 @@ Run: engine command `--lib -- status_pages::status status_pages::history`, then 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add nami-engine/src/status_pages nami-engine/tests/statuspages/status_history.rs
+git add nami-engine/src/statuspages nami-engine/tests/statuspages/status_history.rs
 git commit -m "feat(engine): status page component status and 90-day history (NAMI-SP-4)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1277,11 +1308,9 @@ git commit -m "feat(engine): status page component status and 90-day history (NA
 
 ### Task 5 (NAMI-SP-5): Status reports — incidents and maintenance with updates
 
-Branch `feat/NAMI-SP-5-status-reports`, worktree `.worktrees/NAMI-SP-5/`.
-
 **Files:**
-- Create: `nami-engine/migrations/0101_create_status_reports.sql`, `nami-engine/src/statuspages/report/model.rs`, `nami-engine/src/statuspages/report/routes.rs`, `nami-engine/tests/statuspages/status_reports_api.rs`
-- Modify: `nami-engine/src/core/validate.rs`, `nami-engine/src/core/router.rs`, `nami-engine/src/core/router.rs`, `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs`, `nami-engine/tests/common/mod.rs` (`seed_report`)
+- Create: `nami-engine/src/statuspages/report/{mod,model,routes}.rs`, `nami-engine/tests/statuspages/status_reports_api.rs`
+- Modify: `nami-engine/migrations/NNNN_statuspages_part1.sql` (append), `nami-engine/src/statuspages/mod.rs` (`pub mod report;`), `nami-engine/src/core/router.rs` (merge `router()` of `statuspages::report`), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs`, `nami-engine/tests/common/mod.rs` (`seed_report`)
 
 **Interfaces:**
 - Consumes: Task 2 pages and components; Task 4 `ComponentStatus` (impacts).
@@ -1336,7 +1365,7 @@ Routes (under `/projects/{id}/status-pages/{page_id}/reports`):
 
 - [ ] **Step 1: Write the migration**
 
-`nami-engine/migrations/0101_create_status_reports.sql`:
+Append to `nami-engine/migrations/NNNN_statuspages_part1.sql`:
 
 ```sql
 -- Status reports: incidents and maintenance announced on a status page (NAMI-SP-5).
@@ -1389,7 +1418,7 @@ Add the three tables to `all_tables_exist`. `common::seed_report(pool, page, tit
 
 ```rust
 // Status reports API. Requires `docker compose up -d postgres`.
-mod common;
+use crate::common;
 use axum::http::StatusCode;
 use common::{call, seed_project, test_app, user_with_role};
 use serde_json::json;
@@ -1493,7 +1522,7 @@ async fn notified_updates_are_capped_per_report(pool: sqlx::PgPool) {
 
 Add `POST`/`PATCH` report routes and `POST …/updates` to `json_bodies.rs`.
 
-Run: engine command `--test statuspages status_reports_api:: --test core migrations:: --test core json_bodies::`. Expected: FAIL.
+Run: engine command `--test statuspages --test core -- status_reports_api:: migrations:: json_bodies::`. Expected: FAIL.
 
 - [ ] **Step 3: Implement** the model and routes. `post_update` locks the report row (`for update`), counts updates (`MAX_UPDATES`) and notified updates (`MAX_NOTIFIED_UPDATES`, only when `notify`), validates the status for the kind, inserts, then `update status_reports set status = $2, updated_at = now(), automatic = automatic and not $3` with `$3 = by_hand and status in ('resolved','completed')`. The route passes `by_hand = true`.
 
@@ -1502,7 +1531,7 @@ Run: engine command `--test statuspages status_reports_api:: --test core migrati
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nami-engine/migrations/0101_create_status_reports.sql nami-engine/src nami-engine/tests
+git add nami-engine/migrations/NNNN_statuspages_part1.sql nami-engine/src nami-engine/tests
 git commit -m "feat(engine): status reports with updates, maintenance windows and caps (NAMI-SP-5)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -1510,18 +1539,16 @@ git commit -m "feat(engine): status reports with updates, maintenance windows an
 ---
 ### Task 6 (NAMI-SP-6): Public DTO, snapshot cache, ETag and rate limit
 
-Branch `feat/NAMI-SP-6-public-snapshot`, worktree `.worktrees/NAMI-SP-6/`.
-
 **Files:**
-- Create: `nami-engine/src/status_pages/snapshot.rs`, `nami-engine/src/status_pages/cache.rs`, `nami-engine/src/statuspages/public/routes.rs`, `nami-engine/tests/statuspages/status_public.rs`
-- Modify: `nami-engine/src/core/state.rs` (`pub status_pages: Arc<SnapshotCache>`, `SnapshotCache::default()` in `for_test` and in `main.rs`'s construction), `nami-engine/src/main.rs`, `nami-engine/src/core/router.rs` (merge the public status router behind its own governor), `nami-engine/src/statuspages/page/routes.rs` and `status_reports.rs` (`state.status_pages.invalidate(page_id)` after each successful write), `nami-engine/tests/common/mod.rs` (`call_raw`)
+- Create: `nami-engine/src/statuspages/snapshot.rs`, `nami-engine/src/statuspages/cache.rs`, `nami-engine/src/statuspages/public/{mod,routes}.rs`, `nami-engine/tests/statuspages/status_public.rs`
+- Modify: `nami-engine/src/core/state.rs` (`pub status_pages: Arc<SnapshotCache>`, `SnapshotCache::default()` in `for_test` and in `main.rs`'s construction), `nami-engine/src/main.rs`, `nami-engine/src/core/router.rs` (merge the public status router behind its own governor), `nami-engine/src/statuspages/page/routes.rs` and `nami-engine/src/statuspages/report/routes.rs` (`state.status_pages.invalidate(page_id)` after each successful write), `nami-engine/src/statuspages/mod.rs`, `nami-engine/tests/common/mod.rs` (`call_raw`)
 
 **Interfaces:**
 - Consumes: Task 2 `statuspages::page::model::{find_by_slug, find_by_verified_domain, sections, components}`, Task 3 `domain::app_host`, Task 4 `status::*`, `history::{bars, load_inputs}`, Task 5 `statuspages::report::model`, `uptime::maintenance::model::active_windows`.
 - Produces:
 
 ```rust
-// status_pages::snapshot — the DTO types serialise to exactly R11's shape (no other fields, no skip_serializing_if).
+// statuspages::snapshot — the DTO types serialise to exactly R11's shape (no other fields, no skip_serializing_if).
 #[derive(Debug, Clone, Serialize)] pub struct PublicDto { pub page: PublicPage, pub status: ComponentStatus,
     pub sections: Vec<PublicSection>, pub active_reports: Vec<PublicReport>, pub upcoming_maintenance: Vec<PublicReport>,
     pub history: Vec<PublicReport>, pub subscriptions: Subscriptions, pub generated_at: DateTime<Utc> }
@@ -1544,7 +1571,7 @@ pub fn page_url(config: &Config, page: &StatusPage) -> String;   // R11
 /// Builds from Postgres only (R10). Report lists per R8; at most 20 updates per report, newest first.
 pub async fn build(state: &AppState, page: &StatusPage, now: DateTime<Utc>) -> Result<Snapshot, sqlx::Error>;
 
-// status_pages::cache
+// statuspages::cache
 pub const TTL: Duration = Duration::from_secs(30);
 pub const MAX_ENTRIES: usize = 1000;
 #[derive(Default)] pub struct SnapshotCache { /* std Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<Option<Entry>>>>>,
@@ -1586,11 +1613,11 @@ This task also moves Task 3's `/public/status-domain-check/{host}` behind the sa
 
 ```rust
 // The public status page DTO. Requires `docker compose up -d postgres`.
-mod common;
+use crate::common;
 
 use axum::http::StatusCode;
 use common::{call_raw, seed_project, test_app};
-use nami_engine::state::AppState;
+use nami_engine::core::state::AppState;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -1769,7 +1796,7 @@ pub async fn call_raw(app: &Router, method: &str, uri: &str, headers: &[(&str, &
     -> (StatusCode, axum::http::HeaderMap, Vec<u8>)
 ```
 
-Run: engine command `--test statuspages status_public::`. Expected: FAIL.
+Run: engine command `--test statuspages -- status_public::`. Expected: FAIL.
 
 - [ ] **Step 2: Implement.** Use `tokio::sync::Mutex` per page in the cache. Eviction: when the map holds `MAX_ENTRIES` before an insert, remove the entry with the oldest build instant (or no build yet). `builds` increments inside `get_or_build` when `build` runs. Route lookup: `/public/status-pages/{slug}` → `validate::slug` (a malformed slug is 404 without a query) → `find_by_slug`. `/public/status-domains/{host}` → lowercase, `find_by_verified_domain`.
 
@@ -1787,18 +1814,16 @@ git commit -m "feat(engine): public status page snapshot with cache, ETag and ra
 
 ### Task 7 (NAMI-SP-7): Private pages — password unlock, page-scoped access token, IP allowlist
 
-Branch `feat/NAMI-SP-7-private-pages`, worktree `.worktrees/NAMI-SP-7/`.
-
 **Files:**
-- Create: `nami-engine/migrations/0102_create_status_page_rate_hits.sql`, `nami-engine/src/status_pages/access.rs`, `nami-engine/src/status_pages/rate_limit.rs`
-- Modify: `nami-engine/src/statuspages/public/routes.rs` (access check, unlock), `nami-engine/tests/statuspages/status_public.rs`, `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs`
+- Create: `nami-engine/src/statuspages/access.rs`, `nami-engine/src/statuspages/rate_limit.rs`
+- Modify: `nami-engine/migrations/NNNN_statuspages_part1.sql` (append), `nami-engine/src/statuspages/mod.rs`, `nami-engine/src/statuspages/public/routes.rs` (access check, unlock), `nami-engine/tests/statuspages/status_public.rs`, `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs`
 
 **Interfaces:**
 - Consumes: Task 1 `Cidr`, Task 6 routes (fresh-row lookup before the cache), `auth::password::verify_password`, `core::crypto::Cipher::derive_subkey`, `hmac`.
 - Produces:
 
 ```rust
-// status_pages::access
+// statuspages::access
 pub const ACCESS_TTL: TimeDelta = TimeDelta::days(30);
 pub const HEADER: &str = "x-nami-page-access";
 /// R12: exactly one valid IP in X-Forwarded-For, IPv4-mapped unwrapped; anything else None.
@@ -1810,7 +1835,7 @@ pub fn verify(cipher: &Cipher, token: &str, page_id: Uuid, access_epoch: i32, no
 /// strings are parsed with `Cidr::parse` (a row that fails to parse grants nothing for that entry).
 pub fn granted(cipher: &Cipher, page: &StatusPage, token: Option<&str>, ip: Option<IpAddr>, now: DateTime<Utc>) -> bool;
 
-// status_pages::rate_limit
+// statuspages::rate_limit
 /// Counts one hit in `bucket` and says whether it is within `max` per `window` (R13). Runs its own transaction.
 pub async fn hit(pool: &PgPool, bucket: &str, max: i64, window: Duration) -> Result<bool, sqlx::Error>;
 /// hex(HMAC(subkey "nami/status-rate/v1", ip))[..32], or "unknown".
@@ -1830,7 +1855,7 @@ The GET routes from Task 6 now read `X-Nami-Page-Access` and `client_ip(headers)
 
 - [ ] **Step 1: Write the migration**
 
-`nami-engine/migrations/0102_create_status_page_rate_hits.sql`:
+Append to `nami-engine/migrations/NNNN_statuspages_part1.sql`:
 
 ```sql
 -- DB-backed rate limits for status page unlock and subscribe (NAMI-SP-7, R13):
@@ -1920,7 +1945,7 @@ async fn private_content_needs_a_token_for_this_page_and_epoch(pool: sqlx::PgPoo
     assert_eq!(get(Some(format!("{token}x"))).await.0, StatusCode::NOT_FOUND, "tampered");
     let (_, other) = unlock(&app, "secret-b", "203.0.113.5", "battery staple").await;
     assert_eq!(get(Some(other["token"].as_str().unwrap().into())).await.0, StatusCode::NOT_FOUND, "another page's token");
-    let expired = nami_engine::status_pages::access::sign(&common::test_cipher(), page, 0, chrono::Utc::now().timestamp() - 1);
+    let expired = nami_engine::statuspages::access::sign(&common::test_cipher(), page, 0, chrono::Utc::now().timestamp() - 1);
     assert_eq!(get(Some(expired)).await.0, StatusCode::NOT_FOUND, "expired");
 }
 
@@ -2037,7 +2062,7 @@ async fn a_missing_forwarded_address_grants_no_ip_access(pool: sqlx::PgPool) {
 
 Add both unlock routes to `json_bodies.rs`.
 
-Run: engine command `--lib -- status_pages::access`, then engine command `--test statuspages status_public:: --test core migrations:: --test core json_bodies::`. Expected: FAIL.
+Run: engine command `--lib -- statuspages::access`, then engine command `--test statuspages --test core -- status_public:: migrations:: json_bodies::`. Expected: FAIL.
 
 - [ ] **Step 3: Implement.** `sign`: `format!("v1.{}.{exp}.{}", page_id.simple(), b64url(mac))`. `verify`: split into exactly 4 parts, check `v1` and that the page part equals `page_id.simple()`, recompute the MAC over the parsed `exp` and `verify_slice` it, then check `exp > now`. Hold the subkey in `Zeroizing`.
 
@@ -2046,7 +2071,7 @@ Run: engine command `--lib -- status_pages::access`, then engine command `--test
 - [ ] **Step 5: Commit**
 
 ```bash
-git add nami-engine/migrations/0102_create_status_page_rate_hits.sql nami-engine/src nami-engine/tests
+git add nami-engine/migrations/NNNN_statuspages_part1.sql nami-engine/src nami-engine/tests
 git commit -m "feat(engine): private status pages with password unlock, access tokens and IP allowlist (NAMI-SP-7)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
@@ -2055,18 +2080,16 @@ git commit -m "feat(engine): private status pages with password unlock, access t
 
 ### Task 8 (NAMI-SP-8): Automatic reports from bound incidents
 
-Branch `feat/NAMI-SP-8-automatic-reports`, worktree `.worktrees/NAMI-SP-8/`.
-
 **Files:**
-- Create: `nami-engine/src/status_pages/automatic.rs`, `nami-engine/tests/statuspages/status_automatic.rs`
-- Modify: `nami-engine/src/incidents/lifecycle.rs` (three hook calls), `nami-engine/src/status_pages/mod.rs`
+- Create: `nami-engine/src/statuspages/automatic.rs`, `nami-engine/tests/statuspages/status_automatic.rs`
+- Modify: `nami-engine/src/incidents/lifecycle.rs` (three hook calls; the file is planned in NAMI-INC-1), `nami-engine/src/statuspages/mod.rs`, `nami-engine/tests/statuspages/main.rs`
 
 **Interfaces:**
-- Consumes: NAMI-INC-1 `lifecycle::{open, resolve, resolve_source, OpenIncident, IncidentSource}`, Task 5 `status_report::{insert, post_update, NewReport}`.
+- Consumes: NAMI-INC-1 `lifecycle::{open, resolve, resolve_source, OpenIncident, IncidentSource}`, Task 5 `statuspages::report::model::{insert, post_update, NewReport}`.
 - Produces:
 
 ```rust
-// status_pages::automatic
+// statuspages::automatic
 pub const OPENED_MESSAGE: &str = "We are investigating a disruption affecting {names}.";
 pub const RESOLVED_MESSAGE: &str = "This incident has been resolved.";
 /// R9. Monitor/Heartbeat sources only; anything else returns Ok(0). Returns how many reports were created.
@@ -2096,13 +2119,13 @@ where c.monitor_id = $1 and p.automatic_reports
 order by p.id, c.position, c.display_name
 ```
 
-Group by page. For each page, `status_report::insert` with `title_for(names)`, kind `incident`, status `investigating`, `affected = [(component, MajorOutage)]` for each row, message `OPENED_MESSAGE` with `{names}` replaced, `notify_subscribers = automatic_reports_notify`, `created_by = None`, `incident_id = Some(id)`, `automatic = true`. `on_incident_resolved`: `select id, status_page_id from status_reports r join status_pages p … where incident_id = $1 and automatic and status <> 'resolved'`, then `post_update(.., "resolved", RESOLVED_MESSAGE, p.automatic_reports_notify, None, by_hand = false)`. Task 10 adds `notify::enqueue_update` after both inserts.
+Group by page. For each page, `statuspages::report::model::insert` with `title_for(names)`, kind `incident`, status `investigating`, `affected = [(component, MajorOutage)]` for each row, message `OPENED_MESSAGE` with `{names}` replaced, `notify_subscribers = automatic_reports_notify`, `created_by = None`, `incident_id = Some(id)`, `automatic = true`. `on_incident_resolved`: `select id, status_page_id from status_reports r join status_pages p … where incident_id = $1 and automatic and status <> 'resolved'`, then `post_update(.., "resolved", RESOLVED_MESSAGE, p.automatic_reports_notify, None, by_hand = false)`. Task 10 adds `notify::enqueue_update` after both inserts.
 
 - [ ] **Step 1: Write the failing tests** — `tests/statuspages/status_automatic.rs`:
 
 ```rust
 // Automatic status reports (R9). Requires `docker compose up -d postgres`.
-mod common;
+use crate::common;
 
 use chrono::Utc;
 use nami_engine::incidents::lifecycle::{self, IncidentSource, OpenIncident};
@@ -2174,7 +2197,7 @@ async fn recovery_posts_resolved_and_a_hand_resolved_report_is_left_alone(pool: 
     open_for(&pool, project, IncidentSource::Heartbeat(hb)).await;
     let report: Uuid = sqlx::query_scalar("select id from status_reports where title like 'Jobs%'").fetch_one(&pool).await.unwrap();
     let mut tx = pool.begin().await.unwrap();
-    nami_engine::models::status_report::post_update(&mut tx, report, "resolved", "Fixed by hand.", true, None, true).await.unwrap();
+    nami_engine::statuspages::report::model::post_update(&mut tx, report, "resolved", "Fixed by hand.", true, None, true).await.unwrap();
     tx.commit().await.unwrap();
     let mut tx = pool.begin().await.unwrap();
     lifecycle::resolve_source(&mut tx, &IncidentSource::Heartbeat(hb), Utc::now()).await.unwrap();
@@ -2202,18 +2225,18 @@ async fn notifications_follow_the_page_flag_and_manual_incidents_are_ignored(poo
 #[test]
 fn titles_are_capped() {
     let names: Vec<String> = (0..40).map(|i| format!("Component number {i}")).collect();
-    let t = nami_engine::status_pages::automatic::title_for(&names);
+    let t = nami_engine::statuspages::automatic::title_for(&names);
     assert!(t.chars().count() <= 255 && t.ends_with('…'), "{t}");
 }
 ```
 
-Run: engine command `--test statuspages status_automatic::`. Expected: FAIL.
+Run: engine command `--test statuspages -- status_automatic::`. Expected: FAIL.
 
-- [ ] **Step 2: Implement** `automatic.rs` and the hooks. The existing `incident_lifecycle.rs`, `uptime_worker.rs` and `heartbeats.rs` tests must stay green unchanged (no page → no work: one indexed query per open/resolve).
+- [ ] **Step 2: Implement** `automatic.rs` and the hooks. The existing `tests/incidents/incident_lifecycle.rs` (planned in NAMI-INC-1), `tests/uptime/uptime_worker.rs` and `tests/uptime/heartbeats.rs` tests must stay green unchanged (no page → no work: one indexed query per open/resolve).
 
 In Part 1 only log alerts call `resolve_source_with_reason`, and a log alert cannot be bound to a component, so no test drives that path. The task review checks that the call site is there.
 
-- [ ] **Step 3: Run** `--test statuspages status_automatic:: --test incidents incident_lifecycle:: --test uptime uptime_worker:: --test uptime heartbeats::`, the full suite and clippy. Expected: green.
+- [ ] **Step 3: Run** the engine command with `--test statuspages --test incidents --test uptime -- status_automatic:: incident_lifecycle:: uptime_worker:: heartbeats::` (`incident_lifecycle` is planned in NAMI-INC-1), the full suite and clippy. Expected: green.
 
 - [ ] **Step 4: Commit**
 
@@ -2227,18 +2250,16 @@ git commit -m "feat(engine): automatic status reports from bound monitor and hea
 
 ### Task 9 (NAMI-SP-9): Email subscribers — double opt-in through the delivery queue
 
-Branch `feat/NAMI-SP-9-email-subscribers`, worktree `.worktrees/NAMI-SP-9/`.
-
 **Files:**
-- Create: `nami-engine/migrations/0103_create_status_page_subscribers.sql`, `nami-engine/migrations/0104_status_page_deliveries.sql`, `nami-engine/src/status_pages/tokens.rs`, `nami-engine/src/status_pages/deliver.rs`, `nami-engine/src/statuspages/subscriber/model.rs`, `nami-engine/src/statuspages/subscriber/routes.rs`, `nami-engine/tests/statuspages/status_subscribers.rs`
-- Modify: `nami-engine/src/incidents/deliveries.rs` (claim order, page bucket, dispatch), `nami-engine/src/incidents/worker.rs` (hourly prune), `nami-engine/src/statuspages/public/routes.rs` (subscribe), `nami-engine/src/core/router.rs` (token router + governor), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs`
+- Create: `nami-engine/migrations/NNNN_incidents_statuspages_part1.sql` (numbered after the statuspages file), `nami-engine/src/statuspages/tokens.rs`, `nami-engine/src/statuspages/deliver.rs`, `nami-engine/src/statuspages/subscriber/{mod,model,routes}.rs`, `nami-engine/tests/statuspages/status_subscribers.rs` (plus its `mod` line in `tests/statuspages/main.rs`)
+- Modify: `nami-engine/migrations/NNNN_statuspages_part1.sql` (append the subscriber tables), `nami-engine/src/statuspages/mod.rs`, `nami-engine/src/incidents/deliveries.rs` (claim order, page bucket, dispatch), `nami-engine/src/incidents/worker.rs` (hourly prune) (both planned in NAMI-INC-5), `nami-engine/src/statuspages/public/routes.rs` (subscribe), `nami-engine/src/core/router.rs` (token router + governor), `nami-engine/tests/core/migrations.rs`, `nami-engine/tests/core/json_bodies.rs`
 
 **Interfaces:**
-- Consumes: NAMI-INC-5 queue and drain, Task 6 page resolution, Task 7 `access::granted`, `rate_limit::{hit, client_key}`, `core::email::Mailer::send`, `statuspages::public::routes::json_error`.
+- Consumes: NAMI-INC-5 queue and drain, Task 6 page resolution, Task 7 `access::granted`, `rate_limit::{hit, client_key}`, `core::email::Mailer::send`, `json_error` of `statuspages::public::routes`.
 - Produces:
 
 ```rust
-// status_pages::tokens
+// statuspages::tokens
 #[derive(Debug, Clone, Copy, PartialEq, Eq)] #[repr(u8)]
 pub enum Purpose { Confirm = 1, Manage = 2, Unsubscribe = 3 }
 pub fn sign(cipher: &Cipher, subscriber_id: Uuid, purpose: Purpose, nonce: &[u8; 16]) -> String;   // R14
@@ -2258,7 +2279,7 @@ pub async fn subscribe(conn: &mut PgConnection, page_id: Uuid, email: &str, comp
 pub enum Confirm { Confirmed { page_id: Uuid }, Expired, Invalid }
 pub async fn confirm(conn: &mut PgConnection, cipher: &Cipher, token: &str) -> Result<Confirm, sqlx::Error>;
 
-// status_pages::deliver
+// statuspages::deliver
 pub const STATUS_PAGE_PER_MINUTE: i64 = 600;
 /// `Failed` carries INC-5's struct: a Mailer error is `SendError { message: "email not delivered".into(),
 /// retry: Retry::After(None) }`, recorded with the Incidents plan's retry rules (its Task 5 Step 3 (2f)).
@@ -2280,7 +2301,7 @@ Routes:
 
 - [ ] **Step 1: Write the migrations**
 
-`nami-engine/migrations/0103_create_status_page_subscribers.sql`:
+Append to `nami-engine/migrations/NNNN_statuspages_part1.sql`:
 
 ```sql
 -- Email subscribers of status pages (NAMI-SP-9). No token or token hash is
@@ -2315,7 +2336,7 @@ create table status_page_subscriber_components (
 create index status_page_subscriber_components_component_idx on status_page_subscriber_components (component_id);
 ```
 
-`nami-engine/migrations/0104_status_page_deliveries.sql` (R17):
+`nami-engine/migrations/NNNN_incidents_statuspages_part1.sql` (R17; `notification_deliveries` is an incidents table, so an incidents file, numbered after the statuspages file it references):
 
 ```sql
 -- Status page mail rides the incident delivery queue (NAMI-SP-9, R17).
@@ -2327,10 +2348,11 @@ alter table notification_deliveries
     add column status_report_update_id uuid references status_report_updates(id) on delete cascade,
     add column priority smallint not null default 0 check (priority in (0, 1));
 
--- 0062's unnamed checks on `event` and on (user_id, channel_id) are replaced by one rule per row kind.
+-- The unnamed checks on `event` and on (user_id, channel_id) that Incidents Part 1's phase file
+-- creates (planned in NAMI-INC-5) are replaced by one rule per row kind.
 -- Matched by definition, not by the generated names (`notification_deliveries_event_check`,
 -- `notification_deliveries_check`/`_check1` depend on declaration order). Exactly two must go:
--- anything else means 0062 drifted from its plan, and the migration stops instead of guessing.
+-- anything else means that file drifted from its plan, and the migration stops instead of guessing.
 do $$
 declare c record; dropped int := 0;
 begin
@@ -2423,11 +2445,11 @@ Dispatch per claimed row: `incident_id` set → the existing path, unchanged. Ot
 
 ```rust
 // Status page email subscribers. Requires `docker compose up -d postgres mailpit`.
-mod common;
+use crate::common;
 
 use axum::http::StatusCode;
 use common::{call_raw, run_incident_ticks, seed_project, settled_mail, stored_mail_for, unique_email};
-use nami_engine::state::AppState;
+use nami_engine::core::state::AppState;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -2590,7 +2612,7 @@ async fn a_page_never_sends_more_than_its_per_minute_cap(pool: sqlx::PgPool) {
 
 Add the subscribe and confirm routes to `json_bodies.rs`.
 
-Run: engine command `--lib -- status_pages::tokens`, then engine command `--test statuspages status_subscribers:: --test core migrations:: --test core json_bodies:: --test incidents notification_deliveries::`. Expected: FAIL (`notification_deliveries` must stay green after the change).
+Run: engine command `--lib -- statuspages::tokens`, then engine command `--test statuspages --test core --test incidents -- status_subscribers:: migrations:: json_bodies:: notification_deliveries::`. Expected: FAIL (`notification_deliveries` must stay green after the change).
 
 - [ ] **Step 4: Implement.** `subscribe` (one transaction, `pg_advisory_xact_lock(hashtext('subscribers:' || page_id))`):
   0. Count confirmed and pending rows of the page. Either at its cap (10,000 / 500) → `Full`, **before** looking at the address (R15: the answer must not depend on whether the address is known).
@@ -2607,7 +2629,7 @@ Run: engine command `--lib -- status_pages::tokens`, then engine command `--test
 - [ ] **Step 6: Commit**
 
 ```bash
-git add nami-engine/migrations/0103_create_status_page_subscribers.sql nami-engine/migrations/0104_status_page_deliveries.sql \
+git add nami-engine/migrations/NNNN_statuspages_part1.sql nami-engine/migrations/NNNN_incidents_statuspages_part1.sql \
   nami-engine/src nami-engine/tests
 git commit -m "feat(engine): status page email subscribers with double opt-in via the delivery queue (NAMI-SP-9)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
@@ -2617,18 +2639,16 @@ git commit -m "feat(engine): status page email subscribers with double opt-in vi
 
 ### Task 10 (NAMI-SP-10): Update notifications, manage/unsubscribe, one-click, admin subscriber list
 
-Branch `feat/NAMI-SP-10-subscriber-notifications`, worktree `.worktrees/NAMI-SP-10/`.
-
 **Files:**
-- Create: `nami-engine/src/status_pages/notify.rs`
-- Modify: `nami-engine/src/core/email.rs` (`send_with_headers`), `nami-engine/src/core/config.rs` (`public_engine_url`), `nami-engine/.env.example`, `nami-engine/src/status_pages/deliver.rs` (`sp_update`), `nami-engine/src/status_pages/automatic.rs` and `nami-engine/src/statuspages/report/routes.rs` (call `notify::enqueue_update`, then `kick` after commit in the routes), `nami-engine/src/statuspages/subscriber/routes.rs`, `nami-engine/src/core/router.rs` (one-click on the public listener), `nami-engine/tests/statuspages/status_subscribers.rs`, `nami-engine/tests/core/json_bodies.rs`
+- Create: `nami-engine/src/statuspages/notify.rs`
+- Modify: `nami-engine/src/core/email.rs` (`send_with_headers`), `nami-engine/src/core/config.rs` (`public_engine_url`), `nami-engine/.env.example`, `nami-engine/src/statuspages/deliver.rs` (`sp_update`), `nami-engine/src/statuspages/automatic.rs` and `nami-engine/src/statuspages/report/routes.rs` (call `notify::enqueue_update`, then `kick` after commit in the routes), `nami-engine/src/statuspages/subscriber/routes.rs`, `nami-engine/src/core/router.rs` (one-click on the public listener), `nami-engine/tests/statuspages/status_subscribers.rs`, `nami-engine/tests/core/json_bodies.rs`
 
 **Interfaces:**
 - Consumes: Task 5 updates, Task 8 automatic reports, Task 9 tokens, rows and dispatch.
 - Produces:
 
 ```rust
-// status_pages::notify
+// statuspages::notify
 /// Queues one `sp_update` row per confirmed subscriber the update reaches (R17's SQL below). Returns the row count.
 pub async fn enqueue_update(conn: &mut PgConnection, update_id: Uuid) -> Result<u64, sqlx::Error>;
 // core::email::Mailer
@@ -2662,7 +2682,7 @@ Routes:
   - anything else → 404. The masked address is the first character, `***`, then `@domain`.
 - `POST /public/status-subscriptions/manage {token, components: [uuid] | null}` (Manage only) → `200 {"ok": true}`. A component not on the page → 400.
 - `POST /public/status-subscriptions/unsubscribe {token}` (Manage or Unsubscribe) → deletes the subscriber (its queued rows cascade) → `200 {"ok": true}`. Idempotent (R16): a MAC-valid token whose subscriber is already gone also answers 200. A token whose MAC fails → 404.
-- Public listener: `POST /api/v1/status-subscriptions/one-click/{token}` (RFC 8058). It accepts any body up to 1 KiB of any content type (`DefaultBodyLimit::max(1024)`; the public router has no JSON guard), verifies an Unsubscribe token's MAC **before** touching the database, deletes the subscriber if it still exists, and answers `200 unsubscribed` (text/plain) either way (idempotent; mail providers retry). A token whose MAC fails or whose purpose is not Unsubscribe → 404. CSRF is not a concern here (no cookie; the token is the only credential). It sits behind a governor keyed by the TCP peer (R13: `PeerIpKeyExtractor`, burst 100, `per_millisecond(20)`). Production serves the public listener with `ConnectInfo` (`serve.rs`); tests wrap `common::public_app(state)` in `nami_engine::router::with_fallback_connect_info`, or the peer extractor fails.
+- Public listener: `POST /api/v1/status-subscriptions/one-click/{token}` (RFC 8058). It accepts any body up to 1 KiB of any content type (`DefaultBodyLimit::max(1024)`; the public router has no JSON guard), verifies an Unsubscribe token's MAC **before** touching the database, deletes the subscriber if it still exists, and answers `200 unsubscribed` (text/plain) either way (idempotent; mail providers retry). A token whose MAC fails or whose purpose is not Unsubscribe → 404. CSRF is not a concern here (no cookie; the token is the only credential). It sits behind a governor keyed by the TCP peer (R13: `PeerIpKeyExtractor`, burst 100, `per_millisecond(20)`). Production serves the public listener with `ConnectInfo` (`serve.rs`); tests wrap `common::public_app(state)` in `nami_engine::core::router::with_fallback_connect_info`, or the peer extractor fails.
 - Admin: `GET /projects/{id}/status-pages/{page_id}/subscribers` (admin) → `[{id, email, confirmed, all_components, components: [uuid], created_at}]`. `DELETE …/subscribers/{subscriber_id}` (admin) → 204. A member or viewer → 403.
 
 `deliver::send` for `sp_update`:
@@ -2719,7 +2739,7 @@ async fn emails_carry_one_click_unsubscribe_and_single_purpose_links(pool: sqlx:
     let state = AppState::for_test(pool.clone());
     let app = common::app(state.clone());
     // The one-click governor keys on the TCP peer: oneshot requests carry no ConnectInfo without this.
-    let public = nami_engine::router::with_fallback_connect_info(common::public_app(state.clone()));
+    let public = nami_engine::core::router::with_fallback_connect_info(common::public_app(state.clone()));
     let project = seed_project(&pool).await;
     let (_, _, member) = common::user_with_role(&app, &pool, project, Some("member")).await;
     let page = common::seed_status_page(&pool, project, "acme").await;
@@ -2808,7 +2828,7 @@ async fn manage_switches_to_a_subset_and_back(pool: sqlx::PgPool) {
     let c1 = common::seed_component(&pool, page, "API", Some(m), None).await;
     let subscriber = confirmed(&pool, page, &unique_email("m"), None).await;
     let nonce: Vec<u8> = sqlx::query_scalar("select token_nonce from status_page_subscribers where id = $1").bind(subscriber).fetch_one(&pool).await.unwrap();
-    let token = nami_engine::status_pages::tokens::sign(&state.cipher, subscriber, nami_engine::status_pages::tokens::Purpose::Manage,
+    let token = nami_engine::statuspages::tokens::sign(&state.cipher, subscriber, nami_engine::statuspages::tokens::Purpose::Manage,
         &nonce.try_into().unwrap());
     let (status, _, _) = call_raw(&app, "POST", "/public/status-subscriptions/manage", &[], Some(json!({ "token": token, "components": [c1] }))).await;
     assert_eq!(status, StatusCode::OK);
@@ -2840,11 +2860,11 @@ async fn only_admins_see_subscribers_and_the_dto_never_does(pool: sqlx::PgPool) 
 }
 ```
 
-`email.rs` unit test: `send_with_headers` refuses a value containing `\r` or `\n` and sends nothing. Note that on `main` `Mailer::send` reports SMTP failures as `AppError::Validation("could not send email")` too, so the test must compare the **message**: the refusal is `AppError::Validation("invalid email header")`, and with the Mailer pointed at `127.0.0.1:9` an attempted send would come back as `"could not send email"` instead. A second case sends a clean header to the same dead port and asserts `"could not send email"`, proving the two are told apart.
+`core/email.rs` unit test: `send_with_headers` refuses a value containing `\r` or `\n` and sends nothing. Note that on `main` `Mailer::send` reports SMTP failures as `AppError::Validation("could not send email")` too, so the test must compare the **message**: the refusal is `AppError::Validation("invalid email header")`, and with the Mailer pointed at `127.0.0.1:9` an attempted send would come back as `"could not send email"` instead. A second case sends a clean header to the same dead port and asserts `"could not send email"`, proving the two are told apart.
 
 Add `inspect`, `manage` and `unsubscribe` to `json_bodies.rs`. The one-click route is exempt by design: `emails_carry_one_click_unsubscribe_and_single_purpose_links` (above) posts it as `application/x-www-form-urlencoded` on the public listener. Also add `the_one_click_route_takes_a_form_body` to `json_bodies.rs`, next to `pings_on_the_public_listener_take_any_body`: a form body with a junk token gets 404, not 415.
 
-Run: engine command `--test statuspages status_subscribers:: --test core json_bodies:: --test statuspages status_automatic::`, then engine command `--lib -- email`. Expected: FAIL.
+Run: engine command `--test statuspages --test core -- status_subscribers:: json_bodies:: status_automatic::`, then engine command `--lib -- core::email`. Expected: FAIL.
 
 - [ ] **Step 2: Implement.**
   - `statuspages::report::routes` calls `enqueue_update` for the first update of a new report and for every posted update, inside the write's transaction, then `tokio::spawn(kick)` after commit.
@@ -2864,10 +2884,8 @@ git commit -m "feat(engine): status page update emails with one-click unsubscrib
 ---
 ### Task 11 (NAMI-SP-11): UI — status page list and editor
 
-Branch `feat/NAMI-SP-11-ui-status-page-editor`, worktree `.worktrees/NAMI-SP-11/`.
-
 **Files:**
-- Create: `nami-ui/src/lib/status-pages.ts` (+ `status-pages.test.ts`), `nami-ui/src/lib/server/status-page-form.ts` (+ `status-page-form.test.ts`), `nami-ui/src/routes/(app)/projects/[id=uuid]/status-pages/+page.server.ts`, `+page.svelte`, `status-pages.test.ts`, `nami-ui/src/routes/(app)/projects/[id=uuid]/status-pages/[pageId=uuid]/+page.server.ts`, `+page.svelte`, `editor.test.ts`
+- Create: `nami-ui/src/lib/statuspages/status-pages.ts` (+ `status-pages.test.ts`), `nami-ui/src/lib/server/statuspages/status-page-form.ts` (+ `status-page-form.test.ts`), `nami-ui/src/routes/(app)/projects/[id=uuid]/status-pages/+page.server.ts`, `+page.svelte`, `status-pages.test.ts`, `nami-ui/src/routes/(app)/projects/[id=uuid]/status-pages/[pageId=uuid]/+page.server.ts`, `+page.svelte`, `editor.test.ts`
 - Modify: `nami-ui/src/routes/(app)/projects/[id=uuid]/+layout.svelte` (a "Status pages" tab after "Maintenance")
 
 **Interfaces:**
@@ -2875,11 +2893,11 @@ Branch `feat/NAMI-SP-11-ui-status-page-editor`, worktree `.worktrees/NAMI-SP-11/
 - Produces:
 
 ```ts
-// lib/status-pages.ts
+// lib/statuspages/status-pages.ts
 export const COMPONENT_STATUSES = ['operational', 'degraded', 'partial_outage', 'major_outage', 'maintenance', 'no_data'] as const;
 export type ComponentStatus = (typeof COMPONENT_STATUSES)[number];
 export const STATUS_LABELS: Record<ComponentStatus, string>;   // R6 labels, same text as the engine's `label()`
-export function statusClass(s: string): string;                // Tailwind bg class per status; unknown → the no_data class
+export function statusClass(s: string): string;                // token bg class per status (`status-*` / `success` / `warning` / `danger`); unknown → the no_data class
 export const BANNER_TEXT: Record<ComponentStatus, string>;     // operational → "All systems operational", …
 export type PageView = { id: string; slug: string; title: string; description: string | null; logo_url: string | null;
   logo_dark_url: string | null; accent_color: string; theme: 'light' | 'dark' | 'system'; nav_links: { label: string; url: string }[];
@@ -2892,7 +2910,7 @@ export type Component = { id: string; section_id: string; display_name: string; 
 /** The public URL of a page: https://<verified domain> or `${origin}/status/<slug>`. */
 export function publicUrl(page: PageView, origin: string): string;
 
-// lib/server/status-page-form.ts
+// lib/server/statuspages/status-page-form.ts
 export type Parsed<T> = { ok: true; body: T } | { ok: false; message: string };
 /** Editor "settings" form → PATCH body. Empty optional text → null; password empty → omitted; clear_password=yes → null. */
 export function parsePageSettings(form: FormData): Parsed<Record<string, unknown>>;
@@ -2966,9 +2984,9 @@ describe('parseSource', () => {
 
 `status-pages.test.ts` (list): load returns the pages; `create` posts `{slug, title}` and redirects 303 to the editor; a 409 shows `slug is taken`.
 
-Run: UI command with `src/lib/server/status-page-form.test.ts src/lib/status-pages.test.ts "src/routes/(app)/projects/[id=uuid]/status-pages"`. Expected: FAIL.
+Run: UI command with `src/lib/server/statuspages/status-page-form.test.ts src/lib/statuspages/status-pages.test.ts "src/routes/(app)/projects/[id=uuid]/status-pages"`. Expected: FAIL.
 
-- [ ] **Step 2: Implement** the modules and pages (dark theme classes as on the maintenance pages).
+- [ ] **Step 2: Implement** the modules and pages with the design tokens and `$lib/components/ui` components, as the maintenance pages do (Drift (2026-10-24)).
 - [ ] **Step 3: Run** the UI command again. Expected: PASS, `npm run check` with 0 errors and 0 warnings.
 - [ ] **Step 4: Commit**
 
@@ -2982,10 +3000,8 @@ git commit -m "feat(ui): status page list and editor with sections, components a
 
 ### Task 12 (NAMI-SP-12): UI — report composer, update timeline, subscribers
 
-Branch `feat/NAMI-SP-12-ui-reports`, worktree `.worktrees/NAMI-SP-12/`.
-
 **Files:**
-- Create: `nami-ui/src/lib/server/status-report-form.ts` (+ `.test.ts`), `nami-ui/src/routes/(app)/projects/[id=uuid]/status-pages/[pageId=uuid]/reports/+page.server.ts`, `+page.svelte`, `reports.test.ts`, `…/reports/[reportId=uuid]/+page.server.ts`, `+page.svelte`, `report.test.ts`, `…/subscribers/+page.server.ts`, `+page.svelte`, `subscribers.test.ts`
+- Create: `nami-ui/src/lib/server/statuspages/status-report-form.ts` (+ `.test.ts`), `nami-ui/src/routes/(app)/projects/[id=uuid]/status-pages/[pageId=uuid]/reports/+page.server.ts`, `+page.svelte`, `reports.test.ts`, `…/reports/[reportId=uuid]/+page.server.ts`, `+page.svelte`, `report.test.ts`, `…/subscribers/+page.server.ts`, `+page.svelte`, `subscribers.test.ts`
 - Modify: the editor page (links to "Reports" and "Subscribers")
 
 **Interfaces:**
@@ -2993,7 +3009,7 @@ Branch `feat/NAMI-SP-12-ui-reports`, worktree `.worktrees/NAMI-SP-12/`.
 - Produces:
 
 ```ts
-// lib/server/status-report-form.ts
+// lib/server/statuspages/status-report-form.ts
 /** Composer → POST body: title, kind, status, starts_at/ends_at (datetime-local in UTC → "…:00Z", maintenance only),
  *  affected from `component=<uuid>` checkboxes with `impact_<uuid>` selects, message, notify_subscribers (checkbox, default on). */
 export function parseReportForm(form: FormData): Parsed<Record<string, unknown>>;
@@ -3058,7 +3074,7 @@ describe('parseUpdateForm', () => {
 
 `subscribers.test.ts`: the load returns the list with `private, no-store`; a 403 → the page data `{ forbidden: true }`; remove without `confirm=yes` does nothing.
 
-Run: UI command with `src/lib/server/status-report-form.test.ts "src/routes/(app)/projects/[id=uuid]/status-pages"`. Expected: FAIL.
+Run: UI command with `src/lib/server/statuspages/status-report-form.test.ts "src/routes/(app)/projects/[id=uuid]/status-pages"`. Expected: FAIL.
 
 - [ ] **Step 2: Implement.** - [ ] **Step 3: Run** the UI command again. Expected: PASS, check clean. - [ ] **Step 4: Commit**
 
@@ -3072,11 +3088,9 @@ git commit -m "feat(ui): status report composer, update timeline and subscriber 
 
 ### Task 13 (NAMI-SP-13): UI — public status page, custom-domain routing, password form
 
-Branch `feat/NAMI-SP-13-ui-public-page`, worktree `.worktrees/NAMI-SP-13/`.
-
 **Files:**
-- Create: `nami-ui/src/hooks.ts`, `nami-ui/src/hooks.server.ts` (+ `hooks.server.test.ts`), `nami-ui/src/lib/status-routing.ts` (+ `.test.ts`), `nami-ui/src/lib/server/status-public.ts` (+ `.test.ts`), `nami-ui/src/lib/components/UptimeBars.svelte`, `nami-ui/src/routes/status/[slug]/+page.server.ts`, `+page.svelte`, `+error.svelte`, `public-page.test.ts`, `nami-ui/src/routes/_nami/tls-ask/+server.ts` (+ `server.test.ts`)
-- Modify: `nami-ui/package.json` + lock (`npm install -D @sveltejs/adapter-node@6.0.0`, `npm uninstall @sveltejs/adapter-auto`), `nami-ui/vite.config.ts` (`import adapter from '@sveltejs/adapter-node'`; there is no `svelte.config.js` in this repo, the Kit config lives in the `sveltekit({...})` plugin call; do **not** add `paths.origin` or `csrf.trustedOrigins`), `nami-ui/src/lib/server/core/engine.ts` (`callPublicEngine`), `nami-ui/src/lib/server/engine.test.ts`, `nami-ui/src/lib/server/core/fake-event.ts`, `nami-ui/.env.example`, `nami-ui/README.md`
+- Create: `nami-ui/src/hooks.ts`, `nami-ui/src/hooks.server.ts` (+ `hooks.server.test.ts`), `nami-ui/src/lib/statuspages/status-routing.ts` (+ `.test.ts`), `nami-ui/src/lib/server/statuspages/status-public.ts` (+ `.test.ts`), `nami-ui/src/lib/components/UptimeBars.svelte`, `nami-ui/src/routes/status/[slug]/+page.server.ts`, `+page.svelte`, `+error.svelte`, `public-page.test.ts`, `nami-ui/src/routes/_nami/tls-ask/+server.ts` (+ `server.test.ts`)
+- Modify: `nami-ui/package.json` + lock (`npm install -D @sveltejs/adapter-node@6.0.0`, `npm uninstall @sveltejs/adapter-auto`), `nami-ui/vite.config.ts` (`import adapter from '@sveltejs/adapter-node'`; there is no `svelte.config.js` in this repo, the Kit config lives in the `sveltekit({...})` plugin call; do **not** add `paths.origin` or `csrf.trustedOrigins`), `nami-ui/src/lib/server/core/engine.ts` (`callPublicEngine`), `nami-ui/src/lib/server/core/engine.test.ts`, `nami-ui/src/lib/server/core/fake-event.ts`, `nami-ui/.env.example`, `nami-ui/README.md`
 - `fake-event.ts` extension (backwards compatible; every existing suite must stay green): options `headers?: Record<string, string>` (set on the fake `request`, also for form posts) and `cookies?: Record<string, string>` (read by a new `cookies.get(name)`; `cookies.set` stays a `vi.fn()`); `calls()` entries gain `headers: Record<string, string>`, built from `new Headers(init.headers)` with lowercased names, so a `Headers` object and a plain object both work.
 
 **Interfaces:**
@@ -3084,7 +3098,7 @@ Branch `feat/NAMI-SP-13-ui-public-page`, worktree `.worktrees/NAMI-SP-13/`.
 - Produces:
 
 ```ts
-// lib/status-routing.ts
+// lib/statuspages/status-routing.ts
 export const DOMAIN_SENTINEL = '_domain';
 /** R4. `appHost` null (APP_ORIGIN unset) → never reroutes. Paths under /_app/ (static assets) and /_nami/
  *  (the TLS ask endpoint, called on internal host names) are never rerouted. Compares `url.host` (with port). */
@@ -3094,14 +3108,14 @@ export function statusReroute(url: URL, appHost: string | null): string | undefi
  *  globalThis.process?.env?.APP_ORIGIN). `process` does not exist in the browser, so it is never touched there. */
 export const reroute: Reroute;
 
-// lib/server/engine.ts
+// lib/server/core/engine.ts
 /** Public status routes: headers built from scratch (no visitor header is copied, so no cookie, no visitor
  *  X-Forwarded-For / X-Real-IP / Forwarded), X-Forwarded-For = event.getClientAddress() only (a throw, which
  *  adapter-node does when ADDRESS_HEADER is set but absent, → no X-Forwarded-For), `set-cookie` never relayed.
  *  `access` (the nami_sp_access cookie value) goes out as X-Nami-Page-Access. */
 export async function callPublicEngine(event: RequestEvent, path: string, init?: RequestInit & { access?: string }): Promise<Response>;
 
-// lib/server/status-public.ts
+// lib/server/statuspages/status-public.ts
 export type PageRef = { kind: 'slug'; slug: string } | { kind: 'domain'; host: string };
 export const ACCESS_COOKIE = 'nami_sp_access';
 /** A slug must match ^[a-z0-9-]{3,63}$. `_domain` → `{kind: 'domain', host}` with host = `url.hostname`
@@ -3327,7 +3341,7 @@ describe('public page render', () => {
 
 `hooks.server.test.ts`: `handle` adds the CSP, `nosniff`, `no-referrer` and `DENY` headers to a `/status/[slug]` response and to a 404 on a custom-domain host (route id null), adds `cache-control: no-store` to a status ≥ 400 there, and leaves an app route (`/projects/…`) and `/_nami/tls-ask` untouched.
 
-Run: UI command with `src/lib/status-routing.test.ts src/lib/server/status-public.test.ts src/lib/server/engine.test.ts src/hooks.server.test.ts src/routes/status src/routes/_nami`. Expected: FAIL.
+Run: UI command with `src/lib/statuspages/status-routing.test.ts src/lib/server/statuspages/status-public.test.ts src/lib/server/core/engine.test.ts src/hooks.server.test.ts src/routes/status src/routes/_nami`. Expected: FAIL.
 
 - [ ] **Step 2: Implement.** Install adapter-node and switch `vite.config.ts`. Run `npm run build` once to prove the adapter builds (`build/` stays gitignored).
 - [ ] **Step 3: Run** the UI command again, then the full `npx vitest run` (existing suites must stay green with the extended `fakeEvent`) and `npm run check`. Expected: PASS, 0 errors and 0 warnings.
@@ -3342,8 +3356,6 @@ git commit -m "feat(ui): public status pages with custom-domain routing, passwor
 ---
 
 ### Task 14 (NAMI-SP-14): UI — subscribe, confirm, manage and unsubscribe pages
-
-Branch `feat/NAMI-SP-14-ui-subscriptions`, worktree `.worktrees/NAMI-SP-14/`.
 
 **Files:**
 - Create: `nami-ui/src/routes/status/[slug]/subscribe/confirm/+page.server.ts`, `+page.svelte`, `nami-ui/src/routes/status/[slug]/subscribe/manage/+page.server.ts`, `+page.svelte`, `nami-ui/src/routes/status/[slug]/unsubscribe/+page.server.ts`, `+page.svelte`, `nami-ui/src/routes/status/[slug]/subscriptions.test.ts`
@@ -3438,18 +3450,18 @@ git commit -m "feat(ui): status page subscribe, confirm, manage and unsubscribe 
 
 ### Task 15 (NAMI-SP-15): UI — Atom feed, SVG badge, public JSON status API
 
-Branch `feat/NAMI-SP-15-feed-badge-json`, worktree `.worktrees/NAMI-SP-15/`. Uses Task 13's helpers; runs after Task 14 (its Step 4 ticks the subscriber bullets of the roadmap).
+Uses Task 13's helpers; runs after Task 14.
 
 **Files:**
 - Create: `nami-ui/src/routes/status/[slug]/feed.atom/+server.ts`, `badge.svg/+server.ts`, `status.json/+server.ts`, `nami-ui/src/routes/status/[slug]/machine.test.ts`
-- Modify: `nami-ui/src/lib/status-pages.ts` (+ test): `xmlEscape`, `atomFeed`, `badgeSvg`, `statusJson`
+- Modify: `nami-ui/src/lib/statuspages/status-pages.ts` (+ test): `xmlEscape`, `atomFeed`, `badgeSvg`, `statusJson`
 
 **Interfaces:**
 - Consumes: Task 13 `pageRef`, `fetchPage`, `ACCESS_COOKIE`.
 - Produces:
 
 ```ts
-// lib/status-pages.ts
+// lib/statuspages/status-pages.ts
 /** & < > " ' → entities; strips characters XML 1.0 forbids (C0 controls except \t \n \r, U+FFFE/U+FFFF, lone surrogates). */
 export function xmlEscape(s: string): string;
 /** One <entry> per update (newest first, at most 100): id `${url}#update-${id}`, title `${report} — ${status label}`,
@@ -3522,25 +3534,25 @@ describe('xml output', () => {
 - `badge.svg` has `max-age=60`, the SVG CSP and `nosniff`; a 404 from the engine → 404 `not found`;
 - each route on the custom-domain sentinel calls `/public/status-domains/<host>` (Task 13's `pageRef`).
 
-Run: UI command with `src/lib/status-pages.test.ts src/routes/status`. Expected: FAIL.
+Run: UI command with `src/lib/statuspages/status-pages.test.ts src/routes/status`. Expected: FAIL.
 
-- [ ] **Step 2: Implement.** - [ ] **Step 3: Run** the UI command again, the full vitest run and `npm run check`. Expected: PASS. - [ ] **Step 4: Tick roadmap §5** in `docs/superpowers/roadmap.md`, every bullet except "Webhook subscribers" and "Embeddable announcement widget" (Part 2).
-- [ ] **Step 5: Commit**
+- [ ] **Step 2: Implement.** - [ ] **Step 3: Run** the UI command again, the full vitest run and `npm run check`. Expected: PASS. (The roadmap ticks come at the end of NAMI-SP-16, not here.)
+- [ ] **Step 4: Commit**
 
 ```bash
-git add nami-ui/src docs/superpowers/roadmap.md
+git add nami-ui/src
 git commit -m "feat(ui): status page Atom feed, SVG badge and public JSON API (NAMI-SP-15)" \
   -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 ```
 
 ---
 
-## Final review (whole Part 1)
+### Task 16 (NAMI-SP-16): Part 1 security review and fix wave
 
-Not a numbered task. Per CLAUDE.md every sub-project ends with a dedicated security review and fix wave. Branch `fix/NAMI-SP-part1-final-review`, worktree `.worktrees/NAMI-SP-p1-review/`, from `origin/main` after NAMI-SP-15 merges. The reviewer reads the merged diff of Part 1 for `nami-engine/` and `nami-ui/` and checks at least:
+Per CLAUDE.md every phase ends with a dedicated security review and fix wave. It runs on the phase branch `feat/statuspages-part1` after NAMI-SP-15's task review is clean (no separate branch or PR). Part 2's tasks start at NAMI-SP-17, so this ID is Part 1's own. The reviewer reads the whole phase diff (`origin/main...feat/statuspages-part1`) for `nami-engine/` and `nami-ui/` and checks at least:
 
 1. **Leaks.**
-   - Grep every serialised public type (`status_pages::snapshot`, `statuspages::public::routes`, `statuspages::subscriber::routes`, the nami-ui machine routes) and confirm no field beyond R11 and the spec's JSON shape.
+   - Grep every serialised public type (`statuspages::snapshot`, `statuspages::public::routes`, `statuspages::subscriber::routes`, the nami-ui machine routes) and confirm no field beyond R11 and the spec's JSON shape.
    - Re-run the leak test with a monitor carrying basic-auth credentials, custom headers, a proxy and a keyword, and with an automatic report.
    - The tooltip never shows incident titles or causes.
    - Error bodies of `/public/...` are the fixed set (`not found`, `wrong password`, rate-limit texts, validation messages that echo nothing).
@@ -3573,6 +3585,11 @@ Not a numbered task. Per CLAUDE.md every sub-project ends with a dedicated secur
 8. **CSP.** Public HTML runs no script (`csr = false`); the CSP header is present on every status route; logos load with `no-referrer`.
 9. **RBAC.** Route × role table (outsider, viewer, member, admin, global admin) matches R22. `tests/core/json_bodies.rs` lists every new state-changing route except the one-click route.
 
-Then the **fix wave** for every Important finding and the Minor ones marked fix-now, a scoped re-review, merge, and a decisions log `docs/superpowers/decisions/2026-10-13-status-pages-part1.md` recording R1 … R25 and the five controller rulings of 2026-10-19 (same format as the earlier logs). Part 2 (NAMI-SP-16 onward) starts from that `main`.
+Then, all on `feat/statuspages-part1`:
+1. The **fix wave**: one or more `fix(...)` commits with `(NAMI-SP-16)` in the message, for every Important finding and the Minor ones marked fix-now, each with a test.
+2. A scoped re-review of the fixes, repeated until clean.
+3. The decisions doc `docs/superpowers/decisions/<date>-status-pages-part1.md` recording R1 … R25, the controller rulings of 2026-10-19 and the deferred items (same format as the earlier logs).
+4. The roadmap ticks in `docs/superpowers/roadmap.md` §5 for the rows of Roadmap coverage that Part 1 delivers in full: R5.01-R5.09 and R5.11-R5.14. R5.10, R5.15 and R5.16 stay unticked (partial; Part 2 finishes them).
+5. Push, then open the one phase PR (purpose and scope, the task list NAMI-SP-1 .. NAMI-SP-16 with commit ranges, implementation summary, tests executed with results, breaking changes such as the switch to `@sveltejs/adapter-node` and its deployment variables, risks and follow-ups) and merge it once its review is clean (pre-authorized, CLAUDE.md). Then delete the branch and the worktree. Part 2 (NAMI-SP-17 onward) branches from the updated `origin/main`.
 
-No CI is configured on this repo yet. Every PR description states that, and lists the engine and UI commands run with their results.
+No CI is configured on this repo yet. The PR description states that and lists the engine and UI commands run with their results.

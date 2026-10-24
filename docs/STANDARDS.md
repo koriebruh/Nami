@@ -212,7 +212,8 @@ Correct and bounded first. Fast second, and only with a measurement.
 - Every limit has a test at the bound and one past it. Every role rule has a
   test for the lowest role that passes and the highest role that fails.
 - Run commands:
-  - One domain: `cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test --test <domain>`.
+  - One domain: `cd nami-engine && DATABASE_URL=postgres://nami:nami@localhost:5433/nami cargo test --test <domain> -- --test-threads=8`.
+  - At the default thread count (one per core), tests on a 20-core machine can time out on the shared Postgres (`PoolTimedOut`). Eight threads keep the suite stable.
   - All: the same command with `cargo test`.
 
 ### 12. Comments and docs
