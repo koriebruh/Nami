@@ -17,6 +17,9 @@ pub enum AppError {
     RateLimited,
     #[error("conflict: {0}")]
     Conflict(String),
+    /// 410: something that existed is spent for good (a used single-use link).
+    #[error("gone: {0}")]
+    Gone(String),
     #[error("clickhouse error")]
     ClickHouse(#[from] crate::core::clickhouse::ClickHouseError),
 }
@@ -34,6 +37,7 @@ impl IntoResponse for AppError {
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "too many requests".to_string()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
+            AppError::Gone(msg) => (StatusCode::GONE, msg.clone()),
             AppError::ClickHouse(e) => {
                 // ClickHouse's error text can include SQL and schema details:
                 // log it, never return it.

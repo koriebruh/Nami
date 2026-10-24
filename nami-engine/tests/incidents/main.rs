@@ -2,6 +2,7 @@
 mod common;
 
 mod escalation_policies_api;
+mod incident_actions;
 mod incident_lifecycle;
 mod incidents;
 mod incidents_api;

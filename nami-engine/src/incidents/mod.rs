@@ -1,4 +1,5 @@
 //! Incidents opened by monitors and heartbeats (`model`) and their routes.
+pub mod action;
 pub mod channel;
 pub mod deliveries;
 pub mod escalation;

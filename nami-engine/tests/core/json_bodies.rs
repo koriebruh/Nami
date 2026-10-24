@@ -198,6 +198,8 @@ async fn every_state_changing_route_refuses_bodies_that_are_not_json(pool: sqlx:
         ("POST", format!("/projects/{project}/escalation-policies")),
         ("PUT", format!("/projects/{project}/escalation-policies/{}", Uuid::new_v4())),
         ("POST", format!("/projects/{project}/escalation-policies/{}/default", Uuid::new_v4())),
+        ("POST", "/incident-actions/inspect".to_string()),
+        ("POST", "/incident-actions/confirm".to_string()),
     ] {
         for cookie in [Some(&admin), None] {
             for (content_type, body) in NOT_JSON {

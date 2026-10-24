@@ -366,3 +366,15 @@ select seed_default_escalation_policy(id) from projects;
 -- path would have.
 update incidents i set escalation_policy_id = p.id, escalation_legacy = (i.status <> 'resolved')
 from escalation_policies p where p.project_id = i.project_id and p.is_default;
+
+-- Action links are single-use (NAMI-INC-11): the SHA-256 of each confirmed
+-- token is kept until well after it would have expired anyway.
+create table incident_action_token_uses (
+    token_hash bytea constraint incident_action_token_uses_pkey primary key
+        constraint incident_action_token_uses_hash_length check (octet_length(token_hash) = 32),
+    incident_id uuid not null
+        constraint incident_action_token_uses_incident_id_fkey references incidents(id) on delete cascade,
+    expires_at timestamptz not null,
+    used_at timestamptz not null default now()
+);
+create index incident_action_token_uses_expires_idx on incident_action_token_uses (expires_at);

@@ -37,6 +37,7 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "escalation_policies",
         "escalation_steps",
         "escalation_step_targets",
+        "incident_action_token_uses",
     ] {
         assert!(
             names.contains(&expected.to_string()),
