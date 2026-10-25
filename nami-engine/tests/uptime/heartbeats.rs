@@ -3324,10 +3324,11 @@ async fn a_held_heartbeat_page_waits_for_maintenance_to_end(pool: sqlx::PgPool) 
         let (status, _, _) =
             ping_with(&public, &format!("/api/v1/heartbeat/{token}/{path}"), vec![]).await;
         assert_eq!(status, StatusCode::OK);
-        if n == 0 {
-            // Let the first page leave before the recovery resolves it; the
+        if n < 2 {
+            // Let the first page, then its "Resolved" notice, leave before the
+            // next ping: a reopen cancels a resolved notice still queued. The
             // second failure falls inside the paging gap (R31).
-            settled_mail(&recipient, 1).await;
+            settled_mail(&recipient, n + 1).await;
         }
     }
     let window: Uuid = sqlx::query_scalar(
