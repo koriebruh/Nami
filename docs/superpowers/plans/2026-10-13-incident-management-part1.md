@@ -1,6 +1,6 @@
 # Incident Management + On-call — Part 1 Implementation Plan
 
-> **Status:** ready (starts after Logs Part 2 merges). Nothing of Part 1 is on `main` yet. Part 2 (NAMI-INC-16 onward) is a separate plan that follows this phase.
+> **Status:** done. Shipped as one phase PR; decisions: `docs/superpowers/decisions/2026-10-25-incident-management-part1.md`.
 > **Branch:** `feat/incidents-part1` in `.worktrees/incidents-part1/`.
 > **Depends on:** Logs Part 2 (`feat/logs-part2`, NAMI-LOG-14..18 and its fix wave), whose Task 14 creates `NNNN_logs_alerts.sql` and `NNNN_incidents_log_alerts.sql` (the old 0044 file). Uptime Phase 3 is merged (fix wave #77); this plan builds on its code on `main`.
 

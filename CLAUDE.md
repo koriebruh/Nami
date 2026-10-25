@@ -24,7 +24,7 @@ several independent products, too large for one spec/plan):
 1. **Foundation: auth, org, RBAC, session** — done
 2. **Uptime monitoring** (Phases 1-3) — done
 3. **Log management** (Parts 1-2) — done
-4. Incident management + on-call alerting
+4. Incident management + on-call alerting — Part 1 done, Part 2 next
 5. Status page
 6. Metrics + dashboards (+ collector bundle)
 7. Traces (OpenTelemetry)
@@ -55,10 +55,13 @@ Completed: **Log management** (Parts 1-2). Decisions
 `docs/superpowers/decisions/2026-10-13-log-management-part1.md` and
 `docs/superpowers/decisions/2026-10-25-log-management-part2.md`.
 
-Current sub-project: **Incident management + on-call, Part 1**
+Incident management Part 1 is done (decisions
+`docs/superpowers/decisions/2026-10-25-incident-management-part1.md`).
+
+Current sub-project: **Incident management + on-call, Part 2**
 - Spec: `docs/superpowers/specs/2026-10-13-incident-management-design.md`
-- Plan: `docs/superpowers/plans/2026-10-13-incident-management-part1.md`
-  (branch `feat/incidents-part1`).
+- Plan: `docs/superpowers/plans/2026-10-24-incident-management-part2.md`
+  (branch `feat/incidents-part2`).
 - Every remaining phase, in order, is in the "Plans and execution order"
   table of `docs/superpowers/roadmap.md`. Plan rules:
   `docs/superpowers/plan-conventions.md`; engineering rules:
