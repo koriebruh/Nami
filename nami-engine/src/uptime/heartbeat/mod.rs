@@ -190,7 +190,7 @@ pub struct Recorded {
 /// opens an incident (title `{name} reported a failure`, cause
 /// [`failure_cause`]), or reopens the last one if it was resolved less than
 /// `incident::HEARTBEAT_REOPEN_WINDOW_SECS` ago (a flapping job keeps one
-/// incident; the alert emails are bounded by `alert_throttle`); on a
+/// incident, and pages at most once per `lifecycle::SOURCE_PAGE_GAP_SECS`); on a
 /// heartbeat already down it only moves `last_ping_at` (the open incident
 /// keeps the cause that opened it).
 ///

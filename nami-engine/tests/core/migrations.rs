@@ -1,3 +1,5 @@
+use crate::common;
+
 #[sqlx::test]
 async fn all_tables_exist(pool: sqlx::PgPool) {
     let rows: Vec<(String,)> = sqlx::query_as(
@@ -25,6 +27,17 @@ async fn all_tables_exist(pool: sqlx::PgPool) {
         "monitor_groups",
         "log_views",
         "log_alerts",
+        "incident_severities",
+        "incident_events",
+        "notification_channels",
+        "on_call_schedules",
+        "on_call_participants",
+        "on_call_overrides",
+        "notification_deliveries",
+        "escalation_policies",
+        "escalation_steps",
+        "escalation_step_targets",
+        "incident_action_token_uses",
     ] {
         assert!(
             names.contains(&expected.to_string()),
@@ -263,14 +276,616 @@ async fn log_alerts_constraints_are_all_named(pool: sqlx::PgPool) {
         [
             "log_alerts_comparison_known",
             "log_alerts_created_by_fkey",
+            "log_alerts_escalation_policy_id_fkey",
             "log_alerts_interval_range",
             "log_alerts_lt_needs_a_threshold",
             "log_alerts_pkey",
             "log_alerts_project_id_fkey",
             "log_alerts_query_is_object",
+            "log_alerts_severity_id_fkey",
             "log_alerts_state_known",
             "log_alerts_threshold_range",
             "log_alerts_window_range",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn every_project_gets_the_three_default_severities(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let rows: Vec<(String, i32, bool)> = sqlx::query_as(
+        "select name, rank, is_default from incident_severities where project_id = $1 order by rank",
+    )
+    .bind(project)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        [
+            ("critical".into(), 1, false),
+            ("high".into(), 2, true),
+            ("low".into(), 3, false)
+        ]
+    );
+    let second_default = sqlx::query(
+        "insert into incident_severities (project_id, name, rank, is_default) values ($1, 'x', 9, true)",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        second_default.as_database_error().unwrap().code().as_deref(),
+        Some("23505")
+    );
+}
+
+#[sqlx::test]
+async fn an_acknowledged_incident_still_blocks_a_second_one_for_its_monitor(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let monitor = common::seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    sqlx::query(
+        "insert into incidents (project_id, monitor_id, title, status, acknowledged_at, source)
+         values ($1, $2, 'down', 'acknowledged', now(), 'monitor')",
+    )
+    .bind(project)
+    .bind(monitor)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let second = sqlx::query(
+        "insert into incidents (project_id, monitor_id, title, source) values ($1, $2, 'down', 'monitor')",
+    )
+    .bind(project)
+    .bind(monitor)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        second.as_database_error().unwrap().code().as_deref(),
+        Some("23505")
+    );
+}
+
+#[sqlx::test]
+async fn a_plain_insert_takes_its_source_from_its_foreign_key(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let monitor = common::seed_http_monitor(&pool, project, "api", "http://127.0.0.1:9", 1).await;
+    let source: String = sqlx::query_scalar(
+        "insert into incidents (project_id, monitor_id, title) values ($1, $2, 'down') returning source",
+    )
+    .bind(project)
+    .bind(monitor)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(source, "monitor");
+}
+
+/// Every constraint of the incident lifecycle tables carries the name its
+/// migration gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn incident_lifecycle_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid in ('public.incident_severities'::regclass, 'public.incident_events'::regclass)
+            or (conrelid = 'public.incidents'::regclass
+                and conname not in ('incidents_pkey', 'incidents_project_id_fkey',
+                                    'incidents_monitor_id_fkey', 'incidents_heartbeat_id_fkey',
+                                    'incidents_details_check', 'incidents_log_alert_id_fkey'))
+         order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "incident_events_actor_id_fkey",
+            "incident_events_incident_id_fkey",
+            "incident_events_kind_known",
+            "incident_events_message_size",
+            "incident_events_metadata_is_object",
+            "incident_events_pkey",
+            "incident_severities_name_format",
+            "incident_severities_name_unique",
+            "incident_severities_pkey",
+            "incident_severities_project_id_fkey",
+            "incident_severities_rank_range",
+            "incident_severities_rank_unique",
+            "incidents_acknowledged_by_fkey",
+            "incidents_acknowledged_has_time",
+            "incidents_created_by_fkey",
+            "incidents_escalation_policy_id_fkey",
+            "incidents_metadata_is_object",
+            "incidents_postmortem_size",
+            "incidents_resolved_by_fkey",
+            "incidents_resolved_has_time",
+            "incidents_severity_id_fkey",
+            "incidents_source_known",
+            "incidents_status_check",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn a_channel_belongs_to_exactly_one_owner(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let user = common::seed_user(&pool, &common::unique_email("owner"), "member").await;
+    for (project_id, user_id, kind) in [
+        (None, None, "slack"),
+        (Some(project), Some(user), "slack"),
+        (None, Some(user), "email"),
+    ] {
+        let error = sqlx::query(
+            "insert into notification_channels (id, project_id, user_id, name, kind, config_enc, summary)
+             values (gen_random_uuid(), $1, $2, 'x', $3, '\\x00', 'x')",
+        )
+        .bind(project_id)
+        .bind(user_id)
+        .bind(kind)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("23514"),
+            "{project_id:?} {user_id:?} {kind}"
+        );
+    }
+}
+
+/// Every constraint of `notification_channels` carries the name its
+/// migration gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn notification_channels_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid = 'public.notification_channels'::regclass order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "notification_channels_created_by_fkey",
+            "notification_channels_kind_known",
+            "notification_channels_name_length",
+            "notification_channels_no_personal_email",
+            "notification_channels_one_owner",
+            "notification_channels_pkey",
+            "notification_channels_project_id_fkey",
+            "notification_channels_user_id_fkey",
+            "notification_channels_webhook_has_secret",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn a_custom_rotation_needs_hours_and_others_must_not_have_them(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    for (rotation, hours) in [("custom", None), ("weekly", Some(24))] {
+        let error = sqlx::query(
+            "insert into on_call_schedules (project_id, name, timezone, rotation, rotation_hours, handoff_time, start_date)
+             values ($1, $2, 'UTC', $2, $3, '09:00', '2026-10-19')",
+        )
+        .bind(project)
+        .bind(rotation)
+        .bind(hours)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("23514"),
+            "{rotation} {hours:?}"
+        );
+    }
+}
+
+/// Every constraint of the on-call tables carries the name its migration
+/// gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn on_call_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid in ('public.on_call_schedules'::regclass, 'public.on_call_participants'::regclass,
+                            'public.on_call_overrides'::regclass)
+         order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "on_call_overrides_created_by_fkey",
+            "on_call_overrides_ends_after_start",
+            "on_call_overrides_pkey",
+            "on_call_overrides_schedule_id_fkey",
+            "on_call_overrides_user_id_fkey",
+            "on_call_participants_pkey",
+            "on_call_participants_position_range",
+            "on_call_participants_schedule_id_fkey",
+            "on_call_participants_user_id_fkey",
+            "on_call_participants_user_unique",
+            "on_call_schedules_custom_has_hours",
+            "on_call_schedules_name_unique",
+            "on_call_schedules_pkey",
+            "on_call_schedules_project_id_fkey",
+            "on_call_schedules_restrictions_is_array",
+            "on_call_schedules_rotation_hours_range",
+            "on_call_schedules_rotation_known",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn a_target_gets_one_delivery_per_incident_round(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let user = common::seed_user(&pool, &common::unique_email("member"), "member").await;
+    let incident = common::open_test_incident(&pool, project, user).await;
+    let insert = || {
+        sqlx::query(
+            "insert into notification_deliveries (incident_id, event, round, target_key, user_id)
+             values ($1, 'triggered', 'p0r0s0', 'email:x', $2)",
+        )
+        .bind(incident)
+        .bind(user)
+        .execute(&pool)
+    };
+    insert().await.unwrap();
+    let error = insert().await.unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23505"));
+}
+
+/// Every constraint of `notification_deliveries` carries the name its
+/// migration gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn notification_deliveries_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid = 'public.notification_deliveries'::regclass order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "notification_deliveries_attempts_range",
+            "notification_deliveries_channel_id_fkey",
+            "notification_deliveries_event_known",
+            "notification_deliveries_has_target",
+            "notification_deliveries_incident_id_fkey",
+            "notification_deliveries_last_error_length",
+            "notification_deliveries_pkey",
+            "notification_deliveries_round_length",
+            "notification_deliveries_sent_has_time",
+            "notification_deliveries_status_known",
+            "notification_deliveries_target_unique",
+            "notification_deliveries_user_id_fkey",
+        ]
+    );
+}
+
+#[sqlx::test]
+async fn every_project_gets_a_default_policy_that_pages_all_members(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let rows: Vec<(String, bool, i32, i32, String, i32)> = sqlx::query_as(
+        "select p.name, p.is_default, s.position, s.delay_minutes, t.kind, t.position
+         from escalation_policies p
+         join escalation_steps s on s.policy_id = p.id
+         join escalation_step_targets t on t.step_id = s.id
+         where p.project_id = $1",
+    )
+    .bind(project)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(rows, [("Default".into(), true, 0, 0, "all_members".into(), 0)]);
+}
+
+#[sqlx::test]
+async fn a_policy_cannot_fall_back_to_itself(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let error = sqlx::query(
+        "update escalation_policies set fallback_policy_id = id where project_id = $1",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23514"));
+}
+
+/// A schedule and a project channel of `project`, both targeted by a step
+/// of its default policy (inserted in SQL).
+async fn targeted_schedule_and_channel(pool: &sqlx::PgPool, project: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
+    let schedule: uuid::Uuid = sqlx::query_scalar(
+        "insert into on_call_schedules (project_id, name, timezone, rotation, handoff_time, start_date)
+         values ($1, 'primary', 'UTC', 'weekly', '09:00', '2026-10-19') returning id",
+    )
+    .bind(project)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let channel: uuid::Uuid = sqlx::query_scalar(
+        "insert into notification_channels (id, project_id, name, kind, config_enc, summary)
+         values (gen_random_uuid(), $1, 'ops', 'slack', '\\x00', 'hooks.slack.com') returning id",
+    )
+    .bind(project)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "insert into escalation_step_targets (step_id, position, kind, schedule_id, channel_id)
+         select s.id, v.position, v.kind, v.schedule_id, v.channel_id
+         from escalation_steps s join escalation_policies p on p.id = s.policy_id
+         cross join (values (1, 'schedule', $2::uuid, null::uuid), (2, 'project_channel', null, $3)) as
+             v(position, kind, schedule_id, channel_id)
+         where p.project_id = $1",
+    )
+    .bind(project)
+    .bind(schedule)
+    .bind(channel)
+    .execute(pool)
+    .await
+    .unwrap();
+    (schedule, channel)
+}
+
+#[sqlx::test]
+async fn a_targeted_schedule_cannot_be_deleted_from_sql(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let (schedule, _) = targeted_schedule_and_channel(&pool, project).await;
+    let error = sqlx::query("delete from on_call_schedules where id = $1")
+        .bind(schedule)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23503"));
+}
+
+#[sqlx::test]
+async fn removing_a_project_removes_its_policies_schedules_and_channels(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    targeted_schedule_and_channel(&pool, project).await;
+    sqlx::query("delete from projects where id = $1")
+        .bind(project)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let left: i64 = sqlx::query_scalar(
+        "select (select count(*) from escalation_policies where project_id = $1)
+              + (select count(*) from escalation_steps s
+                 where not exists (select 1 from escalation_policies p where p.id = s.policy_id))
+              + (select count(*) from escalation_step_targets t
+                 where not exists (select 1 from escalation_steps s where s.id = t.step_id))
+              + (select count(*) from on_call_schedules where project_id = $1)
+              + (select count(*) from notification_channels where project_id = $1)",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// Every constraint of the escalation tables carries the name its migration
+/// gives it (STANDARDS §5), primary and foreign keys included.
+#[sqlx::test]
+async fn escalation_constraints_are_all_named(pool: sqlx::PgPool) {
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid in ('public.escalation_policies'::regclass, 'public.escalation_steps'::regclass,
+                            'public.escalation_step_targets'::regclass)
+         order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "escalation_policies_fallback_policy_id_fkey",
+            "escalation_policies_name_unique",
+            "escalation_policies_not_own_fallback",
+            "escalation_policies_pkey",
+            "escalation_policies_project_id_fkey",
+            "escalation_policies_repeat_count_range",
+            "escalation_step_targets_channel_id_fkey",
+            "escalation_step_targets_kind_known",
+            "escalation_step_targets_one_reference",
+            "escalation_step_targets_pkey",
+            "escalation_step_targets_position_range",
+            "escalation_step_targets_position_unique",
+            "escalation_step_targets_schedule_id_fkey",
+            "escalation_step_targets_step_id_fkey",
+            "escalation_step_targets_user_id_fkey",
+            "escalation_steps_condition_is_object",
+            "escalation_steps_delay_range",
+            "escalation_steps_pkey",
+            "escalation_steps_policy_id_fkey",
+            "escalation_steps_position_range",
+            "escalation_steps_position_unique",
+        ]
+    );
+}
+
+/// Each re-adds one project foreign key. Postgres runs a project removal's
+/// cascades in the order their constraints were created, so the table whose
+/// key was re-added last is emptied last.
+const PROJECT_CASCADES: [&str; 5] = [
+    "alter table incidents drop constraint incidents_project_id_fkey,
+        add constraint incidents_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+    "alter table incident_severities drop constraint incident_severities_project_id_fkey,
+        add constraint incident_severities_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+    "alter table notification_channels drop constraint notification_channels_project_id_fkey,
+        add constraint notification_channels_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+    "alter table on_call_schedules drop constraint on_call_schedules_project_id_fkey,
+        add constraint on_call_schedules_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+    "alter table escalation_policies drop constraint escalation_policies_project_id_fkey,
+        add constraint escalation_policies_project_id_fkey
+        foreign key (project_id) references projects(id) on delete cascade",
+];
+
+/// A project whose rows all point at each other: the default policy and a
+/// second one fall back to each other and both target a schedule and a
+/// channel; a manual and a monitor incident use the non-default `critical`
+/// severity and the second policy, and each has a delivery to the channel.
+async fn cross_referenced_project(pool: &sqlx::PgPool) -> uuid::Uuid {
+    let project = common::seed_project(pool).await;
+    let (schedule, channel) = targeted_schedule_and_channel(pool, project).await;
+    let monitor = common::seed_http_monitor(pool, project, "api", "https://example.com", 1).await;
+    sqlx::query(
+        "with second as (
+             insert into escalation_policies (project_id, name, fallback_policy_id)
+             select $1, 'second', id from escalation_policies where project_id = $1 and is_default
+             returning id),
+         step as (
+             insert into escalation_steps (policy_id, position, delay_minutes)
+             select id, 0, 5 from second returning id),
+         targets as (
+             insert into escalation_step_targets (step_id, position, kind, schedule_id, channel_id)
+             select step.id, v.position, v.kind, v.schedule_id, v.channel_id from step
+             cross join (values (0, 'schedule', $2::uuid, null::uuid),
+                                (1, 'project_channel', null::uuid, $3::uuid)) as
+                 v(position, kind, schedule_id, channel_id)),
+         fallback as (
+             update escalation_policies set fallback_policy_id = (select id from second)
+             where project_id = $1 and is_default),
+         opened as (
+             insert into incidents (project_id, monitor_id, title, severity_id, escalation_policy_id)
+             select $1, m, 'down',
+                    (select id from incident_severities where project_id = $1 and name = 'critical'),
+                    (select id from second)
+             from unnest(array[null, $4::uuid]) as m
+             returning id)
+         insert into notification_deliveries (incident_id, event, round, target_key, channel_id)
+         select id, 'triggered', 'g0p0r0s0', 'channel:' || $3::uuid::text, $3::uuid from opened",
+    )
+    .bind(project)
+    .bind(schedule)
+    .bind(channel)
+    .bind(monitor)
+    .execute(pool)
+    .await
+    .unwrap();
+    // The monitor names the second policy and `critical` too (NAMI-INC-10).
+    sqlx::query(
+        "update monitors set
+             escalation_policy_id = (select id from escalation_policies where project_id = $1 and not is_default),
+             severity_id = (select id from incident_severities where project_id = $1 and name = 'critical')
+         where id = $2",
+    )
+    .bind(project)
+    .bind(monitor)
+    .execute(pool)
+    .await
+    .unwrap();
+    project
+}
+
+#[sqlx::test]
+async fn removing_a_cross_referenced_project_works_whatever_table_its_cascade_empties_last(
+    pool: sqlx::PgPool,
+) {
+    let remove = |project: uuid::Uuid| sqlx::query("delete from projects where id = $1").bind(project);
+    let project = cross_referenced_project(&pool).await;
+    remove(project).execute(&pool).await.expect("in migration order");
+    for statement in PROJECT_CASCADES {
+        let project = cross_referenced_project(&pool).await;
+        sqlx::query(statement).execute(&pool).await.unwrap();
+        if let Err(e) = remove(project).execute(&pool).await {
+            panic!("emptied last by: {statement}: {e}");
+        }
+    }
+    let left: i64 = sqlx::query_scalar(
+        "select (select count(*) from incidents) + (select count(*) from incident_severities)
+              + (select count(*) from escalation_policies) + (select count(*) from escalation_steps)
+              + (select count(*) from escalation_step_targets) + (select count(*) from on_call_schedules)
+              + (select count(*) from notification_channels) + (select count(*) from notification_deliveries)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// Monitors, heartbeats and log alerts may name an escalation policy and a
+/// severity (NAMI-INC-10). Deleting either sets it back to null (the project
+/// default), and the keys carry their migration's names.
+#[sqlx::test]
+async fn deleting_a_policy_clears_it_on_monitors(pool: sqlx::PgPool) {
+    let project = common::seed_project(&pool).await;
+    let monitor = common::seed_http_monitor(&pool, project, "api", "https://example.com", 1).await;
+    let policy: uuid::Uuid = sqlx::query_scalar(
+        "insert into escalation_policies (project_id, name) values ($1, 'second') returning id",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let severity: uuid::Uuid = sqlx::query_scalar(
+        "insert into incident_severities (project_id, name, rank) values ($1, 'minor', 4) returning id",
+    )
+    .bind(project)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for insert in [
+        "update monitors set escalation_policy_id = $2, severity_id = $3 where id = $1",
+        "insert into heartbeats (project_id, name, token, period_seconds, escalation_policy_id, severity_id)
+         select project_id, 'job', md5(random()::text), 60, $2, $3 from monitors where id = $1",
+        "insert into log_alerts (project_id, name, threshold, comparison, window_seconds, interval_seconds,
+                                 escalation_policy_id, severity_id)
+         select project_id, 'errors', 1, 'gt', 300, 60, $2, $3 from monitors where id = $1",
+    ] {
+        sqlx::query(insert).bind(monitor).bind(policy).bind(severity).execute(&pool).await.unwrap();
+    }
+    let set = |pool: sqlx::PgPool| async move {
+        sqlx::query_scalar::<_, i64>(
+            "select (select count(*) from monitors where escalation_policy_id is not null)
+                  + (select count(*) from heartbeats where escalation_policy_id is not null)
+                  + (select count(*) from log_alerts where escalation_policy_id is not null)
+                  + (select count(*) from monitors where severity_id is not null)
+                  + (select count(*) from heartbeats where severity_id is not null)
+                  + (select count(*) from log_alerts where severity_id is not null)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(set(pool.clone()).await, 6);
+    sqlx::query("delete from escalation_policies where id = $1").bind(policy).execute(&pool).await.unwrap();
+    sqlx::query("delete from incident_severities where id = $1").bind(severity).execute(&pool).await.unwrap();
+    assert_eq!(set(pool.clone()).await, 0);
+
+    let names: Vec<String> = sqlx::query_scalar(
+        "select conname::text from pg_constraint
+         where conrelid in ('public.monitors'::regclass, 'public.heartbeats'::regclass, 'public.log_alerts'::regclass)
+           and (conname like '%escalation_policy_id%' or conname like '%severity_id%')
+         order by conname",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        names,
+        [
+            "heartbeats_escalation_policy_id_fkey",
+            "heartbeats_severity_id_fkey",
+            "log_alerts_escalation_policy_id_fkey",
+            "log_alerts_severity_id_fkey",
+            "monitors_escalation_policy_id_fkey",
+            "monitors_severity_id_fkey",
         ]
     );
 }

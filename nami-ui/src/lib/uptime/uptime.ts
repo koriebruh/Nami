@@ -2,6 +2,11 @@
 // the monitor and incident pages. All times render in UTC so server- and
 // client-rendered markup agree (and match the alert emails).
 
+import type { Incident } from '#lib/incidents/incidents';
+
+// Existing imports of the incident list type keep working from here.
+export type { Incident };
+
 export type Status = 'pending' | 'up' | 'down';
 export type CheckType =
 	| 'http'
@@ -85,6 +90,9 @@ export type Monitor = {
 	use_tls: boolean;
 	udp_payload: string | null;
 	group_id: string | null;
+	/** null: the project default. */
+	escalation_policy_id?: string | null;
+	severity_id?: string | null;
 	in_maintenance: boolean;
 	/** True when fields were masked (`***`) for the reader, a viewer. */
 	redacted: boolean;
@@ -148,22 +156,6 @@ export type MonitorStats = {
 	series: SeriesBucket[];
 };
 
-export type Incident = {
-	id: string;
-	project_id: string;
-	monitor_id: string | null;
-	heartbeat_id: string | null;
-	log_alert_id: string | null;
-	source_name: string | null;
-	title: string;
-	cause: string | null;
-	status: 'open' | 'resolved';
-	started_at: string;
-	resolved_at: string | null;
-	/** Job output a failing heartbeat reported; plain text, already truncated by the engine. */
-	details: string | null;
-};
-
 export type Heartbeat = {
 	id: string;
 	project_id: string;
@@ -181,6 +173,9 @@ export type Heartbeat = {
 	created_at: string;
 	in_maintenance: boolean;
 	group_id: string | null;
+	/** null: the project default. */
+	escalation_policy_id?: string | null;
+	severity_id?: string | null;
 };
 
 /** One ping a heartbeat received; `output` is plain text, never markup. */
@@ -452,8 +447,8 @@ export function niceTicks(max: number, count = 4): number[] {
 
 /**
  * When the monitor entered its current status. The engine stores no
- * state-change timestamp, so derive it from incidents: down since the open
- * incident started; up since the latest recovery (or creation, if it never
+ * state-change timestamp, so derive it from incidents: down since the
+ * unresolved (open or acknowledged) incident started; up since the latest recovery (or creation, if it never
  * went down); pending since creation.
  */
 export function statusSince(
@@ -461,7 +456,7 @@ export function statusSince(
 	incidents: Incident[]
 ): string {
 	if (monitor.current_status === 'down') {
-		return incidents.find((i) => i.status === 'open')?.started_at ?? monitor.created_at;
+		return incidents.find((i) => i.status !== 'resolved')?.started_at ?? monitor.created_at;
 	}
 	if (monitor.current_status === 'up') {
 		let latest: string | null = null;

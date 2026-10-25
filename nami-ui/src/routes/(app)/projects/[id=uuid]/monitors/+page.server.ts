@@ -6,6 +6,7 @@ import {
 	redirectToLoginIfUnauthorized
 } from '#lib/server/core/engine';
 import type { MonitorGroup, MonitorSummary } from '#lib/uptime/uptime';
+import { loadOnCall } from '#lib/server/incidents/schedule-form';
 import type { PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {
@@ -14,9 +15,11 @@ export const load: PageServerLoad = async (event) => {
 	// keep it. Set first and only here (SvelteKit throws on a second set).
 	event.setHeaders({ 'cache-control': 'private, no-store' });
 
-	const [response, groupsResponse] = await Promise.all([
+	const [response, groupsResponse, onCall] = await Promise.all([
 		callEngine(event, enginePath`/projects/${event.params.id}/monitors`),
-		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`)
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`),
+		// The project dashboard's "on call now" card (NAMI-INC-15).
+		loadOnCall(event)
 	]);
 	redirectToLoginIfUnauthorized(response);
 	if (!response.ok) {
@@ -28,5 +31,5 @@ export const load: PageServerLoad = async (event) => {
 	const monitors: MonitorSummary[] = await response.json();
 	// Groups only arrange the list: without them it still renders, flat.
 	const groups: MonitorGroup[] = groupsResponse.ok ? await groupsResponse.json() : [];
-	return { monitors, groups };
+	return { monitors, groups, onCall };
 };

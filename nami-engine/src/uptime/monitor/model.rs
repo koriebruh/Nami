@@ -19,6 +19,7 @@ use super::{
 use crate::core::validate::{
     has_invisible_or_bidi, nullable, validate_name, with_unchanged_values,
 };
+use crate::incidents::lifecycle;
 use crate::uptime::group::model as monitor_group;
 use crate::{
     core::crypto::{Cipher, SecretString},
@@ -167,6 +168,10 @@ pub struct Monitor {
     /// AES-GCM sealed proxy password, see `monitor_request::open_proxy_password`.
     #[serde(skip_serializing)]
     pub proxy_password_enc: Option<Vec<u8>>,
+    /// The escalation policy of its incidents; `None` is the project default.
+    pub escalation_policy_id: Option<Uuid>,
+    /// The severity of its incidents; `None` is the project default.
+    pub severity_id: Option<Uuid>,
 }
 
 impl Monitor {
@@ -229,6 +234,8 @@ impl fmt::Debug for Monitor {
             proxy_url,
             proxy_username,
             proxy_password_enc,
+            escalation_policy_id,
+            severity_id,
         } = self;
         f.debug_struct("Monitor")
             .field("id", id)
@@ -282,6 +289,8 @@ impl fmt::Debug for Monitor {
                 "proxy_password_enc",
                 &proxy_password_enc.as_ref().map(|_| SEALED),
             )
+            .field("escalation_policy_id", escalation_policy_id)
+            .field("severity_id", severity_id)
             .finish()
     }
 }
@@ -460,6 +469,8 @@ pub struct MonitorConfig {
     pub proxy_url: Option<String>,
     pub proxy_username: Option<String>,
     pub proxy_password: PasswordChange,
+    pub escalation_policy_id: Option<Uuid>,
+    pub severity_id: Option<Uuid>,
 }
 
 impl From<&Monitor> for MonitorConfig {
@@ -504,6 +515,8 @@ impl From<&Monitor> for MonitorConfig {
             proxy_password: PasswordChange::Keep {
                 present: m.proxy_password_enc.is_some(),
             },
+            escalation_policy_id: m.escalation_policy_id,
+            severity_id: m.severity_id,
         }
     }
 }
@@ -598,6 +611,9 @@ pub struct CreateMonitorRequest {
     pub proxy_url: Option<String>,
     pub proxy_username: Option<String>,
     pub proxy_password: Option<SecretString>,
+    /// `None`: the project's default policy and severity.
+    pub escalation_policy_id: Option<Uuid>,
+    pub severity_id: Option<Uuid>,
 }
 
 fn default_ip_version() -> String {
@@ -692,6 +708,8 @@ impl CreateMonitorRequest {
                 Some(password) => PasswordChange::Replace(password),
                 None => PasswordChange::Keep { present: false },
             },
+            escalation_policy_id: self.escalation_policy_id,
+            severity_id: self.severity_id,
         }
     }
 }
@@ -748,6 +766,11 @@ pub struct PatchMonitorRequest {
     pub proxy_username: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
     pub proxy_password: Option<Option<SecretString>>,
+    /// `null` returns to the project's default.
+    #[serde(default, deserialize_with = "nullable")]
+    pub escalation_policy_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub severity_id: Option<Option<Uuid>>,
 }
 
 /// A nullable PATCH field applied to its current value.
@@ -842,6 +865,8 @@ impl PatchMonitorRequest {
                 Some(None) => PasswordChange::Clear,
                 Some(Some(password)) => PasswordChange::Replace(password),
             },
+            escalation_policy_id: patched(self.escalation_policy_id, base.escalation_policy_id),
+            severity_id: patched(self.severity_id, base.severity_id),
         }
     }
 }
@@ -1456,7 +1481,8 @@ async fn write_config(
              consecutive_failures = case when $35 then 0 else consecutive_failures end,
              consecutive_successes = case when $35 then 0 else consecutive_successes end,
              ip_version = $36, remember_cookies = $37, proxy_url = $38, proxy_username = $39,
-             proxy_password_enc = case when $40 then proxy_password_enc else $41 end
+             proxy_password_enc = case when $40 then proxy_password_enc else $41 end,
+             escalation_policy_id = $42, severity_id = $43
          where id = $1 and project_id = $34
          returning *",
     )
@@ -1501,6 +1527,8 @@ async fn write_config(
     .bind(&c.proxy_username)
     .bind(keep_proxy_password)
     .bind(sealed_proxy_password)
+    .bind(c.escalation_policy_id)
+    .bind(c.severity_id)
     .fetch_one(&mut *conn)
     .await
 }
@@ -1585,12 +1613,18 @@ pub async fn update_in_project(
     let updated = write_config(&mut tx, cipher, project_id, monitor_id, &config, write)
         .await
         .map_err(|e| match &e {
-            // The group was deleted between the check and the write.
+            // The group, policy or severity was deleted between the check
+            // and the write.
             sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
                 AppError::NotFound
             }
             _ => AppError::Database(e),
         })?;
+    if resumed {
+        // Under the monitor's lock, the order the worker takes too.
+        let source = lifecycle::IncidentSource::Monitor(monitor_id);
+        lifecycle::resume_source(&mut tx, &source, Utc::now()).await?;
+    }
     tx.commit().await?;
     Ok(Some(updated))
 }

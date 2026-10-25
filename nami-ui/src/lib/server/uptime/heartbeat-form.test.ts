@@ -90,4 +90,33 @@ describe('heartbeatPayloadFromForm', () => {
 			payload: { name: 'B', period_seconds: 60, group_id: null }
 		});
 	});
+
+	describe('escalation policy and severity (NAMI-INC-14)', () => {
+		const P = '0b9d1f6c-5a3e-4c2f-9d47-6e8a1c3b7f25';
+		it('omits empty values on create and sends the chosen ids', () => {
+			expect(heartbeatPayloadFromForm(form({ name: 'B', period_seconds: '60', escalation_policy_id: '', severity_id: '' }))).toEqual({
+				ok: true,
+				payload: { name: 'B', period_seconds: 60 }
+			});
+			expect(heartbeatPayloadFromForm(form({ name: 'B', period_seconds: '60', escalation_policy_id: P, severity_id: P }))).toEqual({
+				ok: true,
+				payload: { name: 'B', period_seconds: 60, escalation_policy_id: P, severity_id: P }
+			});
+		});
+
+		it('sends null for an empty value on edit', () => {
+			const result = heartbeatPayloadFromForm(form({ name: 'B', period_seconds: '60', escalation_policy_id: '', severity_id: '' }), 'edit');
+			expect(result).toEqual({
+				ok: true,
+				payload: { name: 'B', period_seconds: 60, group_id: null, escalation_policy_id: null, severity_id: null }
+			});
+		});
+
+		it('refuses a value that is not a UUID', () => {
+			expect(heartbeatPayloadFromForm(form({ name: 'B', period_seconds: '60', severity_id: 'x' }))).toEqual({
+				ok: false,
+				message: 'Pick the severity from the list.'
+			});
+		});
+	});
 });

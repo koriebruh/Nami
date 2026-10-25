@@ -257,8 +257,8 @@
 								<p class="text-sm wrap-anywhere text-ink">{incident.cause ?? incident.title}</p>
 								<p class="text-xs text-muted">Started {formatUtc(incident.started_at)}</p>
 							</div>
-							<span class="badge {incident.status === 'open' ? 'badge-danger' : 'badge-neutral'}">
-								{incident.status === 'open' ? 'Ongoing' : 'Resolved'} · {formatDuration(
+							<span class="badge {incident.status !== 'resolved' ? 'badge-danger' : 'badge-neutral'}">
+								{incident.status !== 'resolved' ? 'Ongoing' : 'Resolved'} · {formatDuration(
 									incident.started_at,
 									incident.resolved_at,
 									now

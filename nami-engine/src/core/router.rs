@@ -51,6 +51,26 @@ fn rate_limited_with_governor(router: Router<AppState>) -> Router<AppState> {
     )
 }
 
+/// The acknowledge/resolve link endpoints' own per-IP governor (R16): a burst
+/// of [`incidents::action::routes::BURST`], then one request every
+/// [`incidents::action::routes::REPLENISH_SECONDS`]. Looser than the login
+/// one, because a responder may act on several links in a row.
+fn rate_limited_actions(router: Router<AppState>) -> Router<AppState> {
+    let governor_conf = Arc::new(
+        GovernorConfigBuilder::default()
+            .key_extractor(SmartIpKeyExtractor)
+            .per_second(incidents::action::routes::REPLENISH_SECONDS)
+            .burst_size(incidents::action::routes::BURST)
+            .finish()
+            .expect("failed to build rate limit config"),
+    );
+
+    router.layer(
+        GovernorLayer::new(governor_conf)
+            .error_handler(|_err| AppError::RateLimited.into_response()),
+    )
+}
+
 /// Assembles the complete application router exactly as `main.rs` serves it
 /// (all route groups merged, the rate-limited group behind the real governor
 /// config above) — everything EXCEPT the session layer, since the session
@@ -78,6 +98,11 @@ pub fn build_router(state: AppState) -> Router {
         .merge(logs::source::routes::router())
         .merge(uptime::monitor::routes::router())
         .merge(incidents::routes::router())
+        .merge(incidents::severity::routes::router())
+        .merge(incidents::channel::routes::router())
+        .merge(incidents::oncall::routes::router())
+        .merge(incidents::escalation::routes::router())
+        .merge(rate_limited_actions(incidents::action::routes::router()))
         .merge(uptime::heartbeat::routes::router())
         .merge(uptime::maintenance::routes::router())
         .merge(uptime::group::routes::router())

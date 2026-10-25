@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::core::error::AppError;
 use crate::core::validate::{nullable, validate_name, with_unchanged_values};
+use crate::incidents::lifecycle;
 use crate::uptime::group::model as monitor_group;
 
 /// The longest a heartbeat's period, or its grace, may be: 31 days.
@@ -39,6 +40,10 @@ pub struct Heartbeat {
     pub created_at: DateTime<Utc>,
     /// A `monitor_groups` row of the same project, or ungrouped.
     pub group_id: Option<Uuid>,
+    /// The escalation policy of its incidents; `None` is the project default.
+    pub escalation_policy_id: Option<Uuid>,
+    /// The severity of its incidents; `None` is the project default.
+    pub severity_id: Option<Uuid>,
 }
 
 impl fmt::Debug for Heartbeat {
@@ -57,6 +62,8 @@ impl fmt::Debug for Heartbeat {
             resumed_at,
             created_at,
             group_id,
+            escalation_policy_id,
+            severity_id,
         } = self;
         f.debug_struct("Heartbeat")
             .field("id", id)
@@ -71,6 +78,8 @@ impl fmt::Debug for Heartbeat {
             .field("resumed_at", resumed_at)
             .field("created_at", created_at)
             .field("group_id", group_id)
+            .field("escalation_policy_id", escalation_policy_id)
+            .field("severity_id", severity_id)
             .finish()
     }
 }
@@ -93,6 +102,8 @@ impl Heartbeat {
             resumed_at: _,
             created_at,
             group_id,
+            escalation_policy_id,
+            severity_id,
         } = self;
         HeartbeatView {
             id,
@@ -107,6 +118,8 @@ impl Heartbeat {
             created_at,
             in_maintenance,
             group_id,
+            escalation_policy_id,
+            severity_id,
         }
     }
 }
@@ -132,6 +145,10 @@ pub struct HeartbeatView {
     pub in_maintenance: bool,
     /// The project's monitor group this heartbeat is listed under, if any.
     pub group_id: Option<Uuid>,
+    /// The escalation policy and severity of its incidents (`None`: the
+    /// project's defaults).
+    pub escalation_policy_id: Option<Uuid>,
+    pub severity_id: Option<Uuid>,
 }
 
 impl fmt::Debug for HeartbeatView {
@@ -149,6 +166,8 @@ impl fmt::Debug for HeartbeatView {
             created_at,
             in_maintenance,
             group_id,
+            escalation_policy_id,
+            severity_id,
         } = self;
         f.debug_struct("HeartbeatView")
             .field("id", id)
@@ -163,6 +182,8 @@ impl fmt::Debug for HeartbeatView {
             .field("created_at", created_at)
             .field("in_maintenance", in_maintenance)
             .field("group_id", group_id)
+            .field("escalation_policy_id", escalation_policy_id)
+            .field("severity_id", severity_id)
             .finish()
     }
 }
@@ -175,6 +196,8 @@ pub struct HeartbeatConfig {
     pub grace_seconds: i32,
     pub paused: bool,
     pub group_id: Option<Uuid>,
+    pub escalation_policy_id: Option<Uuid>,
+    pub severity_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +210,11 @@ pub struct CreateHeartbeatRequest {
     pub paused: bool,
     #[serde(default)]
     pub group_id: Option<Uuid>,
+    /// `None`: the project's default policy and severity.
+    #[serde(default)]
+    pub escalation_policy_id: Option<Uuid>,
+    #[serde(default)]
+    pub severity_id: Option<Uuid>,
 }
 
 fn default_grace_seconds() -> i32 {
@@ -201,6 +229,8 @@ impl CreateHeartbeatRequest {
             grace_seconds: self.grace_seconds,
             paused: self.paused,
             group_id: self.group_id,
+            escalation_policy_id: self.escalation_policy_id,
+            severity_id: self.severity_id,
         }
     }
 }
@@ -214,6 +244,11 @@ pub struct PatchHeartbeatRequest {
     /// Omitted keeps the group, `null` ungroups, a value regroups.
     #[serde(default, deserialize_with = "nullable")]
     pub group_id: Option<Option<Uuid>>,
+    /// Omitted keeps it, `null` returns to the project's default.
+    #[serde(default, deserialize_with = "nullable")]
+    pub escalation_policy_id: Option<Option<Uuid>>,
+    #[serde(default, deserialize_with = "nullable")]
+    pub severity_id: Option<Option<Uuid>>,
 }
 
 impl PatchHeartbeatRequest {
@@ -224,6 +259,8 @@ impl PatchHeartbeatRequest {
             grace_seconds: self.grace_seconds.unwrap_or(base.grace_seconds),
             paused: self.paused.unwrap_or(base.paused),
             group_id: self.group_id.unwrap_or(base.group_id),
+            escalation_policy_id: self.escalation_policy_id.unwrap_or(base.escalation_policy_id),
+            severity_id: self.severity_id.unwrap_or(base.severity_id),
         }
     }
 }
@@ -262,8 +299,9 @@ pub async fn insert_heartbeat(
     c: &HeartbeatConfig,
 ) -> Result<Heartbeat, sqlx::Error> {
     sqlx::query_as(
-        "insert into heartbeats (project_id, name, token, period_seconds, grace_seconds, paused, group_id)
-         values ($1, $2, $3, $4, $5, $6, $7)
+        "insert into heartbeats (project_id, name, token, period_seconds, grace_seconds, paused, group_id,
+                                 escalation_policy_id, severity_id)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
          returning *",
     )
     .bind(project_id)
@@ -273,6 +311,8 @@ pub async fn insert_heartbeat(
     .bind(c.grace_seconds)
     .bind(c.paused)
     .bind(c.group_id)
+    .bind(c.escalation_policy_id)
+    .bind(c.severity_id)
     .fetch_one(pool)
     .await
 }
@@ -329,6 +369,8 @@ pub async fn update_in_project(
         grace_seconds: current.grace_seconds,
         paused: current.paused,
         group_id: current.group_id,
+        escalation_policy_id: current.escalation_policy_id,
+        severity_id: current.severity_id,
     };
     let config = with_unchanged_values(stored, || validate(patch.apply_to(base)))
         .map_err(AppError::Validation)?;
@@ -343,7 +385,7 @@ pub async fn update_in_project(
         "update heartbeats
          set name = $3, period_seconds = $4, grace_seconds = $5, paused = $6,
              resumed_at = case when $7 then now() else resumed_at end,
-             group_id = $8
+             group_id = $8, escalation_policy_id = $9, severity_id = $10
          where id = $1 and project_id = $2
          returning *",
     )
@@ -355,15 +397,23 @@ pub async fn update_in_project(
     .bind(config.paused)
     .bind(resumed)
     .bind(config.group_id)
+    .bind(config.escalation_policy_id)
+    .bind(config.severity_id)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| match &e {
-        // The group was deleted between the check and the write.
+        // The group, policy or severity was deleted between the check and
+        // the write.
         sqlx::Error::Database(db_err) if db_err.is_foreign_key_violation() => {
             AppError::NotFound
         }
         _ => AppError::Database(e),
     })?;
+    if resumed {
+        // Under the heartbeat's lock, the order the ping and the sweep take too.
+        let source = lifecycle::IncidentSource::Heartbeat(heartbeat_id);
+        lifecycle::resume_source(&mut tx, &source, Utc::now()).await?;
+    }
     tx.commit().await?;
     Ok(Some(updated))
 }
@@ -418,6 +468,8 @@ mod tests {
             resumed_at: None,
             created_at: DateTime::UNIX_EPOCH,
             group_id: None,
+            escalation_policy_id: None,
+            severity_id: None,
         }
     }
 
@@ -428,6 +480,8 @@ mod tests {
             grace_seconds,
             paused: false,
             group_id: None,
+            escalation_policy_id: None,
+            severity_id: None,
         }
     }
 

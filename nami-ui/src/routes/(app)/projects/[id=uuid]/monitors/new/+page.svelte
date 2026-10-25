@@ -13,6 +13,8 @@
 <Card title="New monitor">
 	<MonitorForm
 		groups={data.groups}
+		policies={data.policies}
+		severities={data.severities}
 		submitLabel="Create monitor"
 		message={form?.message ?? null}
 		cancelHref="/projects/{data.project.id}/monitors"

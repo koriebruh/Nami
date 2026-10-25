@@ -18,12 +18,22 @@ pub fn validate_name(raw: &str) -> Result<String, String> {
     validate_label("name", raw)
 }
 
-/// Rule for any short label (monitor and heartbeat names, maintenance window
-/// titles): trimmed, 1-200 characters, no control characters (labels end up
-/// in alert email subjects) and none of the invisible or text-direction
-/// characters that let a label render as something it is not (see
-/// `is_invisible_or_bidi_char`). `field` names the label in the message.
+/// Most chars of a short label ([`validate_label`]).
+pub const MAX_LABEL_CHARS: usize = 200;
+
+/// Rule for any short label (monitor, heartbeat and project names,
+/// maintenance window titles): [`validate_line`] with at most
+/// [`MAX_LABEL_CHARS`] characters.
 pub fn validate_label(field: &str, raw: &str) -> Result<String, String> {
+    validate_line(field, raw, MAX_LABEL_CHARS)
+}
+
+/// Rule for one line of user text: trimmed, 1 to `max_chars` characters, no
+/// control characters (lines end up in alert email subjects) and none of the
+/// invisible or text-direction characters that let a line render as
+/// something it is not (see `is_invisible_or_bidi_char`). Returns the trimmed
+/// text. `field` names the line in the message.
+pub fn validate_line(field: &str, raw: &str, max_chars: usize) -> Result<String, String> {
     // Checked on the raw input, before trimming: U+2028 and U+2029 are
     // whitespace, so `trim` would otherwise drop them at the edges instead
     // of rejecting them.
@@ -36,13 +46,31 @@ pub fn validate_label(field: &str, raw: &str) -> Result<String, String> {
     if label.is_empty() {
         return Err(format!("{field} is required"));
     }
-    if label.chars().count() > 200 {
-        return Err(format!("{field} must be at most 200 characters"));
+    if label.chars().count() > max_chars {
+        return Err(format!("{field} must be at most {max_chars} characters"));
     }
     if label.chars().any(char::is_control) {
         return Err(format!("{field} must not contain control characters"));
     }
     Ok(label.to_string())
+}
+
+/// Rule for multi-line user text (incident descriptions, comments,
+/// postmortems). Returns the text with each `\r\n` turned into `\n`
+/// (browsers submit textarea lines that way), otherwise as it is (not
+/// trimmed). The result is at most `max_bytes` bytes and holds no control
+/// character other than `\n` and `\t`, so a lone `\r` is refused.
+pub fn validate_text(field: &str, raw: &str, max_bytes: usize) -> Result<String, String> {
+    let text = raw.replace("\r\n", "\n");
+    if text.len() > max_bytes {
+        return Err(format!("{field} must be at most {max_bytes} bytes"));
+    }
+    if text.chars().any(|c| c.is_control() && c != '\n' && c != '\t') {
+        return Err(format!(
+            "{field} must not contain control characters other than newlines and tabs"
+        ));
+    }
+    Ok(text)
 }
 
 thread_local! {
@@ -350,6 +378,31 @@ mod tests {
             "API (eu-west) #1",
         ] {
             assert_eq!(validate_name(raw).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn text_turns_crlf_into_lf_and_counts_the_bytes_after() {
+        use super::validate_text;
+        assert_eq!(validate_text("comment", "a\r\nb\r\n", 10).unwrap(), "a\nb\n");
+        // Five `x\r\n` lines are 15 bytes, and 10 once normalized.
+        assert_eq!(validate_text("comment", &"x\r\n".repeat(5), 10).unwrap(), "x\n".repeat(5));
+        assert_eq!(
+            validate_text("comment", &"x\n".repeat(6), 10).unwrap_err(),
+            "comment must be at most 10 bytes"
+        );
+        assert_eq!(validate_text("comment", "a\tb", 10).unwrap(), "a\tb");
+    }
+
+    #[test]
+    fn text_refuses_a_lone_carriage_return_and_other_controls() {
+        use super::validate_text;
+        for raw in ["a\rb", "a\r", "\r\r\n", "a\u{1b}[31m", "a\u{0}"] {
+            assert_eq!(
+                validate_text("comment", raw, 100).unwrap_err(),
+                "comment must not contain control characters other than newlines and tabs",
+                "{raw:?}"
+            );
         }
     }
 }

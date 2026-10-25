@@ -162,6 +162,7 @@ async fn every_state_changing_route_refuses_bodies_that_are_not_json(pool: sqlx:
         source["id"].as_str().unwrap()
     );
 
+    let incident = Uuid::new_v4();
     for (method, uri) in [
         ("POST", "/auth/logout".to_string()),
         ("POST", "/auth/totp/setup".to_string()),
@@ -178,6 +179,27 @@ async fn every_state_changing_route_refuses_bodies_that_are_not_json(pool: sqlx:
         ("POST", format!("/projects/{project}/sources")),
         ("PATCH", source_uri.clone()),
         ("POST", format!("{source_uri}/rotate")),
+        ("POST", format!("/projects/{project}/notification-channels")),
+        ("PATCH", format!("/projects/{project}/notification-channels/{}", Uuid::new_v4())),
+        ("POST", "/account/notification-channels".to_string()),
+        ("PATCH", format!("/account/notification-channels/{}", Uuid::new_v4())),
+        ("POST", format!("/projects/{project}/notification-channels/{}/test", Uuid::new_v4())),
+        ("POST", format!("/account/notification-channels/{}/test", Uuid::new_v4())),
+        ("POST", format!("/projects/{project}/incidents")),
+        ("PATCH", format!("/projects/{project}/incidents/{incident}")),
+        ("POST", format!("/projects/{project}/incidents/{incident}/acknowledge")),
+        ("POST", format!("/projects/{project}/incidents/{incident}/resolve")),
+        ("POST", format!("/projects/{project}/incidents/{incident}/reopen")),
+        ("POST", format!("/projects/{project}/incidents/{incident}/comments")),
+        ("PUT", format!("/projects/{project}/incidents/{incident}/postmortem")),
+        ("POST", format!("/projects/{project}/schedules")),
+        ("PUT", format!("/projects/{project}/schedules/{}", Uuid::new_v4())),
+        ("POST", format!("/projects/{project}/schedules/{}/overrides", Uuid::new_v4())),
+        ("POST", format!("/projects/{project}/escalation-policies")),
+        ("PUT", format!("/projects/{project}/escalation-policies/{}", Uuid::new_v4())),
+        ("POST", format!("/projects/{project}/escalation-policies/{}/default", Uuid::new_v4())),
+        ("POST", "/incident-actions/inspect".to_string()),
+        ("POST", "/incident-actions/confirm".to_string()),
     ] {
         for cookie in [Some(&admin), None] {
             for (content_type, body) in NOT_JSON {

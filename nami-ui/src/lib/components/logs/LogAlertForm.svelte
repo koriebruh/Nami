@@ -24,14 +24,26 @@
 		type LogLevel,
 		type Source
 	} from '#lib/logs/logs';
+	import type { PolicyOption, Severity } from '#lib/incidents/incidents';
+	import RoutingSelects from '#lib/components/RoutingSelects.svelte';
 
 	let {
 		initial,
 		sources,
+		policies = [],
+		severities = [],
 		previewUrl,
 		submitLabel,
 		busy = false
-	}: { initial: LogAlertSettings; sources: Source[]; previewUrl: string; submitLabel: string; busy?: boolean } = $props();
+	}: {
+		initial: LogAlertSettings;
+		sources: Source[];
+		policies?: PolicyOption[];
+		severities?: Severity[];
+		previewUrl: string;
+		submitLabel: string;
+		busy?: boolean;
+	} = $props();
 
 	// The form owns its values from here on: a reload of the page data after a
 	// save must not reset what is being edited.
@@ -210,6 +222,7 @@
 			<input type="checkbox" name="enabled" bind:checked={enabled} class="checkbox" />
 			Enabled
 		</label>
+		<RoutingSelects {policies} {severities} policyId={start.escalation_policy_id} severityId={start.severity_id} idPrefix="alert" />
 	</div>
 
 	<fieldset class="space-y-4 border-t border-border pt-4">

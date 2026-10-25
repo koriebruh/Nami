@@ -78,17 +78,11 @@ async fn main() {
         clickhouse,
         cipher: Cipher::new(&config.encryption_key),
         logs: Arc::new(LogsState::default()),
-        alert_throttle: Arc::new(nami_engine::uptime::alert_throttle::AlertThrottle::new()),
+        notification_sends: Arc::new(tokio::sync::Semaphore::new(
+            nami_engine::incidents::deliveries::MAX_SENDS_IN_FLIGHT,
+        )),
         config,
     };
-
-    // Every instance sends the DOWN alerts its flap control held back, worker
-    // or not: pings are throttled in whichever process received them.
-    tokio::spawn(nami_engine::uptime::alerts::run_deferred_alerts(
-        state.clone(),
-        nami_engine::uptime::alerts::DEFERRED_ALERT_INTERVAL,
-        std::time::Duration::ZERO,
-    ));
 
     // Every instance that ingests logs adds its usage counters to Postgres.
     tokio::spawn(nami_engine::logs::ingest::usage::run_forever(state.clone()));
@@ -109,6 +103,15 @@ async fn main() {
         tracing::info!("log alert worker started");
     } else {
         tracing::info!("uptime worker disabled (UPTIME_WORKER_ENABLED=false)");
+    }
+
+    // Escalation and notification delivery (R23, R27): safe on several
+    // instances at once (skip-locked claims, an advisory-locked queue).
+    if state.config.incidents_worker_enabled {
+        tokio::spawn(nami_engine::incidents::worker::run_forever(state.clone()));
+        tracing::info!("incidents worker started");
+    } else {
+        tracing::info!("incidents worker disabled (INCIDENTS_WORKER_ENABLED=false)");
     }
 
     let public_app = router::build_public_router(state.clone());

@@ -14,7 +14,7 @@ describe('log alert detail', () => {
 			params,
 			respond: (url) => (url.pathname.endsWith('/sources') ? json([]) : json(alert))
 		});
-		expect(await load(event)).toEqual({ alert, sources: [] });
+		expect(await load(event)).toEqual({ alert, sources: [], policies: [], severities: [] });
 		expect(calls()[0]).toMatchObject({ method: 'GET', path: PATH });
 		await expect(load(fakeEvent({ params, status: 404 }).event)).rejects.toMatchObject({ status: 404 });
 	});
@@ -54,5 +54,21 @@ describe('log alert detail', () => {
 
 		const denied = await actions.delete(fakeEvent({ params, form: { confirm: 'yes' }, status: 403 }).event);
 		expect(denied).toMatchObject({ status: 403, data: { message: 'Only project admins can delete alerts.' } });
+	});
+});
+
+describe('log alert edit, escalation policy and severity (NAMI-INC-14)', () => {
+	const fields = { name: 'Quiet', threshold: '1', comparison: 'lt', window_seconds: '3600', interval_seconds: '300' };
+
+	it('sends null for "Project default" on edit', async () => {
+		const { event, calls } = fakeEvent({ params, form: { ...fields, escalation_policy_id: '', severity_id: '' }, respond: () => json(alert) });
+		expect(await actions.update(event)).toEqual({ saved: true });
+		expect(JSON.parse(calls()[0].body!)).toMatchObject({ escalation_policy_id: null, severity_id: null });
+	});
+
+	it('refuses a value that is not a UUID without calling the engine', async () => {
+		const { event, calls } = fakeEvent({ params, form: { ...fields, severity_id: 'x' } });
+		expect(await actions.update(event)).toMatchObject({ status: 400, data: { action: 'update' } });
+		expect(calls()).toEqual([]);
 	});
 });

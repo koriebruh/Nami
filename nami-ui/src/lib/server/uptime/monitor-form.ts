@@ -18,6 +18,7 @@
 // default.
 
 import { IP_VERSION_TYPES, proxyMustBeReentered, secretsMustBeReentered, unescapePayload, type CheckType } from '../../uptime/uptime';
+import { addRouting } from '../incidents/policy-form';
 
 export type FormResult =
 	| { ok: true; payload: Record<string, unknown> }
@@ -128,6 +129,8 @@ export function monitorPayloadFromForm(form: FormData, mode: FormMode = 'create'
 		else if (field in switched) payload[field] = switched[field];
 		else if (mode === 'edit' && field === 'expiry_threshold_days') payload[field] = null;
 	}
+	const routingError = addRouting(form, payload, mode);
+	if (routingError) return { ok: false, message: routingError };
 	return { ok: true, payload };
 }
 

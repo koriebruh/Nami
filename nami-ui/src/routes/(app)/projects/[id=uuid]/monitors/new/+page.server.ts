@@ -1,15 +1,19 @@
 import { fail, redirect } from '@sveltejs/kit';
 import { callEngine, engineFailure, enginePath, redirectToLoginIfUnauthorized } from '#lib/server/core/engine';
+import { loadRoutingChoices } from '#lib/server/incidents/policy-form';
 import { monitorPayloadFromForm } from '#lib/server/uptime/monitor-form';
 import type { MonitorGroup } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {
-	const response = await callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`);
+	const [response, routing] = await Promise.all([
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`),
+		loadRoutingChoices(event)
+	]);
 	redirectToLoginIfUnauthorized(response);
 	// The group picker is optional: offer "No group" alone if this fails.
 	const groups: MonitorGroup[] = response.ok ? await response.json() : [];
-	return { groups };
+	return { groups, ...routing };
 };
 
 export const actions: Actions = {

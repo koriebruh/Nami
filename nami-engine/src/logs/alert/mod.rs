@@ -20,7 +20,10 @@ use crate::{
     core::clickhouse::ClickHouse,
     core::error::AppError,
     core::state::AppState,
-    incidents::model as incident,
+    incidents::{
+        lifecycle::{self, IncidentSource},
+        model as incident,
+    },
     logs::query::{
         self, LogFilters, Sql, Window,
         search::{READ_SETTINGS, user_error},
@@ -289,7 +292,10 @@ pub async fn open_alert_incident(
 }
 
 /// Resolves the alert's open incident (if any). Returns the `Recovered`
-/// transition only when `notify` (disabling an alert resolves quietly).
+/// transition only when `notify`. Without it (the alert was disabled while
+/// alerting) the incident is resolved with the reason `alert disabled`
+/// (R17): everyone already paged gets the usual resolved notice, which says
+/// why, and the caller wakes the incidents worker.
 pub async fn resolve_alert_incident(
     conn: &mut PgConnection,
     alert_id: Uuid,
@@ -298,7 +304,12 @@ pub async fn resolve_alert_incident(
     at: DateTime<Utc>,
     notify: bool,
 ) -> Result<Option<Transition>, sqlx::Error> {
-    incident::resolve_for_log_alert(conn, alert_id, at).await?;
+    if notify {
+        incident::resolve_for_log_alert(conn, alert_id, at).await?;
+    } else {
+        let source = IncidentSource::LogAlert(alert_id);
+        lifecycle::resolve_source_with_reason(conn, &source, at, "alert disabled").await?;
+    }
     Ok(notify.then(|| Transition {
         kind: TransitionKind::Recovered,
         subject: Subject::LogAlert(alert_id),

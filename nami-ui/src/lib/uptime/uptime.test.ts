@@ -127,17 +127,22 @@ describe('niceTicks', () => {
 
 describe('statusSince', () => {
 	const created = '2026-10-01T00:00:00Z';
-	const incident = (status: 'open' | 'resolved', started: string, resolved: string | null): Incident => ({
+	const incident = (status: Incident['status'], started: string, resolved: string | null): Incident => ({
 		id: started,
 		project_id: 'p',
 		monitor_id: 'm',
 		heartbeat_id: null,
 		log_alert_id: null,
+		source: 'monitor',
 		source_name: 'API',
 		title: 'API is down',
 		cause: null,
 		status,
+		severity: 'high',
+		severity_rank: 2,
 		started_at: started,
+		acknowledged_at: null,
+		acknowledged_by_email: null,
 		resolved_at: resolved,
 		details: null
 	});
@@ -149,6 +154,10 @@ describe('statusSince', () => {
 	it('is the open incident start while down', () => {
 		const open = incident('open', '2026-10-12T00:00:00Z', null);
 		expect(statusSince({ current_status: 'down', created_at: created }, [open, ...history])).toBe(open.started_at);
+	});
+	it('is the acknowledged incident start while down', () => {
+		const acked = incident('acknowledged', '2026-10-12T00:00:00Z', null);
+		expect(statusSince({ current_status: 'down', created_at: created }, [acked, ...history])).toBe(acked.started_at);
 	});
 	it('is the latest recovery while up', () => {
 		expect(statusSince({ current_status: 'up', created_at: created }, history)).toBe('2026-10-09T00:30:00Z');

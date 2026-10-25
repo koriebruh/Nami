@@ -949,7 +949,7 @@ async fn a_ping_inside_a_window_is_recorded_but_resolves_nothing(pool: sqlx::PgP
     let project = seed_project(&pool).await;
     let recipient = unique_email("oncall");
     let user = seed_user(&pool, &recipient, "member").await;
-    add_member(&pool, project, user, "viewer").await;
+    add_member(&pool, project, user, "member").await;
     let (id, token) = overdue_heartbeat(&pool, project).await;
     sweep_heartbeats(&state).await.unwrap();
     let window = seed_window_now(&pool, project, None).await;

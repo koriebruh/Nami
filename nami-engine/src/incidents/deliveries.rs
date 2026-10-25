@@ -1,0 +1,588 @@
+//! The durable notification queue: deliveries are queued once per (incident,
+//! round, target), claimed under the storm caps (R13), sent outside any
+//! transaction, recorded in the incident timeline, and retried with backoff
+//! up to [`MAX_ATTEMPTS`] times (R12). A step notification whose incident is
+//! no longer open is cancelled (R15).
+
+use std::time::Duration;
+
+use chrono::{DateTime, Utc};
+use serde_json::json;
+use sqlx::{PgConnection, PgPool};
+use tokio::{task::JoinSet, time::Instant};
+use uuid::Uuid;
+
+use crate::{
+    core::{error::AppError, state::AppState},
+    incidents::{
+        action,
+        channel::model as channel,
+        format::{IncidentSummary, Message, NotifyEvent},
+        lifecycle::{self, EventKind},
+        send::{self, Retry, SendError, Senders, UNDECRYPTABLE},
+    },
+};
+
+/// Attempts per delivery (the table's `attempts` check).
+pub const MAX_ATTEMPTS: i32 = 5;
+/// How long a claimed delivery is held before another claim may take it.
+pub const LEASE: Duration = Duration::from_secs(60);
+/// Most deliveries one channel receives per [`RATE_WINDOW`].
+pub const CHANNEL_PER_MINUTE: i64 = 30;
+/// Most implicit emails one user receives per [`RATE_WINDOW`].
+pub const EMAIL_PER_USER_PER_MINUTE: i64 = 20;
+/// The window of the per-minute caps, and how long an over-cap delivery waits.
+pub const RATE_WINDOW: Duration = Duration::from_secs(60);
+/// Most deliveries one drain claims.
+pub const DRAIN_BATCH: i64 = 50;
+/// Most sends running at once in this process, across every drain
+/// (`AppState::notification_sends`). Above [`CHANNEL_PER_MINUTE`], which
+/// also caps one channel's live leases, so a channel whose receiver hangs
+/// never holds every slot: the rest stay free for the other targets.
+pub const MAX_SENDS_IN_FLIGHT: usize = 40;
+const _: () = assert!(MAX_SENDS_IN_FLIGHT > CHANNEL_PER_MINUTE as usize);
+/// How long one drain claims and waits for its sends. A send still running
+/// then (a receiver that hangs until its 10 s timeout) finishes and records
+/// itself in the background, so it never holds up the next drain.
+pub const DRAIN_DEADLINE: Duration = Duration::from_secs(5);
+/// Most chars of `last_error` and of a delivery's timeline event.
+pub const MAX_RECORDED_CHARS: usize = 200;
+/// What an email delivery to a user without a verified address records.
+pub const NO_VERIFIED_EMAIL: &str = "no verified email";
+const FIRST_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_BACKOFF: Duration = Duration::from_secs(3600);
+
+/// 30 s × 4^(attempt-1), capped at 1 h (attempt is 1-based, the one that just failed).
+pub fn backoff(attempt: i32) -> Duration {
+    let exponent = attempt.clamp(1, 6) as u32 - 1;
+    (FIRST_BACKOFF * 4u32.pow(exponent)).min(MAX_BACKOFF)
+}
+
+/// What a delivery tells its target (`notification_deliveries.event`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryEvent {
+    Triggered,
+    Resolved,
+}
+
+impl DeliveryEvent {
+    fn as_str(self) -> &'static str {
+        match self {
+            DeliveryEvent::Triggered => "triggered",
+            DeliveryEvent::Resolved => "resolved",
+        }
+    }
+}
+
+/// One delivery to queue. `round` names the escalation pass and step (or
+/// `resolved`); a target gets at most one delivery per incident and round.
+pub struct NewDelivery {
+    pub incident_id: Uuid,
+    pub event: DeliveryEvent,
+    pub round: String,
+    pub target: Target,
+}
+
+/// Who a delivery goes to: a user's implicit (verified) email, or a channel
+/// (`user_id` = the owner of a personal channel, checked for membership).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Target {
+    Email { user_id: Uuid },
+    Channel { channel_id: Uuid, user_id: Option<Uuid> },
+}
+
+impl Target {
+    /// `email:{user}` or `channel:{channel}`, the deduplication key.
+    pub fn key(&self) -> String {
+        match self {
+            Target::Email { user_id } => format!("email:{user_id}"),
+            Target::Channel { channel_id, .. } => format!("channel:{channel_id}"),
+        }
+    }
+}
+
+/// Inserts, ignoring a duplicate (incident, round, target). Returns how many rows were new.
+pub async fn enqueue(conn: &mut PgConnection, deliveries: &[NewDelivery]) -> Result<u64, sqlx::Error> {
+    let mut inserted = 0;
+    // ponytail: one statement per row; a step queues at most 100 (R13).
+    for delivery in deliveries {
+        let (user_id, channel_id) = match delivery.target {
+            Target::Email { user_id } => (Some(user_id), None),
+            Target::Channel { channel_id, user_id } => (user_id, Some(channel_id)),
+        };
+        inserted += sqlx::query(
+            "insert into notification_deliveries (incident_id, event, round, target_key, user_id, channel_id)
+             values ($1, $2, $3, $4, $5, $6)
+             on conflict on constraint notification_deliveries_target_unique do nothing",
+        )
+        .bind(delivery.incident_id)
+        .bind(delivery.event.as_str())
+        .bind(&delivery.round)
+        .bind(delivery.target.key())
+        .bind(user_id)
+        .bind(channel_id)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+    }
+    Ok(inserted)
+}
+
+/// Claims up to [`DRAIN_BATCH`] due deliveries and sends them within the
+/// process's [`MAX_SENDS_IN_FLIGHT`] slots, then waits for the sends, all
+/// within [`DRAIN_DEADLINE`]: a send still running then goes on in the
+/// background and records itself. Returns how many were attempted.
+pub async fn drain(state: &AppState, senders: &Senders) -> Result<usize, AppError> {
+    let deadline = Instant::now() + DRAIN_DEADLINE;
+    let mut sends = JoinSet::new();
+    let attempted = claim_and_spawn(state, senders, deadline, &mut sends).await;
+    // A dropped JoinSet aborts its tasks, which would cut sends off mid-way.
+    let _ = tokio::time::timeout_at(deadline, async {
+        while let Some(ended) = sends.join_next().await {
+            log_panic(Some(ended));
+        }
+    })
+    .await;
+    sends.detach_all();
+    attempted
+}
+
+/// Claims rows only for the send slots it holds, so a claimed row starts at
+/// once and its lease and attempt are never spent waiting for a slot. Waits
+/// for a slot until `deadline` at most.
+async fn claim_and_spawn(
+    state: &AppState,
+    senders: &Senders,
+    deadline: Instant,
+    sends: &mut JoinSet<()>,
+) -> Result<usize, AppError> {
+    let batch = usize::try_from(DRAIN_BATCH).unwrap_or(0);
+    let mut attempted = 0;
+    while attempted < batch {
+        let first = tokio::select! {
+            slot = state.notification_sends.clone().acquire_owned() => match slot {
+                Ok(slot) => slot,
+                Err(_) => break,
+            },
+            () = tokio::time::sleep_until(deadline) => break,
+        };
+        let mut slots = vec![first];
+        while slots.len() < batch - attempted {
+            let Ok(slot) = state.notification_sends.clone().try_acquire_owned() else {
+                break;
+            };
+            slots.push(slot);
+        }
+        let claimed = claim(&state.db, slots.len()).await?;
+        if claimed.is_empty() {
+            break;
+        }
+        attempted += claimed.len();
+        for (row, slot) in claimed.into_iter().zip(slots) {
+            let (state, senders) = (state.clone(), senders.clone());
+            sends.spawn(async move {
+                let _slot = slot;
+                let id = row.id;
+                if let Err(e) = deliver(&state, &senders, row).await {
+                    tracing::error!(delivery_id = %id, error = %e, "notification delivery could not be recorded");
+                }
+            });
+        }
+    }
+    Ok(attempted)
+}
+
+fn log_panic(ended: Option<Result<(), tokio::task::JoinError>>) {
+    if let Some(Err(e)) = ended {
+        tracing::error!(error = %e, "notification send task panicked");
+    }
+}
+
+/// A claimed delivery; `attempts` counts this attempt.
+#[derive(sqlx::FromRow)]
+struct Claimed {
+    id: Uuid,
+    incident_id: Uuid,
+    event: String,
+    user_id: Option<Uuid>,
+    channel_id: Option<Uuid>,
+    attempts: i32,
+}
+
+// Poison rows (R12): a lease that expired after the last attempt (the process
+// died mid-send) would otherwise be reclaimed past the attempts check, which
+// would fail the whole claim statement and wedge the queue.
+const FAIL_INTERRUPTED: &str = "update notification_deliveries
+    set status = 'failed', locked_until = null, last_error = 'delivery interrupted'
+    where status = 'sending' and locked_until < now() and attempts >= $1";
+
+// The storm caps (R13): each candidate is ranked within its bucket (a channel,
+// or a user's implicit email) after what the bucket sent in the last window
+// plus what is leased now. Over-cap rows are deferred in the same statement,
+// without spending an attempt, so a busy channel never starves the others.
+// $1 = the claim's limit, $2 = CHANNEL_PER_MINUTE, $3 = EMAIL_PER_USER_PER_MINUTE,
+// $4 = LEASE, $5 = RATE_WINDOW (seconds), $6 = MAX_ATTEMPTS.
+const CLAIM: &str = "with candidates as (
+    select id, channel_id, user_id, next_attempt_at,
+           case when channel_id is not null then 'c:' || channel_id::text else 'u:' || user_id::text end as bucket
+    from notification_deliveries
+    where ((status = 'pending' and next_attempt_at <= now())
+        or (status = 'sending' and locked_until < now()))
+      and attempts < $6
+    order by next_attempt_at, id
+    limit $1
+    for update skip locked
+), recent as (
+    select case when channel_id is not null then 'c:' || channel_id::text else 'u:' || user_id::text end as bucket,
+           count(*) as used
+    from notification_deliveries
+    where ((status = 'sent' and sent_at > now() - make_interval(secs => $5))
+        or (status = 'sending' and locked_until >= now()))
+      and (channel_id in (select channel_id from candidates where channel_id is not null)
+        or (channel_id is null and user_id in (select user_id from candidates where channel_id is null)))
+    group by 1
+), ranked as (
+    select c.id,
+           coalesce(r.used, 0) + row_number() over (partition by c.bucket order by c.next_attempt_at, c.id) as nth,
+           case when c.channel_id is not null then $2::bigint else $3::bigint end as cap
+    from candidates c left join recent r on r.bucket = c.bucket
+), deferred as (
+    update notification_deliveries d
+    set status = 'pending', locked_until = null, next_attempt_at = now() + make_interval(secs => $5)
+    from ranked r where d.id = r.id and r.nth > r.cap
+    returning d.id
+)
+update notification_deliveries d
+set status = 'sending', locked_until = now() + make_interval(secs => $4), attempts = d.attempts + 1
+from ranked r
+where d.id = r.id and r.nth <= r.cap
+returning d.id, d.incident_id, d.event, d.user_id, d.channel_id, d.attempts";
+
+/// Claims at most `limit` due rows. One claim at a time across every engine
+/// instance (a transaction-level advisory lock, held for milliseconds), so
+/// the caps count every lease.
+async fn claim(pool: &PgPool, limit: usize) -> Result<Vec<Claimed>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock(hashtext('nami.notification_deliveries.claim'))")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(FAIL_INTERRUPTED).bind(MAX_ATTEMPTS).execute(&mut *tx).await?;
+    let claimed = sqlx::query_as(CLAIM)
+        .bind(i64::try_from(limit).unwrap_or(DRAIN_BATCH))
+        .bind(CHANNEL_PER_MINUTE)
+        .bind(EMAIL_PER_USER_PER_MINUTE)
+        .bind(LEASE.as_secs_f64())
+        .bind(RATE_WINDOW.as_secs_f64())
+        .bind(MAX_ATTEMPTS)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(claimed)
+}
+
+/// What a delivery needs besides its channel's secrets.
+#[derive(sqlx::FromRow)]
+struct Context {
+    project_id: Uuid,
+    project_name: String,
+    title: String,
+    cause: Option<String>,
+    status: String,
+    source: String,
+    severity: String,
+    started_at: DateTime<Utc>,
+    details: Option<String>,
+    resolution_reason: Option<String>,
+    user_email: Option<String>,
+    user_verified: bool,
+    user_is_member: bool,
+    /// A project member or admin, or a global admin: the user may act on the
+    /// incident, so their email carries action links (R16).
+    user_can_act: bool,
+    channel_kind: Option<String>,
+    channel_name: Option<String>,
+    channel_enabled: Option<bool>,
+}
+
+// $1 = incident, $2 = user (or null), $3 = channel (or null). Membership is
+// `project_members` only: a global admin who is not a member is not paged (R7).
+// A personal channel's owner is checked even when the row names no user.
+// `user_can_act` keeps `action::may_act`'s roles; a channel row has no user.
+const CONTEXT: &str = "select i.project_id, p.name as project_name, i.title, i.cause, i.status, i.source,
+        coalesce(s.name, 'unknown') as severity, i.started_at, i.details,
+        (select e.metadata->>'reason' from incident_events e
+         where e.incident_id = i.id and e.kind = 'resolved' order by e.id desc limit 1) as resolution_reason,
+        u.email as user_email, u.email_verified_at is not null as user_verified,
+        coalesce($2, c.user_id) is null
+            or exists (select 1 from project_members pm
+                       where pm.project_id = i.project_id and pm.user_id = coalesce($2, c.user_id))
+            as user_is_member,
+        coalesce(u.global_role = 'admin', false)
+            or exists (select 1 from project_members pm
+                       where pm.project_id = i.project_id and pm.user_id = $2
+                         and pm.project_role in ('member', 'admin'))
+            as user_can_act,
+        c.kind as channel_kind, c.name as channel_name, c.enabled as channel_enabled
+    from incidents i
+    join projects p on p.id = i.project_id
+    left join incident_severities s on s.id = i.severity_id
+    left join users u on u.id = $2
+    left join notification_channels c on c.id = $3
+    where i.id = $1";
+
+enum Outcome {
+    /// Never sent: the incident is no longer open (a step notification), the
+    /// user left the project, or the channel is gone or disabled.
+    Cancelled,
+    /// `label` names the target in the timeline: `Slack: <name>`, `Email: <address>`.
+    Sent { label: String },
+    Failed { label: String, error: SendError },
+    /// Not sent and not recorded: a later claim took the row over.
+    Lost,
+}
+
+impl Outcome {
+    fn of(label: String, result: Result<(), SendError>) -> Outcome {
+        match result {
+            Ok(()) => Outcome::Sent { label },
+            Err(error) => Outcome::Failed { label, error },
+        }
+    }
+}
+
+async fn deliver(state: &AppState, senders: &Senders, row: Claimed) -> Result<(), sqlx::Error> {
+    let outcome = attempt(state, senders, &row).await?;
+    record(&state.db, &row, outcome).await
+}
+
+async fn attempt(state: &AppState, senders: &Senders, row: &Claimed) -> Result<Outcome, sqlx::Error> {
+    let context: Option<Context> = sqlx::query_as(CONTEXT)
+        .bind(row.incident_id)
+        .bind(row.user_id)
+        .bind(row.channel_id)
+        .fetch_optional(&state.db)
+        .await?;
+    // A deleted incident takes its deliveries with it (cascade).
+    let Some(c) = context else {
+        return Ok(Outcome::Cancelled);
+    };
+    let event = match row.event.as_str() {
+        "resolved" => NotifyEvent::Resolved,
+        _ => NotifyEvent::Triggered,
+    };
+    if (event == NotifyEvent::Triggered && c.status != "open") || !c.user_is_member {
+        return Ok(Outcome::Cancelled);
+    }
+    let message = Message {
+        event,
+        incident: IncidentSummary {
+            id: row.incident_id,
+            title: c.title,
+            cause: c.cause,
+            status: c.status,
+            source: c.source,
+            severity: c.severity,
+            started_at: c.started_at,
+            details: c.details,
+            resolution_reason: c.resolution_reason,
+        },
+        project_id: c.project_id,
+        project_name: c.project_name,
+        incident_url: format!(
+            "{}/projects/{}/incidents/{}",
+            state.config.ui_base_url.trim_end_matches('/'),
+            c.project_id,
+            row.incident_id
+        ),
+        // Only a user's own implicit email: a channel may post into a shared room.
+        actions: row
+            .user_id
+            .filter(|_| event == NotifyEvent::Triggered && row.channel_id.is_none() && c.user_can_act)
+            .map(|user_id| {
+                action::token::links(&state.cipher, &state.config.ui_base_url, row.incident_id, user_id, Utc::now())
+            }),
+    };
+
+    if !renew_lease(&state.db, row).await? {
+        return Ok(Outcome::Lost);
+    }
+    let Some(channel_id) = row.channel_id else {
+        let email = c.user_email.unwrap_or_default();
+        let result = if c.user_verified {
+            send::send_email(&state.mailer, &email, &message).await
+        } else {
+            Err(SendError::never(NO_VERIFIED_EMAIL))
+        };
+        return Ok(Outcome::of(format!("Email: {email}"), result));
+    };
+    let (Some(kind), Some(name), Some(true)) = (c.channel_kind, c.channel_name, c.channel_enabled) else {
+        return Ok(Outcome::Cancelled);
+    };
+    let label = format!("{}: {name}", kind_label(&kind));
+    let result = match channel::open_for_send(&state.db, &state.cipher, channel_id).await? {
+        None => return Ok(Outcome::Cancelled),
+        Some(Err(_)) => Err(SendError::never(UNDECRYPTABLE)),
+        Some(Ok(opened)) => send::send_to_channel(senders, &state.mailer, &opened, &message, row.id).await,
+    };
+    Ok(Outcome::of(label, result))
+}
+
+/// How the timeline names a channel kind.
+fn kind_label(kind: &str) -> &str {
+    match kind {
+        "email" => "Email",
+        "webhook" => "Webhook",
+        "slack" => "Slack",
+        "teams" => "Teams",
+        "telegram" => "Telegram",
+        "discord" => "Discord",
+        other => other,
+    }
+}
+
+// Only while this attempt still holds the row.
+const RENEW: &str = "update notification_deliveries set locked_until = now() + make_interval(secs => $3)
+    where id = $1 and status = 'sending' and attempts = $2";
+
+/// Restarts the lease just before the request, so it covers the send itself
+/// (at most the 10 s client or SMTP timeout) however long the row waited for
+/// a send slot or the database. `false` = a later claim took the row over, and
+/// this attempt must not send it a second time.
+async fn renew_lease(pool: &PgPool, row: &Claimed) -> Result<bool, sqlx::Error> {
+    let renewed = sqlx::query(RENEW)
+        .bind(row.id)
+        .bind(row.attempts)
+        .bind(LEASE.as_secs_f64())
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(renewed == 1)
+}
+
+fn recorded(text: &str) -> String {
+    text.chars().take(MAX_RECORDED_CHARS).collect()
+}
+
+// Only while this attempt still holds the row: a finisher whose lease was
+// taken over by a later claim changes nothing.
+const RECORD: &str = "update notification_deliveries
+    set status = $3, last_error = $4, locked_until = null,
+        sent_at = case when $3 = 'sent' then now() end,
+        next_attempt_at = coalesce(now() + make_interval(secs => $5), next_attempt_at)
+    where id = $1 and status = 'sending' and attempts = $2";
+
+// A page sent after its incident was resolved (it was in flight then, so the
+// resolve did not see it sent) gets the resolved notice the resolve gave the
+// others: same generation ($2) only, once per target.
+const QUEUE_LATE_RESOLVED: &str = "insert into notification_deliveries
+        (incident_id, event, round, target_key, user_id, channel_id)
+    select incident_id, 'resolved', 'resolved:g' || $2, target_key, user_id, channel_id
+    from notification_deliveries
+    where id = $1 and round like 'g' || $2 || 'p%'
+    on conflict on constraint notification_deliveries_target_unique do nothing";
+
+/// Writes the outcome and its timeline event in one transaction: `sent`, a
+/// retry (`pending` after the backoff or a longer `Retry-After`), `failed`
+/// (never retryable, or the last attempt) or `cancelled` (no event). A step
+/// notification sent for an incident already resolved queues its resolved
+/// notice (`QUEUE_LATE_RESOLVED`).
+async fn record(pool: &PgPool, row: &Claimed, outcome: Outcome) -> Result<(), sqlx::Error> {
+    let (status, error, retry_in, event) = match outcome {
+        Outcome::Lost => return Ok(()),
+        Outcome::Cancelled => ("cancelled", None, None, None),
+        Outcome::Sent { label } => ("sent", None, None, Some((EventKind::NotificationSent, label))),
+        Outcome::Failed { label, error } => {
+            let retry_in = match error.retry {
+                Retry::After(wait) if row.attempts < MAX_ATTEMPTS => {
+                    Some(backoff(row.attempts).max(wait.unwrap_or_default()))
+                }
+                _ => None,
+            };
+            let status = if retry_in.is_some() { "pending" } else { "failed" };
+            let event = (EventKind::NotificationFailed, format!("{label}: {}", error.message));
+            (status, Some(recorded(&error.message)), retry_in, Some(event))
+        }
+    };
+    let mut tx = pool.begin().await?;
+    // The incident before the delivery, the order resolve and the tick lock
+    // them in. Locked whatever its status: a resolve committing meanwhile is
+    // then either seen here, or waits and sees this row sent.
+    let incident: Option<(String, i32)> = if status == "sent" && row.event == "triggered" {
+        sqlx::query_as("select status, escalation_generation from incidents where id = $1 for share")
+            .bind(row.incident_id)
+            .fetch_optional(&mut *tx)
+            .await?
+    } else {
+        None
+    };
+    let updated = sqlx::query(RECORD)
+        .bind(row.id)
+        .bind(row.attempts)
+        .bind(status)
+        .bind(error)
+        .bind(retry_in.map(|wait| wait.as_secs_f64()))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if let (1, Some((kind, message))) = (updated, event) {
+        lifecycle::record_event(&mut tx, row.incident_id, kind, None, Some(&recorded(&message)), json!({}))
+            .await?;
+    }
+    if updated == 1
+        && let Some((incident_status, generation)) = incident
+        && incident_status == "resolved"
+    {
+        sqlx::query(QUEUE_LATE_RESOLVED).bind(row.id).bind(generation).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    if updated == 1 && status == "sent" && row.event == "triggered" {
+        note_page(pool, row.incident_id).await;
+    }
+    Ok(())
+}
+
+// R31: the source of the incident (none for a manual one) was paged now.
+const NOTE_PAGE: &str = "with i as (select monitor_id, heartbeat_id, log_alert_id from incidents where id = $1),
+    m as (update monitors set last_paged_at = now() where id = (select monitor_id from i)),
+    h as (update heartbeats set last_paged_at = now() where id = (select heartbeat_id from i))
+    update log_alerts set last_paged_at = now() where id = (select log_alert_id from i)";
+
+/// Sets the incident's source's `last_paged_at`, which holds the source's
+/// next automatic incident off (`lifecycle::SOURCE_PAGE_GAP_SECS`). Its own
+/// statement, after the delivery's transaction: the source row is the lock
+/// the uptime worker and the heartbeat ping take before the incident, and
+/// that transaction holds a key share on the incident. A failure is logged;
+/// the notification itself was sent and recorded.
+async fn note_page(pool: &PgPool, incident_id: Uuid) {
+    if let Err(e) = sqlx::query(NOTE_PAGE).bind(incident_id).execute(pool).await {
+        tracing::warn!(%incident_id, error = %e, "recording the source's last page failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_is_30s_times_4_to_the_attempt_capped_at_an_hour() {
+        let secs: Vec<u64> = (1..=6).map(|a| backoff(a).as_secs()).collect();
+        assert_eq!(secs, [30, 120, 480, 1920, 3600, 3600]);
+    }
+
+    #[test]
+    fn recorded_text_is_cut_at_its_char_limit() {
+        let at = "é".repeat(MAX_RECORDED_CHARS);
+        assert_eq!(recorded(&at), at);
+        assert_eq!(recorded(&format!("{at}x")), at);
+    }
+
+    #[test]
+    fn targets_are_keyed_by_kind_and_id() {
+        let id = Uuid::nil();
+        assert_eq!(Target::Email { user_id: id }.key(), format!("email:{id}"));
+        assert_eq!(
+            Target::Channel { channel_id: id, user_id: Some(Uuid::max()) }.key(),
+            format!("channel:{id}")
+        );
+    }
+}

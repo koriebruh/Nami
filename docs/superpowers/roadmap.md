@@ -35,7 +35,7 @@ phase PR each.
 | # | Phase | Plan | Branch | Status |
 |---|---|---|---|---|
 | 1 | Logs Part 2 | `plans/2026-10-13-log-management-part2.md` | `feat/logs-part2` | done |
-| 2 | Incidents Part 1 | `plans/2026-10-13-incident-management-part1.md` | `feat/incidents-part1` | ready |
+| 2 | Incidents Part 1 | `plans/2026-10-13-incident-management-part1.md` | `feat/incidents-part1` | done |
 | 3 | Incidents Part 2 | `plans/2026-10-24-incident-management-part2.md` | `feat/incidents-part2` | outline |
 | 4 | Status Pages Part 1 | `plans/2026-10-13-status-pages-part1.md` | `feat/statuspages-part1` | ready |
 | 5 | Status Pages Part 2 | `plans/2026-10-24-status-pages-part2.md` | `feat/statuspages-part2` | outline |
@@ -137,19 +137,21 @@ their step-level code is written at phase start against the then-current
 
 ## 4. Incident management + on-call
 
-- [ ] **R4.01** Incident lifecycle: open → acknowledged → resolved; manual incidents
-- [ ] **R4.02** Incident timeline (events, comments), postmortem notes
-- [ ] **R4.03** Escalation policies (multi-step, delays, repeat) per project
-- [ ] **R4.04** Escalation step time-window conditions and fallback policy
-- [ ] **R4.05** On-call schedules: rotations, handoff, overrides, "who's on call"
+Part 1 done (decisions: `docs/superpowers/decisions/2026-10-25-incident-management-part1.md`); R4.06, R4.14, R4.15 and R4.18 are partly delivered and finish with Part 2.
+
+- [x] **R4.01** Incident lifecycle: open → acknowledged → resolved; manual incidents
+- [x] **R4.02** Incident timeline (events, comments), postmortem notes
+- [x] **R4.03** Escalation policies (multi-step, delays, repeat) per project
+- [x] **R4.04** Escalation step time-window conditions and fallback policy
+- [x] **R4.05** On-call schedules: rotations, handoff, overrides, "who's on call"
 - [ ] **R4.06** On-call working-hours restriction, shift reminder emails (24 h
       ahead), per-user ICS feed, "take over shift"
-- [ ] **R4.07** Notification channels: email, generic webhook, Slack, Telegram,
+- [x] **R4.07** Notification channels: email, generic webhook, Slack, Telegram,
       Discord; per-user and per-policy targets
-- [ ] **R4.08** Microsoft Teams channel (Adaptive Cards)
-- [ ] **R4.09** Acknowledge/resolve from email links (signed, expiring tokens)
+- [x] **R4.08** Microsoft Teams channel (Adaptive Cards)
+- [x] **R4.09** Acknowledge/resolve from email links (signed, expiring tokens)
 - [ ] **R4.10** Slack Acknowledge/Resolve buttons (signed requests, optional per project)
-- [ ] **R4.11** Monitors, heartbeats and log alerts route through escalation policies
+- [x] **R4.11** Monitors, heartbeats and log alerts route through escalation policies
 - [ ] **R4.12** Incoming integrations: generic JSON webhook, Prometheus
       Alertmanager, Grafana alerting (secret URL, dedup, auto-resolve)
 - [ ] **R4.13** Public incident report form (secret URL, per-IP rate limit, honeypot)

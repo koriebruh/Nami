@@ -211,8 +211,16 @@ async fn a_racing_open_goes_ahead_when_the_first_writer_rolls_back(pool: PgPool)
 }
 
 #[sqlx::test]
-async fn status_is_limited_to_open_and_resolved(pool: PgPool) {
+async fn status_is_limited_to_the_lifecycle_states(pool: PgPool) {
     let project = seed_project(&pool).await;
+    sqlx::query(
+        "insert into incidents (project_id, title, status, acknowledged_at)
+         values ($1, 'x', 'acknowledged', now())",
+    )
+    .bind(project)
+    .execute(&pool)
+    .await
+    .unwrap();
     let result =
         sqlx::query("insert into incidents (project_id, title, status) values ($1, 'x', 'bogus')")
             .bind(project)

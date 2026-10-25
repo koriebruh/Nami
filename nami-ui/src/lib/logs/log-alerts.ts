@@ -29,12 +29,23 @@ export type LogAlert = {
 	last_error: string | null;
 	last_error_at: string | null;
 	next_evaluation_at: string;
+	/** null: the project default. */
+	escalation_policy_id?: string | null;
+	severity_id?: string | null;
 };
 
 /** What the alert form edits: the alert's settings without its evaluation state. */
 export type LogAlertSettings = Pick<
 	LogAlert,
-	'name' | 'query' | 'threshold' | 'comparison' | 'window_seconds' | 'interval_seconds' | 'enabled'
+	| 'name'
+	| 'query'
+	| 'threshold'
+	| 'comparison'
+	| 'window_seconds'
+	| 'interval_seconds'
+	| 'enabled'
+	| 'escalation_policy_id'
+	| 'severity_id'
 >;
 
 export const WINDOW_RANGE = { min: 60, max: 86_400 };
@@ -56,7 +67,9 @@ export const NEW_ALERT: LogAlertSettings = {
 	comparison: 'gt',
 	window_seconds: 300,
 	interval_seconds: 60,
-	enabled: true
+	enabled: true,
+	escalation_policy_id: null,
+	severity_id: null
 };
 
 /** "5 min", "1 h", "90 s" (as the engine's alert emails write it). */

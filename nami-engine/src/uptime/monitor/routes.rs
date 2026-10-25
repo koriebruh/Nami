@@ -17,6 +17,7 @@ use crate::{
         CurrentUser, ProjectReader, Role, require_project_reader, require_project_role,
     },
     core::state::AppState,
+    incidents::model as incident,
     uptime::group::model as monitor_group,
     uptime::maintenance::model as maintenance,
     uptime::monitor::model::{
@@ -166,6 +167,17 @@ async fn create_monitor(
             return Err(AppError::NotFound);
         }
     }
+    // So is a policy or severity of another project.
+    if !incident::routing_belongs_to(
+        &state.db,
+        project_id,
+        config.escalation_policy_id,
+        config.severity_id,
+    )
+    .await?
+    {
+        return Err(AppError::NotFound);
+    }
     let created = monitor::insert_monitor(&state.db, &state.cipher, project_id, &config)
         .await
         .map_err(|e| match &e {
@@ -229,6 +241,14 @@ async fn patch_monitor(
     Json(payload): Json<PatchMonitorRequest>,
 ) -> Result<Json<MonitorView>, AppError> {
     require_project_role(&state.db, &user, project_id, Role::Member).await?;
+    // A policy or severity of another project is a 404, like any foreign id.
+    let (policy, severity) = (
+        payload.escalation_policy_id.flatten(),
+        payload.severity_id.flatten(),
+    );
+    if !incident::routing_belongs_to(&state.db, project_id, policy, severity).await? {
+        return Err(AppError::NotFound);
+    }
     let updated =
         monitor::update_in_project(&state.db, &state.cipher, project_id, monitor_id, payload)
             .await?

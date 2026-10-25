@@ -205,6 +205,93 @@ pub async fn seed_http_monitor(
     .unwrap()
 }
 
+/// Opens a manual incident in `project` (title "test incident") through
+/// `incidents::lifecycle::open` and returns its id.
+pub async fn open_test_incident(pool: &sqlx::PgPool, project: Uuid, created_by: Uuid) -> Uuid {
+    use nami_engine::incidents::lifecycle::{self, IncidentSource, OpenIncident};
+    let mut conn = pool.acquire().await.unwrap();
+    lifecycle::open(
+        &mut conn,
+        &OpenIncident {
+            project_id: project,
+            source: IncidentSource::Manual { created_by },
+            title: "test incident",
+            cause: None,
+            severity_id: None,
+            metadata: None,
+            escalation_policy_id: None,
+            started_at: Utc::now(),
+        },
+    )
+    .await
+    .unwrap()
+    .expect("a manual incident has no conflict target, so it always opens")
+}
+
+/// Seals and inserts an enabled channel without the destination rules (R9),
+/// so tests can target wiremock. A project channel's creator is a freshly
+/// seeded admin; a personal channel's is its user.
+pub async fn insert_channel(
+    pool: &sqlx::PgPool,
+    project: Option<Uuid>,
+    user: Option<Uuid>,
+    name: &str,
+    config: nami_engine::incidents::channel::model::ChannelConfig,
+) -> Uuid {
+    use nami_engine::incidents::channel::model::{self as channel, Inserted, Owner};
+    let (owner, created_by) = match (project, user) {
+        (Some(project), None) => (
+            Owner::Project(project),
+            seed_user(pool, &unique_email("channel-admin"), "admin").await,
+        ),
+        (None, Some(user)) => (Owner::User(user), user),
+        _ => panic!("a channel has exactly one owner"),
+    };
+    match channel::insert(pool, &test_cipher(), owner, name, &config, true, created_by)
+        .await
+        .unwrap()
+    {
+        Inserted::Created(created) => created.channel.id,
+        _ => panic!("the channel was not inserted"),
+    }
+}
+
+/// One escalation tick (from Task 9 on) and one delivery drain, as the
+/// worker would run them.
+pub async fn run_incident_ticks(state: &AppState) {
+    nami_engine::incidents::worker::kick(state).await
+}
+
+/// Makes the incident's next escalation step due now, only if one is
+/// scheduled (unconditionally, it would resurrect an exhausted escalation).
+pub async fn make_escalation_due(pool: &sqlx::PgPool, incident: Uuid) {
+    sqlx::query(
+        "update incidents set next_escalation_at = now()
+         where id = $1 and next_escalation_at is not null",
+    )
+    .bind(incident)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Replaces the project's default policy with `body` through the API as
+/// `admin`; returns its id.
+pub async fn set_policy(app: &Router, project: Uuid, admin: &HeaderValue, body: Value) -> Uuid {
+    let path = format!("/projects/{project}/escalation-policies");
+    let (status, policies) = call(app, "GET", &path, Some(admin), None).await;
+    assert_eq!(status, StatusCode::OK, "{policies}");
+    let id = policies
+        .as_array()
+        .and_then(|all| all.iter().find(|p| p["is_default"] == true))
+        .and_then(|p| p["id"].as_str())
+        .expect("every project has a default policy")
+        .to_string();
+    let (status, saved) = call(app, "PUT", &format!("{path}/{id}"), Some(admin), Some(body)).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    id.parse().unwrap()
+}
+
 /// AppState whose ClickHouse client is bound to a fresh per-test database.
 /// Call `clickhouse.drop_database()` at the end of the test.
 pub async fn state_with_clickhouse(

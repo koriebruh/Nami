@@ -962,7 +962,7 @@ async fn the_worker_survives_an_undecryptable_monitor_and_its_alert_has_no_secre
     let project = seed_project(&pool).await;
     let recipient = unique_email("oncall");
     let user = seed_user(&pool, &recipient, "member").await;
-    add_member(&pool, project, user, "viewer").await;
+    add_member(&pool, project, user, "member").await;
     let healthy_server = MockServer::start().await;
     Mock::given(method("GET"))
         .respond_with(ResponseTemplate::new(200))

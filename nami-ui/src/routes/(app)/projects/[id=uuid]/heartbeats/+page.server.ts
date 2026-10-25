@@ -7,6 +7,7 @@ import {
 	publicEngineUrl,
 	redirectToLoginIfUnauthorized
 } from '#lib/server/core/engine';
+import { loadRoutingChoices } from '#lib/server/incidents/policy-form';
 import { heartbeatPayloadFromForm } from '#lib/server/uptime/heartbeat-form';
 import type { Heartbeat, MonitorGroup } from '#lib/uptime/uptime';
 import type { Actions, PageServerLoad } from './$types';
@@ -28,9 +29,10 @@ export const load: PageServerLoad = async (event) => {
 	// only here: SvelteKit throws when a header is set twice.
 	event.setHeaders({ 'cache-control': 'private, no-store' });
 
-	const [response, groupsResponse] = await Promise.all([
+	const [response, groupsResponse, routing] = await Promise.all([
 		callEngine(event, enginePath`/projects/${event.params.id}/heartbeats`),
-		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`)
+		callEngine(event, enginePath`/projects/${event.params.id}/monitor-groups`),
+		loadRoutingChoices(event)
 	]);
 	redirectToLoginIfUnauthorized(response);
 	if (!response.ok) {
@@ -44,7 +46,7 @@ export const load: PageServerLoad = async (event) => {
 	const heartbeats: Heartbeat[] = await response.json();
 	// Groups only arrange the list: without them it still renders, flat.
 	const groups = await jsonArray<MonitorGroup>(groupsResponse);
-	return { heartbeats, groups, engineUrl: publicEngineUrl() };
+	return { heartbeats, groups, engineUrl: publicEngineUrl(), ...routing };
 };
 
 export const actions: Actions = {

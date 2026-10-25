@@ -4,6 +4,7 @@
 	import { refreshAll } from '$app/navigation';
 	import CopyButton from '#lib/components/CopyButton.svelte';
 	import MaintenanceBadge from '#lib/components/MaintenanceBadge.svelte';
+	import RoutingSelects from '#lib/components/RoutingSelects.svelte';
 	import StatusBadge from '#lib/components/StatusBadge.svelte';
 	import Icon from '#lib/components/ui/Icon.svelte';
 	import { formatSeconds, groupMonitors, pingUrl, timeAgo } from '#lib/uptime/uptime';
@@ -169,6 +170,9 @@
 					</select>
 				</div>
 			{/if}
+			<div class="grid gap-4 sm:col-span-3 sm:grid-cols-2">
+				<RoutingSelects policies={data.policies} severities={data.severities} idPrefix="hb" />
+			</div>
 			<button
 				type="submit"
 				disabled={creating}

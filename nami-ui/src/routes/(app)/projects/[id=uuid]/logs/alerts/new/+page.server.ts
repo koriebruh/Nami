@@ -2,13 +2,15 @@ import { fail, redirect } from '@sveltejs/kit';
 import { callEngine, engineFailure, enginePath } from '#lib/server/core/engine';
 import { logAlertPayloadFromForm } from '#lib/server/logs/log-alert-form';
 import { loadSources } from '#lib/server/logs/log-alert-load';
+import { loadRoutingChoices } from '#lib/server/incidents/policy-form';
 import { alertQueryFromExplorer, NEW_ALERT, type LogAlert, type LogAlertSettings } from '#lib/logs/log-alerts';
 import type { Actions, PageServerLoad } from './$types';
 
 export const load: PageServerLoad = async (event) => {
 	// "Create alert from this search" links here with the explorer's query string.
 	const initial: LogAlertSettings = { ...NEW_ALERT, query: alertQueryFromExplorer(event.url.searchParams) };
-	return { initial, sources: await loadSources(event) };
+	const [sources, routing] = await Promise.all([loadSources(event), loadRoutingChoices(event)]);
+	return { initial, sources, ...routing };
 };
 
 export const actions: Actions = {
