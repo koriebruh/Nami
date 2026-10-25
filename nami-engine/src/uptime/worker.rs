@@ -618,8 +618,11 @@ pub async fn run_pass(state: &AppState, notifications: &Notifications) -> Result
     pass(state, notifications, &CheckLimits::new()).await
 }
 
-/// [`run_pass`] that also waits for the alerts it started to be sent, so the
-/// caller knows they are out when it returns. Returns how many checks ran.
+/// [`run_pass`] that also waits for the alert tasks it started. Every alert
+/// runs an incidents kick, whose drain waits at most
+/// `deliveries::DRAIN_DEADLINE` for its sends: those that finish within it
+/// are out when this returns, and a slower one (a hanging receiver) goes on
+/// in the background. Returns how many checks ran.
 pub async fn run_due_checks(state: &AppState) -> Result<usize, AppError> {
     let notifications = Notifications::new();
     let ran = run_pass(state, &notifications).await?;
@@ -641,9 +644,10 @@ pub async fn sweep_pass(
     Ok(swept)
 }
 
-/// [`sweep_pass`] that also waits for the alerts it started to be sent, so the
-/// caller knows they are out when it returns. Returns how many heartbeats went
-/// down.
+/// [`sweep_pass`] that also waits for the alert tasks it started, with the
+/// same bound as [`run_due_checks`]: sends that finish within
+/// `deliveries::DRAIN_DEADLINE` are out when this returns, a slower one goes
+/// on in the background. Returns how many heartbeats went down.
 pub async fn sweep_heartbeats(state: &AppState) -> Result<usize, AppError> {
     let notifications = Notifications::new();
     let swept = sweep_pass(state, &notifications).await?;

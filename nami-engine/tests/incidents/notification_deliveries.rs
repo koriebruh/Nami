@@ -11,7 +11,7 @@ use nami_engine::{
     core::state::AppState,
     incidents::channel::model::ChannelConfig,
     incidents::deliveries::{self, DeliveryEvent, NewDelivery, Target},
-    incidents::{lifecycle, outbound::OUTBOUND_TIMEOUT},
+    incidents::{lifecycle, outbound::OUTBOUND_TIMEOUT, send::Senders},
 };
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -659,10 +659,22 @@ async fn sending_to(pool: &sqlx::PgPool, channel: Uuid) -> i64 {
 
 /// A receiver that hangs holds its own send slots until its timeout, never
 /// the queue: with as many of its sends in flight as its cap allows, the
-/// worker's next drain still sends to another channel.
+/// drain that started them returns at its deadline, and the next drain sends
+/// to another channel while they are still hanging.
+///
+/// The drains are called directly, not through `kick`: its permits are
+/// process-wide and shared with every other test running in parallel, and
+/// waiting for one is what made a wall-clock bound here flaky. Whether a
+/// drain was held up is read from the rows instead (the hanging sends are
+/// still `sending`). The one timing assumption left: the second drain, one
+/// send to a local mock, ends within the `OUTBOUND_TIMEOUT - DRAIN_DEADLINE`
+/// (5 s) the hanging sends have left after the first drain returns.
 #[sqlx::test]
 async fn a_hanging_receiver_does_not_hold_up_another_channel(pool: sqlx::PgPool) {
+    // The hanging sends outlive the drain that started them.
+    const _: () = assert!(deliveries::DRAIN_DEADLINE.as_secs() < OUTBOUND_TIMEOUT.as_secs());
     let state = AppState::for_test(pool.clone());
+    let senders = Senders::from_config(&state.config);
     let app = test_app(pool.clone());
     let project = seed_project(&pool).await;
     let (user, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
@@ -677,28 +689,20 @@ async fn a_hanging_receiver_does_not_hold_up_another_channel(pool: sqlx::PgPool)
     for n in 0..deliveries::CHANNEL_PER_MINUTE {
         queue(&pool, incident, &format!("hung{n}"), Target::Channel { channel_id: hung, user_id: None }).await;
     }
-    // The worker loop: one kick after another, never two at once.
-    let worker = tokio::spawn({
-        let state = state.clone();
-        async move {
-            loop {
-                run_incident_ticks(&state).await;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-    });
-    let all_in_flight =
-        wait_until(Duration::from_secs(5), || async { sending_to(&pool, hung).await == deliveries::CHANNEL_PER_MINUTE })
-            .await;
-    assert!(all_in_flight, "the hanging channel's deliveries were claimed");
+
+    let attempted = deliveries::drain(&state, &senders).await.unwrap();
+    assert_eq!(attempted, deliveries::CHANNEL_PER_MINUTE as usize, "one drain claims the hanging channel's cap");
+    assert_eq!(
+        sending_to(&pool, hung).await,
+        deliveries::CHANNEL_PER_MINUTE,
+        "the drain returned with its sends still hanging"
+    );
 
     queue(&pool, incident, "p0r0s0", Target::Channel { channel_id: other, user_id: None }).await;
-    let queued = Instant::now();
-    let sent = wait_until(OUTBOUND_TIMEOUT * 2, || async { !fast.received_requests().await.unwrap().is_empty() }).await;
-    let waited = queued.elapsed();
-    worker.abort();
-    assert!(sent && waited < OUTBOUND_TIMEOUT, "the other channel waited {waited:?} (sent: {sent})");
-    assert_eq!(sending_to(&pool, hung).await, deliveries::CHANNEL_PER_MINUTE, "still hanging meanwhile");
+    let attempted = deliveries::drain(&state, &senders).await.unwrap();
+    assert_eq!(attempted, 1, "the next drain claims the other channel's delivery");
+    assert_eq!(fast.received_requests().await.unwrap().len(), 1, "and sends it");
+    assert_eq!(sending_to(&pool, hung).await, deliveries::CHANNEL_PER_MINUTE, "while the others still hang");
 }
 
 /// A page still in flight when its incident is resolved is followed by its

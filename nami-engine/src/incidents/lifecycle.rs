@@ -267,8 +267,9 @@ pub const MAX_REASON_CHARS: usize = 200;
 
 /// open|acknowledged -> resolved at `at`, which stops escalation. `actor:
 /// None` = automatic. Queues a `resolved` notice for every target the
-/// current escalation generation has notified (`QUEUE_RESOLVED`; for a
-/// legacy incident, every verified member) and cancels the step
+/// current escalation generation has notified or whose resolved notice the
+/// last reopen cancelled (`QUEUE_RESOLVED`; for a legacy incident, every
+/// verified member) and cancels the step
 /// notifications still queued. `false` when it was already resolved (or does
 /// not exist).
 pub async fn resolve(
@@ -282,17 +283,25 @@ pub async fn resolve(
 
 // One `resolved` notice per target with a sent step notification in the
 // current generation ($2): its rounds start `g{generation}p`, and the `p`
-// keeps g1 from matching g10.
+// keeps g1 from matching g10. Also every target whose previous generation's
+// resolved notice was cancelled (by the reopen that started this generation,
+// or chained through earlier reopens), so a page from before the reopen is
+// not left open when this generation resolves before paging them again. Only
+// a reopen bumps the generation, so `$2 - 1` is the one that resolved last.
+// Someone who has left the project is cancelled again at send time.
 const QUEUE_RESOLVED: &str = "insert into notification_deliveries
         (incident_id, event, round, target_key, user_id, channel_id)
     select distinct incident_id, 'resolved', 'resolved:g' || $2, target_key, user_id, channel_id
     from notification_deliveries
-    where incident_id = $1 and event = 'triggered' and status = 'sent'
-      and round like 'g' || $2 || 'p%'
+    where incident_id = $1
+      and ((event = 'triggered' and status = 'sent' and round like 'g' || $2 || 'p%')
+        or (event = 'resolved' and status = 'cancelled' and round = 'resolved:g' || ($2 - 1)))
     on conflict on constraint notification_deliveries_target_unique do nothing";
 
 // A legacy incident (unresolved at deploy, R6) was emailed to every member by
 // the old path, which recorded no deliveries: each verified member is told.
+// Only generation 0 is legacy (`ARM` clears the flag on a reopen), so this
+// never needs the cancelled notices `QUEUE_RESOLVED` picks up.
 const QUEUE_RESOLVED_LEGACY: &str = "insert into notification_deliveries
         (incident_id, event, round, target_key, user_id)
     select i.id, 'resolved', 'resolved:g' || $2, 'email:' || m.user_id, m.user_id

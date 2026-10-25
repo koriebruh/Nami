@@ -553,6 +553,70 @@ async fn a_reopen_cancels_the_resolved_notices_still_queued(pool: sqlx::PgPool) 
     assert_eq!(resolved_notices(&pool, opened).await, ["cancelled", "cancelled"]);
 }
 
+/// A resolved notice the reopen cancelled comes back when the reopened
+/// incident resolves before its new generation pages anyone, so nobody is
+/// left with an open page. One who left the project meanwhile gets nothing.
+#[sqlx::test]
+async fn a_resolve_after_a_reopen_requeues_the_cancelled_resolved_notices(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (admin, admin_email, _) = user_with_role(&app, &pool, project, Some("admin")).await;
+    let (member_id, email, member) = user_with_role(&app, &pool, project, Some("member")).await;
+    let id = open(&app, project, &member).await;
+    run_incident_ticks(&state).await;
+    act(&app, project, &member, &id, "resolve").await;
+    act(&app, project, &member, &id, "reopen").await;
+    assert_eq!(resolved_notices(&pool, uid(&id)).await, ["cancelled", "cancelled"]);
+    sqlx::query("delete from project_members where project_id = $1 and user_id = $2")
+        .bind(project)
+        .bind(admin)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Resolved again before a tick pages anyone in g1.
+    act(&app, project, &member, &id, "resolve").await;
+    let mut queued: Vec<String> = sqlx::query_scalar(
+        "select target_key from notification_deliveries where incident_id = $1::uuid and round = 'resolved:g1'",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    queued.sort();
+    let mut expected = vec![format!("email:{admin}"), format!("email:{member_id}")];
+    expected.sort();
+    assert_eq!(queued, expected);
+
+    run_incident_ticks(&state).await;
+    let subjects: Vec<String> = settled_mail(&email, 2).await.into_iter().map(|(s, _)| s).collect();
+    assert_eq!(subjects, ["[Nami] [high] db down", "[Nami] Resolved: db down"]);
+    let admin_status: String = sqlx::query_scalar(
+        "select status from notification_deliveries
+         where incident_id = $1::uuid and round = 'resolved:g1' and target_key = $2",
+    )
+    .bind(&id)
+    .bind(format!("email:{admin}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(admin_status, "cancelled", "left the project");
+    assert_eq!(settled_mail(&admin_email, 1).await.len(), 1, "only the g0 page");
+
+    // Only the previous generation's cancelled notices carry over: the member
+    // was told g1 resolved, so a g2 that pages nobody tells them nothing.
+    act(&app, project, &member, &id, "reopen").await;
+    act(&app, project, &member, &id, "resolve").await;
+    let queued: Vec<String> = sqlx::query_scalar(
+        "select target_key from notification_deliveries where incident_id = $1::uuid and round = 'resolved:g2'",
+    )
+    .bind(&id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queued, [format!("email:{admin}")], "the admin's g1 notice was cancelled, the member's sent");
+}
+
 #[sqlx::test]
 async fn racing_ticks_notify_each_target_once(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());
