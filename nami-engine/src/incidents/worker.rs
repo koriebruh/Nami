@@ -44,11 +44,12 @@ pub async fn run_forever(state: AppState) {
 }
 
 /// One escalation tick, then one drain, now. Used by
-/// `uptime::alerts::notify_transition`, the log alert PATCH and tests.
-/// Returns at once when
+/// `uptime::alerts::notify_transition`, the action link confirm, the log
+/// alert PATCH and tests. Returns at once when
 /// `!state.config.incidents_worker_enabled`. Otherwise waits for one of the
 /// [`MAX_CONCURRENT_KICKS`] permits, then runs both, each bounded; a failed
-/// tick is logged and never skips the drain.
+/// tick is logged and never skips the drain. A send still running at the
+/// drain's `deliveries::DRAIN_DEADLINE` finishes after this returns.
 pub async fn kick(state: &AppState) {
     if !state.config.incidents_worker_enabled {
         return;

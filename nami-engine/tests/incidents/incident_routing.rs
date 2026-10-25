@@ -369,9 +369,9 @@ async fn a_source_that_recovered_while_paused_resolves_without_paging_on_resume(
     assert!(settled_mail(&bob_email, 0).await.is_empty(), "nobody is paged for a recovered source");
 }
 
-/// A maintenance window defers a due step until it is over, looking again
-/// at each tick (ruling on NAMI-INC-10). Only project-wide windows cover a
-/// log alert, as when it is evaluated. A manual incident is never held.
+/// A maintenance window defers a due step until it is over (ruling on
+/// NAMI-INC-10). Only project-wide windows cover a log alert, as when it is
+/// evaluated. A manual incident is never held.
 #[sqlx::test]
 async fn maintenance_defers_a_log_alert_page_until_the_window_ends(pool: sqlx::PgPool) {
     let state = AppState::for_test(pool.clone());

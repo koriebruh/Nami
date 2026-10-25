@@ -744,3 +744,47 @@ async fn a_page_in_flight_at_resolve_time_gets_its_resolved_notice(pool: sqlx::P
     assert_eq!(notices().await, [("resolved:g0".to_string(), "sent".to_string())]);
     assert_eq!(slow.received_requests().await.unwrap().len(), 2);
 }
+
+/// A drain claims a row only for a free send slot: with every one of the
+/// instance's slots held by a hanging send, the next due row is not claimed
+/// (no attempt spent, no lease taken) until a slot frees up.
+#[sqlx::test]
+async fn a_row_past_the_free_send_slots_is_not_claimed(pool: sqlx::PgPool) {
+    let state = AppState::for_test(pool.clone());
+    let app = test_app(pool.clone());
+    let project = seed_project(&pool).await;
+    let (user, _, _) = user_with_role(&app, &pool, project, Some("member")).await;
+    let (port, _silent) = common::silent_server().await;
+    let incident = open_test_incident(&pool, project, user).await;
+    // Two hanging channels, so neither reaches its per-minute cap first.
+    let cap = deliveries::CHANNEL_PER_MINUTE as usize;
+    let per_channel = [cap, deliveries::MAX_SENDS_IN_FLIGHT - cap];
+    for (name, rows) in ["a", "b"].into_iter().zip(per_channel) {
+        let config = ChannelConfig::Slack { webhook_url: format!("http://127.0.0.1:{port}/services/{name}") };
+        let channel = insert_channel(&pool, Some(project), None, name, config).await;
+        for n in 0..rows {
+            queue(&pool, incident, &format!("hung-{name}{n}"), Target::Channel { channel_id: channel, user_id: None }).await;
+        }
+    }
+    sqlx::query("update notification_deliveries set next_attempt_at = now() - interval '1 hour' where round like 'hung-%'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let fast = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(200)).mount(&fast).await;
+    let config = ChannelConfig::Slack { webhook_url: format!("{}/services/c", fast.uri()) };
+    let next = insert_channel(&pool, Some(project), None, "c", config).await;
+    queue(&pool, incident, "p0r0s0", Target::Channel { channel_id: next, user_id: None }).await;
+
+    run_incident_ticks(&state).await;
+    let in_flight: i64 = sqlx::query_scalar(
+        "select count(*) from notification_deliveries where round like 'hung-%' and status = 'sending'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(in_flight, deliveries::MAX_SENDS_IN_FLIGHT as i64, "every slot is held");
+    let (status, attempts, _) = delivery(&pool, incident).await;
+    assert_eq!((status.as_str(), attempts), ("pending", 0), "the one past the slots waits, unattempted");
+    assert!(fast.received_requests().await.unwrap().is_empty());
+}
